@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any
 
 import requests
 
-from PyQt6.QtCore import Qt, QObject, QEvent, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QObject, QEvent, pyqtSignal, QTimer, QPoint
 from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy
@@ -90,6 +90,8 @@ class ConveyorWidget(QWidget):
         self._items: list[dict] = []
         self._belt_y = 58.0
         self._phase = 0
+        self._packer_phase = 0
+        self._pack_cycle = 0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(33)
@@ -118,7 +120,10 @@ class ConveyorWidget(QWidget):
     def _tick(self):
         alive = []
         self._phase = (self._phase + 2) % 24
-        exit_x = self.width() - 8
+        self._packer_phase = (self._packer_phase + 1) % 32
+        if self._pack_cycle > 0:
+            self._pack_cycle -= 1
+        pickup_x = max(40, self.width() - 162)
         for it in self._items:
             if not it["landed"]:
                 it["vy"] += 0.9
@@ -129,7 +134,8 @@ class ConveyorWidget(QWidget):
             else:
                 speed = 3.4 if it["kind"] == "PACK" else 2.8 if it["kind"] == "BUTAL" else 2.0
                 it["x"] += speed
-                if it["x"] >= exit_x:
+                if it["x"] >= pickup_x:
+                    self._pack_cycle = 20
                     continue
 
             if it["x"] <= self.width() + 30:
@@ -140,33 +146,116 @@ class ConveyorWidget(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        belt_right = max(120, self.width() - 170)
 
         # Conveyor frame
         frame_y = int(self._belt_y) - 8
         p.setPen(QPen(QColor("#64748b"), 1))
         p.setBrush(QColor("#e2e8f0"))
-        p.drawRoundedRect(4, frame_y, self.width() - 68, 40, 10, 10)
+        p.drawRoundedRect(4, frame_y, belt_right - 4, 40, 10, 10)
 
         # Belt bed
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor("#334155"))
-        p.drawRoundedRect(12, int(self._belt_y), self.width() - 84, 14, 7, 7)
+        p.drawRoundedRect(12, int(self._belt_y), belt_right - 16, 14, 7, 7)
 
         # Moving belt slats
         p.setPen(QPen(QColor("#64748b"), 1))
-        for i in range(14 - self._phase, self.width() - 84, 12):
+        for i in range(14 - self._phase, belt_right - 8, 12):
             p.drawLine(i, int(self._belt_y) + 2, i + 4, int(self._belt_y) + 12)
 
         # rollers
         p.setPen(QPen(QColor("#475569"), 1))
         p.setBrush(QColor("#94a3b8"))
-        for i in range(14, self.width() - 78, 32):
+        for i in range(14, belt_right - 2, 32):
             p.drawEllipse(i, int(self._belt_y) + 16, 10, 10)
 
-        # End chute
+        # Belt end guard
         p.setPen(QPen(QColor("#64748b"), 1))
         p.setBrush(QColor("#cbd5e1"))
-        p.drawRoundedRect(self.width() - 18, int(self._belt_y) - 2, 12, 22, 4, 4)
+        p.drawRoundedRect(belt_right - 8, int(self._belt_y) - 2, 12, 22, 4, 4)
+
+        # Packer character at station
+        base_x = self.width() - 120
+        base_y = int(self._belt_y) - 2
+        carrying = self._pack_cycle > 0
+        arm_reach = 12 if carrying else (4 if self._packer_phase < 16 else 9)
+        body_bob = 0 if self._packer_phase < 16 else 1
+
+        # legs + shoes
+        p.setPen(QPen(QColor("#1f2937"), 2))
+        p.setBrush(QColor("#0f172a"))
+        p.drawRoundedRect(base_x + 9, base_y + 1, 5, 12, 2, 2)
+        p.drawRoundedRect(base_x + 17, base_y + 1, 5, 12, 2, 2)
+        p.drawRoundedRect(base_x + 7, base_y + 12, 8, 3, 1, 1)
+        p.drawRoundedRect(base_x + 16, base_y + 12, 8, 3, 1, 1)
+
+        # torso
+        p.setPen(QPen(QColor("#1e3a8a"), 1))
+        p.setBrush(QColor("#2563eb"))
+        p.drawRoundedRect(base_x + 7, base_y - 18 + body_bob, 18, 22, 4, 4)
+
+        # neck
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#f1c27d"))
+        p.drawRoundedRect(base_x + 13, base_y - 20 + body_bob, 6, 4, 2, 2)
+
+        # head
+        p.setPen(QPen(QColor("#334155"), 1))
+        p.setBrush(QColor("#f6c88f"))
+        p.drawEllipse(base_x + 9, base_y - 34 + body_bob, 14, 14)
+        # hair
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#3f2a1d"))
+        p.drawChord(base_x + 9, base_y - 35 + body_bob, 14, 10, 0, 2880)
+        # face (tiny eyes)
+        p.setPen(QPen(QColor("#1f2937"), 1))
+        p.drawPoint(base_x + 13, base_y - 26 + body_bob)
+        p.drawPoint(base_x + 18, base_y - 26 + body_bob)
+
+        # arms (right arm reaches toward box)
+        p.setPen(QPen(QColor("#1e3a8a"), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(base_x + 8, base_y - 11 + body_bob, base_x + 2, base_y - 3 + body_bob)
+        p.drawLine(base_x + 24, base_y - 11 + body_bob, base_x + 30 + arm_reach, base_y - 6 + body_bob)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#f1c27d"))
+        p.drawEllipse(base_x - 1, base_y - 5 + body_bob, 4, 4)
+        p.drawEllipse(base_x + 29 + arm_reach, base_y - 8 + body_bob, 4, 4)
+
+        # Container/bin where boxes are dropped
+        bin_x = self.width() - 62
+        bin_y = int(self._belt_y) - 24
+        p.setPen(QPen(QColor("#334155"), 2))
+        p.setBrush(QColor("#cbd5e1"))
+        p.drawRoundedRect(bin_x, bin_y, 48, 38, 6, 6)
+        p.setBrush(QColor("#e2e8f0"))
+        p.drawRect(bin_x + 4, bin_y + 6, 40, 26)
+
+        # Box at pickup point (only when not currently carried)
+        box_x = self.width() - 154
+        box_y = int(self._belt_y) - 12
+        if not carrying:
+            p.setPen(QPen(QColor("#78350f"), 1))
+            p.setBrush(QColor("#92400e"))
+            p.drawRoundedRect(box_x, box_y, 16, 12, 2, 2)
+            p.setPen(QPen(QColor("#fef3c7"), 1))
+            p.drawLine(box_x + 8, box_y, box_x + 8, box_y + 12)
+
+        # Carried box: hand moves from pickup point toward container
+        if carrying:
+            t = (20 - self._pack_cycle) / 20.0
+            carry_x = int(box_x + (bin_x + 12 - box_x) * t)
+            carry_y = int(box_y + (bin_y + 12 - box_y) * t)
+            p.setPen(QPen(QColor("#78350f"), 1))
+            p.setBrush(QColor("#b45309"))
+            p.drawRoundedRect(carry_x, carry_y, 16, 12, 2, 2)
+            p.setPen(QPen(QColor("#fef3c7"), 1))
+            p.drawLine(carry_x + 8, carry_y, carry_x + 8, carry_y + 12)
+
+        # Subtle drop highlight in the bin at end of cycle
+        if 1 <= self._pack_cycle <= 4:
+            p.setPen(QPen(QColor("#60a5fa"), 2))
+            p.drawEllipse(bin_x + 14, bin_y + 18, 20, 12)
 
         # items
         for it in self._items:
@@ -195,6 +284,8 @@ class ClientUI(QWidget):
         self.state = ClientState()
         self._serial_stop = threading.Event()
         self._serial_thread: Optional[threading.Thread] = None
+        self._scanner_alert_active = False
+        self._scanner_alert_step = 0
 
         self.setWindowTitle("Machine Client Dashboard")
         self.setMinimumSize(0, 0)
@@ -345,6 +436,9 @@ class ClientUI(QWidget):
         self.machine_anim_timer.timeout.connect(self._animate_machine_icon)
         self.machine_anim_timer.start(180)
         self._machine_anim_step = 0
+        self._scanner_alert_timer = QTimer(self)
+        self._scanner_alert_timer.timeout.connect(self._animate_scanner_alert)
+        self._scanner_alert_timer.start(90)
 
         self._refresh_ui()
 
@@ -452,6 +546,16 @@ class ClientUI(QWidget):
 
     def _set_status_text(self, text: str):
         t = str(text).replace("\n", " ").strip()
+        low = t.lower()
+        if "scanner serial connected" in low:
+            self._set_scanner_alert(False)
+        elif (
+            ("serial retry" in low)
+            or ("serial requested but pyserial is not installed" in low)
+            or ("waiting for scanner" in low)
+        ):
+            self._set_scanner_alert(True)
+
         if len(t) > 120:
             short = t[:117] + "..."
             self.status.setText(short)
@@ -459,6 +563,80 @@ class ClientUI(QWidget):
         else:
             self.status.setText(t)
             self.status.setToolTip("")
+
+    def _set_scanner_alert(self, active: bool):
+        self._scanner_alert_active = bool(active)
+        if not self._scanner_alert_active:
+            self._scanner_alert_step = 0
+        self.update()
+
+    def _animate_scanner_alert(self):
+        if not self._scanner_alert_active:
+            return
+        self._scanner_alert_step = (self._scanner_alert_step + 1) % 20
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._scanner_alert_active:
+            return
+
+        # Aggressive strobe pulse for critical scanner missing state.
+        pulse = [120, 170, 235, 255, 220, 180, 255, 200, 255, 150]
+        alpha = pulse[self._scanner_alert_step % len(pulse)]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setClipRect(self.rect())
+        flash = (self._scanner_alert_step % 2) == 0
+
+        # Bright base flash.
+        p.setPen(Qt.PenStyle.NoPen)
+        base = QColor(255, 32, 32, min(255, alpha)) if flash else QColor(255, 210, 0, min(235, alpha))
+        p.setBrush(base)
+        p.drawRect(self.rect())
+
+        # High-contrast moving warning stripes.
+        stripe_w = 64
+        shift = (self._scanner_alert_step * 14) % stripe_w
+        start = -self.height() - stripe_w
+        end = self.width() + self.height() + stripe_w
+        for x in range(start - shift, end, stripe_w):
+            p.setBrush(QColor(255, 235, 59, min(255, alpha)))
+            p.drawPolygon(
+                QPoint(x, 0),
+                QPoint(x + 32, 0),
+                QPoint(x + self.height() + 32, self.height()),
+                QPoint(x + self.height(), self.height()),
+            )
+            p.setBrush(QColor(220, 20, 20, min(255, alpha)))
+            p.drawPolygon(
+                QPoint(x + 32, 0),
+                QPoint(x + 64, 0),
+                QPoint(x + self.height() + 64, self.height()),
+                QPoint(x + self.height() + 32, self.height()),
+            )
+
+        # Extra white flash layer.
+        p.setBrush(QColor(255, 255, 255, 75 if flash else 35))
+        p.drawRect(self.rect())
+
+        # Front warning text.
+        p.setPen(QPen(QColor(0, 0, 0, 180), 1))
+        title_font = p.font()
+        title_font.setPointSize(max(30, int(min(self.width(), self.height()) * 0.075)))
+        title_font.setBold(True)
+        p.setFont(title_font)
+        center = self.rect()
+        p.drawText(center.adjusted(3, 3, 3, 3), Qt.AlignmentFlag.AlignCenter, "NO SCANNER DETECTED")
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(center, Qt.AlignmentFlag.AlignCenter, "NO SCANNER DETECTED")
+
+        sub_font = p.font()
+        sub_font.setPointSize(max(12, int(min(self.width(), self.height()) * 0.022)))
+        sub_font.setBold(True)
+        p.setFont(sub_font)
+        p.drawText(center.adjusted(0, 96, 0, 0), Qt.AlignmentFlag.AlignCenter, "Reconnect scanner to clear alert")
+        p.end()
 
     def _setup_scanner_input(self):
         mode = SCANNER_MODE
@@ -470,17 +648,21 @@ class ClientUI(QWidget):
             self.installEventFilter(self.filter)
             self.filter.scanned.connect(self.scan_received.emit)
             if mode == "keyboard":
+                self._set_scanner_alert(False)
                 self._set_status_text("Scanner input: Keyboard mode")
                 return
 
         # auto or serial path
         if serial is None:
+            self._set_scanner_alert(mode == "serial")
             if mode == "serial":
                 self._set_status_text("Scanner input: Serial requested but pyserial is not installed.")
             else:
                 self._set_status_text("Scanner input: Keyboard mode (pyserial not installed)")
             return
 
+        self._set_scanner_alert(True)
+        self._set_status_text(f"Scanner input: Waiting for scanner on {SCANNER_COM_PORT} ...")
         self._serial_thread = threading.Thread(target=self._serial_reader_loop, daemon=True)
         self._serial_thread.start()
         if mode == "auto":
@@ -515,6 +697,7 @@ class ClientUI(QWidget):
         return bool(s.machine_code and s.job_code and s.operator_id)
 
     def on_scanned(self, raw: str):
+        self._set_scanner_alert(False)
         res = parse_scan(raw)
         self.log_last(self._scan_display_text(res, raw))
 
