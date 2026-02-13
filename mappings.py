@@ -1,8 +1,10 @@
 # mappings.py
 from __future__ import annotations
+import json
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Any
 
 
 MACHINE_MAP: Dict[str, str] = {
@@ -30,6 +32,19 @@ OPERATOR_MAP: Dict[str, str] = {
     "1000002": "Charlie Brown",
     "1000003": "Lucy Van Pelt",
 }
+
+
+def _load_job_stubs() -> Dict[str, Any]:
+    p = Path(__file__).with_name("job_data_stubs.json")
+    try:
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+JOB_STUBS: Dict[str, Any] = _load_job_stubs()
 
 
 def now_iso() -> str:
@@ -66,10 +81,15 @@ class ScanResult:
     raw: str
     value: str
     qty: Optional[int] = None
+    meta: Optional[Dict[str, Any]] = None
 
 
 def parse_scan(raw: str) -> Optional[ScanResult]:
     s = raw.strip()
+
+    # Reject summary trigger
+    if s.lower() == "rejectsummary":
+        return ScanResult(kind="REJECT_SUMMARY", raw=raw, value="Reject summary")
 
     # Reject trigger
     if s.lower() == "reject~1":
@@ -86,6 +106,35 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
     # Job
     if s in JOB_MAP:
         return ScanResult(kind="JOB", raw=raw, value=JOB_MAP[s])
+
+    # Job stub by key value from local stub file
+    if s in JOB_STUBS and isinstance(JOB_STUBS[s], dict):
+        payload = JOB_STUBS[s]
+        job = {}
+        if isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("job"), dict):
+            job = payload["data"]["job"]
+        job_ref = str(job.get("ref_no", "")).strip() or s
+        return ScanResult(kind="JOB_STUB", raw=raw, value=f"Job payload: {job_ref}", meta=payload)
+
+    # Job payload / API stub (JSON in QR)
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, dict):
+            has_job_shape = any(
+                k in parsed
+                for k in ("job_code", "job_name", "job", "summary", "reject_summary", "rejects")
+            )
+            if has_job_shape:
+                job_code = str(parsed.get("job_code", "")).strip()
+                job_name = str(parsed.get("job_name", "")).strip()
+                label = "Job payload"
+                if job_name:
+                    label = f"Job payload: {job_name}"
+                elif job_code:
+                    label = f"Job payload: {job_code}"
+                return ScanResult(kind="JOB_STUB", raw=raw, value=label, meta=parsed)
+    except Exception:
+        pass
 
     # Operator
     if is_operator_badge(s):

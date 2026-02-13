@@ -1,6 +1,7 @@
 # client.py
 from __future__ import annotations
 import os
+import re
 import socket
 import sys
 import threading
@@ -9,10 +10,10 @@ from typing import Optional, Dict, Any
 
 import requests
 
-from PyQt6.QtCore import Qt, QObject, QEvent, pyqtSignal, QTimer, QPoint
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtCore import Qt, QObject, QEvent, pyqtSignal, QTimer, QSize
+from PyQt6.QtGui import QMovie, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy
+    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect
 )
 
 from mappings import parse_scan, MACHINE_MAP, JOB_MAP, REJECT_REASON_MAP
@@ -30,6 +31,30 @@ SCANNER_MODE = os.environ.get("MACHINE_SCANNER_MODE", "auto").strip().lower()
 SCANNER_COM_PORT = os.environ.get("MACHINE_SCANNER_COM_PORT", "COM6").strip()
 SCANNER_BAUDRATE = int(os.environ.get("MACHINE_SCANNER_BAUDRATE", "9600"))
 SCANNER_TIMEOUT = float(os.environ.get("MACHINE_SCANNER_TIMEOUT", "1.0"))
+INVALID_SCAN_GIF = os.environ.get("MACHINE_INVALID_SCAN_GIF", "slap-virtual-slap.gif").strip()
+
+REJECT_DETAIL_ITEMS = [
+    ("BM", "BURN MARK"),
+    ("CS", "COLOR STREAK"),
+    ("CO", "CONTAMINATION"),
+    ("CR", "CRACK/BRITTLE"),
+    ("DI", "DISCOLORATION"),
+    ("EM", "EJECTOR MARK"),
+    ("FL", "FLASHES"),
+    ("FM", "FLOW MARK/ WRINKLE"),
+    ("NO", "NO SHOT"),
+    ("OC", "OVER-CUT"),
+    ("SC", "SCRATCH"),
+    ("SS", "SHORT SHOT"),
+    ("SI", "SILICONE MARK"),
+    ("SK", "SILVER STREAK"),
+    ("SM", "SINK MARK"),
+    ("ST", "STUCK"),
+    ("VO", "VOID"),
+    ("WA", "WARP"),
+    ("WM", "WATER MARK"),
+    ("WL", "WELD LINE"),
+]
 
 
 @dataclass
@@ -40,16 +65,21 @@ class ClientState:
     job_name: Optional[str] = None
     operator_id: Optional[str] = None
 
-    pack_total: int = 0
+    pack_count: int = 0
+    good_total: int = 0
     butal_total: int = 0
     reject_total: int = 0
     reject_breakdown: Dict[str, int] = None
 
     waiting_reject_reason: bool = False
+    showing_reject_summary: bool = False
+    job_payload: Dict[str, Any] = None
 
     def __post_init__(self):
         if self.reject_breakdown is None:
             self.reject_breakdown = {}
+        if self.job_payload is None:
+            self.job_payload = {}
 
 
 class ScannerFilter(QObject):
@@ -83,198 +113,6 @@ class ScannerFilter(QObject):
         return False
 
 
-class ConveyorWidget(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setMinimumHeight(90)
-        self._items: list[dict] = []
-        self._belt_y = 58.0
-        self._phase = 0
-        self._packer_phase = 0
-        self._pack_cycle = 0
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start(33)
-
-    def spawn_item(self, kind: str, qty: int = 1):
-        if kind == "PACK":
-            size = 18
-            color = QColor("#3b82f6")
-        elif kind == "BUTAL":
-            size = 12
-            color = QColor("#10b981")
-        else:  # REJECT
-            size = 16
-            color = QColor("#ef4444")
-
-        self._items.append({
-            "kind": kind,
-            "x": 8.0,
-            "y": 2.0,
-            "vy": 0.0,
-            "size": float(size),
-            "color": color,
-            "landed": False,
-        })
-
-    def _tick(self):
-        alive = []
-        self._phase = (self._phase + 2) % 24
-        self._packer_phase = (self._packer_phase + 1) % 32
-        if self._pack_cycle > 0:
-            self._pack_cycle -= 1
-        pickup_x = max(40, self.width() - 162)
-        for it in self._items:
-            if not it["landed"]:
-                it["vy"] += 0.9
-                it["y"] += it["vy"]
-                if it["y"] >= self._belt_y - it["size"]:
-                    it["y"] = self._belt_y - it["size"]
-                    it["landed"] = True
-            else:
-                speed = 3.4 if it["kind"] == "PACK" else 2.8 if it["kind"] == "BUTAL" else 2.0
-                it["x"] += speed
-                if it["x"] >= pickup_x:
-                    self._pack_cycle = 20
-                    continue
-
-            if it["x"] <= self.width() + 30:
-                alive.append(it)
-        self._items = alive
-        self.update()
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        belt_right = max(120, self.width() - 170)
-
-        # Conveyor frame
-        frame_y = int(self._belt_y) - 8
-        p.setPen(QPen(QColor("#64748b"), 1))
-        p.setBrush(QColor("#e2e8f0"))
-        p.drawRoundedRect(4, frame_y, belt_right - 4, 40, 10, 10)
-
-        # Belt bed
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#334155"))
-        p.drawRoundedRect(12, int(self._belt_y), belt_right - 16, 14, 7, 7)
-
-        # Moving belt slats
-        p.setPen(QPen(QColor("#64748b"), 1))
-        for i in range(14 - self._phase, belt_right - 8, 12):
-            p.drawLine(i, int(self._belt_y) + 2, i + 4, int(self._belt_y) + 12)
-
-        # rollers
-        p.setPen(QPen(QColor("#475569"), 1))
-        p.setBrush(QColor("#94a3b8"))
-        for i in range(14, belt_right - 2, 32):
-            p.drawEllipse(i, int(self._belt_y) + 16, 10, 10)
-
-        # Belt end guard
-        p.setPen(QPen(QColor("#64748b"), 1))
-        p.setBrush(QColor("#cbd5e1"))
-        p.drawRoundedRect(belt_right - 8, int(self._belt_y) - 2, 12, 22, 4, 4)
-
-        # Packer character at station
-        base_x = self.width() - 120
-        base_y = int(self._belt_y) - 2
-        carrying = self._pack_cycle > 0
-        arm_reach = 12 if carrying else (4 if self._packer_phase < 16 else 9)
-        body_bob = 0 if self._packer_phase < 16 else 1
-
-        # legs + shoes
-        p.setPen(QPen(QColor("#1f2937"), 2))
-        p.setBrush(QColor("#0f172a"))
-        p.drawRoundedRect(base_x + 9, base_y + 1, 5, 12, 2, 2)
-        p.drawRoundedRect(base_x + 17, base_y + 1, 5, 12, 2, 2)
-        p.drawRoundedRect(base_x + 7, base_y + 12, 8, 3, 1, 1)
-        p.drawRoundedRect(base_x + 16, base_y + 12, 8, 3, 1, 1)
-
-        # torso
-        p.setPen(QPen(QColor("#1e3a8a"), 1))
-        p.setBrush(QColor("#2563eb"))
-        p.drawRoundedRect(base_x + 7, base_y - 18 + body_bob, 18, 22, 4, 4)
-
-        # neck
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#f1c27d"))
-        p.drawRoundedRect(base_x + 13, base_y - 20 + body_bob, 6, 4, 2, 2)
-
-        # head
-        p.setPen(QPen(QColor("#334155"), 1))
-        p.setBrush(QColor("#f6c88f"))
-        p.drawEllipse(base_x + 9, base_y - 34 + body_bob, 14, 14)
-        # hair
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#3f2a1d"))
-        p.drawChord(base_x + 9, base_y - 35 + body_bob, 14, 10, 0, 2880)
-        # face (tiny eyes)
-        p.setPen(QPen(QColor("#1f2937"), 1))
-        p.drawPoint(base_x + 13, base_y - 26 + body_bob)
-        p.drawPoint(base_x + 18, base_y - 26 + body_bob)
-
-        # arms (right arm reaches toward box)
-        p.setPen(QPen(QColor("#1e3a8a"), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        p.drawLine(base_x + 8, base_y - 11 + body_bob, base_x + 2, base_y - 3 + body_bob)
-        p.drawLine(base_x + 24, base_y - 11 + body_bob, base_x + 30 + arm_reach, base_y - 6 + body_bob)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#f1c27d"))
-        p.drawEllipse(base_x - 1, base_y - 5 + body_bob, 4, 4)
-        p.drawEllipse(base_x + 29 + arm_reach, base_y - 8 + body_bob, 4, 4)
-
-        # Container/bin where boxes are dropped
-        bin_x = self.width() - 62
-        bin_y = int(self._belt_y) - 24
-        p.setPen(QPen(QColor("#334155"), 2))
-        p.setBrush(QColor("#cbd5e1"))
-        p.drawRoundedRect(bin_x, bin_y, 48, 38, 6, 6)
-        p.setBrush(QColor("#e2e8f0"))
-        p.drawRect(bin_x + 4, bin_y + 6, 40, 26)
-
-        # Box at pickup point (only when not currently carried)
-        box_x = self.width() - 154
-        box_y = int(self._belt_y) - 12
-        if not carrying:
-            p.setPen(QPen(QColor("#78350f"), 1))
-            p.setBrush(QColor("#92400e"))
-            p.drawRoundedRect(box_x, box_y, 16, 12, 2, 2)
-            p.setPen(QPen(QColor("#fef3c7"), 1))
-            p.drawLine(box_x + 8, box_y, box_x + 8, box_y + 12)
-
-        # Carried box: hand moves from pickup point toward container
-        if carrying:
-            t = (20 - self._pack_cycle) / 20.0
-            carry_x = int(box_x + (bin_x + 12 - box_x) * t)
-            carry_y = int(box_y + (bin_y + 12 - box_y) * t)
-            p.setPen(QPen(QColor("#78350f"), 1))
-            p.setBrush(QColor("#b45309"))
-            p.drawRoundedRect(carry_x, carry_y, 16, 12, 2, 2)
-            p.setPen(QPen(QColor("#fef3c7"), 1))
-            p.drawLine(carry_x + 8, carry_y, carry_x + 8, carry_y + 12)
-
-        # Subtle drop highlight in the bin at end of cycle
-        if 1 <= self._pack_cycle <= 4:
-            p.setPen(QPen(QColor("#60a5fa"), 2))
-            p.drawEllipse(bin_x + 14, bin_y + 18, 20, 12)
-
-        # items
-        for it in self._items:
-            x = int(it["x"])
-            y = int(it["y"])
-            s = int(it["size"])
-            p.setPen(QPen(QColor("#334155"), 1))
-            p.setBrush(it["color"])
-            p.drawRoundedRect(x, y, s, s, 3, 3)
-
-            if it["kind"] == "REJECT":
-                # cracked marker
-                p.setPen(QPen(QColor("#ffffff"), 2))
-                p.drawLine(x + 3, y + 2, x + s - 4, y + s - 4)
-                p.drawLine(x + s - 6, y + 2, x + 4, y + s - 5)
-
-        p.end()
-
-
 class ClientUI(QWidget):
     scan_received = pyqtSignal(str)
     scanner_status = pyqtSignal(str)
@@ -284,8 +122,20 @@ class ClientUI(QWidget):
         self.state = ClientState()
         self._serial_stop = threading.Event()
         self._serial_thread: Optional[threading.Thread] = None
-        self._scanner_alert_active = False
-        self._scanner_alert_step = 0
+        self._motion_index = 0
+        self._motion_frames = [
+            "[M] >    ",
+            "[M] >>   ",
+            "[M] >>>  ",
+            "[M]  >>> ",
+            "[M]   >>>",
+            "[M]    >>",
+        ]
+        self._label_icon_candidates = {
+            "machine": ["machine.png", "machine.jpg", "machine.jpeg", "machine_icon.png", "icon_machine.png"],
+            "job": ["job-seeker.png", "job.png", "job.jpg", "job.jpeg", "job_icon.png", "icon_job.png"],
+            "operator": ["worker.png", "operator.png", "operator.jpg", "operator.jpeg", "operator_icon.png", "icon_operator.png"],
+        }
 
         self.setWindowTitle("Machine Client Dashboard")
         self.setMinimumSize(0, 0)
@@ -305,7 +155,6 @@ class ClientUI(QWidget):
         self.pageTitle.setObjectName("PageTitle")
 
         self._banner_base_text = "Scan MACHINE QR to start"
-        self._banner_anim_step = 0
         self.banner = QLabel(self._banner_base_text)
         self.banner.setObjectName("Banner")
         self.banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -314,10 +163,15 @@ class ClientUI(QWidget):
         self.status.setWordWrap(True)
         self.status.setFixedHeight(44)
         self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.machineAnim = QLabel("[M] ----")
+        self.machineAnim.setObjectName("MachineAnim")
+        self.machineAnim.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.machineAnim.setFixedWidth(160)
 
         left.addWidget(self.pageTitle)
         left.addWidget(self.banner)
         left.addWidget(self.status)
+        left.addWidget(self.machineAnim)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
@@ -328,20 +182,32 @@ class ClientUI(QWidget):
         statRow = QHBoxLayout()
         statRow.setSpacing(10)
         self.lblPack = QLabel("0")
+        self.lblGood = QLabel("0")
         self.lblButal = QLabel("0")
         self.lblReject = QLabel("0")
-        statRow.addWidget(self._make_stat_card("Pack", self.lblPack, "StatPack"))
-        statRow.addWidget(self._make_stat_card("Butal", self.lblButal, "StatButal"))
-        statRow.addWidget(self._make_stat_card("Reject", self.lblReject, "StatReject"))
+        self.lblTotalGood = QLabel("0")
+        self.cardStatPack = self._make_stat_card("Pack", self.lblPack, "StatPack")
+        self.cardStatGood = self._make_stat_card("Good", self.lblGood, "StatGood")
+        self.cardStatButal = self._make_stat_card("Butal", self.lblButal, "StatButal")
+        self.cardStatReject = self._make_stat_card("Reject", self.lblReject, "StatReject")
+        self.cardStatTotalGood = self._make_stat_card("Total Good", self.lblTotalGood, "StatTotalGood")
+        statRow.addWidget(self.cardStatPack)
+        statRow.addWidget(self.cardStatGood)
+        statRow.addWidget(self.cardStatButal)
+        statRow.addWidget(self.cardStatReject)
+        statRow.addWidget(self.cardStatTotalGood)
         self.cardProduction.layout().addLayout(statRow)
-        self.cardProduction.setFixedHeight(180)
+        self.cardProduction.setFixedHeight(155)
         grid.addWidget(self.cardProduction, 0, 0, 1, 2)
 
         # Session panel
         self.cardSession = self._make_card("Session")
         sessionGrid = QGridLayout()
-        sessionGrid.setHorizontalSpacing(10)
+        sessionGrid.setHorizontalSpacing(12)
         sessionGrid.setVerticalSpacing(10)
+        sessionGrid.setContentsMargins(0, 0, 10, 0)
+        sessionGrid.setColumnStretch(0, 0)
+        sessionGrid.setColumnStretch(1, 1)
 
         self.lblMachine = QLabel("-")
         self.lblJob = QLabel("-")
@@ -353,43 +219,97 @@ class ClientUI(QWidget):
             ("Operator", self.lblOperator),
         ]
         for i, (name, value_lbl) in enumerate(session_rows):
-            n = QLabel(name)
-            n.setObjectName("MetaLabel")
+            n = self._make_meta_label_with_icon(name)
             value_lbl.setObjectName("MetaValue")
+            value_lbl.setMinimumWidth(260)
+            value_lbl.setMinimumHeight(40)
+            value_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             sessionGrid.addWidget(n, i, 0)
             sessionGrid.addWidget(value_lbl, i, 1)
         self.cardSession.layout().addLayout(sessionGrid)
-        self.cardSession.setFixedHeight(190)
+        self.cardSession.setFixedHeight(175)
         grid.addWidget(self.cardSession, 1, 0)
 
         # Reject detail panel
         self.cardReject = self._make_card("Reject Details")
-        self.lblRejectBreak = QLabel("-")
-        self.lblRejectBreak.setWordWrap(True)
-        self.lblRejectBreak.setObjectName("MetaValue")
-        self.lblRejectBreak.setFixedHeight(42)
-        self.cardReject.layout().addWidget(self.lblRejectBreak)
-        self.cardReject.setFixedHeight(120)
-        grid.addWidget(self.cardReject, 2, 0)
+        self.rejectDetailGrid = QGridLayout()
+        self.rejectDetailGrid.setHorizontalSpacing(8)
+        self.rejectDetailGrid.setVerticalSpacing(6)
+        self.reject_detail_labels: Dict[str, QLabel] = {}
+
+        for idx, (code, label) in enumerate(REJECT_DETAIL_ITEMS):
+            item = QLabel(f"{label} = 0")
+            item.setObjectName("MetaValue")
+            item.setWordWrap(True)
+            item.setMinimumHeight(44)
+            item.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            self.reject_detail_labels[code] = item
+            row = idx // 4
+            col = idx % 4
+            self.rejectDetailGrid.addWidget(item, row, col)
+
+        self.cardReject.layout().addLayout(self.rejectDetailGrid)
+        self.cardReject.setFixedHeight(300)
+        grid.addWidget(self.cardReject, 2, 0, 1, 2)
+
+        # Job details panel
+        self.cardJobDetails = self._make_card("Job Details")
+        self.jobDetailGrid = QGridLayout()
+        self.jobDetailGrid.setHorizontalSpacing(8)
+        self.jobDetailGrid.setVerticalSpacing(6)
+        self.jobDetailGrid.setContentsMargins(0, 0, 0, 0)
+        self.job_detail_labels: Dict[str, QLabel] = {}
+
+        fields = [
+            ("Job Ref", "job_ref"),
+            ("Product ID", "product_id"),
+            ("Mold", "mold"),
+            ("Color", "color"),
+            ("System Code", "system_code"),
+            ("Cavities", "cavities"),
+        ]
+        for idx, (title, key) in enumerate(fields):
+            card = QFrame()
+            card.setObjectName("SubPanel")
+            card.setLayout(QVBoxLayout())
+            card.layout().setContentsMargins(10, 8, 10, 8)
+            card.layout().setSpacing(4)
+            if key in ("job_ref", "color"):
+                card.layout().setContentsMargins(10, 4, 10, 8)
+                card.layout().setSpacing(2)
+            t = QLabel(title)
+            t.setObjectName("MetaLabel")
+            v = QLabel("-")
+            v.setObjectName("MetaValue")
+            v.setWordWrap(True)
+            v.setMinimumHeight(38)
+            if key in ("job_ref", "color"):
+                v.setMinimumHeight(34)
+            card.layout().addWidget(t)
+            card.layout().addWidget(v)
+            self.job_detail_labels[key] = v
+            row = idx // 3
+            col = idx % 3
+            self.jobDetailGrid.addWidget(card, row, col)
+
+        self.cardJobDetails.layout().addLayout(self.jobDetailGrid)
+        self.cardJobDetails.layout().addStretch(1)
+        self.cardJobDetails.setFixedHeight(220)
+        grid.addWidget(self.cardJobDetails, 3, 0, 1, 2)
 
         # Activity panel
         self.cardActivity = self._make_card("Activity")
         self.lblLast = QLabel("-")
         self.lblLast.setObjectName("MetaValue")
+        self.lblLast.setWordWrap(True)
         self.cardActivity.layout().addWidget(self.lblLast)
-        self.cardActivity.setFixedHeight(190)
+        self.cardActivity.setFixedHeight(165)
         grid.addWidget(self.cardActivity, 1, 1)
 
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         left.addLayout(grid)
 
-        # Bottom conveyor panel
-        self.cardConveyor = self._make_card("Conveyor")
-        self.conveyor = ConveyorWidget()
-        self.cardConveyor.layout().addWidget(self.conveyor)
-        self.cardConveyor.setFixedHeight(165)
-        left.addWidget(self.cardConveyor)
         left.addStretch(1)
 
         # Right side placeholder for future views.
@@ -404,21 +324,49 @@ class ClientUI(QWidget):
         self.rightTitle.setObjectName("RightTitle")
         self.rightHint = QLabel("Reserved area for upcoming UI modules.")
         self.rightHint.setObjectName("RightHint")
-        self.machineAnim = QLabel("[M] ----")
-        self.machineAnim.setObjectName("MachineAnim")
-        self.machineAnim.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.machineAnim.setFixedWidth(160)
-
         rightLayout.addWidget(self.rightTitle)
         rightLayout.addWidget(self.rightHint)
-        rightLayout.addStretch()
-        rightLayout.addWidget(self.machineAnim)
         rightLayout.addStretch()
 
         root.addWidget(leftWrap, 1)
         root.addWidget(self.rightPanel, 1)
 
         self.setLayout(root)
+
+        # Center overlay for invalid scans (GIF)
+        self.invalidOverlay = QFrame(self)
+        self.invalidOverlay.setObjectName("InvalidOverlay")
+        self.invalidOverlay.setStyleSheet(
+            "background: rgba(220,38,38,0.60); border: 2px solid rgba(0,0,0,0.72); border-radius: 0px;"
+        )
+        self.invalidOverlay.setLayout(QVBoxLayout())
+        self.invalidOverlay.layout().setContentsMargins(10, 10, 10, 10)
+        self.invalidOverlay.layout().setSpacing(8)
+        self.invalidOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.invalidGifLabel = QLabel()
+        self.invalidGifLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.invalidTextLabel = QLabel("INVALID SCAN")
+        self.invalidTextLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.invalidTextLabel.setStyleSheet("color: #ffffff; font-size: 28px; font-weight: 900;")
+        gif_shadow = QGraphicsDropShadowEffect(self)
+        gif_shadow.setBlurRadius(10)
+        gif_shadow.setOffset(0, 0)
+        gif_shadow.setColor(Qt.GlobalColor.black)
+        self.invalidGifLabel.setGraphicsEffect(gif_shadow)
+        text_shadow = QGraphicsDropShadowEffect(self)
+        text_shadow.setBlurRadius(8)
+        text_shadow.setOffset(0, 0)
+        text_shadow.setColor(Qt.GlobalColor.black)
+        self.invalidTextLabel.setGraphicsEffect(text_shadow)
+        self.invalidOverlay.layout().addWidget(self.invalidGifLabel, 0, Qt.AlignmentFlag.AlignCenter)
+        self.invalidOverlay.layout().addWidget(self.invalidTextLabel, 0, Qt.AlignmentFlag.AlignCenter)
+        self.invalidOverlay.hide()
+        self.invalidOverlay.raise_()
+        self._invalid_movie: Optional[QMovie] = None
+        self._invalid_hide_timer = QTimer(self)
+        self._invalid_hide_timer.setSingleShot(True)
+        self._invalid_hide_timer.timeout.connect(self._hide_invalid_overlay)
+        self._setup_invalid_overlay_media()
 
         self.scan_received.connect(self.on_scanned)
         self.scanner_status.connect(self._set_status_text)
@@ -429,18 +377,77 @@ class ClientUI(QWidget):
         self.hb.timeout.connect(self.send_heartbeat)
         self.hb.start(5000)
 
-        self.banner_anim = QTimer(self)
-        self.banner_anim.timeout.connect(self._animate_banner)
-        self.banner_anim.start(260)
-        self.machine_anim_timer = QTimer(self)
-        self.machine_anim_timer.timeout.connect(self._animate_machine_icon)
-        self.machine_anim_timer.start(180)
-        self._machine_anim_step = 0
-        self._scanner_alert_timer = QTimer(self)
-        self._scanner_alert_timer.timeout.connect(self._animate_scanner_alert)
-        self._scanner_alert_timer.start(90)
+        self.motionTimer = QTimer(self)
+        self.motionTimer.timeout.connect(self._tick_motion)
+        self.motionTimer.start(220)
 
         self._refresh_ui()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_invalid_overlay()
+        if self._invalid_movie is not None:
+            self._invalid_movie.setScaledSize(self._fit_movie_size(self.invalidOverlay.size()))
+
+    def _setup_invalid_overlay_media(self):
+        gif_path = INVALID_SCAN_GIF
+        if gif_path and os.path.exists(gif_path):
+            movie = QMovie(gif_path)
+            if movie.isValid():
+                movie.jumpToFrame(0)
+                movie.setScaledSize(self._fit_movie_size(self.invalidOverlay.size(), movie))
+                movie.setSpeed(180)
+                self.invalidGifLabel.setMovie(movie)
+                self._invalid_movie = movie
+                return
+        # fallback is text-only overlay when gif is missing/invalid
+        self._invalid_movie = None
+
+    def _fit_movie_size(self, container: QSize, movie: Optional[QMovie] = None) -> QSize:
+        m = movie or self._invalid_movie
+        if m is None:
+            return container
+        frame = m.currentPixmap().size()
+        if not frame.isValid() or frame.width() <= 0 or frame.height() <= 0:
+            return container
+        max_w = max(1, int(container.width() * 0.82))
+        max_h = max(1, int(container.height() * 0.82))
+        ratio = min(max_w / frame.width(), max_h / frame.height())
+        return QSize(max(1, int(frame.width() * ratio)), max(1, int(frame.height() * ratio)))
+
+    def _position_invalid_overlay(self):
+        fm = self.invalidTextLabel.fontMetrics()
+        text_w = fm.horizontalAdvance("INVALID SCAN") + 24
+        text_h = fm.height() + 12
+        gif_size = QSize(220, 140)
+        if self._invalid_movie is not None:
+            f = self._invalid_movie.currentPixmap().size()
+            if f.isValid():
+                gif_size = QSize(max(180, min(320, f.width())), max(100, min(240, f.height())))
+        w = max(text_w, gif_size.width()) + 30
+        h = gif_size.height() + text_h + 34
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
+        self.invalidOverlay.setGeometry(x, y, w, h)
+
+    def _show_invalid_overlay(self):
+        self._position_invalid_overlay()
+        if self._invalid_movie is not None:
+            self._invalid_movie.stop()
+            self._invalid_movie.setScaledSize(self._fit_movie_size(self.invalidOverlay.size()))
+            self._invalid_movie.start()
+            self.invalidGifLabel.show()
+        else:
+            self.invalidGifLabel.hide()
+        self.invalidTextLabel.setText("INVALID SCAN")
+        self.invalidOverlay.show()
+        self.invalidOverlay.raise_()
+        self._invalid_hide_timer.start(3000)
+
+    def _hide_invalid_overlay(self):
+        if self._invalid_movie is not None:
+            self._invalid_movie.stop()
+        self.invalidOverlay.hide()
 
     def _make_card(self, title: str) -> QFrame:
         f = QFrame()
@@ -452,6 +459,45 @@ class ClientUI(QWidget):
         t.setObjectName("SectionTitle")
         f.layout().addWidget(t)
         return f
+
+    def _find_icon_path(self, key: str) -> Optional[str]:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        for candidate in self._label_icon_candidates.get(key.lower(), []):
+            # Try script directory first, then current working directory.
+            p1 = os.path.join(base_dir, candidate)
+            if os.path.exists(p1):
+                return p1
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+        return None
+
+    def _make_meta_label_with_icon(self, text: str) -> QWidget:
+        key = text.strip().lower()
+        icon_path = self._find_icon_path(key)
+        wrap = QWidget()
+        wrap.setStyleSheet("background: transparent;")
+        wrap.setFixedWidth(150)
+        wrap.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        lay = QHBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        wrap.setLayout(lay)
+
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(18, 18)
+        if icon_path:
+            pm = QPixmap(icon_path)
+            if not pm.isNull():
+                pm = pm.scaled(18, 18, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                icon_lbl.setPixmap(pm)
+        lay.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+
+        txt = QLabel(text)
+        txt.setObjectName("MetaLabel")
+        txt.setStyleSheet("font-size: 14px; font-weight: 800; background: transparent;")
+        lay.addWidget(txt, 0, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        lay.addStretch(1)
+        return wrap
 
     def _make_stat_card(self, title: str, value_label: QLabel, stat_object_name: str) -> QFrame:
         f = QFrame()
@@ -468,21 +514,34 @@ class ClientUI(QWidget):
         f.layout().addWidget(value_label)
         return f
 
+    def _pulse_card(self, card: QFrame):
+        if card is None:
+            return
+        card.setProperty("flash", "1")
+        card.style().unpolish(card)
+        card.style().polish(card)
+        QTimer.singleShot(220, lambda c=card: self._clear_pulse(c))
+
+    def _clear_pulse(self, card: QFrame):
+        if card is None:
+            return
+        card.setProperty("flash", "0")
+        card.style().unpolish(card)
+        card.style().polish(card)
+
     def _refresh_ui(self):
         s = self.state
         self.lblMachine.setText(s.machine_name or "-")
         self.lblJob.setText(s.job_name or "-")
         self.lblOperator.setText(self._operator_display_name(s.operator_id))
 
-        self.lblPack.setText(str(s.pack_total))
+        self.lblPack.setText(str(s.pack_count))
+        self.lblGood.setText(str(s.good_total))
         self.lblButal.setText(str(s.butal_total))
         self.lblReject.setText(str(s.reject_total))
+        self.lblTotalGood.setText(str(s.good_total + s.butal_total))
 
-        if s.reject_breakdown:
-            parts = [f"{k}={v}" for k, v in s.reject_breakdown.items()]
-            self.lblRejectBreak.setText(", ".join(parts))
-        else:
-            self.lblRejectBreak.setText("-")
+        self._refresh_reject_detail_grid()
 
         # banner message depending on workflow
         if not s.machine_code:
@@ -491,28 +550,134 @@ class ClientUI(QWidget):
             self._set_banner_text("Scan JOB QR")
         elif not s.operator_id:
             self._set_banner_text("Scan OPERATOR badge")
+        elif s.showing_reject_summary:
+            self._set_banner_text("Reject summary loaded")
         elif s.waiting_reject_reason:
             self._set_banner_text("Reject mode: Scan reject reason (BM01/CS02/CO03/CR04/DI05)")
         else:
             self._set_banner_text("Ready: Scan PACK / BUTAL / Reject~1")
+        self._refresh_job_details()
+
+    def _session_is_running(self) -> bool:
+        s = self.state
+        return bool(s.machine_code and s.job_code and s.operator_id and not s.waiting_reject_reason)
+
+    def _tick_motion(self):
+        if self._session_is_running():
+            frame = self._motion_frames[self._motion_index % len(self._motion_frames)]
+            self.machineAnim.setText(frame)
+            if self._motion_index % 2 == 0:
+                self.banner.setText(f"{self._banner_base_text}  .")
+            else:
+                self.banner.setText(f"{self._banner_base_text}  ..")
+            self._motion_index += 1
+        else:
+            if not self.state.machine_code:
+                self.machineAnim.setText("[M] idle")
+            else:
+                self.machineAnim.setText("[M] ready")
+            self.banner.setText(self._banner_base_text)
+
+    def _refresh_reject_detail_grid(self):
+        counts_by_name: Dict[str, int] = {}
+        breakdown = self.state.reject_breakdown or {}
+
+        for k, v in breakdown.items():
+            key = str(k).strip().upper()
+            try:
+                qty = int(v or 0)
+            except Exception:
+                qty = 0
+            counts_by_name[key] = counts_by_name.get(key, 0) + qty
+
+        for code, label in REJECT_DETAIL_ITEMS:
+            by_name = counts_by_name.get(label.upper(), 0)
+            by_code = counts_by_name.get(code.upper(), 0)
+            total = by_name if by_name else by_code
+            self.reject_detail_labels[code].setText(f"{label} = {total}")
+
+    def _safe_text(self, v: Any, fallback: str = "-") -> str:
+        if v is None:
+            return fallback
+        s = str(v).strip()
+        return s if s else fallback
+
+    def _extract_job_record(self) -> Dict[str, Any]:
+        payload = self.state.job_payload or {}
+        if isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("job"), dict):
+            return payload["data"]["job"]
+        if isinstance(payload.get("job"), dict):
+            return payload["job"]
+        return payload if isinstance(payload, dict) else {}
+
+    def _refresh_job_details(self):
+        job = self._extract_job_record()
+        fields = {
+            "job_ref": self._safe_text(job.get("ref_no") or self.state.job_name),
+            "product_id": self._safe_text(job.get("product_id")),
+            "mold": self._safe_text(job.get("custom_05")),
+            "color": self._safe_text(job.get("custom_06"), "N/A"),
+            "system_code": self._safe_text(job.get("custom_09")),
+            "cavities": self._safe_text(job.get("custom_11")),
+        }
+        for key, label in self.job_detail_labels.items():
+            label.setText(fields.get(key, "-"))
+
+    def _build_reject_summary_text(self) -> str:
+        s = self.state
+        payload = s.job_payload or {}
+        job = self._extract_job_record()
+
+        summary = {}
+        if isinstance(payload.get("summary"), dict):
+            summary = payload["summary"]
+        elif isinstance(payload.get("reject_summary"), dict):
+            summary = payload["reject_summary"]
+
+        pack_total = summary.get("pack_total", s.pack_count)
+        good_total = summary.get("good_total", s.good_total)
+        butal_total = summary.get("butal_total", s.butal_total)
+        reject_total = summary.get("reject_total", s.reject_total)
+
+        if isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("partials"), list):
+            p_list = payload["data"]["partials"]
+            if p_list:
+                pack_total = sum(int(float(p.get("partial_qty", 0) or 0)) for p in p_list)
+                reject_total = sum(int(float(p.get("reject_qty", 0) or 0)) for p in p_list)
+                good_total = pack_total
+
+        breakdown = {}
+        if isinstance(summary.get("reject_breakdown"), dict):
+            breakdown = summary.get("reject_breakdown")
+        elif isinstance(payload.get("rejects"), dict):
+            breakdown = payload.get("rejects")
+        elif s.reject_breakdown:
+            breakdown = s.reject_breakdown
+
+        lines = [
+            f"Job: {self._safe_text(job.get('ref_no') or s.job_name)} ({s.job_code or '-'})",
+            f"Pack: {pack_total} | Good: {good_total} | Butal: {butal_total} | Reject: {reject_total} | Total Good: {good_total + butal_total}",
+        ]
+
+        if breakdown:
+            details = ", ".join(f"{k}={v}" for k, v in breakdown.items())
+            lines.append(f"Reasons: {details}")
+        else:
+            lines.append("Reasons: -")
+
+        extra_ref = job.get("id") or payload.get("reference") or payload.get("process_id") or payload.get("id")
+        if extra_ref:
+            lines.append(f"Ref: {extra_ref}")
+
+        return "\n".join(lines)
 
     def _set_banner_text(self, text: str):
         self._banner_base_text = text
-        self._animate_banner()
-
-    def _animate_banner(self):
-        frames = ["[>   ]", "[>>  ]", "[ >>>]", "[  >>]", "[   >]"]
-        frame = frames[self._banner_anim_step % len(frames)]
-        self._banner_anim_step += 1
-        self.banner.setText(f"{self._banner_base_text}  {frame}")
-
-    def _animate_machine_icon(self):
+        self.banner.setText(self._banner_base_text)
         if not self.state.machine_code:
             self.machineAnim.setText("[M] idle")
-            return
-        frames = ["[M] active .  ", "[M] active .. ", "[M] active ..."]
-        self.machineAnim.setText(frames[self._machine_anim_step % len(frames)])
-        self._machine_anim_step += 1
+        else:
+            self.machineAnim.setText("[M] active")
 
     def _operator_display_name(self, text: Optional[str]) -> str:
         if not text:
@@ -521,6 +686,21 @@ class ClientUI(QWidget):
         if len(parts) == 2:
             return parts[1] or "-"
         return str(text)
+
+    def _normalize_job_code(self, value: Optional[str]) -> str:
+        if not value:
+            return ""
+        digits = "".join(ch for ch in str(value) if ch.isdigit())
+        if not digits:
+            return str(value).strip().upper()
+        return digits.lstrip("0") or "0"
+
+    def _extract_job_code_from_pack_qr(self, raw: str) -> Optional[str]:
+        # Expected tail format like "...-000000102378" where 102378 is the job code.
+        m = re.search(r"-0*(\d+)\s*$", str(raw).strip())
+        if not m:
+            return None
+        return m.group(1).lstrip("0") or "0"
 
     def _scan_display_text(self, res, raw: str) -> str:
         if res is None:
@@ -539,6 +719,10 @@ class ClientUI(QWidget):
             return "Reject mode enabled"
         if res.kind == "REJECT_REASON":
             return f"Reject reason: {res.value}"
+        if res.kind == "REJECT_SUMMARY":
+            return "Reject summary requested"
+        if res.kind == "JOB_STUB":
+            return res.value
         return "Scan received"
 
     def log_last(self, text: str):
@@ -546,16 +730,6 @@ class ClientUI(QWidget):
 
     def _set_status_text(self, text: str):
         t = str(text).replace("\n", " ").strip()
-        low = t.lower()
-        if "scanner serial connected" in low:
-            self._set_scanner_alert(False)
-        elif (
-            ("serial retry" in low)
-            or ("serial requested but pyserial is not installed" in low)
-            or ("waiting for scanner" in low)
-        ):
-            self._set_scanner_alert(True)
-
         if len(t) > 120:
             short = t[:117] + "..."
             self.status.setText(short)
@@ -563,80 +737,6 @@ class ClientUI(QWidget):
         else:
             self.status.setText(t)
             self.status.setToolTip("")
-
-    def _set_scanner_alert(self, active: bool):
-        self._scanner_alert_active = bool(active)
-        if not self._scanner_alert_active:
-            self._scanner_alert_step = 0
-        self.update()
-
-    def _animate_scanner_alert(self):
-        if not self._scanner_alert_active:
-            return
-        self._scanner_alert_step = (self._scanner_alert_step + 1) % 20
-        self.update()
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self._scanner_alert_active:
-            return
-
-        # Aggressive strobe pulse for critical scanner missing state.
-        pulse = [120, 170, 235, 255, 220, 180, 255, 200, 255, 150]
-        alpha = pulse[self._scanner_alert_step % len(pulse)]
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        p.setClipRect(self.rect())
-        flash = (self._scanner_alert_step % 2) == 0
-
-        # Bright base flash.
-        p.setPen(Qt.PenStyle.NoPen)
-        base = QColor(255, 32, 32, min(255, alpha)) if flash else QColor(255, 210, 0, min(235, alpha))
-        p.setBrush(base)
-        p.drawRect(self.rect())
-
-        # High-contrast moving warning stripes.
-        stripe_w = 64
-        shift = (self._scanner_alert_step * 14) % stripe_w
-        start = -self.height() - stripe_w
-        end = self.width() + self.height() + stripe_w
-        for x in range(start - shift, end, stripe_w):
-            p.setBrush(QColor(255, 235, 59, min(255, alpha)))
-            p.drawPolygon(
-                QPoint(x, 0),
-                QPoint(x + 32, 0),
-                QPoint(x + self.height() + 32, self.height()),
-                QPoint(x + self.height(), self.height()),
-            )
-            p.setBrush(QColor(220, 20, 20, min(255, alpha)))
-            p.drawPolygon(
-                QPoint(x + 32, 0),
-                QPoint(x + 64, 0),
-                QPoint(x + self.height() + 64, self.height()),
-                QPoint(x + self.height() + 32, self.height()),
-            )
-
-        # Extra white flash layer.
-        p.setBrush(QColor(255, 255, 255, 75 if flash else 35))
-        p.drawRect(self.rect())
-
-        # Front warning text.
-        p.setPen(QPen(QColor(0, 0, 0, 180), 1))
-        title_font = p.font()
-        title_font.setPointSize(max(30, int(min(self.width(), self.height()) * 0.075)))
-        title_font.setBold(True)
-        p.setFont(title_font)
-        center = self.rect()
-        p.drawText(center.adjusted(3, 3, 3, 3), Qt.AlignmentFlag.AlignCenter, "NO SCANNER DETECTED")
-        p.setPen(QColor(255, 255, 255))
-        p.drawText(center, Qt.AlignmentFlag.AlignCenter, "NO SCANNER DETECTED")
-
-        sub_font = p.font()
-        sub_font.setPointSize(max(12, int(min(self.width(), self.height()) * 0.022)))
-        sub_font.setBold(True)
-        p.setFont(sub_font)
-        p.drawText(center.adjusted(0, 96, 0, 0), Qt.AlignmentFlag.AlignCenter, "Reconnect scanner to clear alert")
-        p.end()
 
     def _setup_scanner_input(self):
         mode = SCANNER_MODE
@@ -648,21 +748,17 @@ class ClientUI(QWidget):
             self.installEventFilter(self.filter)
             self.filter.scanned.connect(self.scan_received.emit)
             if mode == "keyboard":
-                self._set_scanner_alert(False)
                 self._set_status_text("Scanner input: Keyboard mode")
                 return
 
         # auto or serial path
         if serial is None:
-            self._set_scanner_alert(mode == "serial")
             if mode == "serial":
                 self._set_status_text("Scanner input: Serial requested but pyserial is not installed.")
             else:
                 self._set_status_text("Scanner input: Keyboard mode (pyserial not installed)")
             return
 
-        self._set_scanner_alert(True)
-        self._set_status_text(f"Scanner input: Waiting for scanner on {SCANNER_COM_PORT} ...")
         self._serial_thread = threading.Thread(target=self._serial_reader_loop, daemon=True)
         self._serial_thread.start()
         if mode == "auto":
@@ -697,7 +793,6 @@ class ClientUI(QWidget):
         return bool(s.machine_code and s.job_code and s.operator_id)
 
     def on_scanned(self, raw: str):
-        self._set_scanner_alert(False)
         res = parse_scan(raw)
         self.log_last(self._scan_display_text(res, raw))
 
@@ -713,10 +808,10 @@ class ClientUI(QWidget):
                 reason = res.value
                 s.reject_total += 1
                 s.reject_breakdown[reason] = s.reject_breakdown.get(reason, 0) + 1
-                self.conveyor.spawn_item("REJECT")
                 s.waiting_reject_reason = False
                 self.status.setText(f"Reject recorded: {reason}")
                 self._refresh_ui()
+                self._pulse_card(self.cardStatReject)
                 self.push_event({"type": "REJECT", "qty": 1, "reason": reason}, f"REJECT {reason} +1")
                 return
             else:
@@ -732,21 +827,59 @@ class ClientUI(QWidget):
             s.job_name = None
             s.operator_id = None
             s.waiting_reject_reason = False
+            s.showing_reject_summary = False
+            s.job_payload = {}
             self.status.setText(f"Machine set: {s.machine_name}")
             self._refresh_ui()
             self.push_event({"type": "MACHINE_SET"}, f"MACHINE {s.machine_name}")
             return
 
-        if res.kind == "JOB":
+        if res.kind in ("JOB", "JOB_STUB"):
             if not s.machine_code:
                 self.status.setText("Scan MACHINE first.")
                 return
-            s.job_code = raw.strip()
-            s.job_name = res.value
+
+            if res.kind == "JOB":
+                s.job_code = raw.strip()
+                s.job_name = res.value
+                s.job_payload = {}
+            else:
+                payload = res.meta or {}
+                s.job_payload = payload
+                job = self._extract_job_record()
+                s.job_code = (
+                    self._safe_text(job.get("id"), "")
+                    or self._safe_text(job.get("ref_no"), "")
+                    or self._safe_text(payload.get("job_code"), "")
+                    or s.job_code
+                    or "QR-STUB"
+                )
+                s.job_name = (
+                    self._safe_text(job.get("ref_no"), "")
+                    or self._safe_text(payload.get("job_name"), "")
+                    or s.job_name
+                    or "Job Stub"
+                )
+
             s.operator_id = None
+            s.showing_reject_summary = False
             self.status.setText(f"Job set: {s.job_name}")
             self._refresh_ui()
-            self.push_event({"type": "JOB_SET"}, f"JOB {s.job_name}")
+            if res.kind == "JOB":
+                self.push_event({"type": "JOB_SET"}, f"JOB {s.job_name}")
+            else:
+                self.push_event({"type": "JOB_STUB_SET", "stub": s.job_payload}, f"JOB STUB {s.job_name}")
+            return
+
+        if res.kind == "REJECT_SUMMARY":
+            if not s.machine_code or not s.job_code:
+                self.status.setText("Scan MACHINE and JOB first.")
+                return
+            s.showing_reject_summary = True
+            s.waiting_reject_reason = False
+            self.status.setText("Reject summary loaded.")
+            self._refresh_ui()
+            self.push_event({"type": "REJECT_SUMMARY_VIEW"}, "REJECT SUMMARY")
             return
 
         if res.kind == "OPERATOR":
@@ -774,20 +907,37 @@ class ClientUI(QWidget):
                 return
 
             if res.kind == "PACK":
+                scanned_job_code = self._extract_job_code_from_pack_qr(raw)
+                current_job_code = self._normalize_job_code(s.job_code)
+                if scanned_job_code is None:
+                    self.status.setText("Invalid PACK QR format: missing job code segment.")
+                    self._show_invalid_overlay()
+                    return
+                if current_job_code and scanned_job_code != current_job_code:
+                    self.status.setText(
+                        f"Invalid PACK QR: job code {scanned_job_code} does not match current job {s.job_code}."
+                    )
+                    self._show_invalid_overlay()
+                    return
+
                 qty = int(res.qty or 0)
-                s.pack_total += qty
-                self.conveyor.spawn_item("PACK", qty=max(1, qty))
-                self.status.setText(f"Pack +{qty}")
+                s.pack_count += 1
+                s.good_total += qty
+                self.status.setText(f"Pack +1 (Good +{qty})")
                 self._refresh_ui()
+                self._pulse_card(self.cardStatPack)
+                self._pulse_card(self.cardStatGood)
+                self._pulse_card(self.cardStatTotalGood)
                 self.push_event({"type": "PACK", "qty": qty}, f"PACK +{qty}")
                 return
 
             if res.kind == "BUTAL":
                 qty = int(res.qty or 0)
                 s.butal_total += qty
-                self.conveyor.spawn_item("BUTAL")
                 self.status.setText(f"Butal +{qty}")
                 self._refresh_ui()
+                self._pulse_card(self.cardStatButal)
+                self._pulse_card(self.cardStatTotalGood)
                 self.push_event({"type": "BUTAL", "qty": qty}, f"BUTAL +{qty}")
                 return
 

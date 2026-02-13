@@ -75,90 +75,176 @@ async def broadcast_state():
 
 
 DASHBOARD_HTML = """
-<!doctype html>
+<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Machine Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Machine Status & Analytics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
-    body { font-family: Arial, sans-serif; margin: 16px; }
-    .top { display:flex; gap: 16px; align-items:center; margin-bottom: 12px; }
-    .pill { padding: 6px 10px; border-radius: 999px; background: #eee; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; }
-    th { background: #f6f6f6; text-align: left; }
-    .muted { color: #666; }
-    .small { font-size: 12px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    html, body { height: 100%; margin: 0; }
+    body { font-family: "Poppins", sans-serif; background: #f8f8f8; color: #333; display: flex; flex-direction: column; }
+    .diagnostics { padding: 16px 20px; background: #e9ecef; border-bottom: 1px solid #d9d9d9; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .diag-item { background: #fff; border-radius: 10px; padding: 10px 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); font-size: 13px; }
+    .diag-item .value { font-weight: 700; margin-top: 6px; }
+    .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+    .connected { background: #4CAF50; }
+    .disconnected { background: #f44336; }
+    .main-tabs { display: flex; gap: 10px; padding: 14px 20px 10px; flex-wrap: wrap; }
+    .main-tab-button { background: #e1e5ef; border: none; border-radius: 20px; padding: 8px 18px; font-weight: 600; cursor: pointer; }
+    .main-tab-button.active { background: #1f8ef1; color: #fff; }
+    .main-tab-content { display: none; padding: 0 20px 20px; }
+    .main-tab-content.active { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 12px; }
+    .card { background: #fff; border-radius: 12px; padding: 16px; border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .card.active { border-color: #4CAF50; }
+    .card.stopped { border-color: #f44336; }
+    .card.maintenance { border-color: #FF9800; }
+    .card h3 { margin: 0 0 10px; font-size: 1.05rem; border-bottom: 1px solid #eee; padding-bottom: 8px; }
+    .card p { margin: 6px 0; font-size: 0.9rem; }
+    .panel { margin-top: 14px; background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .panel h3 { margin: 0 0 6px; }
+    .muted { color: #666; font-size: 0.9rem; }
+    .placeholder { border: 1px dashed #d9d9d9; border-radius: 10px; padding: 14px; color: #777; background: #fafafa; margin-top: 12px; }
+    @media (max-width: 1400px) { .grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
+    @media (max-width: 1100px) { .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+    @media (max-width: 768px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .main-tab-content { padding: 0 12px 12px; } .main-tabs { padding: 12px; } .diagnostics { padding: 12px; } }
   </style>
 </head>
 <body>
-  <div class="top">
-    <h2 style="margin:0;">Machine Dashboard</h2>
-    <div class="pill" id="conn">Connecting...</div>
-    <div class="pill muted small" id="time"></div>
+  <div class="diagnostics">
+    <div class="diag-item">Client Status<div class="value" id="client-status"><span class="status-dot disconnected"></span>Connecting...</div></div>
+    <div class="diag-item">Server Time<div class="value" id="time">N/A</div></div>
+    <div class="diag-item">Last Message<div class="value" id="last-message">N/A</div></div>
+    <div class="diag-item">Machine Count<div class="value" id="machine-count">0</div></div>
   </div>
 
-  <table>
-    <thead>
-      <tr>
-        <th>Machine</th>
-        <th>Job</th>
-        <th>Operator</th>
-        <th>Pack</th>
-        <th>Butal</th>
-        <th>Reject</th>
-        <th>Reject Breakdown</th>
-        <th>Last Event</th>
-        <th>Last Seen (UTC)</th>
-      </tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
+  <div class="main-tabs">
+    <button class="main-tab-button active" data-target="machinesTab">Machines</button>
+    <button class="main-tab-button" data-target="jobQueueTab">Job Queue</button>
+    <button class="main-tab-button" data-target="finishedJobsTab">Finished Jobs</button>
+    <button class="main-tab-button" data-target="archivedJobsTab">Archived Jobs</button>
+    <button class="main-tab-button" data-target="pdrTab">PDR Reports</button>
+  </div>
+
+  <div id="machinesTab" class="main-tab-content active">
+    <div class="grid" id="machineGrid"></div>
+  </div>
+
+  <div id="jobQueueTab" class="main-tab-content">
+    <div class="panel">
+      <h3>Job Queue Map</h3>
+      <div class="muted">UI shell ready. Queue data wiring can be added next.</div>
+      <div class="placeholder">Queue map placeholder</div>
+    </div>
+    <div class="panel">
+      <h3>Auto-Assign Job</h3>
+      <div class="placeholder">Form placeholder</div>
+    </div>
+  </div>
+
+  <div id="finishedJobsTab" class="main-tab-content">
+    <div class="panel">
+      <h3>Finished Job Confirmation</h3>
+      <div class="placeholder">Finished jobs list placeholder</div>
+    </div>
+  </div>
+
+  <div id="archivedJobsTab" class="main-tab-content">
+    <div class="panel">
+      <h3>Archived Jobs</h3>
+      <div class="placeholder">Archived jobs list placeholder</div>
+    </div>
+  </div>
+
+  <div id="pdrTab" class="main-tab-content">
+    <div class="panel">
+      <h3>Production Daily Reports</h3>
+      <div class="placeholder">PDR table and print-preview placeholder</div>
+    </div>
+  </div>
 
 <script>
-  const conn = document.getElementById("conn");
-  const rows = document.getElementById("rows");
+  const clientStatus = document.getElementById("client-status");
   const timeEl = document.getElementById("time");
+  const lastMessageEl = document.getElementById("last-message");
+  const machineCountEl = document.getElementById("machine-count");
+  const machineGrid = document.getElementById("machineGrid");
+  const MACHINE_CODES = Array.from({length: 23}, (_, i) => `M${String(i + 1).padStart(5, "0")}`);
 
   function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;"); }
 
+  function statusClass(lastSeenUtc){
+    if(!lastSeenUtc) return "stopped";
+    const seen = new Date(lastSeenUtc).getTime();
+    if(Number.isNaN(seen)) return "stopped";
+    const ageSec = (Date.now() - seen) / 1000;
+    return ageSec <= 30 ? "active" : "stopped";
+  }
+
   function render(state){
     timeEl.textContent = "Server UTC: " + state.server_time_utc;
-    rows.innerHTML = "";
+    machineGrid.innerHTML = "";
     const sessions = state.sessions || [];
-    sessions.sort((a,b)=> (a.machine_name||"").localeCompare(b.machine_name||""));
+    const byCode = Object.fromEntries(sessions.map(s => [String(s.machine_code || "").trim(), s]));
+    machineCountEl.textContent = String(MACHINE_CODES.length);
 
-    for(const s of sessions){
-      const r = document.createElement("tr");
-      const rb = s.reject_breakdown || {};
-      const rbText = Object.keys(rb).length
-        ? Object.entries(rb).map(([k,v])=> `${k}:${v}`).join(", ")
-        : "";
-      r.innerHTML = `
-        <td><div><b>${esc(s.machine_name)}</b></div><div class="muted small mono">${esc(s.machine_code)}</div></td>
-        <td><div>${esc(s.job_name||"")}</div><div class="muted small mono">${esc(s.job_code||"")}</div></td>
-        <td class="mono">${esc(s.operator_id||"")}</td>
-        <td>${esc(s.pack_total)}</td>
-        <td>${esc(s.butal_total)}</td>
-        <td>${esc(s.reject_total)}</td>
-        <td class="small">${esc(rbText)}</td>
-        <td class="small">${esc(s.last_event||"")}</td>
-        <td class="small mono">${esc(s.last_seen_utc||"")}</td>
+    for(const code of MACHINE_CODES){
+      const s = byCode[code] || {
+        machine_code: code,
+        machine_name: `Machine ${parseInt(code.slice(1), 10) || code}`,
+        job_name: "",
+        operator_id: "",
+        pack_total: 0,
+        butal_total: 0,
+        reject_total: 0,
+        last_event: "No data yet",
+        last_seen_utc: "",
+      };
+      const css = statusClass(s.last_seen_utc) || "stopped";
+      const card = document.createElement("div");
+      card.className = `card ${css}`;
+      const total = Number(s.pack_total||0) + Number(s.butal_total||0) + Number(s.reject_total||0);
+      card.innerHTML = `
+        <h3>${esc(s.machine_name || s.machine_code)}</h3>
+        <p>Machine: <strong>${esc(s.machine_code || code)}</strong></p>
+        <p>Job: <strong>${esc(s.job_name || "No Job Set")}</strong></p>
+        <p>Operator: <strong>${esc(s.operator_id || "-")}</strong></p>
+        <p>Status: <strong>${css.toUpperCase()}</strong></p>
+        <p>Pack: <strong>${esc(s.pack_total)}</strong></p>
+        <p>Butal: <strong>${esc(s.butal_total)}</strong></p>
+        <p>Reject: <strong>${esc(s.reject_total)}</strong></p>
+        <p>Total: <strong>${esc(total)}</strong></p>
+        <p class="muted">Last Event: ${esc(s.last_event || "-")}</p>
       `;
-      rows.appendChild(r);
+      machineGrid.appendChild(card);
     }
   }
+
+  // tab handling
+  document.querySelectorAll(".main-tab-button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const target = btn.getAttribute("data-target");
+      document.querySelectorAll(".main-tab-button").forEach(b => b.classList.remove("active"));
+      document.querySelectorAll(".main-tab-content").forEach(c => c.classList.remove("active"));
+      btn.classList.add("active");
+      document.getElementById(target)?.classList.add("active");
+    });
+  });
 
   const wsProto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${wsProto}://${location.host}/ws`);
 
-  ws.onopen = () => { conn.textContent = "Connected"; conn.style.background = "#d6f5d6"; };
-  ws.onclose = () => { conn.textContent = "Disconnected"; conn.style.background = "#ffd6d6"; };
-  ws.onerror = () => { conn.textContent = "Error"; conn.style.background = "#ffd6d6"; };
+  ws.onopen = () => { clientStatus.innerHTML = '<span class="status-dot connected"></span>Connected'; };
+  ws.onclose = () => { clientStatus.innerHTML = '<span class="status-dot disconnected"></span>Disconnected'; };
+  ws.onerror = () => { clientStatus.innerHTML = '<span class="status-dot disconnected"></span>Error'; };
 
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
+    lastMessageEl.textContent = "STATE";
     if(msg.type === "STATE") render(msg);
   };
 </script>
