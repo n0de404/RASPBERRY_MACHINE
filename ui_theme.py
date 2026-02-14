@@ -41,6 +41,53 @@ QLabel#RightHint {
     color: #6b7280;
     font-size: 12px;
 }
+QLabel#ProductionLiveReason {
+    color: #0f172a;
+    font-size: 16px;
+    font-weight: 800;
+    background: transparent;
+    border: none;
+    border-radius: 10px;
+    padding: 4px 2px;
+}
+QLabel#ProductionCounter7 {
+    color: #38bdf8;
+    background: #2f343f;
+    border: none;
+    border-radius: 12px;
+    padding: 10px 12px;
+    font-family: "Consolas", "Lucida Console", "Courier New", monospace;
+    font-size: 58px;
+    font-weight: 900;
+    letter-spacing: 4px;
+}
+QLabel#ProductionFixAnim {
+    color: #0f172a;
+    font-size: 20px;
+    font-weight: 900;
+    background: #ffffff;
+    border: none;
+    border-radius: 10px;
+    padding: 8px 12px;
+}
+QLabel#ProductionMarqueeText {
+    color: #334155;
+    font-size: 14px;
+    font-weight: 700;
+    background: transparent;
+}
+QFrame#ProductionOverlay {
+    background: qradialgradient(cx:0.5, cy:0.45, radius:0.9,
+                                fx:0.5, fy:0.45,
+                                stop:0 rgba(255,255,255,0.99),
+                                stop:0.58 rgba(248,250,252,0.98),
+                                stop:1 rgba(226,232,240,0.98));
+    border: 2px solid #fb923c;
+    border-radius: 14px;
+}
+QFrame#ProductionOverlay[pulse="1"] {
+    border: 2px solid #f97316;
+}
 
 /* ===== Top banner (scan instruction) ===== */
 QLabel#Banner {
@@ -112,8 +159,8 @@ QFrame[role="stat"] {
     padding: 10px;
 }
 QLabel#StatTitle {
-    font-size: 12px;
-    color: #475569;
+    font-size: 16px;
+    color: #e2e8f0;
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: 0.7px;
@@ -122,29 +169,44 @@ QLabel#StatValue {
     font-family: "Segoe UI Variable Display", "Bahnschrift", "Inter";
     font-size: 50px;
     font-weight: 800;
-    color: #0f172a;
+    color: #22d3ee;
+}
+QFrame#StatPack QLabel#StatValue {
+    color: #38bdf8;
+}
+QFrame#StatGood QLabel#StatValue {
+    color: #22d3ee;
+}
+QFrame#StatButal QLabel#StatValue {
+    color: #34d399;
+}
+QFrame#StatReject QLabel#StatValue {
+    color: #fb7185;
+}
+QFrame#StatTotalGood QLabel#StatValue {
+    color: #a78bfa;
 }
 
 /* Pack / Butal / Reject with stronger identity */
 QFrame#StatPack {
-    background: #eff6ff;
-    border: 1px solid #93c5fd;
+    background: #0c4a6e;
+    border: 1px solid #38bdf8;
 }
 QFrame#StatButal {
-    background: #ecfdf5;
-    border: 1px solid #86efac;
+    background: #14532d;
+    border: 1px solid #34d399;
 }
 QFrame#StatReject {
-    background: #fef2f2;
-    border: 1px solid #fca5a5;
+    background: #7f1d1d;
+    border: 1px solid #fb7185;
 }
 QFrame#StatGood {
-    background: #ecfeff;
-    border: 1px solid #67e8f9;
+    background: #164e63;
+    border: 1px solid #22d3ee;
 }
 QFrame#StatTotalGood {
-    background: #ede9fe;
-    border: 1px solid #c4b5fd;
+    background: #4c1d95;
+    border: 1px solid #a78bfa;
 }
 
 /* short pulse state toggled from client.py */

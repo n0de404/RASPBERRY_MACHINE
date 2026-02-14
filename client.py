@@ -5,15 +5,17 @@ import re
 import socket
 import sys
 import threading
+import time
+import math
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
 import requests
 
 from PyQt6.QtCore import Qt, QObject, QEvent, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QMovie, QPixmap
+from PyQt6.QtGui import QMovie, QPixmap, QColor
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect
+    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect, QGraphicsBlurEffect
 )
 
 from mappings import parse_scan, MACHINE_MAP, JOB_MAP, REJECT_REASON_MAP
@@ -32,6 +34,7 @@ SCANNER_COM_PORT = os.environ.get("MACHINE_SCANNER_COM_PORT", "COM6").strip()
 SCANNER_BAUDRATE = int(os.environ.get("MACHINE_SCANNER_BAUDRATE", "9600"))
 SCANNER_TIMEOUT = float(os.environ.get("MACHINE_SCANNER_TIMEOUT", "1.0"))
 INVALID_SCAN_GIF = os.environ.get("MACHINE_INVALID_SCAN_GIF", "slap-virtual-slap.gif").strip()
+REPAIR_GIF = os.environ.get("MACHINE_REPAIR_GIF", "repair.gif").strip()
 
 REJECT_DETAIL_ITEMS = [
     ("BM", "BURN MARK"),
@@ -56,6 +59,24 @@ REJECT_DETAIL_ITEMS = [
     ("WL", "WELD LINE"),
 ]
 
+PRODUCTION_DAILY_REPORT_ITEMS = [
+    ("01", "Machine Issue/Breakdown/Repair"),
+    ("02", "Machine Adjustment - Parameters"),
+    ("03", "Material Issue/Delay/Drying"),
+    ("04", "Mold Issue/Repair/Cleaning"),
+    ("05", "No Manpower/Operator"),
+    ("06", "Material Color Change"),
+    ("07", "Mold Change"),
+    ("08", "Preventive Maintenance"),
+    ("09", "No production schedule"),
+    ("10", "Start-up/Shutdown (1st&Last Day)"),
+    ("11", "Shift Meeting/Shift Turn-over"),
+    ("12", "Mold / Color Testing"),
+    ("13", "Power interruption"),
+    ("14", "Robot Set-up/Adjustment"),
+    ("15", "Others"),
+]
+
 
 @dataclass
 class ClientState:
@@ -72,8 +93,22 @@ class ClientState:
     reject_breakdown: Dict[str, int] = None
 
     waiting_reject_reason: bool = False
+    waiting_production_report_reason: bool = False
+    waiting_cycle_time_input: bool = False
+    waiting_maintenance_qr: bool = False
+    waiting_supervisor_qr: bool = False
+    waiting_operator_downtime_confirm: bool = False
     showing_reject_summary: bool = False
     job_payload: Dict[str, Any] = None
+    downtime_reason_code: Optional[str] = None
+    downtime_reason_text: Optional[str] = None
+    downtime_started_at: Optional[float] = None
+    downtime_last_seconds: Optional[int] = None
+    downtime_active: bool = False
+    cycle_time_current: Optional[str] = None
+    cycle_time_new_input: str = ""
+    maintenance_name: Optional[str] = None
+    supervisor_name: Optional[str] = None
 
     def __post_init__(self):
         if self.reject_breakdown is None:
@@ -146,6 +181,7 @@ class ClientUI(QWidget):
         root.setSpacing(10)
 
         leftWrap = QWidget()
+        self.leftWrap = leftWrap
         left = QVBoxLayout()
         left.setContentsMargins(0, 0, 0, 0)
         left.setSpacing(8)
@@ -312,7 +348,7 @@ class ClientUI(QWidget):
 
         left.addStretch(1)
 
-        # Right side placeholder for future views.
+        # Right side panel (downtime reason + timer).
         self.rightPanel = QFrame()
         self.rightPanel.setObjectName("Panel")
         rightLayout = QVBoxLayout()
@@ -320,12 +356,38 @@ class ClientUI(QWidget):
         rightLayout.setSpacing(10)
         self.rightPanel.setLayout(rightLayout)
 
-        self.rightTitle = QLabel("Future View")
+        self.rightTitle = QLabel("Downtime Monitor")
         self.rightTitle.setObjectName("RightTitle")
-        self.rightHint = QLabel("Reserved area for upcoming UI modules.")
+        self.rightHint = QLabel("Scan ProductionDailyReport~1, then scan reason QR (01-15).")
         self.rightHint.setObjectName("RightHint")
+        self.rightDowntimeTimer = QLabel("Downtime: 00:00:00")
+        self.rightDowntimeTimer.setObjectName("MetaValue")
+        self.rightDowntimeReason = QLabel("Reason: -")
+        self.rightDowntimeReason.setObjectName("MetaValue")
+        self.rightDowntimeReason.setWordWrap(True)
+        self.rightCycleTitle = QLabel("Cycle Monitor")
+        self.rightCycleTitle.setObjectName("RightTitle")
+        self.rightCycleHint = QLabel("Cycle count and cycle time status.")
+        self.rightCycleHint.setObjectName("RightHint")
+        self.rightCycleCount = QLabel("Cycle Count: 0")
+        self.rightCycleCount.setObjectName("MetaValue")
+        self.rightCycleCurrent = QLabel("Cycle Time: ")
+        self.rightCycleCurrent.setObjectName("MetaValue")
+        self.rightMaintenance = QLabel("Maintenance: ")
+        self.rightMaintenance.setObjectName("MetaValue")
+        self.rightSupervisor = QLabel("Supervisor: ")
+        self.rightSupervisor.setObjectName("MetaValue")
+
         rightLayout.addWidget(self.rightTitle)
         rightLayout.addWidget(self.rightHint)
+        rightLayout.addWidget(self.rightDowntimeTimer)
+        rightLayout.addWidget(self.rightDowntimeReason)
+        rightLayout.addWidget(self.rightMaintenance)
+        rightLayout.addWidget(self.rightSupervisor)
+        rightLayout.addWidget(self.rightCycleTitle)
+        rightLayout.addWidget(self.rightCycleHint)
+        rightLayout.addWidget(self.rightCycleCount)
+        rightLayout.addWidget(self.rightCycleCurrent)
         rightLayout.addStretch()
 
         root.addWidget(leftWrap, 1)
@@ -368,6 +430,99 @@ class ClientUI(QWidget):
         self._invalid_hide_timer.timeout.connect(self._hide_invalid_overlay)
         self._setup_invalid_overlay_media()
 
+        # Center overlay for Production Daily Report reason options.
+        self.productionOverlay = QFrame(self)
+        self.productionOverlay.setObjectName("ProductionOverlay")
+        self.productionOverlay.setStyleSheet("")
+        self.productionOverlay.setLayout(QVBoxLayout())
+        self.productionOverlay.layout().setContentsMargins(14, 12, 14, 12)
+        self.productionOverlay.layout().setSpacing(6)
+        self.productionOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.productionTitle = QLabel("PRODUCTION DAILY REPORT")
+        self.productionTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
+        self.productionOverlay.layout().addWidget(self.productionTitle)
+        self.productionHint = QLabel("Scan reason QR code (01-15)")
+        self.productionHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.productionOverlay.layout().addWidget(self.productionHint)
+        self.productionReasonList = QLabel("\n".join(f"{code} - {label}" for code, label in PRODUCTION_DAILY_REPORT_ITEMS))
+        self.productionReasonList.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: 700;")
+        self.productionReasonList.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.productionReasonList.setWordWrap(True)
+        self.productionOverlay.layout().addWidget(self.productionReasonList)
+
+        self.productionLiveReason = QLabel("Reason: -")
+        self.productionLiveReason.setObjectName("ProductionLiveReason")
+        self.productionLiveReason.setWordWrap(True)
+        self.productionOverlay.layout().addWidget(self.productionLiveReason)
+
+        self.productionCounter = QLabel("00:00:00")
+        self.productionCounter.setObjectName("ProductionCounter7")
+        self.productionCounter.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productionOverlay.layout().addWidget(self.productionCounter)
+
+        self.productionFixAnim = QLabel("Repair in progress...")
+        self.productionFixAnim.setObjectName("ProductionFixAnim")
+        self.productionFixAnim.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productionOverlay.layout().addWidget(self.productionFixAnim)
+
+        self.productionMarqueeWrap = QWidget()
+        self.productionMarqueeWrap.setObjectName("ProductionMarqueeWrap")
+        self.productionMarqueeWrap.setFixedHeight(28)
+        self.productionMarqueeWrap.setStyleSheet("background: transparent;")
+        self.productionMarqueeText = QLabel(
+            "MACHINE IS UNDER REPAIR/ADJUSTMENT...   MACHINE IS UNDER REPAIR/ADJUSTMENT..."
+        )
+        self.productionMarqueeText.setObjectName("ProductionMarqueeText")
+        self.productionMarqueeText.setParent(self.productionMarqueeWrap)
+        self.productionMarqueeText.adjustSize()
+        self._marquee_x = 0
+        self._marquee_speed = 5
+        self.productionOverlay.layout().addWidget(self.productionMarqueeWrap)
+
+        self.resolveOverlay = QFrame(self)
+        self.resolveOverlay.setObjectName("ProductionOverlay")
+        self.resolveOverlay.setStyleSheet("")
+        self.resolveOverlay.setLayout(QVBoxLayout())
+        self.resolveOverlay.layout().setContentsMargins(14, 12, 14, 12)
+        self.resolveOverlay.layout().setSpacing(8)
+        self.resolveOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.resolveTitle = QLabel("DOWNTIME RESOLUTION")
+        self.resolveTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
+        self.resolveHint = QLabel("Scan cycle time digits (num_0..num_9), backspace, then confirm")
+        self.resolveHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.resolveOldCycle = QLabel("Old Cycle Time: -")
+        self.resolveOldCycle.setObjectName("MetaValue")
+        self.resolveNewCycle = QLabel("Cycle Time: ")
+        self.resolveNewCycle.setObjectName("MetaValue")
+        self.resolveOverlay.layout().addWidget(self.resolveTitle)
+        self.resolveOverlay.layout().addWidget(self.resolveHint)
+        self.resolveOverlay.layout().addWidget(self.resolveOldCycle)
+        self.resolveOverlay.layout().addWidget(self.resolveNewCycle)
+        self.resolveOverlay.hide()
+        self.resolveOverlay.raise_()
+
+        self._repair_movie: Optional[QMovie] = None
+        if REPAIR_GIF and os.path.exists(REPAIR_GIF):
+            repair_movie = QMovie(REPAIR_GIF)
+            if repair_movie.isValid():
+                self.productionFixAnim.setMovie(repair_movie)
+                self._repair_movie = repair_movie
+        self._overlay_mode = "select"
+        self._overlay_pulse_on = False
+        self._pulse_phase = 0.0
+        self._overlay_shadow = QGraphicsDropShadowEffect(self)
+        self._overlay_shadow.setBlurRadius(18)
+        self._overlay_shadow.setOffset(0, 0)
+        self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
+        self.productionOverlay.setGraphicsEffect(self._overlay_shadow)
+        self._blur_left = None
+        self._blur_right = None
+        self.leftWrap.setGraphicsEffect(None)
+        self.rightPanel.setGraphicsEffect(None)
+        self._set_production_overlay_mode("select")
+        self.productionOverlay.hide()
+        self.productionOverlay.raise_()
+
         self.scan_received.connect(self.on_scanned)
         self.scanner_status.connect(self._set_status_text)
         self._setup_scanner_input()
@@ -381,13 +536,25 @@ class ClientUI(QWidget):
         self.motionTimer.timeout.connect(self._tick_motion)
         self.motionTimer.start(220)
 
+        self.downtimeTimer = QTimer(self)
+        self.downtimeTimer.timeout.connect(self._refresh_downtime_panel)
+        self.downtimeTimer.start(1000)
+
+        self.overlayPulseTimer = QTimer(self)
+        self.overlayPulseTimer.timeout.connect(self._tick_overlay_pulse)
+        self.overlayPulseTimer.start(70)
+
         self._refresh_ui()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._position_invalid_overlay()
+        self._position_production_overlay()
+        self._position_resolve_overlay()
         if self._invalid_movie is not None:
             self._invalid_movie.setScaledSize(self._fit_movie_size(self.invalidOverlay.size()))
+        self._position_marquee()
+        self._update_repair_movie_size()
 
     def _setup_invalid_overlay_media(self):
         gif_path = INVALID_SCAN_GIF
@@ -448,6 +615,149 @@ class ClientUI(QWidget):
         if self._invalid_movie is not None:
             self._invalid_movie.stop()
         self.invalidOverlay.hide()
+
+    def _position_production_overlay(self):
+        w = min(760, max(500, int(self.width() * 0.58)))
+        h = min(620, max(420, int(self.height() * 0.72)))
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
+        self.productionOverlay.setGeometry(x, y, w, h)
+        self._position_marquee()
+        self._update_repair_movie_size()
+
+    def _position_resolve_overlay(self):
+        w = min(700, max(460, int(self.width() * 0.52)))
+        h = min(360, max(250, int(self.height() * 0.42)))
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
+        self.resolveOverlay.setGeometry(x, y, w, h)
+
+    def _update_repair_movie_size(self):
+        if self._repair_movie is None:
+            return
+        base = self._repair_movie.currentPixmap().size()
+        if not base.isValid() or base.width() <= 0 or base.height() <= 0:
+            base = self._repair_movie.frameRect().size()
+        if not base.isValid() or base.width() <= 0 or base.height() <= 0:
+            return
+        max_w = max(120, int(self.productionOverlay.width() * 0.46))
+        max_h = 120
+        ratio = min(max_w / base.width(), max_h / base.height())
+        self._repair_movie.setScaledSize(QSize(max(1, int(base.width() * ratio)), max(1, int(base.height() * ratio))))
+
+    def _position_marquee(self):
+        if self.productionMarqueeText.parent() is not self.productionMarqueeWrap:
+            self.productionMarqueeText.setParent(self.productionMarqueeWrap)
+        y = max(0, (self.productionMarqueeWrap.height() - self.productionMarqueeText.sizeHint().height()) // 2)
+        self.productionMarqueeText.move(self._marquee_x, y)
+
+    def _show_production_overlay(self):
+        self._position_production_overlay()
+        self._set_background_blur(True)
+        self.productionOverlay.setProperty("pulse", "0")
+        self._overlay_shadow.setBlurRadius(18)
+        self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
+        self.productionOverlay.show()
+        self.productionOverlay.raise_()
+        self._position_marquee()
+        self._update_repair_movie_size()
+        if self._repair_movie is not None and self._overlay_mode == "active":
+            self._repair_movie.start()
+
+    def _hide_production_overlay(self):
+        if self._repair_movie is not None:
+            self._repair_movie.stop()
+        self.productionOverlay.hide()
+        self.productionOverlay.setProperty("pulse", "0")
+        self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
+        self._set_background_blur(False)
+        self._apply_overlay_base_style()
+
+    def _show_resolve_overlay(self):
+        self._position_resolve_overlay()
+        self._set_background_blur(True)
+        self.resolveOverlay.show()
+        self.resolveOverlay.raise_()
+
+    def _hide_resolve_overlay(self):
+        self.resolveOverlay.hide()
+        if not self.productionOverlay.isVisible():
+            self._set_background_blur(False)
+
+    def _set_background_blur(self, enabled: bool):
+        if enabled:
+            self._blur_left = QGraphicsBlurEffect(self.leftWrap)
+            self._blur_left.setBlurRadius(3.2)
+            self._blur_right = QGraphicsBlurEffect(self.rightPanel)
+            self._blur_right.setBlurRadius(3.2)
+            self.leftWrap.setGraphicsEffect(self._blur_left)
+            self.rightPanel.setGraphicsEffect(self._blur_right)
+        else:
+            self.leftWrap.setGraphicsEffect(None)
+            self.rightPanel.setGraphicsEffect(None)
+            self._blur_left = None
+            self._blur_right = None
+
+    def _set_production_overlay_mode(self, mode: str):
+        self._overlay_mode = mode
+        if mode == "select":
+            self.productionTitle.setText("PRODUCTION DAILY REPORT")
+            self.productionHint.setText("Scan reason QR code (01-15)")
+            self.productionReasonList.show()
+            self.productionLiveReason.hide()
+            self.productionCounter.hide()
+            self.productionFixAnim.hide()
+            self.productionMarqueeWrap.hide()
+            return
+        self.productionTitle.setText("DOWNTIME ACTIVE")
+        self.productionHint.setText("Machine under repair / adjustment")
+        self.productionReasonList.hide()
+        self.productionLiveReason.show()
+        self.productionCounter.show()
+        self.productionFixAnim.show()
+        self.productionMarqueeWrap.show()
+        self._marquee_x = self.productionMarqueeWrap.width()
+        self._position_marquee()
+        if self._repair_movie is not None and self.productionOverlay.isVisible():
+            self._repair_movie.start()
+
+    def _apply_overlay_base_style(self):
+        self.productionOverlay.setStyleSheet(
+            "QFrame#ProductionOverlay {"
+            "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
+            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(248,250,252,0.98), stop:1 rgba(226,232,240,0.98));"
+            "border: 3px solid #fb923c; border-radius: 14px; }"
+        )
+
+    def _tick_overlay_pulse(self):
+        if not self.productionOverlay.isVisible() or self._overlay_mode != "active":
+            return
+        self._pulse_phase += 0.16
+        level = (math.sin(self._pulse_phase) + 1.0) * 0.5
+        border_alpha = int(130 + 110 * level)
+        glow_alpha = int(45 + 155 * level)
+        blur = 18 + 16 * level
+        self.productionOverlay.setStyleSheet(
+            "QFrame#ProductionOverlay {"
+            "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
+            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(248,250,252,0.98), stop:1 rgba(226,232,240,0.98));"
+            f"border: 3px solid rgba(249,115,22,{border_alpha}); border-radius: 14px; }}"
+        )
+        self._overlay_shadow.setBlurRadius(blur)
+        self._overlay_shadow.setColor(QColor(249, 115, 22, glow_alpha))
+        self._tick_marquee()
+
+    def _tick_marquee(self):
+        if self._overlay_mode != "active" or not self.productionMarqueeWrap.isVisible():
+            return
+        text_w = self.productionMarqueeText.sizeHint().width()
+        if text_w <= 0:
+            self.productionMarqueeText.adjustSize()
+            text_w = self.productionMarqueeText.sizeHint().width()
+        self._marquee_x -= self._marquee_speed
+        if self._marquee_x + text_w < 0:
+            self._marquee_x = self.productionMarqueeWrap.width()
+        self._position_marquee()
 
     def _make_card(self, title: str) -> QFrame:
         f = QFrame()
@@ -554,13 +864,32 @@ class ClientUI(QWidget):
             self._set_banner_text("Reject summary loaded")
         elif s.waiting_reject_reason:
             self._set_banner_text("Reject mode: Scan reject reason (BM01/CS02/CO03/CR04/DI05)")
+        elif s.waiting_production_report_reason:
+            self._set_banner_text("Production Daily Report mode: Scan reason QR (01-15)")
+        elif s.waiting_cycle_time_input:
+            self._set_banner_text("Downtime resolve: Scan cycle time digits, then confirm")
+        elif s.waiting_maintenance_qr:
+            self._set_banner_text("Downtime resolve: Scan Maintenance QR (2000001)")
+        elif s.waiting_supervisor_qr:
+            self._set_banner_text("Downtime resolve: Scan Supervisor QR (3000001)")
+        elif s.waiting_operator_downtime_confirm:
+            self._set_banner_text("Downtime resolve: Scan Operator QR to confirm")
+        elif s.downtime_active:
+            self._set_banner_text('Downtime active: only scan "productiondailyreport~2"')
         else:
             self._set_banner_text("Ready: Scan PACK / BUTAL / Reject~1")
         self._refresh_job_details()
+        self._refresh_downtime_panel()
 
     def _session_is_running(self) -> bool:
         s = self.state
-        return bool(s.machine_code and s.job_code and s.operator_id and not s.waiting_reject_reason)
+        return bool(
+            s.machine_code
+            and s.job_code
+            and s.operator_id
+            and not s.waiting_reject_reason
+            and not s.downtime_active
+        )
 
     def _tick_motion(self):
         if self._session_is_running():
@@ -577,6 +906,79 @@ class ClientUI(QWidget):
             else:
                 self.machineAnim.setText("[M] ready")
             self.banner.setText(self._banner_base_text)
+
+    def _refresh_downtime_panel(self):
+        s = self.state
+        if s.downtime_reason_code and s.downtime_reason_text:
+            self.rightDowntimeReason.setText(f"Reason {s.downtime_reason_code}: {s.downtime_reason_text}")
+        else:
+            self.rightDowntimeReason.setText("Reason: -")
+
+        if s.downtime_started_at:
+            elapsed = max(0, int(time.time() - s.downtime_started_at))
+            hh = elapsed // 3600
+            mm = (elapsed % 3600) // 60
+            ss = elapsed % 60
+            self.rightDowntimeTimer.setText(f"Downtime: {hh:02d}:{mm:02d}:{ss:02d}")
+            if self._overlay_mode == "active":
+                self.productionLiveReason.setText(self.rightDowntimeReason.text())
+                self.productionCounter.setText(f"{hh:02d}:{mm:02d}:{ss:02d}")
+        else:
+            if s.downtime_last_seconds is not None:
+                hh = s.downtime_last_seconds // 3600
+                mm = (s.downtime_last_seconds % 3600) // 60
+                ss = s.downtime_last_seconds % 60
+                self.rightDowntimeTimer.setText(f"Downtime: {hh:02d}:{mm:02d}:{ss:02d}")
+            else:
+                self.rightDowntimeTimer.setText("Downtime: 00:00:00")
+            if self._overlay_mode == "active":
+                self.productionCounter.setText("00:00:00")
+                if self._repair_movie is None:
+                    self.productionFixAnim.setText("Repair in progress...")
+        self.rightCycleCount.setText(f"Cycle Count: {s.pack_count}")
+        self.rightCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
+        self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or ''}")
+        self.rightSupervisor.setText(f"Supervisor: {s.supervisor_name or ''}")
+
+    def _extract_production_reason_code(self, raw: str) -> Optional[str]:
+        m = re.search(r"(\d+)", str(raw).strip())
+        if not m:
+            return None
+        try:
+            idx = int(m.group(1))
+        except Exception:
+            return None
+        if idx < 1 or idx > len(PRODUCTION_DAILY_REPORT_ITEMS):
+            return None
+        return f"{idx:02d}"
+
+    def _operator_code_only(self, operator_text: Optional[str]) -> str:
+        if not operator_text:
+            return ""
+        return str(operator_text).split(" - ", 1)[0].strip()
+
+    def _reset_downtime_resolution_state(self):
+        s = self.state
+        s.waiting_cycle_time_input = False
+        s.waiting_maintenance_qr = False
+        s.waiting_supervisor_qr = False
+        s.waiting_operator_downtime_confirm = False
+        s.cycle_time_new_input = ""
+
+    def _begin_downtime_resolution(self):
+        s = self.state
+        self._reset_downtime_resolution_state()
+        s.waiting_cycle_time_input = True
+        s.cycle_time_new_input = ""
+        self._hide_production_overlay()
+        self.resolveTitle.setText("DOWNTIME RESOLUTION")
+        self.resolveHint.setText("Scan cycle time digits (num_0..num_9), backspace, then confirm")
+        self.resolveOldCycle.setText(f"Old Cycle Time: {s.cycle_time_current or '-'}")
+        self.resolveNewCycle.setText("Cycle Time: ")
+        self._show_resolve_overlay()
+
+    def _update_cycle_input_display(self):
+        self.resolveNewCycle.setText(f"Cycle Time: {self.state.cycle_time_new_input}")
 
     def _refresh_reject_detail_grid(self):
         counts_by_name: Dict[str, int] = {}
@@ -721,6 +1123,10 @@ class ClientUI(QWidget):
             return f"Reject reason: {res.value}"
         if res.kind == "REJECT_SUMMARY":
             return "Reject summary requested"
+        if res.kind == "PRODUCTION_DAILY_REPORT_TRIGGER":
+            return "Production daily report mode enabled"
+        if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
+            return "Production daily report resolve"
         if res.kind == "JOB_STUB":
             return res.value
         return "Scan received"
@@ -793,16 +1199,135 @@ class ClientUI(QWidget):
         return bool(s.machine_code and s.job_code and s.operator_id)
 
     def on_scanned(self, raw: str):
-        res = parse_scan(raw)
-        self.log_last(self._scan_display_text(res, raw))
+        raw_s = str(raw).strip()
+        raw_l = raw_s.lower()
+        s = self.state
+
+        # Resolution step 1: Cycle time input via num_0..num_9, backspace, confirm
+        if s.waiting_cycle_time_input:
+            if raw_l.startswith("num_") and raw_l[-1:].isdigit():
+                s.cycle_time_new_input += raw_l[-1]
+                self._update_cycle_input_display()
+                return
+            if raw_l == "backspace":
+                s.cycle_time_new_input = s.cycle_time_new_input[:-1]
+                self._update_cycle_input_display()
+                return
+            if raw_l == "confirm":
+                if not s.cycle_time_new_input:
+                    self.status.setText("Cycle Time is empty. Scan digits first.")
+                    return
+                s.cycle_time_current = s.cycle_time_new_input
+                s.waiting_cycle_time_input = False
+                s.waiting_maintenance_qr = True
+                self.resolveHint.setText("Scan Maintenance QR (2000001)")
+                self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_current}")
+                return
+            self.status.setText("Cycle Time input mode: scan num_0..num_9, backspace, confirm.")
+            return
+
+        # Resolution step 2: Maintenance
+        if s.waiting_maintenance_qr:
+            if raw_s == "2000001":
+                s.maintenance_name = "Lucy Van Pelt"
+                s.waiting_maintenance_qr = False
+                s.waiting_supervisor_qr = True
+                self.resolveHint.setText("Scan Supervisor QR (3000001)")
+                return
+            self.status.setText("Scan valid Maintenance QR (2000001).")
+            return
+
+        # Resolution step 3: Supervisor
+        if s.waiting_supervisor_qr:
+            if raw_s == "3000001":
+                s.supervisor_name = "Charlie Brown"
+                s.waiting_supervisor_qr = False
+                s.waiting_operator_downtime_confirm = True
+                self.resolveHint.setText("Scan Operator QR to confirm.")
+                return
+            self.status.setText("Scan valid Supervisor QR (3000001).")
+            return
+
+        # Resolution step 4: Operator confirmation
+        if s.waiting_operator_downtime_confirm:
+            res_op = parse_scan(raw_s)
+            if res_op and res_op.kind == "OPERATOR":
+                scanned_operator_code = self._operator_code_only(res_op.value)
+                current_operator_code = self._operator_code_only(s.operator_id)
+                if scanned_operator_code != current_operator_code:
+                    self.status.setText("Operator confirmation failed: must be current operator.")
+                    return
+                if s.downtime_started_at:
+                    s.downtime_last_seconds = max(0, int(time.time() - s.downtime_started_at))
+                s.downtime_started_at = None
+                s.downtime_active = False
+                self._reset_downtime_resolution_state()
+                self._hide_resolve_overlay()
+                self._hide_production_overlay()
+                self.status.setText("Downtime resolved and confirmed.")
+                self.push_event(
+                    {
+                        "type": "PRODUCTION_DAILY_REPORT_RESOLVED",
+                        "reason_code": s.downtime_reason_code,
+                        "reason": s.downtime_reason_text,
+                        "cycle_time": s.cycle_time_current,
+                        "maintenance": s.maintenance_name,
+                        "supervisor": s.supervisor_name,
+                    },
+                    "PRODUCTION DAILY REPORT RESOLVED",
+                )
+                self._refresh_ui()
+                return
+            self.status.setText("Scan operator QR to confirm.")
+            return
+
+        # Downtime lock: only allow resolve trigger while active
+        if s.downtime_active and raw_l != "productiondailyreport~2":
+            self.status.setText('Downtime active: only "productiondailyreport~2" is allowed.')
+            return
+
+        res = parse_scan(raw_s)
+        self.log_last(self._scan_display_text(res, raw_s))
+
+        if s.waiting_production_report_reason:
+            code = self._extract_production_reason_code(raw_s)
+            if not code:
+                self.status.setText("Production Daily Report: scan valid reason QR (01-15).")
+                return
+            reason_map = {k: v for k, v in PRODUCTION_DAILY_REPORT_ITEMS}
+            reason = reason_map.get(code)
+            if not reason:
+                self.status.setText("Production Daily Report: unknown reason code.")
+                return
+            s.waiting_production_report_reason = False
+            s.downtime_reason_code = code
+            s.downtime_reason_text = reason
+            s.downtime_started_at = time.time()
+            s.downtime_active = True
+            s.maintenance_name = None
+            s.supervisor_name = None
+            self._set_production_overlay_mode("active")
+            self._show_production_overlay()
+            self.status.setText(f"Production Daily Report reason set: {code} - {reason}")
+            self._refresh_ui()
+            self.push_event(
+                {"type": "PRODUCTION_DAILY_REPORT", "reason_code": code, "reason": reason},
+                f"PRODUCTION DAILY REPORT {code} {reason}",
+            )
+            return
 
         if res is None:
             self.status.setText("Unknown scan (ignored).")
             return
 
-        s = self.state
+        if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
+            if not s.downtime_active:
+                self.status.setText("No active downtime to resolve.")
+                return
+            self._begin_downtime_resolution()
+            self.status.setText("Downtime resolve mode: enter cycle time.")
+            return
 
-        # reject flow step 2
         if s.waiting_reject_reason:
             if res.kind == "REJECT_REASON":
                 reason = res.value
@@ -814,21 +1339,30 @@ class ClientUI(QWidget):
                 self._pulse_card(self.cardStatReject)
                 self.push_event({"type": "REJECT", "qty": 1, "reason": reason}, f"REJECT {reason} +1")
                 return
-            else:
-                self.status.setText("Reject mode: please scan a valid reason code (BM01/CS02/CO03/CR04/DI05).")
-                return
+            self.status.setText("Reject mode: please scan a valid reason code (BM01/CS02/CO03/CR04/DI05).")
+            return
 
-        # workflow
         if res.kind == "MACHINE":
-            s.machine_code = raw.strip()
+            s.machine_code = raw_s
             s.machine_name = res.value
-            # reset when machine changes
             s.job_code = None
             s.job_name = None
             s.operator_id = None
             s.waiting_reject_reason = False
+            s.waiting_production_report_reason = False
             s.showing_reject_summary = False
             s.job_payload = {}
+            s.downtime_reason_code = None
+            s.downtime_reason_text = None
+            s.downtime_started_at = None
+            s.downtime_last_seconds = None
+            s.downtime_active = False
+            s.cycle_time_current = None
+            s.maintenance_name = None
+            s.supervisor_name = None
+            self._reset_downtime_resolution_state()
+            self._hide_resolve_overlay()
+            self._hide_production_overlay()
             self.status.setText(f"Machine set: {s.machine_name}")
             self._refresh_ui()
             self.push_event({"type": "MACHINE_SET"}, f"MACHINE {s.machine_name}")
@@ -838,9 +1372,8 @@ class ClientUI(QWidget):
             if not s.machine_code:
                 self.status.setText("Scan MACHINE first.")
                 return
-
             if res.kind == "JOB":
-                s.job_code = raw.strip()
+                s.job_code = raw_s
                 s.job_name = res.value
                 s.job_payload = {}
             else:
@@ -860,9 +1393,19 @@ class ClientUI(QWidget):
                     or s.job_name
                     or "Job Stub"
                 )
-
             s.operator_id = None
             s.showing_reject_summary = False
+            s.waiting_production_report_reason = False
+            s.downtime_reason_code = None
+            s.downtime_reason_text = None
+            s.downtime_started_at = None
+            s.downtime_last_seconds = None
+            s.downtime_active = False
+            s.maintenance_name = None
+            s.supervisor_name = None
+            self._reset_downtime_resolution_state()
+            self._hide_resolve_overlay()
+            self._hide_production_overlay()
             self.status.setText(f"Job set: {s.job_name}")
             self._refresh_ui()
             if res.kind == "JOB":
@@ -877,6 +1420,8 @@ class ClientUI(QWidget):
                 return
             s.showing_reject_summary = True
             s.waiting_reject_reason = False
+            s.waiting_production_report_reason = False
+            self._hide_production_overlay()
             self.status.setText("Reject summary loaded.")
             self._refresh_ui()
             self.push_event({"type": "REJECT_SUMMARY_VIEW"}, "REJECT SUMMARY")
@@ -892,22 +1437,32 @@ class ClientUI(QWidget):
             self.push_event({"type": "OPERATOR_SET"}, f"OPERATOR {s.operator_id}")
             return
 
-        # production scans require full session
-        if res.kind in ("PACK", "BUTAL", "REJECT_TRIGGER"):
+        if res.kind in ("PACK", "BUTAL", "REJECT_TRIGGER", "PRODUCTION_DAILY_REPORT_TRIGGER"):
             if not self.can_accept_production_scans():
-                self.status.setText("Complete session first: MACHINE → JOB → OPERATOR.")
+                self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+                return
+
+            if res.kind == "PRODUCTION_DAILY_REPORT_TRIGGER":
+                s.waiting_production_report_reason = True
+                s.waiting_reject_reason = False
+                self._set_production_overlay_mode("select")
+                self._show_production_overlay()
+                self.status.setText("Production Daily Report mode enabled. Scan reason QR now (01-15).")
+                self._refresh_ui()
+                self.push_event({"type": "PRODUCTION_DAILY_REPORT_MODE"}, "PRODUCTION DAILY REPORT MODE")
                 return
 
             if res.kind == "REJECT_TRIGGER":
                 s.waiting_reject_reason = True
+                s.waiting_production_report_reason = False
+                self._hide_production_overlay()
                 self.status.setText("Reject mode enabled. Scan reason code now.")
                 self._refresh_ui()
-                # optional: notify server that reject mode started
                 self.push_event({"type": "REJECT_MODE"}, "REJECT MODE")
                 return
 
             if res.kind == "PACK":
-                scanned_job_code = self._extract_job_code_from_pack_qr(raw)
+                scanned_job_code = self._extract_job_code_from_pack_qr(raw_s)
                 current_job_code = self._normalize_job_code(s.job_code)
                 if scanned_job_code is None:
                     self.status.setText("Invalid PACK QR format: missing job code segment.")
@@ -943,7 +1498,6 @@ class ClientUI(QWidget):
 
         self.status.setText(f"Scan handled: {res.kind}")
         self._refresh_ui()
-
     def send_heartbeat(self):
         # heartbeat is just a lightweight state push so server keeps it "active"
         if self.state.machine_code:
@@ -991,3 +1545,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

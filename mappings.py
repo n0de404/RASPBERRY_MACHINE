@@ -87,6 +87,12 @@ class ScanResult:
 def parse_scan(raw: str) -> Optional[ScanResult]:
     s = raw.strip()
 
+    # Production daily report trigger
+    if s.lower() == "productiondailyreport~1":
+        return ScanResult(kind="PRODUCTION_DAILY_REPORT_TRIGGER", raw=raw, value="Production daily report mode")
+    if s.lower() == "productiondailyreport~2":
+        return ScanResult(kind="PRODUCTION_DAILY_REPORT_RESOLVE", raw=raw, value="Production daily report resolve")
+
     # Reject summary trigger
     if s.lower() == "rejectsummary":
         return ScanResult(kind="REJECT_SUMMARY", raw=raw, value="Reject summary")
