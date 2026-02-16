@@ -86,19 +86,20 @@ class ScanResult:
 
 def parse_scan(raw: str) -> Optional[ScanResult]:
     s = raw.strip()
+    s_l = s.lower()
 
     # Production daily report trigger
-    if s.lower() == "productiondailyreport~1":
+    if s_l == "productiondailyreport~1":
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_TRIGGER", raw=raw, value="Production daily report mode")
-    if s.lower() == "productiondailyreport~2":
+    if s_l == "productiondailyreport~2":
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_RESOLVE", raw=raw, value="Production daily report resolve")
 
     # Reject summary trigger
-    if s.lower() == "rejectsummary":
+    if s_l == "rejectsummary":
         return ScanResult(kind="REJECT_SUMMARY", raw=raw, value="Reject summary")
 
     # Reject trigger
-    if s.lower() == "reject~1":
+    if s_l == "reject~1":
         return ScanResult(kind="REJECT_TRIGGER", raw=raw, value="Reject mode")
 
     # Reject reason code
@@ -145,6 +146,20 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
     # Operator
     if is_operator_badge(s):
         return ScanResult(kind="OPERATOR", raw=raw, value=f"{s} - {OPERATOR_MAP[s]}")
+
+    # Raw materials
+    if s_l.startswith("rawmat~") or s_l.startswith("rawmaterial~") or s_l.startswith("rm~"):
+        parts = [p.strip() for p in s.split("~")]
+        material = parts[1] if len(parts) > 1 and parts[1] else "Sack"
+        qty = 1
+        if len(parts) > 2:
+            try:
+                qty = max(1, int(parts[2]))
+            except Exception:
+                qty = 1
+        return ScanResult(kind="RAW_MATERIAL", raw=raw, value=material, qty=qty)
+    if s_l in ("rawmat", "rawmaterial", "rm"):
+        return ScanResult(kind="RAW_MATERIAL", raw=raw, value="Sack", qty=1)
 
     # Butal (QB first, because it contains Q)
     if "V2" in s and "QB" in s:

@@ -8,7 +8,7 @@ import threading
 import time
 import math
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import requests
 
@@ -109,12 +109,16 @@ class ClientState:
     cycle_time_new_input: str = ""
     maintenance_name: Optional[str] = None
     supervisor_name: Optional[str] = None
+    raw_sacks_count: int = 0
+    raw_material_scans: List[str] = None
 
     def __post_init__(self):
         if self.reject_breakdown is None:
             self.reject_breakdown = {}
         if self.job_payload is None:
             self.job_payload = {}
+        if self.raw_material_scans is None:
+            self.raw_material_scans = []
 
 
 class ScannerFilter(QObject):
@@ -356,6 +360,16 @@ class ClientUI(QWidget):
         rightLayout.setSpacing(10)
         self.rightPanel.setLayout(rightLayout)
 
+        self.rightRawTitle = QLabel("Raw Materials Consumption")
+        self.rightRawTitle.setObjectName("RightTitle")
+        self.rightRawHint = QLabel("Track sacks count and scanned raw materials.")
+        self.rightRawHint.setObjectName("RightHint")
+        self.rightRawSacks = QLabel("Sacks Count: 0")
+        self.rightRawSacks.setObjectName("MetaValue")
+        self.rightRawScanned = QLabel("Raw Mats Scanned: -")
+        self.rightRawScanned.setObjectName("MetaValue")
+        self.rightRawScanned.setWordWrap(True)
+
         self.rightTitle = QLabel("Downtime Monitor")
         self.rightTitle.setObjectName("RightTitle")
         self.rightHint = QLabel("Scan ProductionDailyReport~1, then scan reason QR (01-15).")
@@ -378,16 +392,43 @@ class ClientUI(QWidget):
         self.rightSupervisor = QLabel("Supervisor: ")
         self.rightSupervisor.setObjectName("MetaValue")
 
+        topRow = QHBoxLayout()
+        topRow.setSpacing(12)
+
+        rawFrame = QFrame()
+        rawFrame.setObjectName("SubPanel")
+        rawFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        rawCol = QVBoxLayout()
+        rawCol.setContentsMargins(10, 8, 10, 8)
+        rawCol.setSpacing(6)
+        rawFrame.setLayout(rawCol)
+        rawCol.addWidget(self.rightRawTitle)
+        rawCol.addWidget(self.rightRawHint)
+        rawCol.addWidget(self.rightRawSacks)
+        rawCol.addWidget(self.rightRawScanned)
+
+        cycleFrame = QFrame()
+        cycleFrame.setObjectName("SubPanel")
+        cycleFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        cycleCol = QVBoxLayout()
+        cycleCol.setContentsMargins(10, 8, 10, 8)
+        cycleCol.setSpacing(6)
+        cycleFrame.setLayout(cycleCol)
+        cycleCol.addWidget(self.rightCycleTitle)
+        cycleCol.addWidget(self.rightCycleHint)
+        cycleCol.addWidget(self.rightCycleCount)
+        cycleCol.addWidget(self.rightCycleCurrent)
+
+        topRow.addWidget(rawFrame, 1)
+        topRow.addWidget(cycleFrame, 1)
+
+        rightLayout.addLayout(topRow)
         rightLayout.addWidget(self.rightTitle)
         rightLayout.addWidget(self.rightHint)
         rightLayout.addWidget(self.rightDowntimeTimer)
         rightLayout.addWidget(self.rightDowntimeReason)
         rightLayout.addWidget(self.rightMaintenance)
         rightLayout.addWidget(self.rightSupervisor)
-        rightLayout.addWidget(self.rightCycleTitle)
-        rightLayout.addWidget(self.rightCycleHint)
-        rightLayout.addWidget(self.rightCycleCount)
-        rightLayout.addWidget(self.rightCycleCurrent)
         rightLayout.addStretch()
 
         root.addWidget(leftWrap, 1)
@@ -909,6 +950,12 @@ class ClientUI(QWidget):
 
     def _refresh_downtime_panel(self):
         s = self.state
+        self.rightRawSacks.setText(f"Sacks Count: {s.raw_sacks_count}")
+        if s.raw_material_scans:
+            self.rightRawScanned.setText(f"Raw Mats Scanned: {', '.join(s.raw_material_scans[-8:])}")
+        else:
+            self.rightRawScanned.setText("Raw Mats Scanned: -")
+
         if s.downtime_reason_code and s.downtime_reason_text:
             self.rightDowntimeReason.setText(f"Reason {s.downtime_reason_code}: {s.downtime_reason_text}")
         else:
@@ -1113,6 +1160,8 @@ class ClientUI(QWidget):
             return f"Job: {res.value}"
         if res.kind == "OPERATOR":
             return f"Operator: {self._operator_display_name(res.value)}"
+        if res.kind == "RAW_MATERIAL":
+            return f"Raw Material: {res.value} (+{int(res.qty or 1)})"
         if res.kind == "PACK":
             return f"Pack +{int(res.qty or 0)}"
         if res.kind == "BUTAL":
@@ -1202,6 +1251,24 @@ class ClientUI(QWidget):
         raw_s = str(raw).strip()
         raw_l = raw_s.lower()
         s = self.state
+        res_pre = parse_scan(raw_s)
+
+        # Raw material scanning: no mode/state required, only needs active session.
+        if res_pre and res_pre.kind == "RAW_MATERIAL":
+            if not self.can_accept_production_scans():
+                self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+                return
+            qty = int(res_pre.qty or 1)
+            s.raw_sacks_count += qty
+            s.raw_material_scans.append(res_pre.value)
+            self.log_last(self._scan_display_text(res_pre, raw_s))
+            self.status.setText(f"Raw material scanned: {res_pre.value} (+{qty})")
+            self._refresh_ui()
+            self.push_event(
+                {"type": "RAW_MATERIAL", "material": res_pre.value, "qty": qty},
+                f"RAW MATERIAL {res_pre.value} +{qty}",
+            )
+            return
 
         # Resolution step 1: Cycle time input via num_0..num_9, backspace, confirm
         if s.waiting_cycle_time_input:
@@ -1360,6 +1427,8 @@ class ClientUI(QWidget):
             s.cycle_time_current = None
             s.maintenance_name = None
             s.supervisor_name = None
+            s.raw_sacks_count = 0
+            s.raw_material_scans = []
             self._reset_downtime_resolution_state()
             self._hide_resolve_overlay()
             self._hide_production_overlay()
@@ -1403,6 +1472,8 @@ class ClientUI(QWidget):
             s.downtime_active = False
             s.maintenance_name = None
             s.supervisor_name = None
+            s.raw_sacks_count = 0
+            s.raw_material_scans = []
             self._reset_downtime_resolution_state()
             self._hide_resolve_overlay()
             self._hide_production_overlay()
