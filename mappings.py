@@ -1,6 +1,7 @@
 # mappings.py
 from __future__ import annotations
 import json
+import re
 from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ JOB_MAP: Dict[str, str] = {
     "101245": "J024-0305",
     "250424": "JO22-0100",
     "56675":  "J023-1122",
+    "102378": "J021-9233",
 }
 
 REJECT_REASON_MAP: Dict[str, str] = {
@@ -75,6 +77,54 @@ def extract_qty_segment(payload: str, marker: str) -> Optional[int]:
     return int(digits)
 
 
+def _parse_structured_raw_material(payload: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse raw material QR like:
+    O...V2P00000001180QRM00000000012I00000000001T00000000003L20260213150028-000000045890
+
+    - P(11 digits)   -> material code/name seed
+    - QRM(11 digits) -> quantity
+    - I..T..L..-..   -> unique key payload, also carries trailing job id after '-'
+    """
+    s = str(payload).strip()
+    if "V2" not in s or "QRM" not in s or "P" not in s:
+        return None
+
+    p_match = re.search(r"P(\d{11})", s)
+    q_match = re.search(r"QRM(\d{11})", s)
+    uniq_match = re.search(r"(I\d{11}T\d{11}L\d{14}-\d+)\s*$", s)
+    job_match = re.search(r"-0*(\d+)\s*$", s)
+    if not p_match or not q_match or not uniq_match or not job_match:
+        return None
+
+    material_code_digits = p_match.group(1).lstrip("0") or "0"
+    qty = int(q_match.group(1))
+    unique_key = uniq_match.group(1)
+    job_code = job_match.group(1).lstrip("0") or "0"
+    material_name = f"Raw Material {material_code_digits}"
+    return {
+        "material_code": material_code_digits,
+        "material_name": material_name,
+        "qty": qty,
+        "unique_key": unique_key,
+        "job_code": job_code,
+    }
+
+
+def _extract_po_from_job_qr(payload: str) -> Optional[str]:
+    """
+    Parse job QR format like: O000000000240000010237800000000000
+    The PO number is in the middle 11-digit segment.
+    """
+    s = str(payload).strip()
+    m = re.fullmatch(r"O(\d{11})(\d{11})(\d{11})", s)
+    if not m:
+        return None
+    mid_block = m.group(2)
+    po = mid_block.lstrip("0") or "0"
+    return po
+
+
 @dataclass
 class ScanResult:
     kind: str
@@ -105,6 +155,8 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
     # Reject reason code
     if s in REJECT_REASON_MAP:
         return ScanResult(kind="REJECT_REASON", raw=raw, value=REJECT_REASON_MAP[s])
+    if s_l == "sur":
+        return ScanResult(kind="STARTUP_REJECT", raw=raw, value="Start Up Reject", qty=1)
 
     # Machine
     if s in MACHINE_MAP:
@@ -113,6 +165,14 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
     # Job
     if s in JOB_MAP:
         return ScanResult(kind="JOB", raw=raw, value=JOB_MAP[s])
+    po_from_structured_job = _extract_po_from_job_qr(s)
+    if po_from_structured_job is not None:
+        return ScanResult(
+            kind="JOB",
+            raw=raw,
+            value=JOB_MAP.get(po_from_structured_job, f"PO-{po_from_structured_job}"),
+            meta={"po_number": po_from_structured_job},
+        )
 
     # Job stub by key value from local stub file
     if s in JOB_STUBS and isinstance(JOB_STUBS[s], dict):
@@ -148,6 +208,16 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="OPERATOR", raw=raw, value=f"{s} - {OPERATOR_MAP[s]}")
 
     # Raw materials
+    structured_raw = _parse_structured_raw_material(s)
+    if structured_raw is not None:
+        return ScanResult(
+            kind="RAW_MATERIAL",
+            raw=raw,
+            value=structured_raw["material_name"],
+            qty=structured_raw["qty"],
+            meta=structured_raw,
+        )
+
     if s_l.startswith("rawmat~") or s_l.startswith("rawmaterial~") or s_l.startswith("rm~"):
         parts = [p.strip() for p in s.split("~")]
         material = parts[1] if len(parts) > 1 and parts[1] else "Sack"

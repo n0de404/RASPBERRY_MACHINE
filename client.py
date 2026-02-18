@@ -8,14 +8,14 @@ import threading
 import time
 import math
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 
 import requests
 
 from PyQt6.QtCore import Qt, QObject, QEvent, pyqtSignal, QTimer, QSize
 from PyQt6.QtGui import QMovie, QPixmap, QColor
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect, QGraphicsBlurEffect
+    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect, QGraphicsBlurEffect, QProgressBar
 )
 
 from mappings import parse_scan, MACHINE_MAP, JOB_MAP, REJECT_REASON_MAP
@@ -35,6 +35,9 @@ SCANNER_BAUDRATE = int(os.environ.get("MACHINE_SCANNER_BAUDRATE", "9600"))
 SCANNER_TIMEOUT = float(os.environ.get("MACHINE_SCANNER_TIMEOUT", "1.0"))
 INVALID_SCAN_GIF = os.environ.get("MACHINE_INVALID_SCAN_GIF", "slap-virtual-slap.gif").strip()
 REPAIR_GIF = os.environ.get("MACHINE_REPAIR_GIF", "repair.gif").strip()
+SUPERVISOR_BADGES = {"3000001": "Charlie Brown"}
+QC_BADGES = {"4000001": "Lucy Van Pelt"}
+REJECT_REVIEW_REQUIRED_ROTATIONS = 4
 
 REJECT_DETAIL_ITEMS = [
     ("BM", "BURN MARK"),
@@ -111,6 +114,14 @@ class ClientState:
     supervisor_name: Optional[str] = None
     raw_sacks_count: int = 0
     raw_material_scans: List[str] = None
+    raw_material_unique_keys: Set[str] = None
+    startup_reject_total: int = 0
+    reject_review_open: bool = False
+    reject_review_phase: int = 0
+    reject_review_actor_code: Optional[str] = None
+    reject_review_actor_name: Optional[str] = None
+    reject_review_actor_role: Optional[str] = None
+    reject_review_logs: List[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.reject_breakdown is None:
@@ -119,6 +130,10 @@ class ClientState:
             self.job_payload = {}
         if self.raw_material_scans is None:
             self.raw_material_scans = []
+        if self.raw_material_unique_keys is None:
+            self.raw_material_unique_keys = set()
+        if self.reject_review_logs is None:
+            self.reject_review_logs = []
 
 
 class ScannerFilter(QObject):
@@ -379,6 +394,8 @@ class ClientUI(QWidget):
         self.rightDowntimeReason = QLabel("Reason: -")
         self.rightDowntimeReason.setObjectName("MetaValue")
         self.rightDowntimeReason.setWordWrap(True)
+        self.rightStartupReject = QLabel("Start Up Reject: 0")
+        self.rightStartupReject.setObjectName("MetaValue")
         self.rightCycleTitle = QLabel("Cycle Monitor")
         self.rightCycleTitle.setObjectName("RightTitle")
         self.rightCycleHint = QLabel("Cycle count and cycle time status.")
@@ -427,6 +444,7 @@ class ClientUI(QWidget):
         rightLayout.addWidget(self.rightHint)
         rightLayout.addWidget(self.rightDowntimeTimer)
         rightLayout.addWidget(self.rightDowntimeReason)
+        rightLayout.addWidget(self.rightStartupReject)
         rightLayout.addWidget(self.rightMaintenance)
         rightLayout.addWidget(self.rightSupervisor)
         rightLayout.addStretch()
@@ -542,6 +560,96 @@ class ClientUI(QWidget):
         self.resolveOverlay.hide()
         self.resolveOverlay.raise_()
 
+        # Center overlay for raw materials history (toggle with "showrawmats").
+        self.rawMatsOverlay = QFrame(self)
+        self.rawMatsOverlay.setObjectName("ProductionOverlay")
+        self.rawMatsOverlay.setLayout(QVBoxLayout())
+        self.rawMatsOverlay.layout().setContentsMargins(14, 12, 14, 12)
+        self.rawMatsOverlay.layout().setSpacing(8)
+        self.rawMatsOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.rawMatsTitle = QLabel("RAW MATERIALS SCANNED")
+        self.rawMatsTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
+        self.rawMatsHint = QLabel('Scan "showrawmats" again to close')
+        self.rawMatsHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.rawMatsList = QLabel("No raw materials scanned yet.")
+        self.rawMatsList.setObjectName("ProductionLiveReason")
+        self.rawMatsList.setWordWrap(True)
+        self.rawMatsList.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.rawMatsOverlay.layout().addWidget(self.rawMatsTitle)
+        self.rawMatsOverlay.layout().addWidget(self.rawMatsHint)
+        self.rawMatsOverlay.layout().addWidget(self.rawMatsList)
+        self.rawMatsOverlay.hide()
+        self.rawMatsOverlay.raise_()
+
+        # Center overlay for reject confirmation by Supervisor/QC.
+        self.rejectReviewOverlay = QFrame(self)
+        self.rejectReviewOverlay.setObjectName("ProductionOverlay")
+        self.rejectReviewOverlay.setLayout(QVBoxLayout())
+        self.rejectReviewOverlay.layout().setContentsMargins(14, 12, 14, 12)
+        self.rejectReviewOverlay.layout().setSpacing(8)
+        self.rejectReviewOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.rejectReviewTitle = QLabel("REJECT CHECK")
+        self.rejectReviewTitle.setStyleSheet("color: #0f172a; font-size: 20px; font-weight: 900;")
+        self.rejectReviewActor = QLabel("Authorized Review")
+        self.rejectReviewActor.setObjectName("MetaValue")
+        self.rejectReviewList = QLabel("No rejects to confirm.")
+        self.rejectReviewList.setObjectName("ProductionLiveReason")
+        self.rejectReviewList.setWordWrap(True)
+        self.rejectReviewList.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.rejectReviewCycle = QLabel("Cycle Count: - | Cycle Time: -")
+        self.rejectReviewCycle.setObjectName("MetaValue")
+        self.rejectReviewCycle.hide()
+        self.rejectReviewHint = QLabel("Scan the same authorized badge to continue.")
+        self.rejectReviewHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.rejectReviewOverlay.layout().addWidget(self.rejectReviewTitle)
+        self.rejectReviewOverlay.layout().addWidget(self.rejectReviewActor)
+        self.rejectReviewOverlay.layout().addWidget(self.rejectReviewList)
+        self.rejectReviewOverlay.layout().addWidget(self.rejectReviewCycle)
+        self.rejectReviewOverlay.layout().addWidget(self.rejectReviewHint)
+        self.rejectReviewLoadingLayer = QFrame(self.rejectReviewOverlay)
+        self.rejectReviewLoadingLayer.setStyleSheet("background: rgba(255,255,255,0.46); border: none;")
+        self.rejectReviewLoadingLayer.setLayout(QVBoxLayout())
+        self.rejectReviewLoadingLayer.layout().setContentsMargins(18, 18, 18, 18)
+        self.rejectReviewLoadingLayer.layout().setSpacing(8)
+        self.rejectReviewLoadingLayer.layout().setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rejectReviewLoadingText = QLabel("Confirming...")
+        self.rejectReviewLoadingText.setObjectName("MetaValue")
+        self.rejectReviewLoadingText.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rejectReviewLoadingBar = QProgressBar()
+        self.rejectReviewLoadingBar.setRange(0, 100)
+        self.rejectReviewLoadingBar.setValue(0)
+        self.rejectReviewLoadingBar.setTextVisible(False)
+        self.rejectReviewLoadingBar.setFixedWidth(260)
+        self.rejectReviewLoadingLayer.layout().addWidget(self.rejectReviewLoadingText)
+        self.rejectReviewLoadingLayer.layout().addWidget(self.rejectReviewLoadingBar, 0, Qt.AlignmentFlag.AlignCenter)
+        self.rejectReviewLoadingLayer.hide()
+        self.rejectReviewLoadingLayer.raise_()
+        self.rejectReviewOverlay.setStyleSheet(
+            "QFrame#ProductionOverlay {"
+            "background: qradialgradient(cx:0.45, cy:0.35, radius:1.0, fx:0.45, fy:0.35,"
+            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(236,253,245,0.98), stop:1 rgba(209,250,229,0.97));"
+            "border: 3px solid #0f766e; border-radius: 14px; }"
+            "QProgressBar {"
+            "border: 1px solid #0f766e; border-radius: 8px; background: rgba(255,255,255,0.88); min-height: 14px; }"
+            "QProgressBar::chunk {"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0f766e, stop:1 #f59e0b);"
+            "border-radius: 7px; }"
+        )
+        self.rejectReviewOverlay.hide()
+        self.rejectReviewOverlay.raise_()
+        self._reject_review_anim_timer = QTimer(self)
+        self._reject_review_anim_timer.setInterval(80)
+        self._reject_review_anim_timer.timeout.connect(self._tick_reject_review_anim)
+        self._reject_review_anim_value = 0
+        self._reject_review_blur_effects: List[QGraphicsBlurEffect] = []
+        self._reject_review_blur_targets = [
+            self.rejectReviewTitle,
+            self.rejectReviewActor,
+            self.rejectReviewList,
+            self.rejectReviewCycle,
+            self.rejectReviewHint,
+        ]
+
         self._repair_movie: Optional[QMovie] = None
         if REPAIR_GIF and os.path.exists(REPAIR_GIF):
             repair_movie = QMovie(REPAIR_GIF)
@@ -592,6 +700,8 @@ class ClientUI(QWidget):
         self._position_invalid_overlay()
         self._position_production_overlay()
         self._position_resolve_overlay()
+        self._position_raw_mats_overlay()
+        self._position_reject_review_overlay()
         if self._invalid_movie is not None:
             self._invalid_movie.setScaledSize(self._fit_movie_size(self.invalidOverlay.size()))
         self._position_marquee()
@@ -673,6 +783,123 @@ class ClientUI(QWidget):
         y = max(0, (self.height() - h) // 2)
         self.resolveOverlay.setGeometry(x, y, w, h)
 
+    def _position_raw_mats_overlay(self):
+        w = min(760, max(520, int(self.width() * 0.58)))
+        h = min(640, max(360, int(self.height() * 0.65)))
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
+        self.rawMatsOverlay.setGeometry(x, y, w, h)
+
+    def _position_reject_review_overlay(self):
+        self.rejectReviewOverlay.adjustSize()
+        hint_h = self.rejectReviewOverlay.sizeHint().height()
+        hint_w = self.rejectReviewOverlay.sizeHint().width()
+        w = min(620, max(420, hint_w + 28))
+        h = min(460, max(220, hint_h + 20))
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
+        self.rejectReviewOverlay.setGeometry(x, y, w, h)
+        self.rejectReviewLoadingLayer.setGeometry(0, 0, w, h)
+
+    def _refresh_raw_mats_overlay(self):
+        mats = self.state.raw_material_scans or []
+        if not mats:
+            self.rawMatsList.setText("No raw materials scanned yet.")
+            return
+        self.rawMatsList.setText("\n".join(f"{i}. {name}" for i, name in enumerate(mats, start=1)))
+
+    def _show_raw_mats_overlay(self):
+        self._refresh_raw_mats_overlay()
+        self._position_raw_mats_overlay()
+        self._set_background_blur(True)
+        self.rawMatsOverlay.show()
+        self.rawMatsOverlay.raise_()
+
+    def _hide_raw_mats_overlay(self):
+        self.rawMatsOverlay.hide()
+        if (
+            not self.productionOverlay.isVisible()
+            and not self.resolveOverlay.isVisible()
+            and not self.rejectReviewOverlay.isVisible()
+        ):
+            self._set_background_blur(False)
+
+    def _reviewer_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
+        code = str(raw).strip()
+        if code in SUPERVISOR_BADGES:
+            return {"code": code, "name": SUPERVISOR_BADGES[code], "role": "SUPERVISOR"}
+        if code in QC_BADGES:
+            return {"code": code, "name": QC_BADGES[code], "role": "QC"}
+        return None
+
+    def _get_non_zero_rejects(self) -> List[tuple]:
+        rows = []
+        for key, count in (self.state.reject_breakdown or {}).items():
+            qty = int(count or 0)
+            if qty > 0:
+                rows.append((str(key), qty))
+        rows.sort(key=lambda x: x[0])
+        return rows
+
+    def _show_reject_review_overlay(self, reviewer: Dict[str, str]):
+        s = self.state
+        s.reject_review_open = True
+        s.reject_review_phase = 1
+        s.reject_review_actor_code = reviewer["code"]
+        s.reject_review_actor_name = reviewer["name"]
+        s.reject_review_actor_role = reviewer["role"]
+        rows = self._get_non_zero_rejects()
+        self.rejectReviewActor.setText(f"Authorized: {reviewer['name']}")
+        self.rejectReviewList.setText("\n".join(f"{k}: {v}" for k, v in rows))
+        self.rejectReviewCycle.hide()
+        self.rejectReviewLoadingLayer.hide()
+        self.rejectReviewLoadingBar.setValue(0)
+        self.rejectReviewHint.setText("Scan the same authorized badge to show cycle count/time.")
+        self._position_reject_review_overlay()
+        self._set_background_blur(True)
+        self.rejectReviewOverlay.show()
+        self.rejectReviewOverlay.raise_()
+
+    def _hide_reject_review_overlay(self):
+        s = self.state
+        s.reject_review_open = False
+        s.reject_review_phase = 0
+        s.reject_review_actor_code = None
+        s.reject_review_actor_name = None
+        s.reject_review_actor_role = None
+        self.rejectReviewOverlay.hide()
+        self._reject_review_anim_timer.stop()
+        self.rejectReviewLoadingLayer.hide()
+        self.rejectReviewLoadingBar.setValue(0)
+        self._set_reject_review_blur(False)
+        if (
+            not self.productionOverlay.isVisible()
+            and not self.resolveOverlay.isVisible()
+            and not self.rawMatsOverlay.isVisible()
+        ):
+            self._set_background_blur(False)
+
+    def _set_reject_review_blur(self, enabled: bool):
+        if enabled:
+            if self._reject_review_blur_effects:
+                return
+            for target in self._reject_review_blur_targets:
+                fx = QGraphicsBlurEffect(target)
+                fx.setBlurRadius(2.8)
+                target.setGraphicsEffect(fx)
+                self._reject_review_blur_effects.append(fx)
+            return
+        for target in self._reject_review_blur_targets:
+            target.setGraphicsEffect(None)
+        self._reject_review_blur_effects = []
+
+    def _tick_reject_review_anim(self):
+        self._reject_review_anim_value = min(100, self._reject_review_anim_value + 8)
+        self.rejectReviewLoadingBar.setValue(self._reject_review_anim_value)
+        if self._reject_review_anim_value >= 100:
+            self._reject_review_anim_timer.stop()
+            self._set_reject_review_blur(False)
+
     def _update_repair_movie_size(self):
         if self._repair_movie is None:
             return
@@ -711,7 +938,12 @@ class ClientUI(QWidget):
         self.productionOverlay.hide()
         self.productionOverlay.setProperty("pulse", "0")
         self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
-        self._set_background_blur(False)
+        if (
+            not self.resolveOverlay.isVisible()
+            and not self.rawMatsOverlay.isVisible()
+            and not self.rejectReviewOverlay.isVisible()
+        ):
+            self._set_background_blur(False)
         self._apply_overlay_base_style()
 
     def _show_resolve_overlay(self):
@@ -722,7 +954,11 @@ class ClientUI(QWidget):
 
     def _hide_resolve_overlay(self):
         self.resolveOverlay.hide()
-        if not self.productionOverlay.isVisible():
+        if (
+            not self.productionOverlay.isVisible()
+            and not self.rawMatsOverlay.isVisible()
+            and not self.rejectReviewOverlay.isVisible()
+        ):
             self._set_background_blur(False)
 
     def _set_background_blur(self, enabled: bool):
@@ -904,7 +1140,7 @@ class ClientUI(QWidget):
         elif s.showing_reject_summary:
             self._set_banner_text("Reject summary loaded")
         elif s.waiting_reject_reason:
-            self._set_banner_text("Reject mode: Scan reject reason (BM01/CS02/CO03/CR04/DI05)")
+            self._set_banner_text("Reject mode: Scan reason (BM01/CS02/CO03/CR04/DI05) or SUR")
         elif s.waiting_production_report_reason:
             self._set_banner_text("Production Daily Report mode: Scan reason QR (01-15)")
         elif s.waiting_cycle_time_input:
@@ -916,7 +1152,7 @@ class ClientUI(QWidget):
         elif s.waiting_operator_downtime_confirm:
             self._set_banner_text("Downtime resolve: Scan Operator QR to confirm")
         elif s.downtime_active:
-            self._set_banner_text('Downtime active: only scan "productiondailyreport~2"')
+            self._set_banner_text('Downtime active: scan "productiondailyreport~2" or SUR')
         else:
             self._set_banner_text("Ready: Scan PACK / BUTAL / Reject~1")
         self._refresh_job_details()
@@ -960,6 +1196,7 @@ class ClientUI(QWidget):
             self.rightDowntimeReason.setText(f"Reason {s.downtime_reason_code}: {s.downtime_reason_text}")
         else:
             self.rightDowntimeReason.setText("Reason: -")
+        self.rightStartupReject.setText(f"Start Up Reject: {s.startup_reject_total}")
 
         if s.downtime_started_at:
             elapsed = max(0, int(time.time() - s.downtime_started_at))
@@ -1161,6 +1398,8 @@ class ClientUI(QWidget):
         if res.kind == "OPERATOR":
             return f"Operator: {self._operator_display_name(res.value)}"
         if res.kind == "RAW_MATERIAL":
+            if isinstance(res.meta, dict) and res.meta.get("unique_key"):
+                return f"Raw Material: {res.value} (+{int(res.qty or 1)}) [{res.meta.get('unique_key')}]"
             return f"Raw Material: {res.value} (+{int(res.qty or 1)})"
         if res.kind == "PACK":
             return f"Pack +{int(res.qty or 0)}"
@@ -1170,6 +1409,8 @@ class ClientUI(QWidget):
             return "Reject mode enabled"
         if res.kind == "REJECT_REASON":
             return f"Reject reason: {res.value}"
+        if res.kind == "STARTUP_REJECT":
+            return "Start Up Reject +1"
         if res.kind == "REJECT_SUMMARY":
             return "Reject summary requested"
         if res.kind == "PRODUCTION_DAILY_REPORT_TRIGGER":
@@ -1251,6 +1492,85 @@ class ClientUI(QWidget):
         raw_s = str(raw).strip()
         raw_l = raw_s.lower()
         s = self.state
+
+        reviewer = self._reviewer_from_scan(raw_s)
+        if reviewer is not None:
+            in_downtime_flow = (
+                s.waiting_production_report_reason
+                or s.waiting_cycle_time_input
+                or s.waiting_maintenance_qr
+                or s.waiting_supervisor_qr
+                or s.waiting_operator_downtime_confirm
+                or s.downtime_active
+            )
+            if not in_downtime_flow:
+                if not self.can_accept_production_scans():
+                    self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+                    return
+                if not s.reject_review_open:
+                    rows = self._get_non_zero_rejects()
+                    if not rows:
+                        self.status.setText("No recorded rejects to review.")
+                        return
+                    self._show_reject_review_overlay(reviewer)
+                    self.status.setText("Reject check started. Scan same badge to continue.")
+                    return
+                if raw_s != (s.reject_review_actor_code or ""):
+                    self.status.setText("Reject review active: scan the same badge to continue.")
+                    return
+                if s.reject_review_phase == 1:
+                    s.reject_review_phase = 2
+                    self.rejectReviewCycle.setText(f"Cycle Count: {s.pack_count} | Cycle Time: {s.cycle_time_current or '-'}")
+                    self.rejectReviewCycle.show()
+                    self.rejectReviewHint.setText("Scan the same authorized badge again to confirm.")
+                    self.status.setText("Cycle details shown. Scan same badge again to confirm.")
+                    return
+                if s.reject_review_phase == 2:
+                    s.reject_review_phase = 3
+                    self.rejectReviewLoadingLayer.show()
+                    self.rejectReviewLoadingLayer.raise_()
+                    self._reject_review_anim_value = 0
+                    self.rejectReviewLoadingBar.setValue(0)
+                    self._set_reject_review_blur(True)
+                    self._set_background_blur(True)
+                    self._reject_review_anim_timer.start()
+                    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                    log = {
+                        "timestamp": stamp,
+                        "status": "CONFIRMED",
+                        "actor_role": s.reject_review_actor_role,
+                        "actor_name": s.reject_review_actor_name,
+                        "actor_code": s.reject_review_actor_code,
+                    }
+                    s.reject_review_logs.append(log)
+                    self.push_event(
+                        {
+                            "type": "REJECT_REVIEW_CONFIRM",
+                            "timestamp": stamp,
+                            "status": "CONFIRMED",
+                            "actor_role": log["actor_role"],
+                            "actor_name": log["actor_name"],
+                            "rotation_count": len(s.reject_review_logs),
+                        },
+                        f"REJECT REVIEW CONFIRMED {log['actor_name']} ({log['actor_role']})",
+                    )
+                    self._refresh_ui()
+                    QTimer.singleShot(1200, self._hide_reject_review_overlay)
+                    self.status.setText("Reject review confirmed.")
+                    return
+
+        if raw_l == "showrawmats":
+            if self.rawMatsOverlay.isVisible():
+                self._hide_raw_mats_overlay()
+                self.status.setText("Raw materials list closed.")
+            else:
+                self._show_raw_mats_overlay()
+                self.status.setText("Raw materials list opened.")
+            return
+
+        if self.rawMatsOverlay.isVisible():
+            self._hide_raw_mats_overlay()
+
         res_pre = parse_scan(raw_s)
 
         # Raw material scanning: no mode/state required, only needs active session.
@@ -1258,14 +1578,38 @@ class ClientUI(QWidget):
             if not self.can_accept_production_scans():
                 self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
                 return
+            meta = res_pre.meta if isinstance(res_pre.meta, dict) else {}
+            raw_job_code = self._normalize_job_code(meta.get("job_code")) if meta.get("job_code") else ""
+            current_job_code = self._normalize_job_code(s.job_code)
+            if raw_job_code and current_job_code and raw_job_code != current_job_code:
+                self.status.setText(
+                    f"Invalid RAW MATERIAL QR: job code {raw_job_code} does not match current job {s.job_code}."
+                )
+                self._show_invalid_overlay()
+                return
+
+            unique_key = str(meta.get("unique_key") or "").strip()
+            if unique_key and unique_key in s.raw_material_unique_keys:
+                self.status.setText("Invalid RAW MATERIAL QR: duplicate serial already scanned.")
+                self._show_invalid_overlay()
+                return
+
             qty = int(res_pre.qty or 1)
             s.raw_sacks_count += qty
             s.raw_material_scans.append(res_pre.value)
+            if unique_key:
+                s.raw_material_unique_keys.add(unique_key)
             self.log_last(self._scan_display_text(res_pre, raw_s))
             self.status.setText(f"Raw material scanned: {res_pre.value} (+{qty})")
             self._refresh_ui()
             self.push_event(
-                {"type": "RAW_MATERIAL", "material": res_pre.value, "qty": qty},
+                {
+                    "type": "RAW_MATERIAL",
+                    "material": res_pre.value,
+                    "qty": qty,
+                    "unique_key": unique_key or None,
+                    "raw_job_code": raw_job_code or None,
+                },
                 f"RAW MATERIAL {res_pre.value} +{qty}",
             )
             return
@@ -1348,9 +1692,9 @@ class ClientUI(QWidget):
             self.status.setText("Scan operator QR to confirm.")
             return
 
-        # Downtime lock: only allow resolve trigger while active
-        if s.downtime_active and raw_l != "productiondailyreport~2":
-            self.status.setText('Downtime active: only "productiondailyreport~2" is allowed.')
+        # Downtime lock: allow resolve trigger and SUR while active
+        if s.downtime_active and raw_l not in ("productiondailyreport~2", "sur"):
+            self.status.setText('Downtime active: only "productiondailyreport~2" or "SUR" is allowed.')
             return
 
         res = parse_scan(raw_s)
@@ -1406,10 +1750,31 @@ class ClientUI(QWidget):
                 self._pulse_card(self.cardStatReject)
                 self.push_event({"type": "REJECT", "qty": 1, "reason": reason}, f"REJECT {reason} +1")
                 return
-            self.status.setText("Reject mode: please scan a valid reason code (BM01/CS02/CO03/CR04/DI05).")
+            if res.kind == "STARTUP_REJECT":
+                s.startup_reject_total += 1
+                s.waiting_reject_reason = False
+                self.status.setText("Start Up Reject recorded.")
+                self._refresh_ui()
+                self.push_event({"type": "STARTUP_REJECT", "qty": 1}, "STARTUP REJECT +1")
+                return
+            self.status.setText("Reject mode: scan BM01/CS02/CO03/CR04/DI05 or SUR.")
+            return
+
+        if res.kind == "STARTUP_REJECT":
+            if not self.can_accept_production_scans():
+                self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+                return
+            s.startup_reject_total += 1
+            self.status.setText("Start Up Reject recorded.")
+            self._refresh_ui()
+            self.push_event({"type": "STARTUP_REJECT", "qty": 1}, "STARTUP REJECT +1")
             return
 
         if res.kind == "MACHINE":
+            if s.machine_code:
+                self.status.setText("Finish your current job first before changing machine.")
+                self._show_invalid_overlay()
+                return
             s.machine_code = raw_s
             s.machine_name = res.value
             s.job_code = None
@@ -1429,20 +1794,31 @@ class ClientUI(QWidget):
             s.supervisor_name = None
             s.raw_sacks_count = 0
             s.raw_material_scans = []
+            s.raw_material_unique_keys = set()
+            s.startup_reject_total = 0
+            s.reject_review_logs = []
             self._reset_downtime_resolution_state()
             self._hide_resolve_overlay()
             self._hide_production_overlay()
+            self._hide_raw_mats_overlay()
+            self._hide_reject_review_overlay()
             self.status.setText(f"Machine set: {s.machine_name}")
             self._refresh_ui()
             self.push_event({"type": "MACHINE_SET"}, f"MACHINE {s.machine_name}")
             return
 
         if res.kind in ("JOB", "JOB_STUB"):
+            if s.machine_code and s.job_code and s.operator_id:
+                self.status.setText("Finish your current job first before changing machine or job.")
+                return
             if not s.machine_code:
                 self.status.setText("Scan MACHINE first.")
                 return
             if res.kind == "JOB":
-                s.job_code = raw_s
+                po_from_meta = ""
+                if isinstance(res.meta, dict):
+                    po_from_meta = self._safe_text(res.meta.get("po_number"), "")
+                s.job_code = po_from_meta or raw_s
                 s.job_name = res.value
                 s.job_payload = {}
             else:
@@ -1474,9 +1850,14 @@ class ClientUI(QWidget):
             s.supervisor_name = None
             s.raw_sacks_count = 0
             s.raw_material_scans = []
+            s.raw_material_unique_keys = set()
+            s.startup_reject_total = 0
+            s.reject_review_logs = []
             self._reset_downtime_resolution_state()
             self._hide_resolve_overlay()
             self._hide_production_overlay()
+            self._hide_raw_mats_overlay()
+            self._hide_reject_review_overlay()
             self.status.setText(f"Job set: {s.job_name}")
             self._refresh_ui()
             if res.kind == "JOB":
