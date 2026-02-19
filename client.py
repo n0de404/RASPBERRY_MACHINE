@@ -1,5 +1,6 @@
 # client.py
 from __future__ import annotations
+import json
 import os
 import re
 import socket
@@ -8,6 +9,7 @@ import threading
 import time
 import math
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Set
 
 import requests
@@ -33,8 +35,18 @@ SCANNER_MODE = os.environ.get("MACHINE_SCANNER_MODE", "auto").strip().lower()
 SCANNER_COM_PORT = os.environ.get("MACHINE_SCANNER_COM_PORT", "COM6").strip()
 SCANNER_BAUDRATE = int(os.environ.get("MACHINE_SCANNER_BAUDRATE", "9600"))
 SCANNER_TIMEOUT = float(os.environ.get("MACHINE_SCANNER_TIMEOUT", "1.0"))
-INVALID_SCAN_GIF = os.environ.get("MACHINE_INVALID_SCAN_GIF", "slap-virtual-slap.gif").strip()
-REPAIR_GIF = os.environ.get("MACHINE_REPAIR_GIF", "repair.gif").strip()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ANIMATIONS_DIR = os.path.join(BASE_DIR, "Animations")
+IMAGES_DIR = os.path.join(BASE_DIR, "Images")
+DATABASE_DIR = os.path.join(BASE_DIR, "Database")
+INVALID_SCAN_GIF = os.environ.get(
+    "MACHINE_INVALID_SCAN_GIF",
+    os.path.join(ANIMATIONS_DIR, "slap-virtual-slap.gif"),
+).strip()
+REPAIR_GIF = os.environ.get(
+    "MACHINE_REPAIR_GIF",
+    os.path.join(ANIMATIONS_DIR, "repair.gif"),
+).strip()
 SUPERVISOR_BADGES = {"3000001": "Charlie Brown"}
 QC_BADGES = {"4000001": "Lucy Van Pelt"}
 REJECT_REVIEW_REQUIRED_ROTATIONS = 4
@@ -114,6 +126,7 @@ class ClientState:
     supervisor_name: Optional[str] = None
     raw_sacks_count: int = 0
     raw_material_scans: List[str] = None
+    raw_material_logs: List[Dict[str, Any]] = None
     raw_material_unique_keys: Set[str] = None
     startup_reject_total: int = 0
     reject_review_open: bool = False
@@ -130,6 +143,8 @@ class ClientState:
             self.job_payload = {}
         if self.raw_material_scans is None:
             self.raw_material_scans = []
+        if self.raw_material_logs is None:
+            self.raw_material_logs = []
         if self.raw_material_unique_keys is None:
             self.raw_material_unique_keys = set()
         if self.reject_review_logs is None:
@@ -177,14 +192,6 @@ class ClientUI(QWidget):
         self._serial_stop = threading.Event()
         self._serial_thread: Optional[threading.Thread] = None
         self._motion_index = 0
-        self._motion_frames = [
-            "[M] >    ",
-            "[M] >>   ",
-            "[M] >>>  ",
-            "[M]  >>> ",
-            "[M]   >>>",
-            "[M]    >>",
-        ]
         self._label_icon_candidates = {
             "machine": ["machine.png", "machine.jpg", "machine.jpeg", "machine_icon.png", "icon_machine.png"],
             "job": ["job-seeker.png", "job.png", "job.jpg", "job.jpeg", "job_icon.png", "icon_job.png"],
@@ -1048,12 +1055,14 @@ class ClientUI(QWidget):
         return f
 
     def _find_icon_path(self, key: str) -> Optional[str]:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
         for candidate in self._label_icon_candidates.get(key.lower(), []):
-            # Try script directory first, then current working directory.
-            p1 = os.path.join(base_dir, candidate)
+            p1 = os.path.join(IMAGES_DIR, candidate)
             if os.path.exists(p1):
                 return p1
+            # Fallback: script directory and current working directory.
+            p2 = os.path.join(BASE_DIR, candidate)
+            if os.path.exists(p2):
+                return p2
             if os.path.exists(candidate):
                 return os.path.abspath(candidate)
         return None
@@ -1170,13 +1179,8 @@ class ClientUI(QWidget):
 
     def _tick_motion(self):
         if self._session_is_running():
-            frame = self._motion_frames[self._motion_index % len(self._motion_frames)]
-            self.machineAnim.setText(frame)
-            if self._motion_index % 2 == 0:
-                self.banner.setText(f"{self._banner_base_text}  .")
-            else:
-                self.banner.setText(f"{self._banner_base_text}  ..")
-            self._motion_index += 1
+            self.machineAnim.setText("[M] ready")
+            self.banner.setText(self._banner_base_text)
         else:
             if not self.state.machine_code:
                 self.machineAnim.setText("[M] idle")
@@ -1219,6 +1223,223 @@ class ClientUI(QWidget):
                 self.productionCounter.setText("00:00:00")
                 if self._repair_movie is None:
                     self.productionFixAnim.setText("Repair in progress...")
+
+    def _save_finished_job_local(self, payload: Dict[str, Any]):
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        p = os.path.join(DATABASE_DIR, "finished_jobs_client.json")
+        rows: List[Dict[str, Any]] = []
+        try:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    rows = loaded
+        except Exception:
+            rows = []
+        rows.append(payload)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+
+    def _active_session_file_path(self) -> str:
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        return os.path.join(DATABASE_DIR, "active_machine_sessions.json")
+
+    def _load_active_sessions_map(self) -> Dict[str, Any]:
+        p = self._active_session_file_path()
+        try:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    return loaded
+        except Exception:
+            pass
+        return {}
+
+    def _save_active_sessions_map(self, rows: Dict[str, Any]):
+        p = self._active_session_file_path()
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+
+    def _state_to_active_snapshot(self) -> Dict[str, Any]:
+        s = self.state
+        return {
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "machine_code": s.machine_code,
+            "machine_name": s.machine_name,
+            "job_code": s.job_code,
+            "job_name": s.job_name,
+            "operator_id": s.operator_id,
+            "pack_count": int(s.pack_count or 0),
+            "good_total": int(s.good_total or 0),
+            "butal_total": int(s.butal_total or 0),
+            "reject_total": int(s.reject_total or 0),
+            "reject_breakdown": dict(s.reject_breakdown or {}),
+            "waiting_reject_reason": bool(s.waiting_reject_reason),
+            "waiting_production_report_reason": bool(s.waiting_production_report_reason),
+            "showing_reject_summary": bool(s.showing_reject_summary),
+            "job_payload": s.job_payload or {},
+            "downtime_reason_code": s.downtime_reason_code,
+            "downtime_reason_text": s.downtime_reason_text,
+            "downtime_started_at": s.downtime_started_at,
+            "downtime_last_seconds": s.downtime_last_seconds,
+            "downtime_active": bool(s.downtime_active),
+            "cycle_time_current": s.cycle_time_current,
+            "cycle_time_new_input": s.cycle_time_new_input,
+            "waiting_cycle_time_input": bool(s.waiting_cycle_time_input),
+            "waiting_maintenance_qr": bool(s.waiting_maintenance_qr),
+            "waiting_supervisor_qr": bool(s.waiting_supervisor_qr),
+            "waiting_operator_downtime_confirm": bool(s.waiting_operator_downtime_confirm),
+            "maintenance_name": s.maintenance_name,
+            "supervisor_name": s.supervisor_name,
+            "raw_sacks_count": int(s.raw_sacks_count or 0),
+            "raw_material_scans": list(s.raw_material_scans or []),
+            "raw_material_logs": list(s.raw_material_logs or []),
+            "raw_material_unique_keys": sorted(list(s.raw_material_unique_keys or set())),
+            "startup_reject_total": int(s.startup_reject_total or 0),
+            "reject_review_open": bool(s.reject_review_open),
+            "reject_review_phase": int(s.reject_review_phase or 0),
+            "reject_review_actor_code": s.reject_review_actor_code,
+            "reject_review_actor_name": s.reject_review_actor_name,
+            "reject_review_actor_role": s.reject_review_actor_role,
+            "reject_review_logs": list(s.reject_review_logs or []),
+        }
+
+    def _save_active_session_snapshot(self):
+        s = self.state
+        machine_code = str(s.machine_code or "").strip()
+        if not machine_code:
+            return
+        rows = self._load_active_sessions_map()
+        rows[machine_code] = self._state_to_active_snapshot()
+        self._save_active_sessions_map(rows)
+
+    def _load_active_session_snapshot(self, machine_code: str) -> Optional[Dict[str, Any]]:
+        rows = self._load_active_sessions_map()
+        snap = rows.get(str(machine_code or "").strip())
+        if isinstance(snap, dict):
+            return snap
+        return None
+
+    def _clear_active_session_snapshot(self, machine_code: Optional[str]):
+        code = str(machine_code or "").strip()
+        if not code:
+            return
+        rows = self._load_active_sessions_map()
+        if code in rows:
+            del rows[code]
+            self._save_active_sessions_map(rows)
+
+    def _restore_state_from_snapshot(self, snap: Dict[str, Any]):
+        s = self.state
+        s.machine_code = snap.get("machine_code")
+        s.machine_name = snap.get("machine_name")
+        s.job_code = snap.get("job_code")
+        s.job_name = snap.get("job_name")
+        s.operator_id = snap.get("operator_id")
+        s.pack_count = int(snap.get("pack_count") or 0)
+        s.good_total = int(snap.get("good_total") or 0)
+        s.butal_total = int(snap.get("butal_total") or 0)
+        s.reject_total = int(snap.get("reject_total") or 0)
+        s.reject_breakdown = dict(snap.get("reject_breakdown") or {})
+        s.waiting_reject_reason = bool(snap.get("waiting_reject_reason"))
+        s.waiting_production_report_reason = bool(snap.get("waiting_production_report_reason"))
+        s.showing_reject_summary = bool(snap.get("showing_reject_summary"))
+        s.job_payload = snap.get("job_payload") or {}
+        s.downtime_reason_code = snap.get("downtime_reason_code")
+        s.downtime_reason_text = snap.get("downtime_reason_text")
+        s.downtime_started_at = snap.get("downtime_started_at")
+        s.downtime_last_seconds = snap.get("downtime_last_seconds")
+        s.downtime_active = bool(snap.get("downtime_active"))
+        s.cycle_time_current = snap.get("cycle_time_current")
+        s.cycle_time_new_input = str(snap.get("cycle_time_new_input") or "")
+        s.waiting_cycle_time_input = bool(snap.get("waiting_cycle_time_input"))
+        s.waiting_maintenance_qr = bool(snap.get("waiting_maintenance_qr"))
+        s.waiting_supervisor_qr = bool(snap.get("waiting_supervisor_qr"))
+        s.waiting_operator_downtime_confirm = bool(snap.get("waiting_operator_downtime_confirm"))
+        s.maintenance_name = snap.get("maintenance_name")
+        s.supervisor_name = snap.get("supervisor_name")
+        s.raw_sacks_count = int(snap.get("raw_sacks_count") or 0)
+        s.raw_material_scans = list(snap.get("raw_material_scans") or [])
+        s.raw_material_logs = list(snap.get("raw_material_logs") or [])
+        s.raw_material_unique_keys = set(snap.get("raw_material_unique_keys") or [])
+        s.startup_reject_total = int(snap.get("startup_reject_total") or 0)
+        s.reject_review_open = bool(snap.get("reject_review_open"))
+        s.reject_review_phase = int(snap.get("reject_review_phase") or 0)
+        s.reject_review_actor_code = snap.get("reject_review_actor_code")
+        s.reject_review_actor_name = snap.get("reject_review_actor_name")
+        s.reject_review_actor_role = snap.get("reject_review_actor_role")
+        s.reject_review_logs = list(snap.get("reject_review_logs") or [])
+        self._refresh_ui()
+
+    def _build_finished_job_payload(self) -> Dict[str, Any]:
+        s = self.state
+        return {
+            "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+            "client_id": CLIENT_ID,
+            "machine_code": s.machine_code,
+            "machine_name": s.machine_name,
+            "job_code": s.job_code,
+            "job_name": s.job_name,
+            "operator_id": s.operator_id,
+            "pack_count": int(s.pack_count or 0),
+            "good_total": int(s.good_total or 0),
+            "butal_total": int(s.butal_total or 0),
+            "reject_total": int(s.reject_total or 0),
+            "total_good": int((s.good_total or 0) + (s.butal_total or 0)),
+            "reject_breakdown": dict(s.reject_breakdown or {}),
+            "startup_reject_total": int(s.startup_reject_total or 0),
+            "raw_sacks_count": int(s.raw_sacks_count or 0),
+            "raw_material_scans": list(s.raw_material_scans or []),
+            "raw_material_logs": list(s.raw_material_logs or []),
+            "job_payload": s.job_payload or {},
+            "reject_review_logs": list(s.reject_review_logs or []),
+            "downtime_last_seconds": s.downtime_last_seconds,
+            "downtime_reason_code": s.downtime_reason_code,
+            "downtime_reason_text": s.downtime_reason_text,
+            "cycle_time_current": s.cycle_time_current,
+            "maintenance_name": s.maintenance_name,
+            "supervisor_name": s.supervisor_name,
+        }
+
+    def _clear_full_session(self):
+        s = self.state
+        active_machine_code = s.machine_code
+        s.machine_code = None
+        s.machine_name = None
+        s.job_code = None
+        s.job_name = None
+        s.operator_id = None
+        s.pack_count = 0
+        s.good_total = 0
+        s.butal_total = 0
+        s.reject_total = 0
+        s.reject_breakdown = {}
+        s.waiting_reject_reason = False
+        s.waiting_production_report_reason = False
+        s.showing_reject_summary = False
+        s.job_payload = {}
+        s.downtime_reason_code = None
+        s.downtime_reason_text = None
+        s.downtime_started_at = None
+        s.downtime_last_seconds = None
+        s.downtime_active = False
+        s.cycle_time_current = None
+        s.maintenance_name = None
+        s.supervisor_name = None
+        s.raw_sacks_count = 0
+        s.raw_material_scans = []
+        s.raw_material_logs = []
+        s.raw_material_unique_keys = set()
+        s.startup_reject_total = 0
+        s.reject_review_logs = []
+        self._reset_downtime_resolution_state()
+        self._hide_resolve_overlay()
+        self._hide_production_overlay()
+        self._hide_raw_mats_overlay()
+        self._hide_reject_review_overlay()
+        self._clear_active_session_snapshot(active_machine_code)
+        self._refresh_ui()
         self.rightCycleCount.setText(f"Cycle Count: {s.pack_count}")
         self.rightCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
         self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or ''}")
@@ -1597,6 +1818,15 @@ class ClientUI(QWidget):
             qty = int(res_pre.qty or 1)
             s.raw_sacks_count += qty
             s.raw_material_scans.append(res_pre.value)
+            s.raw_material_logs.append(
+                {
+                    "material": res_pre.value,
+                    "qty": qty,
+                    "unique_key": unique_key or None,
+                    "raw_job_code": raw_job_code or None,
+                    "scanned_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             if unique_key:
                 s.raw_material_unique_keys.add(unique_key)
             self.log_last(self._scan_display_text(res_pre, raw_s))
@@ -1731,6 +1961,34 @@ class ClientUI(QWidget):
             self.status.setText("Unknown scan (ignored).")
             return
 
+        if res.kind == "FINISH_JOB":
+            if not self.can_accept_production_scans():
+                self.status.setText("Cannot finish yet: complete MACHINE -> JOB -> OPERATOR first.")
+                return
+            if (
+                s.waiting_reject_reason
+                or s.waiting_production_report_reason
+                or s.waiting_cycle_time_input
+                or s.waiting_maintenance_qr
+                or s.waiting_supervisor_qr
+                or s.waiting_operator_downtime_confirm
+                or s.downtime_active
+            ):
+                self.status.setText("Cannot finish while downtime/reject flow is active.")
+                return
+            finished_payload = self._build_finished_job_payload()
+            try:
+                self._save_finished_job_local(finished_payload)
+            except Exception as e:
+                self.status.setText(f"Finish saved to server only (local JSON failed: {e})")
+            self.push_event(
+                {"type": "FINISH_JOB", "finished_job": finished_payload},
+                f"FINISH JOB {s.job_name or s.job_code or ''}".strip(),
+            )
+            self.status.setText("Job session finished. Data saved.")
+            self._clear_full_session()
+            return
+
         if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
             if not s.downtime_active:
                 self.status.setText("No active downtime to resolve.")
@@ -1775,6 +2033,16 @@ class ClientUI(QWidget):
                 self.status.setText("Finish your current job first before changing machine.")
                 self._show_invalid_overlay()
                 return
+            snap = self._load_active_session_snapshot(raw_s)
+            if snap is not None and str(snap.get("job_code") or "").strip():
+                self._restore_state_from_snapshot(snap)
+                if not self.state.machine_name:
+                    self.state.machine_name = res.value
+                self.status.setText(
+                    f"Recovered ongoing session for {self.state.machine_name} / {self.state.job_name or self.state.job_code}."
+                )
+                self.push_event({"type": "SESSION_RESUME"}, "SESSION RESUMED")
+                return
             s.machine_code = raw_s
             s.machine_name = res.value
             s.job_code = None
@@ -1794,6 +2062,7 @@ class ClientUI(QWidget):
             s.supervisor_name = None
             s.raw_sacks_count = 0
             s.raw_material_scans = []
+            s.raw_material_logs = []
             s.raw_material_unique_keys = set()
             s.startup_reject_total = 0
             s.reject_review_logs = []
@@ -1804,6 +2073,7 @@ class ClientUI(QWidget):
             self._hide_reject_review_overlay()
             self.status.setText(f"Machine set: {s.machine_name}")
             self._refresh_ui()
+            self._save_active_session_snapshot()
             self.push_event({"type": "MACHINE_SET"}, f"MACHINE {s.machine_name}")
             return
 
@@ -1850,6 +2120,7 @@ class ClientUI(QWidget):
             s.supervisor_name = None
             s.raw_sacks_count = 0
             s.raw_material_scans = []
+            s.raw_material_logs = []
             s.raw_material_unique_keys = set()
             s.startup_reject_total = 0
             s.reject_review_logs = []
@@ -1860,6 +2131,7 @@ class ClientUI(QWidget):
             self._hide_reject_review_overlay()
             self.status.setText(f"Job set: {s.job_name}")
             self._refresh_ui()
+            self._save_active_session_snapshot()
             if res.kind == "JOB":
                 self.push_event({"type": "JOB_SET"}, f"JOB {s.job_name}")
             else:
@@ -1886,6 +2158,7 @@ class ClientUI(QWidget):
             s.operator_id = res.value
             self.status.setText(f"Operator set: {s.operator_id}")
             self._refresh_ui()
+            self._save_active_session_snapshot()
             self.push_event({"type": "OPERATOR_SET"}, f"OPERATOR {s.operator_id}")
             return
 
@@ -1959,6 +2232,7 @@ class ClientUI(QWidget):
         s = self.state
         if not s.machine_code:
             return
+        self._save_active_session_snapshot()
 
         payload = {
             "client_id": CLIENT_ID,
@@ -1984,6 +2258,7 @@ class ClientUI(QWidget):
 
     def closeEvent(self, event):
         self._serial_stop.set()
+        self._save_active_session_snapshot()
         super().closeEvent(event)
 
 

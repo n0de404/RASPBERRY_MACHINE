@@ -1,0 +1,57 @@
+[
+  {
+    "finished_at_utc": "2026-02-19T07:03:54.863674+00:00",
+    "client_id": "philtop-it-001",
+    "machine_code": "M00001",
+    "machine_name": "Machine 01",
+    "job_code": "102378",
+    "job_name": "J021-9233",
+    "operator_id": "1000001 - Snoopy Von Peanuts",
+    "pack_count": 3,
+    "good_total": 36,
+    "butal_total": 8,
+    "reject_total": 4,
+    "total_good": 44,
+    "reject_breakdown": {
+      "CONTAMINATION": 4
+    },
+    "startup_reject_total": 0,
+    "raw_sacks_count": 3,
+    "raw_material_scans": [
+      "Raw Material 5210",
+      "Raw Material 5210",
+      "Raw Material 5210"
+    ],
+    "raw_material_logs": [
+      {
+        "material": "Raw Material 5210",
+        "qty": 1,
+        "unique_key": "I00000000003T00000000003L20260218131830-000000102378",
+        "raw_job_code": "102378",
+        "scanned_at": "2026-02-19T06:47:05.146293+00:00"
+      },
+      {
+        "material": "Raw Material 5210",
+        "qty": 1,
+        "unique_key": "I00000000002T00000000003L20260218131830-000000102378",
+        "raw_job_code": "102378",
+        "scanned_at": "2026-02-19T06:47:21.739595+00:00"
+      },
+      {
+        "material": "Raw Material 5210",
+        "qty": 1,
+        "unique_key": "I00000000001T00000000003L20260218131830-000000102378",
+        "raw_job_code": "102378",
+        "scanned_at": "2026-02-19T06:48:02.239124+00:00"
+      }
+    ],
+    "job_payload": {},
+    "reject_review_logs": [],
+    "downtime_last_seconds": null,
+    "downtime_reason_code": null,
+    "downtime_reason_text": null,
+    "cycle_time_current": null,
+    "maintenance_name": null,
+    "supervisor_name": null
+  }
+]

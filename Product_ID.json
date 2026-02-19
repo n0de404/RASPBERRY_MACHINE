@@ -1,0 +1,9 @@
+{
+  "bms": {
+    "base_url": "https://sbk-ptii.net/philtop/IMS/v1",
+    "username": "svcapirolewh",
+    "password": "0t1docmtl$tm",
+    "ttl_seconds": 604800,
+    "force_new_token": true
+  }
+}

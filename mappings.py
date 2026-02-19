@@ -37,10 +37,13 @@ OPERATOR_MAP: Dict[str, str] = {
 
 
 def _load_job_stubs() -> Dict[str, Any]:
-    p = Path(__file__).with_name("job_data_stubs.json")
+    p = Path(__file__).resolve().parent / "Database" / "job_data_stubs.json"
+    fallback = Path(__file__).resolve().parent / "job_data_stubs.json"
     try:
         if p.exists():
             return json.loads(p.read_text(encoding="utf-8"))
+        if fallback.exists():
+            return json.loads(fallback.read_text(encoding="utf-8"))
     except Exception:
         pass
     return {}
@@ -143,6 +146,8 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_TRIGGER", raw=raw, value="Production daily report mode")
     if s_l == "productiondailyreport~2":
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_RESOLVE", raw=raw, value="Production daily report resolve")
+    if s_l in ("finishjob", "finishjob~1", "jobfinish"):
+        return ScanResult(kind="FINISH_JOB", raw=raw, value="Finish current job session")
 
     # Reject summary trigger
     if s_l == "rejectsummary":
