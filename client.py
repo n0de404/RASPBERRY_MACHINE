@@ -14,10 +14,10 @@ from typing import Optional, Dict, Any, List, Set
 
 import requests
 
-from PyQt6.QtCore import Qt, QObject, QEvent, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QMovie, QPixmap, QColor
+from PyQt6.QtCore import Qt, QObject, QEvent, pyqtSignal, QTimer, QSize, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty
+from PyQt6.QtGui import QMovie, QPixmap, QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect, QGraphicsBlurEffect, QProgressBar
+    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect, QGraphicsBlurEffect, QProgressBar, QPushButton
 )
 
 from mappings import parse_scan, MACHINE_MAP, JOB_MAP, REJECT_REASON_MAP
@@ -182,6 +182,81 @@ class ScannerFilter(QObject):
         return False
 
 
+class SuccessCheck(QWidget):
+    def __init__(self, size=140, parent=None):
+        super().__init__(parent)
+
+        self._progress = 0.0
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("background: transparent; border: none;")
+
+        self.animation = QPropertyAnimation(self, b"progress")
+        self.animation.setDuration(650)
+        self.animation.setStartValue(0.0)
+        self.animation.setEndValue(1.0)
+        self.animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+    def start(self):
+        self.animation.stop()
+        self.setProgress(0.0)
+        self.animation.start()
+
+    def getProgress(self):
+        return self._progress
+
+    def setProgress(self, value):
+        self._progress = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    progress = pyqtProperty(float, fget=getProgress, fset=setProgress)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+        padding = int(min(w, h) * 0.12)
+        rect = QRectF(padding, padding, w - padding * 2, h - padding * 2)
+
+        pen = QPen(QColor(22, 163, 74))
+        pen.setWidth(int(min(w, h) * 0.07))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+
+        circle_phase = min(self._progress / 0.65, 1.0)
+        check_phase = 0.0 if self._progress < 0.65 else min((self._progress - 0.65) / 0.35, 1.0)
+
+        start_angle = int(270 * 16)
+        span_angle = int(-360 * 16 * circle_phase)
+        painter.drawArc(rect, start_angle, span_angle)
+
+        if check_phase > 0:
+            x0 = rect.left()
+            y0 = rect.top()
+            rw = rect.width()
+            rh = rect.height()
+
+            a = (x0 + 0.28 * rw, y0 + 0.55 * rh)
+            b = (x0 + 0.44 * rw, y0 + 0.70 * rh)
+            c = (x0 + 0.74 * rw, y0 + 0.38 * rh)
+
+            if check_phase <= 0.5:
+                t = check_phase / 0.5
+                bx = a[0] + (b[0] - a[0]) * t
+                by = a[1] + (b[1] - a[1]) * t
+                painter.drawLine(int(a[0]), int(a[1]), int(bx), int(by))
+            else:
+                painter.drawLine(int(a[0]), int(a[1]), int(b[0]), int(b[1]))
+                t = (check_phase - 0.5) / 0.5
+                cx = b[0] + (c[0] - b[0]) * t
+                cy = b[1] + (c[1] - b[1]) * t
+                painter.drawLine(int(b[0]), int(b[1]), int(cx), int(cy))
+
+
 class ClientUI(QWidget):
     scan_received = pyqtSignal(str)
     scanner_status = pyqtSignal(str)
@@ -201,6 +276,9 @@ class ClientUI(QWidget):
         self.setWindowTitle("Machine Client Dashboard")
         self.setMinimumSize(0, 0)
         self.setStyleSheet(APP_STYLESHEET)
+        self.enable_check_animation = True
+        self.enable_flashing_lights = True
+        self.enable_pulse_effects = True
 
         root = QHBoxLayout()
         root.setContentsMargins(10, 8, 10, 8)
@@ -215,6 +293,17 @@ class ClientUI(QWidget):
 
         self.pageTitle = QLabel("Machine Dashboard")
         self.pageTitle.setObjectName("PageTitle")
+        self.btnSettings = QPushButton("\u2699")
+        self.btnSettings.setObjectName("SettingsButton")
+        self.btnSettings.setFixedSize(40, 40)
+        self.btnSettings.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btnSettings.clicked.connect(self._show_settings_overlay)
+
+        headerRow = QHBoxLayout()
+        headerRow.setContentsMargins(0, 0, 0, 0)
+        headerRow.setSpacing(8)
+        headerRow.addWidget(self.btnSettings, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        headerRow.addWidget(self.pageTitle, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         self._banner_base_text = "Scan MACHINE QR to start"
         self.banner = QLabel(self._banner_base_text)
@@ -230,7 +319,7 @@ class ClientUI(QWidget):
         self.machineAnim.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.machineAnim.setFixedWidth(160)
 
-        left.addWidget(self.pageTitle)
+        left.addLayout(headerRow)
         left.addWidget(self.banner)
         left.addWidget(self.status)
         left.addWidget(self.machineAnim)
@@ -301,9 +390,11 @@ class ClientUI(QWidget):
 
         for idx, (code, label) in enumerate(REJECT_DETAIL_ITEMS):
             item = QLabel(f"{label} = 0")
-            item.setObjectName("MetaValue")
-            item.setWordWrap(True)
-            item.setMinimumHeight(44)
+            item.setObjectName("RejectDetailItem")
+            item.setWordWrap(False)
+            item.setMinimumHeight(42)
+            item.setProperty("active", "0")
+            item.setProperty("flash", "0")
             item.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
             self.reject_detail_labels[code] = item
             row = idx // 4
@@ -657,6 +748,107 @@ class ClientUI(QWidget):
             self.rejectReviewHint,
         ]
 
+        # Center overlay for finish-job processing.
+        self.finishOverlay = QFrame(self)
+        self.finishOverlay.setObjectName("ProductionOverlay")
+        self.finishOverlay.setLayout(QVBoxLayout())
+        self.finishOverlay.layout().setContentsMargins(16, 14, 16, 14)
+        self.finishOverlay.layout().setSpacing(10)
+        self.finishOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.finishTitle = QLabel("FINISHING JOB")
+        self.finishTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
+        self.finishTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.finishStatus = QLabel("Processing...")
+        self.finishStatus.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.finishStatus.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.finishProgressBar = QProgressBar()
+        self.finishProgressBar.setRange(0, 100)
+        self.finishProgressBar.setValue(0)
+        self.finishProgressBar.setTextVisible(False)
+        self.finishProgressBar.setFixedWidth(300)
+        self.finishSuccessRow = QWidget()
+        self.finishSuccessRow.setObjectName("FinishSuccessRow")
+        self.finishSuccessRow.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.finishSuccessRow.setStyleSheet("background: transparent;")
+        self.finishSuccessRow.setLayout(QHBoxLayout())
+        self.finishSuccessRow.layout().setContentsMargins(0, 0, 0, 0)
+        self.finishSuccessRow.layout().setSpacing(10)
+        self.finishSuccessRow.layout().setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.finishCheck = SuccessCheck(size=64, parent=self.finishSuccessRow)
+        self.finishDoneText = QLabel("Success")
+        self.finishDoneText.setObjectName("FinishDoneText")
+        self.finishDoneText.setStyleSheet("background: transparent; color: #166534; font-size: 20px; font-weight: 900;")
+        self.finishSuccessRow.layout().addWidget(self.finishCheck, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.finishSuccessRow.layout().addWidget(self.finishDoneText, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.finishSuccessRow.hide()
+        self.finishOverlay.layout().addWidget(self.finishTitle)
+        self.finishOverlay.layout().addWidget(self.finishStatus)
+        self.finishOverlay.layout().addWidget(self.finishProgressBar, 0, Qt.AlignmentFlag.AlignCenter)
+        self.finishOverlay.layout().addWidget(self.finishSuccessRow, 0, Qt.AlignmentFlag.AlignCenter)
+        self.finishOverlay.setStyleSheet(
+            "QFrame#ProductionOverlay {"
+            "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
+            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(240,253,244,0.98), stop:1 rgba(220,252,231,0.98));"
+            "border: 3px solid #16a34a; border-radius: 14px; }"
+            "QWidget#FinishSuccessRow { background: transparent; border: none; }"
+            "QLabel#FinishDoneText { background: transparent; border: none; }"
+            "QProgressBar {"
+            "border: 1px solid #16a34a; border-radius: 8px; background: rgba(255,255,255,0.88); min-height: 14px; }"
+            "QProgressBar::chunk {"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16a34a, stop:1 #22c55e);"
+            "border-radius: 7px; }"
+        )
+        self.finishOverlay.hide()
+        self.finishOverlay.raise_()
+        self._finish_anim_timer = QTimer(self)
+        self._finish_anim_timer.setInterval(75)
+        self._finish_anim_timer.timeout.connect(self._tick_finish_anim)
+        self._finish_anim_value = 0
+        self._finish_anim_running = False
+        self._finish_pending_clear = False
+
+        # Settings overlay for runtime visual effects toggles.
+        self.settingsOverlay = QFrame(self)
+        self.settingsOverlay.setObjectName("SettingsOverlay")
+        self.settingsOverlay.setLayout(QVBoxLayout())
+        self.settingsOverlay.layout().setContentsMargins(16, 14, 16, 14)
+        self.settingsOverlay.layout().setSpacing(10)
+        self.settingsOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.settingsTitle = QLabel("SETTINGS")
+        self.settingsTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
+        self.settingsHint = QLabel("Toggle visual effects without changing loading bars.")
+        self.settingsHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.chkCheckAnimation = QPushButton()
+        self.chkCheckAnimation.setObjectName("SettingToggle")
+        self.chkCheckAnimation.setCheckable(True)
+        self.chkCheckAnimation.setChecked(True)
+        self.chkFlashingLights = QPushButton()
+        self.chkFlashingLights.setObjectName("SettingToggle")
+        self.chkFlashingLights.setCheckable(True)
+        self.chkFlashingLights.setChecked(True)
+        self.chkPulseEffects = QPushButton()
+        self.chkPulseEffects.setObjectName("SettingToggle")
+        self.chkPulseEffects.setCheckable(True)
+        self.chkPulseEffects.setChecked(True)
+        self._set_toggle_button_text(self.chkCheckAnimation, "Enable check animation", True)
+        self._set_toggle_button_text(self.chkFlashingLights, "Enable flashing lights", True)
+        self._set_toggle_button_text(self.chkPulseEffects, "Enable pulse / moving effects", True)
+        self.settingsCloseBtn = QPushButton("Close")
+        self.settingsCloseBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settingsCloseBtn.clicked.connect(self._hide_settings_overlay)
+        self.chkCheckAnimation.toggled.connect(self._on_setting_check_animation_toggled)
+        self.chkFlashingLights.toggled.connect(self._on_setting_flashing_lights_toggled)
+        self.chkPulseEffects.toggled.connect(self._on_setting_pulse_effects_toggled)
+        self.settingsOverlay.layout().addWidget(self.settingsTitle)
+        self.settingsOverlay.layout().addWidget(self.settingsHint)
+        self.settingsOverlay.layout().addWidget(self.chkCheckAnimation)
+        self.settingsOverlay.layout().addWidget(self.chkFlashingLights)
+        self.settingsOverlay.layout().addWidget(self.chkPulseEffects)
+        self.settingsOverlay.layout().addStretch(1)
+        self.settingsOverlay.layout().addWidget(self.settingsCloseBtn, 0, Qt.AlignmentFlag.AlignRight)
+        self.settingsOverlay.hide()
+        self.settingsOverlay.raise_()
+
         self._repair_movie: Optional[QMovie] = None
         if REPAIR_GIF and os.path.exists(REPAIR_GIF):
             repair_movie = QMovie(REPAIR_GIF)
@@ -700,6 +892,11 @@ class ClientUI(QWidget):
         self.overlayPulseTimer.timeout.connect(self._tick_overlay_pulse)
         self.overlayPulseTimer.start(70)
 
+        self.rejectDetailFlashTimer = QTimer(self)
+        self.rejectDetailFlashTimer.timeout.connect(self._tick_reject_detail_flash)
+        self.rejectDetailFlashTimer.start(450)
+        self._reject_detail_flash_on = False
+
         self._refresh_ui()
 
     def resizeEvent(self, event):
@@ -709,6 +906,8 @@ class ClientUI(QWidget):
         self._position_resolve_overlay()
         self._position_raw_mats_overlay()
         self._position_reject_review_overlay()
+        self._position_finish_overlay()
+        self._position_settings_overlay()
         if self._invalid_movie is not None:
             self._invalid_movie.setScaledSize(self._fit_movie_size(self.invalidOverlay.size()))
         self._position_marquee()
@@ -808,6 +1007,31 @@ class ClientUI(QWidget):
         self.rejectReviewOverlay.setGeometry(x, y, w, h)
         self.rejectReviewLoadingLayer.setGeometry(0, 0, w, h)
 
+    def _position_finish_overlay(self):
+        w = min(560, max(380, int(self.width() * 0.45)))
+        h = min(280, max(210, int(self.height() * 0.30)))
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
+        self.finishOverlay.setGeometry(x, y, w, h)
+
+    def _position_settings_overlay(self):
+        w = min(520, max(340, int(self.width() * 0.40)))
+        h = min(320, max(220, int(self.height() * 0.34)))
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
+        self.settingsOverlay.setGeometry(x, y, w, h)
+
+    def _show_settings_overlay(self):
+        self._position_settings_overlay()
+        self._set_background_blur(True)
+        self.settingsOverlay.show()
+        self.settingsOverlay.raise_()
+
+    def _hide_settings_overlay(self):
+        self.settingsOverlay.hide()
+        if not self._should_keep_background_blur():
+            self._set_background_blur(False)
+
     def _refresh_raw_mats_overlay(self):
         mats = self.state.raw_material_scans or []
         if not mats:
@@ -824,11 +1048,7 @@ class ClientUI(QWidget):
 
     def _hide_raw_mats_overlay(self):
         self.rawMatsOverlay.hide()
-        if (
-            not self.productionOverlay.isVisible()
-            and not self.resolveOverlay.isVisible()
-            and not self.rejectReviewOverlay.isVisible()
-        ):
+        if not self._should_keep_background_blur():
             self._set_background_blur(False)
 
     def _reviewer_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
@@ -879,12 +1099,49 @@ class ClientUI(QWidget):
         self.rejectReviewLoadingLayer.hide()
         self.rejectReviewLoadingBar.setValue(0)
         self._set_reject_review_blur(False)
-        if (
-            not self.productionOverlay.isVisible()
-            and not self.resolveOverlay.isVisible()
-            and not self.rawMatsOverlay.isVisible()
-        ):
+        if not self._should_keep_background_blur():
             self._set_background_blur(False)
+
+    def _show_finish_overlay(self):
+        self._position_finish_overlay()
+        self._set_background_blur(True)
+        self.finishStatus.setText("Processing...")
+        self.finishProgressBar.setValue(0)
+        self.finishSuccessRow.hide()
+        self.finishCheck.setProgress(0.0)
+        self._finish_anim_value = 0
+        self._finish_anim_running = True
+        self.finishOverlay.show()
+        self.finishOverlay.raise_()
+        self._finish_anim_timer.start()
+
+    def _hide_finish_overlay(self):
+        self._finish_anim_timer.stop()
+        self._finish_anim_running = False
+        self.finishOverlay.hide()
+        if not self._should_keep_background_blur():
+            self._set_background_blur(False)
+
+    def _tick_finish_anim(self):
+        self._finish_anim_value = min(100, self._finish_anim_value + 7)
+        self.finishProgressBar.setValue(self._finish_anim_value)
+        if self._finish_anim_value < 100:
+            return
+        self._finish_anim_timer.stop()
+        self.finishStatus.setText("Completed")
+        self.finishSuccessRow.show()
+        if self.enable_check_animation:
+            self.finishCheck.start()
+            QTimer.singleShot(900, self._complete_finish_sequence)
+        else:
+            self.finishCheck.setProgress(1.0)
+            QTimer.singleShot(280, self._complete_finish_sequence)
+
+    def _complete_finish_sequence(self):
+        self._hide_finish_overlay()
+        if self._finish_pending_clear:
+            self._finish_pending_clear = False
+            self._clear_full_session()
 
     def _set_reject_review_blur(self, enabled: bool):
         if enabled:
@@ -945,11 +1202,7 @@ class ClientUI(QWidget):
         self.productionOverlay.hide()
         self.productionOverlay.setProperty("pulse", "0")
         self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
-        if (
-            not self.resolveOverlay.isVisible()
-            and not self.rawMatsOverlay.isVisible()
-            and not self.rejectReviewOverlay.isVisible()
-        ):
+        if not self._should_keep_background_blur():
             self._set_background_blur(False)
         self._apply_overlay_base_style()
 
@@ -961,11 +1214,7 @@ class ClientUI(QWidget):
 
     def _hide_resolve_overlay(self):
         self.resolveOverlay.hide()
-        if (
-            not self.productionOverlay.isVisible()
-            and not self.rawMatsOverlay.isVisible()
-            and not self.rejectReviewOverlay.isVisible()
-        ):
+        if not self._should_keep_background_blur():
             self._set_background_blur(False)
 
     def _set_background_blur(self, enabled: bool):
@@ -1014,6 +1263,11 @@ class ClientUI(QWidget):
         )
 
     def _tick_overlay_pulse(self):
+        if not self.enable_pulse_effects:
+            if self.productionOverlay.isVisible():
+                self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
+                self._apply_overlay_base_style()
+            return
         if not self.productionOverlay.isVisible() or self._overlay_mode != "active":
             return
         self._pulse_phase += 0.16
@@ -1112,6 +1366,8 @@ class ClientUI(QWidget):
 
     def _pulse_card(self, card: QFrame):
         if card is None:
+            return
+        if not self.enable_pulse_effects:
             return
         card.setProperty("flash", "1")
         card.style().unpolish(card)
@@ -1501,7 +1757,58 @@ class ClientUI(QWidget):
             by_name = counts_by_name.get(label.upper(), 0)
             by_code = counts_by_name.get(code.upper(), 0)
             total = by_name if by_name else by_code
-            self.reject_detail_labels[code].setText(f"{label} = {total}")
+            item = self.reject_detail_labels[code]
+            item.setText(f"{label} = {total}")
+            is_active = total == 1
+            item.setProperty("active", "1" if is_active else "0")
+            if not is_active or not self.enable_flashing_lights:
+                item.setProperty("flash", "0")
+            item.style().unpolish(item)
+            item.style().polish(item)
+
+    def _tick_reject_detail_flash(self):
+        if not self.enable_flashing_lights:
+            return
+        self._reject_detail_flash_on = not self._reject_detail_flash_on
+        flash_value = "1" if self._reject_detail_flash_on else "0"
+        for item in self.reject_detail_labels.values():
+            if item.property("active") == "1":
+                item.setProperty("flash", flash_value)
+                item.style().unpolish(item)
+                item.style().polish(item)
+
+    def _on_setting_check_animation_toggled(self, checked: bool):
+        self.enable_check_animation = bool(checked)
+        self._set_toggle_button_text(self.chkCheckAnimation, "Enable check animation", self.enable_check_animation)
+
+    def _on_setting_flashing_lights_toggled(self, checked: bool):
+        self.enable_flashing_lights = bool(checked)
+        self._set_toggle_button_text(self.chkFlashingLights, "Enable flashing lights", self.enable_flashing_lights)
+        if not self.enable_flashing_lights:
+            for item in self.reject_detail_labels.values():
+                item.setProperty("flash", "0")
+                item.style().unpolish(item)
+                item.style().polish(item)
+
+    def _on_setting_pulse_effects_toggled(self, checked: bool):
+        self.enable_pulse_effects = bool(checked)
+        self._set_toggle_button_text(self.chkPulseEffects, "Enable pulse / moving effects", self.enable_pulse_effects)
+        if not self.enable_pulse_effects:
+            self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
+            self._apply_overlay_base_style()
+
+    def _set_toggle_button_text(self, btn: QPushButton, label: str, enabled: bool):
+        btn.setText(f"{label}: {'ON' if enabled else 'OFF'}")
+
+    def _should_keep_background_blur(self) -> bool:
+        return (
+            self.productionOverlay.isVisible()
+            or self.resolveOverlay.isVisible()
+            or self.rawMatsOverlay.isVisible()
+            or self.rejectReviewOverlay.isVisible()
+            or self.finishOverlay.isVisible()
+            or self.settingsOverlay.isVisible()
+        )
 
     def _safe_text(self, v: Any, fallback: str = "-") -> str:
         if v is None:
@@ -1710,6 +2017,9 @@ class ClientUI(QWidget):
         return bool(s.machine_code and s.job_code and s.operator_id)
 
     def on_scanned(self, raw: str):
+        if self._finish_anim_running:
+            self.status.setText("Finish job in progress. Please wait.")
+            return
         raw_s = str(raw).strip()
         raw_l = raw_s.lower()
         s = self.state
@@ -1985,8 +2295,9 @@ class ClientUI(QWidget):
                 {"type": "FINISH_JOB", "finished_job": finished_payload},
                 f"FINISH JOB {s.job_name or s.job_code or ''}".strip(),
             )
-            self.status.setText("Job session finished. Data saved.")
-            self._clear_full_session()
+            self.status.setText("Finishing job...")
+            self._finish_pending_clear = True
+            self._show_finish_overlay()
             return
 
         if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":

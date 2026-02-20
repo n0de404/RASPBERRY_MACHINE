@@ -4,12 +4,14 @@ import asyncio
 import base64
 import io
 import json
+import os
 import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from urllib import request as urllib_request
+from urllib import error as urllib_error
 from urllib.parse import urlencode
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
@@ -24,6 +26,7 @@ FINISHED_JOBS_FILE = Path(__file__).resolve().parent / "Database" / "finished_jo
 CLIENT_FINISHED_JOBS_FILE = Path(__file__).resolve().parent / "Database" / "finished_jobs_client.json"
 PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"
 PRODUCT_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "product_catalog_cache.json"
+QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.1.125:5000").strip().rstrip("/")
 RAW_QR_O_SEGMENT = "O000000000240000010237800000000000"
 RAW_QR_REMARK = "V2"
 WIDTH_P = 11
@@ -118,13 +121,14 @@ def _zpad_digits(value: Any, width: int) -> str:
     return d.zfill(width)
 
 
-def _build_raw_material_qr_value(product_id: str) -> str:
+def _build_raw_material_qr_value(product_id: str, po_number: str = "") -> str:
     stamp = datetime.now().strftime("%Y%m%d%H%M%S")
     p = "P" + _zpad_digits(product_id, WIDTH_P)
     q = "Q" + _zpad_digits("1", WIDTH_Q)
     i = "I" + _zpad_digits("1", WIDTH_I)
     t = "T" + _zpad_digits("1", WIDTH_T)
-    l = "L" + f"{stamp}-000000000000"
+    po_digits = _zpad_digits(po_number, 12)
+    l = "L" + f"{stamp}-{po_digits}"
     return f"{RAW_QR_O_SEGMENT}{RAW_QR_REMARK}{p}{q}{i}{t}{l}"
 
 
@@ -184,10 +188,15 @@ def _parse_qr_segments(qr_value: str) -> Dict[str, str]:
     p_digits = _extract_seg(qr_value, "P", WIDTH_P)
     q_digits = _extract_seg(qr_value, "Q", WIDTH_Q)
     i_digits = _extract_seg(qr_value, "I", WIDTH_I)
+    t_digits = _extract_seg(qr_value, "T", WIDTH_T)
     l_seg = _extract_seg(qr_value, "L", WIDTH_L)
     yy = ""
     mm = ""
     l_trim = l_seg.lstrip("0")
+    lot_number = l_trim or l_seg
+    po_number = ""
+    if "-" in l_seg:
+        po_number = _strip_leading_zeros(l_seg.split("-", 1)[1])
     if len(l_trim) >= 8 and l_trim[:8].isdigit():
         yyyy = l_trim[0:4]
         mm = l_trim[4:6]
@@ -196,6 +205,9 @@ def _parse_qr_segments(qr_value: str) -> Dict[str, str]:
         "product": _strip_leading_zeros(p_digits),
         "qty": _strip_leading_zeros(q_digits),
         "index": _strip_leading_zeros(i_digits),
+        "total": _strip_leading_zeros(t_digits),
+        "lot_number": lot_number,
+        "po_number": po_number,
         "yy": yy,
         "mm": mm,
     }
@@ -306,6 +318,30 @@ def _load_json_object(path: Path) -> Dict[str, Any]:
     return {}
 
 
+def _requested_at_ph_str() -> str:
+    ph_tz = timezone(timedelta(hours=8))
+    return datetime.now(ph_tz).strftime("%Y%m%d%H%M%S")
+
+
+def _post_qrgen_pending_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{QRGEN_BASE_URL}/api/pending-request"
+    req = urllib_request.Request(
+        url=url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    with urllib_request.urlopen(req, timeout=12) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+        code = int(getattr(resp, "status", 200) or 200)
+    parsed: Any = raw
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception:
+        pass
+    return {"status_code": code, "body": parsed}
+
+
 def _extract_products_from_payload(payload: Any) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     rows = []
@@ -332,6 +368,57 @@ def _extract_products_from_payload(payload: Any) -> List[Dict[str, str]]:
         if pid and name:
             out.append({"id": pid, "name": name, "sku": sku})
     return out
+
+
+def _extract_pagination(payload: Any) -> Dict[str, Optional[int | bool]]:
+    if not isinstance(payload, dict):
+        return {"page": None, "total_pages": None, "has_next": None}
+
+    page = None
+    total_pages = None
+    has_next = None
+
+    def _to_int(v: Any) -> Optional[int]:
+        try:
+            if v is None:
+                return None
+            return int(v)
+        except Exception:
+            return None
+
+    direct_page = _to_int(payload.get("page"))
+    direct_total_pages = _to_int(payload.get("totalPages") or payload.get("total_pages"))
+    direct_has_next = payload.get("hasNext") if isinstance(payload.get("hasNext"), bool) else payload.get("has_next")
+    if isinstance(direct_has_next, bool):
+        has_next = direct_has_next
+    if direct_page is not None:
+        page = direct_page
+    if direct_total_pages is not None:
+        total_pages = direct_total_pages
+
+    data_obj = payload.get("data")
+    if isinstance(data_obj, dict):
+        if page is None:
+            page = _to_int(data_obj.get("page"))
+        if total_pages is None:
+            total_pages = _to_int(data_obj.get("totalPages") or data_obj.get("total_pages"))
+        if has_next is None:
+            d_has_next = data_obj.get("hasNext") if isinstance(data_obj.get("hasNext"), bool) else data_obj.get("has_next")
+            if isinstance(d_has_next, bool):
+                has_next = d_has_next
+
+    pag_obj = payload.get("pagination")
+    if isinstance(pag_obj, dict):
+        if page is None:
+            page = _to_int(pag_obj.get("page") or pag_obj.get("currentPage") or pag_obj.get("current_page"))
+        if total_pages is None:
+            total_pages = _to_int(pag_obj.get("totalPages") or pag_obj.get("total_pages") or pag_obj.get("lastPage") or pag_obj.get("last_page"))
+        if has_next is None:
+            p_has_next = pag_obj.get("hasNext") if isinstance(pag_obj.get("hasNext"), bool) else pag_obj.get("has_next")
+            if isinstance(p_has_next, bool):
+                has_next = p_has_next
+
+    return {"page": page, "total_pages": total_pages, "has_next": has_next}
 
 
 def _load_product_cache() -> Dict[str, Any]:
@@ -400,16 +487,47 @@ def _fetch_products_from_source() -> List[Dict[str, str]]:
         if not token:
             return []
 
-        products_url = f"{base_url}/products?{urlencode({'page': 1, 'perPage': 10000, 'includeInactive': 0})}"
-        req_prod = urllib_request.Request(url=products_url, method="GET")
-        req_prod.add_header("Authorization", f"Bearer {token}")
-        with urllib_request.urlopen(req_prod, timeout=12) as resp:
-            prod_raw = resp.read().decode("utf-8", errors="ignore")
-        try:
-            prod_parsed = json.loads(prod_raw)
-        except Exception:
-            return []
-        return _extract_products_from_payload(prod_parsed)
+        all_items: List[Dict[str, str]] = []
+        seen_ids = set()
+        per_page = int(bms.get("per_page", 1000) or 1000)
+        max_pages = int(bms.get("max_pages", 500) or 500)
+        page = 1
+
+        while page <= max_pages:
+            products_url = f"{base_url}/products?{urlencode({'page': page, 'perPage': per_page, 'includeInactive': 0})}"
+            req_prod = urllib_request.Request(url=products_url, method="GET")
+            req_prod.add_header("Authorization", f"Bearer {token}")
+            with urllib_request.urlopen(req_prod, timeout=12) as resp:
+                prod_raw = resp.read().decode("utf-8", errors="ignore")
+            try:
+                prod_parsed = json.loads(prod_raw)
+            except Exception:
+                break
+
+            page_items = _extract_products_from_payload(prod_parsed)
+            if page_items:
+                for it in page_items:
+                    pid = str(it.get("id", "")).strip()
+                    if not pid:
+                        continue
+                    if pid in seen_ids:
+                        continue
+                    seen_ids.add(pid)
+                    all_items.append(it)
+
+            page_info = _extract_pagination(prod_parsed)
+            total_pages = page_info.get("total_pages")
+            has_next = page_info.get("has_next")
+
+            if isinstance(total_pages, int) and total_pages > 0 and page >= total_pages:
+                break
+            if has_next is False:
+                break
+            if not page_items:
+                break
+            page += 1
+
+        return all_items
 
     # Preferred two-step auth + products flow.
     # {
@@ -683,6 +801,35 @@ DASHBOARD_HTML = """
     .overlay-row > * { min-width: 0; }
     .overlay-row select, .overlay-row input, .overlay-row textarea { width: 100%; max-width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 10px; padding: 8px 10px; font-family: inherit; font-size: 0.9rem; }
     .overlay-row textarea { min-height: 80px; resize: vertical; }
+    .overlay-input-wrap { position: relative; width: 100%; }
+    .overlay-suggest {
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      right: 0;
+      z-index: 25;
+      background: #fff;
+      border: 1px solid #cbd5e1;
+      border-radius: 10px;
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.16);
+      max-height: 220px;
+      overflow-y: auto;
+      display: none;
+    }
+    .overlay-suggest.active { display: block; }
+    .overlay-suggest-item {
+      width: 100%;
+      border: none;
+      border-bottom: 1px solid #eef2f7;
+      background: #fff;
+      text-align: left;
+      padding: 8px 10px;
+      cursor: pointer;
+      font: inherit;
+      font-size: 0.88rem;
+    }
+    .overlay-suggest-item:last-child { border-bottom: none; }
+    .overlay-suggest-item:hover, .overlay-suggest-item.active { background: #eff6ff; }
     #overlayQrPayload { font-family: "Consolas", "Courier New", monospace; font-size: 0.78rem; line-height: 1.35; overflow-wrap: anywhere; word-break: break-all; }
     .overlay-preview { display: flex; align-items: center; justify-content: center; background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 10px; padding: 10px; min-height: 170px; }
     .overlay-preview img { width: 320px; max-width: 100%; height: auto; object-fit: contain; background: #fff; border: 1px solid #dbe4f0; border-radius: 8px; }
@@ -761,23 +908,40 @@ DASHBOARD_HTML = """
         </div>
         <div class="overlay-row">
           <label>Product Name</label>
-          <input id="overlayProductSelect" type="text" list="overlayProductList" placeholder="Select or type product name..." />
-          <datalist id="overlayProductList"></datalist>
+          <div class="overlay-input-wrap">
+            <input id="overlayProductSelect" type="text" autocomplete="off" placeholder="Select or type product name..." />
+            <div id="overlayProductSuggest" class="overlay-suggest"></div>
+          </div>
         </div>
         <div class="overlay-row">
           <label>QR Payload</label>
           <textarea id="overlayQrPayload" readonly></textarea>
         </div>
         <div class="overlay-row">
-          <label>QR Preview</label>
-          <div class="overlay-preview">
-            <img id="overlayQrPreview" alt="QR preview" />
-          </div>
+          <label>PO Number</label>
+          <input id="overlayPoNumber" type="text" placeholder="Enter PO Number..." />
+        </div>
+        <div class="overlay-row">
+          <label>Quantity</label>
+          <input id="overlayQty" type="text" readonly />
+        </div>
+        <div class="overlay-row">
+          <label>Index</label>
+          <input id="overlayIndex" type="text" readonly />
+        </div>
+        <div class="overlay-row">
+          <label>Total</label>
+          <input id="overlayTotal" type="text" readonly />
+        </div>
+        <div class="overlay-row">
+          <label>Lot Number</label>
+          <input id="overlayLotNumber" type="text" readonly />
         </div>
       </div>
       <div class="overlay-actions">
         <button id="overlayCancelBtn" class="btn-secondary" type="button">Cancel</button>
         <button id="overlayGenerateBtn" class="btn-primary" type="button">Generate QR Payload</button>
+        <button id="overlayRequestBtn" class="btn-primary" type="button">Request Print</button>
       </div>
     </div>
   </div>
@@ -793,15 +957,32 @@ DASHBOARD_HTML = """
   const overlayCloseBtn = document.getElementById("overlayCloseBtn");
   const overlayCancelBtn = document.getElementById("overlayCancelBtn");
   const overlayGenerateBtn = document.getElementById("overlayGenerateBtn");
+  const overlayRequestBtn = document.getElementById("overlayRequestBtn");
   const overlayJobInfo = document.getElementById("overlayJobInfo");
   const overlayProductSelect = document.getElementById("overlayProductSelect");
-  const overlayProductList = document.getElementById("overlayProductList");
+  const overlayProductSuggest = document.getElementById("overlayProductSuggest");
   const overlayQrPayload = document.getElementById("overlayQrPayload");
-  const overlayQrPreview = document.getElementById("overlayQrPreview");
+  const overlayPoNumber = document.getElementById("overlayPoNumber");
+  const overlayQty = document.getElementById("overlayQty");
+  const overlayIndex = document.getElementById("overlayIndex");
+  const overlayTotal = document.getElementById("overlayTotal");
+  const overlayLotNumber = document.getElementById("overlayLotNumber");
   const MACHINE_CODES = Array.from({length: 23}, (_, i) => `M${String(i + 1).padStart(5, "0")}`);
   let finishedJobsState = [];
   let productItems = [];
   let activeJobRow = null;
+  let productsHydrated = false;
+  let productSuggestionItems = [];
+  let productSuggestionIndex = -1;
+  const PRODUCT_SUGGEST_LIMIT = 8;
+  let generatedQrState = {
+    jobKey: "",
+    payload: "",
+    qty: "",
+    index: "",
+    total: "",
+    lotNumber: "",
+  };
 
   function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;"); }
 
@@ -823,21 +1004,65 @@ DASHBOARD_HTML = """
   }
 
   function resolveProductIdFromText(text){
+    const found = resolveProductFromText(text);
+    return found ? String(found.id || "") : "";
+  }
+
+  function resolveProductFromText(text){
     const t = (text || "").trim();
-    if(!t) return "";
+    if(!t) return null;
     const exact = productItems.find(
       p =>
         `${p.sku || ""} - ${p.name}` === t
         || `${p.name}` === t
         || `${p.sku || ""}` === t
     );
-    if(exact) return String(exact.id || "");
+    if(exact) return exact;
     const low = t.toLowerCase();
     const candidates = productItems
       .filter(p => `${(p.name||"").toString().toLowerCase()} ${(p.sku||"").toString().toLowerCase()}`.includes(low))
       .sort((a,b) => scoreProduct(a, low) - scoreProduct(b, low));
-    if(candidates.length) return String(candidates[0].id || "");
-    return "";
+    if(candidates.length) return candidates[0];
+    return null;
+  }
+
+  function renderProductSuggestions(query = ""){
+    const q = (query || "").trim().toLowerCase();
+    productSuggestionItems = [...productItems]
+      .map(p => ({ ...p, label: `${p.sku || ""} - ${p.name}`.trim() }))
+      .filter(p => !q || p.label.toLowerCase().includes(q) || String(p.name || "").toLowerCase().includes(q))
+      .sort((a, b) => scoreProduct(a, q) - scoreProduct(b, q))
+      .slice(0, PRODUCT_SUGGEST_LIMIT);
+    productSuggestionIndex = -1;
+    if(!productSuggestionItems.length){
+      overlayProductSuggest.classList.remove("active");
+      overlayProductSuggest.innerHTML = "";
+      return;
+    }
+    overlayProductSuggest.innerHTML = productSuggestionItems
+      .map((p, i) => `<button type="button" class="overlay-suggest-item" data-idx="${i}">${esc(p.label)}</button>`)
+      .join("");
+    overlayProductSuggest.classList.add("active");
+  }
+
+  function pickProductSuggestion(index){
+    const item = productSuggestionItems[index];
+    if(!item) return;
+    overlayProductSelect.value = item.label;
+    overlayProductSuggest.classList.remove("active");
+    overlayProductSuggest.innerHTML = "";
+    productSuggestionItems = [];
+    productSuggestionIndex = -1;
+  }
+
+  function jobKeyOf(row){
+    if(!row || typeof row !== "object") return "";
+    return [
+      row.finished_at_utc || "",
+      row.machine_code || "",
+      row.job_code || "",
+      row.operator_id || "",
+    ].join("|");
   }
 
   function renderFinishedJobs(rows){
@@ -880,19 +1105,19 @@ DASHBOARD_HTML = """
   }
 
   async function loadProducts(forceRefresh = false){
-    const url = forceRefresh ? "/api/products?refresh=1" : "/api/products";
+    const shouldRefresh = forceRefresh;
+    const url = shouldRefresh ? "/api/products?refresh=1" : "/api/products";
     const res = await fetch(url, { method: "GET" });
     const data = await res.json();
     productItems = Array.isArray(data.items) ? data.items : [];
+    productsHydrated = true;
     if(!productItems.length){
-      overlayProductList.innerHTML = "";
+      overlayProductSuggest.innerHTML = "";
+      overlayProductSuggest.classList.remove("active");
       overlayProductSelect.value = "";
       overlayProductSelect.placeholder = "No products available";
       return;
     }
-    overlayProductList.innerHTML = productItems
-      .map(p => `<option value="${esc(p.sku || "")} - ${esc(p.name)}"></option>`)
-      .join("");
     if(!overlayProductSelect.value){
       const first = productItems[0];
       overlayProductSelect.value = `${first.sku || ""} - ${first.name}`;
@@ -904,10 +1129,26 @@ DASHBOARD_HTML = """
     const title = activeJobRow
       ? `${activeJobRow.job_name || activeJobRow.job_code || "Finished Job"} | ${activeJobRow.machine_name || activeJobRow.machine_code || "-"}`
       : "Finished Job";
+    const key = jobKeyOf(activeJobRow);
     overlayJobInfo.value = title;
-    overlayQrPayload.value = "";
-    overlayQrPreview.removeAttribute("src");
+    if(generatedQrState.jobKey === key){
+      overlayQrPayload.value = generatedQrState.payload || "";
+      overlayQty.value = generatedQrState.qty || "";
+      overlayIndex.value = generatedQrState.index || "";
+      overlayTotal.value = generatedQrState.total || "";
+      overlayLotNumber.value = generatedQrState.lotNumber || "";
+    } else {
+      generatedQrState = { jobKey: key, payload: "", qty: "", index: "", total: "", lotNumber: "" };
+      overlayQrPayload.value = "";
+      overlayQty.value = "";
+      overlayIndex.value = "";
+      overlayTotal.value = "";
+      overlayLotNumber.value = "";
+    }
     approvePrintOverlay.classList.add("active");
+    if(productItems.length){
+      renderProductSuggestions(overlayProductSelect.value || "");
+    }
   }
 
   function closeApprovePrintOverlay(){
@@ -974,10 +1215,10 @@ DASHBOARD_HTML = """
     const sorted = [...(finishedJobsState || [])].reverse();
     const row = sorted[idx];
     if(!row) return;
-    if(!productItems.length){
-      await loadProducts(false);
-    }
     openApprovePrintOverlay(row);
+    if(!productItems.length){
+      loadProducts(false);
+    }
   });
 
   overlayCloseBtn.addEventListener("click", closeApprovePrintOverlay);
@@ -986,10 +1227,74 @@ DASHBOARD_HTML = """
     if(ev.target === approvePrintOverlay) closeApprovePrintOverlay();
   });
 
+  overlayProductSelect.addEventListener("focus", () => {
+    if(productItems.length){
+      renderProductSuggestions(overlayProductSelect.value || "");
+    }
+  });
+
+  overlayProductSelect.addEventListener("input", () => {
+    renderProductSuggestions(overlayProductSelect.value || "");
+  });
+
+  overlayProductSelect.addEventListener("keydown", (ev) => {
+    if(!overlayProductSuggest.classList.contains("active")){
+      if(ev.key === "Escape"){
+        ev.stopPropagation();
+      }
+      return;
+    }
+    if(ev.key === "ArrowDown"){
+      ev.preventDefault();
+      productSuggestionIndex = Math.min(productSuggestionItems.length - 1, productSuggestionIndex + 1);
+    } else if(ev.key === "ArrowUp"){
+      ev.preventDefault();
+      productSuggestionIndex = Math.max(0, productSuggestionIndex - 1);
+    } else if(ev.key === "Enter"){
+      if(productSuggestionIndex >= 0){
+        ev.preventDefault();
+        pickProductSuggestion(productSuggestionIndex);
+      }
+      return;
+    } else if(ev.key === "Escape"){
+      ev.preventDefault();
+      ev.stopPropagation();
+      overlayProductSuggest.classList.remove("active");
+      return;
+    } else {
+      return;
+    }
+    Array.from(overlayProductSuggest.querySelectorAll(".overlay-suggest-item")).forEach((el, idx) => {
+      el.classList.toggle("active", idx === productSuggestionIndex);
+    });
+  });
+
+  overlayProductSuggest.addEventListener("mousedown", (ev) => {
+    const btn = ev.target.closest(".overlay-suggest-item");
+    if(!btn) return;
+    ev.preventDefault();
+    const idx = Number(btn.getAttribute("data-idx"));
+    if(!Number.isNaN(idx)){
+      pickProductSuggestion(idx);
+    }
+  });
+
+  document.addEventListener("mousedown", (ev) => {
+    if(!approvePrintOverlay.classList.contains("active")) return;
+    if(ev.target === overlayProductSelect) return;
+    if(overlayProductSuggest.contains(ev.target)) return;
+    overlayProductSuggest.classList.remove("active");
+  });
+
   overlayGenerateBtn.addEventListener("click", async () => {
     const productId = resolveProductIdFromText(overlayProductSelect.value || "");
     if(!productId){
       overlayQrPayload.value = "Select a product first.";
+      return;
+    }
+    const poNumber = (overlayPoNumber.value || "").trim();
+    if(!poNumber){
+      overlayQrPayload.value = "Provide PO Number first.";
       return;
     }
     const resp = await fetch("/api/raw-material-qr", {
@@ -997,17 +1302,64 @@ DASHBOARD_HTML = """
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         product_id: productId,
+        po_number: poNumber,
         finished_job: activeJobRow || {},
       }),
     });
     const out = await resp.json();
-    overlayQrPayload.value = out.qr_payload || out.error || "Failed to generate.";
-    if(out.label_image_data_url){
-      overlayQrPreview.src = out.label_image_data_url;
-    } else if(out.qr_image_data_url){
-      overlayQrPreview.src = out.qr_image_data_url;
+    const payloadText = out.qr_payload || out.error || "Failed to generate.";
+    overlayQrPayload.value = payloadText;
+    const parsed = out.parsed || {};
+    overlayQty.value = parsed.qty || "";
+    overlayIndex.value = parsed.index || "";
+    overlayTotal.value = parsed.total || "";
+    overlayLotNumber.value = parsed.lot_number || "";
+    generatedQrState = {
+      jobKey: jobKeyOf(activeJobRow),
+      payload: payloadText,
+      qty: overlayQty.value || "",
+      index: overlayIndex.value || "",
+      total: overlayTotal.value || "",
+      lotNumber: overlayLotNumber.value || "",
+    };
+  });
+
+  overlayRequestBtn.addEventListener("click", async () => {
+    const product = resolveProductFromText(overlayProductSelect.value || "");
+    if(!product){
+      overlayQrPayload.value = "Select a product first.";
+      return;
+    }
+    const quantity = (overlayQty.value || "").trim();
+    const total = (overlayTotal.value || "").trim();
+    const poNumber = (overlayPoNumber.value || "").trim();
+    const lotNumber = (overlayLotNumber.value || "").trim();
+    if(!quantity || !total || !poNumber || !lotNumber){
+      overlayQrPayload.value = "Generate QR first so Quantity/Total/Lot/PO are complete.";
+      return;
+    }
+
+    const productName = `[${(product.sku || "").toString().trim()}] ${(product.name || "").toString().trim()}`.trim();
+    const requestPayload = {
+      product_name: productName,
+      quantity: quantity,
+      total: total,
+      po_number: poNumber,
+      product_desc: (activeJobRow && (activeJobRow.job_name || activeJobRow.job_code)) || "",
+      requested_at_ph: "",
+      lot_number: lotNumber,
+    };
+
+    const resp = await fetch("/api/qrgen/pending-request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestPayload),
+    });
+    const out = await resp.json();
+    if(out.ok){
+      overlayQrPayload.value = `${overlayQrPayload.value}\n\nPrint request sent.`;
     } else {
-      overlayQrPreview.removeAttribute("src");
+      overlayQrPayload.value = out.error || "Print request failed.";
     }
   });
 
@@ -1023,6 +1375,12 @@ DASHBOARD_HTML = """
     lastMessageEl.textContent = "STATE";
     if(msg.type === "STATE") render(msg);
   };
+
+  // Warm product cache on page load so overlay opens fast.
+  loadProducts(false).then(() => {
+    // Optional background refresh; does not block UI.
+    loadProducts(true).catch(() => {});
+  }).catch(() => {});
 </script>
 </body>
 </html>
@@ -1127,9 +1485,12 @@ def api_products(refresh: int = 0):
 async def api_raw_material_qr(req: Request):
     data = await req.json()
     product_id = str(data.get("product_id", "")).strip()
+    po_number = str(data.get("po_number", "")).strip()
     if not product_id:
         return JSONResponse({"ok": False, "error": "product_id is required"}, status_code=400)
-    payload = _build_raw_material_qr_value(product_id)
+    if not po_number:
+        return JSONResponse({"ok": False, "error": "po_number is required"}, status_code=400)
+    payload = _build_raw_material_qr_value(product_id, po_number=po_number)
     product_meta = _lookup_product_meta(product_id)
     product_name = product_meta.get("name", "")
     product_sku = product_meta.get("sku", "")
@@ -1154,8 +1515,73 @@ async def api_raw_material_qr(req: Request):
         "qr_payload": payload,
         "qr_image_data_url": image_url,
         "label_image_data_url": label_url,
+        "parsed": _parse_qr_segments(payload),
         "qr_format": _raw_qr_format_template(),
     }
+
+
+@APP.post("/api/qrgen/pending-request")
+async def api_qrgen_pending_request(req: Request):
+    data = await req.json()
+    product_name = str(data.get("product_name", "")).strip()
+    quantity = str(data.get("quantity", "")).strip()
+    total = str(data.get("total", "")).strip()
+    po_number = str(data.get("po_number", "")).strip()
+    product_desc = str(data.get("product_desc", "")).strip()
+    lot_number = str(data.get("lot_number", "")).strip()
+    requested_at_ph = str(data.get("requested_at_ph", "")).strip() or _requested_at_ph_str()
+
+    if not product_name:
+        return JSONResponse({"ok": False, "error": "product_name is required"}, status_code=400)
+    if not quantity:
+        return JSONResponse({"ok": False, "error": "quantity is required"}, status_code=400)
+    if not total:
+        return JSONResponse({"ok": False, "error": "total is required"}, status_code=400)
+    if not po_number:
+        return JSONResponse({"ok": False, "error": "po_number is required"}, status_code=400)
+
+    outbound = {
+        "product_name": product_name,
+        "quantity": quantity,
+        "total": total,
+        "po_number": po_number,
+        "product_desc": product_desc,
+        "requested_at_ph": requested_at_ph,
+    }
+    if lot_number:
+        outbound["lot_number"] = lot_number
+
+    try:
+        upstream = _post_qrgen_pending_request(outbound)
+        return {
+            "ok": True,
+            "target_base_url": QRGEN_BASE_URL,
+            "sent": outbound,
+            "upstream_status_code": upstream.get("status_code"),
+            "upstream_body": upstream.get("body"),
+        }
+    except urllib_error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"QRGEN upstream HTTP {e.code}",
+                "target_base_url": QRGEN_BASE_URL,
+                "upstream_body": body,
+                "sent": outbound,
+            },
+            status_code=502,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"QRGEN request failed: {e}",
+                "target_base_url": QRGEN_BASE_URL,
+                "sent": outbound,
+            },
+            status_code=502,
+        )
 
 
 @APP.websocket("/ws")

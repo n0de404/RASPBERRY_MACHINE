@@ -151,6 +151,25 @@ QLabel#MetaValue {
     border-radius: 14px;
     padding: 10px 12px;
 }
+QLabel#RejectDetailItem {
+    color: #6b7280;
+    font-size: 13px;
+    font-weight: 800;
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    border-left: 5px solid #9ca3af;
+    border-radius: 12px;
+    padding: 8px 10px;
+}
+QLabel#RejectDetailItem[active="1"] {
+    color: #991b1b;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-left: 5px solid #dc2626;
+}
+QLabel#RejectDetailItem[active="1"][flash="1"] {
+    border-left: 5px solid #f52727;
+}
 
 /* ===== KPI Stat Cards ===== */
 QFrame[role="stat"] {
@@ -274,5 +293,48 @@ QPushButton:disabled {
     background: #cbd5e1;
     border: 1px solid #cbd5e1;
     color: #64748b;
+}
+
+QPushButton#SettingsButton {
+    background: #ffffff;
+    color: #0f172a;
+    border: 1px solid #dbe4f0;
+    border-radius: 12px;
+    font-size: 22px;
+    font-weight: 800;
+    padding: 0px;
+}
+QPushButton#SettingsButton:hover {
+    background: #eff6ff;
+    border: 1px solid #93c5fd;
+}
+
+QCheckBox {
+    color: #0f172a;
+    font-size: 14px;
+    font-weight: 700;
+    spacing: 8px;
+}
+
+QFrame#SettingsOverlay {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                stop:0 #ffffff, stop:1 #eef2ff);
+    border: 2px solid #94a3b8;
+    border-radius: 16px;
+}
+QPushButton#SettingToggle {
+    background: #f8fafc;
+    color: #0f172a;
+    border: 1px solid #cbd5e1;
+    border-radius: 12px;
+    text-align: left;
+    padding: 8px 12px;
+    font-size: 14px;
+    font-weight: 800;
+}
+QPushButton#SettingToggle:checked {
+    background: #ecfeff;
+    color: #0f766e;
+    border: 1px solid #99f6e4;
 }
 """
