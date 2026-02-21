@@ -14,10 +14,14 @@ from typing import Optional, Dict, Any, List, Set
 
 import requests
 
-from PyQt6.QtCore import Qt, QObject, QEvent, pyqtSignal, QTimer, QSize, QRectF, QPropertyAnimation, QEasingCurve, pyqtProperty
-from PyQt6.QtGui import QMovie, QPixmap, QColor, QPainter, QPen
+from PyQt6.QtCore import (
+    Qt, QObject, QEvent, pyqtSignal, QTimer, QSize, QRectF,
+    QPropertyAnimation, QEasingCurve, pyqtProperty,
+)
+from PyQt6.QtGui import QMovie, QPixmap, QColor, QPainter, QPen, QFont
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy, QGraphicsDropShadowEffect, QGraphicsBlurEffect, QProgressBar, QPushButton
+    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy,
+    QGraphicsDropShadowEffect, QGraphicsBlurEffect, QProgressBar, QPushButton, QComboBox, QScrollArea
 )
 
 from mappings import parse_scan, MACHINE_MAP, JOB_MAP, REJECT_REASON_MAP
@@ -29,10 +33,10 @@ except Exception:
     serial = None
 
 
-SERVER_URL = os.environ.get("MACHINE_SERVER_URL", "http://127.0.0.1:8000")
+SERVER_URL = os.environ.get("MACHINE_SERVER_URL", "http://192.168.1.178:8000")
 CLIENT_ID = os.environ.get("MACHINE_CLIENT_ID", socket.gethostname())
 SCANNER_MODE = os.environ.get("MACHINE_SCANNER_MODE", "auto").strip().lower()
-SCANNER_COM_PORT = os.environ.get("MACHINE_SCANNER_COM_PORT", "COM6").strip()
+SCANNER_COM_PORT = os.environ.get("MACHINE_SCANNER_COM_PORT", "/dev/ttyACM0").strip()
 SCANNER_BAUDRATE = int(os.environ.get("MACHINE_SCANNER_BAUDRATE", "9600"))
 SCANNER_TIMEOUT = float(os.environ.get("MACHINE_SCANNER_TIMEOUT", "1.0"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -151,6 +155,11 @@ class ClientState:
             self.reject_review_logs = []
 
 
+@dataclass
+class StatusPulse:
+    age: float
+
+
 class ScannerFilter(QObject):
     scanned = pyqtSignal(str)
 
@@ -180,6 +189,97 @@ class ScannerFilter(QObject):
                 return True
 
         return False
+
+
+class HeartbeatBorderPulseOverlay(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.pulses: List[StatusPulse] = []
+        self.t = 0.0
+        self.beat_pattern = [0.00]
+        self.beat_cycle = 1.00
+        self._next_cycle_time = 0.0
+        self._pattern_index = 0
+        self._active_mode = False
+        self._target_rect = QRectF()
+
+    def set_target_rect(self, rect: QRectF):
+        self._target_rect = QRectF(rect)
+        self.update()
+
+    def set_mode(self, active: bool):
+        self._active_mode = bool(active)
+
+    def trigger_now(self):
+        self.pulses.append(StatusPulse(age=0.0))
+        self.update()
+
+    def advance(self, enabled: bool, dt: float = 0.06):
+        if not enabled:
+            if self.pulses:
+                self.pulses = []
+                self.update()
+            return
+
+        self.t += dt
+        if self.t >= self._next_cycle_time:
+            self._next_cycle_time = self.t + self.beat_cycle
+            self._pattern_index = 0
+
+        cycle_start = self._next_cycle_time - self.beat_cycle
+        while self._pattern_index < len(self.beat_pattern) and self.t >= cycle_start + self.beat_pattern[self._pattern_index]:
+            self.pulses.append(StatusPulse(age=0.0))
+            self._pattern_index += 1
+
+        max_age = 1.2
+        keep: List[StatusPulse] = []
+        for pl in self.pulses:
+            pl.age += dt
+            if pl.age <= max_age:
+                keep.append(pl)
+        self.pulses = keep
+        self.update()
+
+    def paintEvent(self, _):
+        if not self.pulses or self._target_rect.isNull():
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        for pl in self.pulses:
+            self._draw_pulse_ring(p, self._target_rect, 14.0, pl.age)
+        p.end()
+
+    def _draw_pulse_ring(self, p: QPainter, card: QRectF, base_radius: float, age: float):
+        duration = 1.2
+        u = max(0.0, min(1.0, age / duration))
+        start_out = 4.0
+        end_out = 24.0
+        out = start_out + (end_out - start_out) * (u ** 0.85)
+        alpha = int(255 * (1.0 - u) ** 1.6)
+        glow_w = 7.0 * (1.0 - u) + 1.4
+        core_w = 2.0 * (1.0 - u) + 1.0
+        base = QColor("#22c55e" if self._active_mode else "#f97316")
+
+        ring = QRectF(
+            card.left() - out,
+            card.top() - out,
+            card.width() + out * 2,
+            card.height() + out * 2,
+        )
+        rr = base_radius + out
+
+        glow = QColor(base)
+        glow.setAlpha(max(0, min(120, int(alpha * 0.42))))
+        p.setPen(QPen(glow, glow_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(ring, rr, rr)
+
+        core = QColor(base)
+        core.setAlpha(max(0, min(255, int(alpha * 0.88))))
+        p.setPen(QPen(core, core_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.drawRoundedRect(ring, rr, rr)
 
 
 class SuccessCheck(QWidget):
@@ -271,18 +371,32 @@ class ClientUI(QWidget):
             "machine": ["machine.png", "machine.jpg", "machine.jpeg", "machine_icon.png", "icon_machine.png"],
             "job": ["job-seeker.png", "job.png", "job.jpg", "job.jpeg", "job_icon.png", "icon_job.png"],
             "operator": ["worker.png", "operator.png", "operator.jpg", "operator.jpeg", "operator_icon.png", "icon_operator.png"],
+            "raw-material": ["raw-material.png"],
+            "cycle": ["cycle.png"],
+            "downtime": ["downtime (1).png"],
         }
 
         self.setWindowTitle("Machine Client Dashboard")
         self.setMinimumSize(0, 0)
-        self.setStyleSheet(APP_STYLESHEET)
+        self.setObjectName("ClientUIRoot")
+        bg_image = os.path.join(IMAGES_DIR, "background.png").replace("\\", "/")
+        self.setStyleSheet(
+            APP_STYLESHEET
+            + f"""
+QWidget#ClientUIRoot {{
+    background-image: url("{bg_image}");
+    background-position: center;
+    background-repeat: no-repeat;
+}}
+"""
+        )
         self.enable_check_animation = True
         self.enable_flashing_lights = True
         self.enable_pulse_effects = True
 
-        root = QHBoxLayout()
+        root = QVBoxLayout()
         root.setContentsMargins(10, 8, 10, 8)
-        root.setSpacing(10)
+        root.setSpacing(8)
 
         leftWrap = QWidget()
         self.leftWrap = leftWrap
@@ -293,6 +407,9 @@ class ClientUI(QWidget):
 
         self.pageTitle = QLabel("Machine Dashboard")
         self.pageTitle.setObjectName("PageTitle")
+        self.headerDateTime = QLabel("")
+        self.headerDateTime.setObjectName("MetaValue")
+        self.headerDateTime.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.btnSettings = QPushButton("\u2699")
         self.btnSettings.setObjectName("SettingsButton")
         self.btnSettings.setFixedSize(40, 40)
@@ -304,6 +421,12 @@ class ClientUI(QWidget):
         headerRow.setSpacing(8)
         headerRow.addWidget(self.btnSettings, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.pageTitle, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        headerRow.addWidget(self.headerDateTime, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.headerDivider = QFrame()
+        self.headerDivider.setFrameShape(QFrame.Shape.HLine)
+        self.headerDivider.setFrameShadow(QFrame.Shadow.Plain)
+        self.headerDivider.setStyleSheet("background: rgba(148, 163, 184, 0.45); min-height: 1px; max-height: 1px; border: none;")
 
         self._banner_base_text = "Scan MACHINE QR to start"
         self.banner = QLabel(self._banner_base_text)
@@ -316,20 +439,23 @@ class ClientUI(QWidget):
         self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.machineAnim = QLabel("[M] ----")
         self.machineAnim.setObjectName("MachineAnim")
-        self.machineAnim.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.machineAnim.setFixedWidth(160)
+        self.machineAnim.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.machineAnim.setProperty("mode", "idle")
+        self.machineAnim.setProperty("pulse", "0")
+        self.scanSectionDivider = QFrame()
+        self.scanSectionDivider.setFrameShape(QFrame.Shape.HLine)
+        self.scanSectionDivider.setFrameShadow(QFrame.Shadow.Plain)
+        self.scanSectionDivider.setStyleSheet("background: rgba(148, 163, 184, 0.35); min-height: 1px; max-height: 1px; border: none;")
 
-        left.addLayout(headerRow)
         left.addWidget(self.banner)
-        left.addWidget(self.status)
-        left.addWidget(self.machineAnim)
+        left.addWidget(self.scanSectionDivider)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(8)
 
         # Production panel
-        self.cardProduction = self._make_card("Production")
+        self.cardProductionOuter, self.cardProduction = self._make_double_layer_card("Production")
         statRow = QHBoxLayout()
         statRow.setSpacing(10)
         self.lblPack = QLabel("0")
@@ -348,11 +474,11 @@ class ClientUI(QWidget):
         statRow.addWidget(self.cardStatReject)
         statRow.addWidget(self.cardStatTotalGood)
         self.cardProduction.layout().addLayout(statRow)
-        self.cardProduction.setFixedHeight(155)
-        grid.addWidget(self.cardProduction, 0, 0, 1, 2)
+        self.cardProductionOuter.setFixedHeight(171)
+        grid.addWidget(self.cardProductionOuter, 0, 0, 1, 2)
 
         # Session panel
-        self.cardSession = self._make_card("Session")
+        self.cardSessionOuter, self.cardSession = self._make_double_layer_card("Session")
         sessionGrid = QGridLayout()
         sessionGrid.setHorizontalSpacing(12)
         sessionGrid.setVerticalSpacing(10)
@@ -378,11 +504,11 @@ class ClientUI(QWidget):
             sessionGrid.addWidget(n, i, 0)
             sessionGrid.addWidget(value_lbl, i, 1)
         self.cardSession.layout().addLayout(sessionGrid)
-        self.cardSession.setFixedHeight(175)
-        grid.addWidget(self.cardSession, 1, 0)
+        self.cardSessionOuter.setFixedHeight(191)
+        grid.addWidget(self.cardSessionOuter, 1, 0)
 
         # Reject detail panel
-        self.cardReject = self._make_card("Reject Details")
+        self.cardRejectOuter, self.cardReject = self._make_double_layer_card("Reject Details")
         self.rejectDetailGrid = QGridLayout()
         self.rejectDetailGrid.setHorizontalSpacing(8)
         self.rejectDetailGrid.setVerticalSpacing(6)
@@ -402,11 +528,11 @@ class ClientUI(QWidget):
             self.rejectDetailGrid.addWidget(item, row, col)
 
         self.cardReject.layout().addLayout(self.rejectDetailGrid)
-        self.cardReject.setFixedHeight(300)
-        grid.addWidget(self.cardReject, 2, 0, 1, 2)
+        self.cardRejectOuter.setFixedHeight(316)
+        grid.addWidget(self.cardRejectOuter, 2, 0, 1, 2)
 
         # Job details panel
-        self.cardJobDetails = self._make_card("Job Details")
+        self.cardJobDetailsOuter, self.cardJobDetails = self._make_double_layer_card("Job Details")
         self.jobDetailGrid = QGridLayout()
         self.jobDetailGrid.setHorizontalSpacing(8)
         self.jobDetailGrid.setVerticalSpacing(6)
@@ -447,17 +573,24 @@ class ClientUI(QWidget):
 
         self.cardJobDetails.layout().addLayout(self.jobDetailGrid)
         self.cardJobDetails.layout().addStretch(1)
-        self.cardJobDetails.setFixedHeight(220)
-        grid.addWidget(self.cardJobDetails, 3, 0, 1, 2)
+        self.cardJobDetailsOuter.setFixedHeight(236)
+        grid.addWidget(self.cardJobDetailsOuter, 3, 0, 1, 2)
 
         # Activity panel
-        self.cardActivity = self._make_card("Activity")
+        self.cardActivityOuter, self.cardActivity = self._make_double_layer_card("Activity")
+        self.machineAnim.setText("Machine Status: Idle")
+        self.machineAnim.setFixedHeight(40)
+        self.machineAnim.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.cardActivity.layout().addWidget(self.machineAnim)
         self.lblLast = QLabel("-")
         self.lblLast.setObjectName("MetaValue")
         self.lblLast.setWordWrap(True)
         self.cardActivity.layout().addWidget(self.lblLast)
-        self.cardActivity.setFixedHeight(165)
-        grid.addWidget(self.cardActivity, 1, 1)
+        self.machinePulseOverlay = HeartbeatBorderPulseOverlay(self.cardActivity)
+        self.machinePulseOverlay.setGeometry(self.cardActivity.rect())
+        self.machinePulseOverlay.raise_()
+        self.cardActivityOuter.setFixedHeight(181)
+        grid.addWidget(self.cardActivityOuter, 1, 1)
 
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
@@ -467,20 +600,24 @@ class ClientUI(QWidget):
 
         # Right side panel (downtime reason + timer).
         self.rightPanel = QFrame()
-        self.rightPanel.setObjectName("Panel")
+        self.rightPanel.setObjectName("RightPanel")
         rightLayout = QVBoxLayout()
-        rightLayout.setContentsMargins(16, 14, 16, 14)
-        rightLayout.setSpacing(10)
+        rightLayout.setContentsMargins(16, 0, 16, 14)
+        rightLayout.setSpacing(0)
         self.rightPanel.setLayout(rightLayout)
+        self.rightTopSpacer = QWidget()
+        self.rightTopSpacer.setFixedHeight(0)
+        self.rightTopSpacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        rightLayout.addWidget(self.rightTopSpacer)
 
         self.rightRawTitle = QLabel("Raw Materials Consumption")
         self.rightRawTitle.setObjectName("RightTitle")
         self.rightRawHint = QLabel("Track sacks count and scanned raw materials.")
         self.rightRawHint.setObjectName("RightHint")
         self.rightRawSacks = QLabel("Sacks Count: 0")
-        self.rightRawSacks.setObjectName("MetaValue")
+        self.rightRawSacks.setObjectName("RightMonitorValue")
         self.rightRawScanned = QLabel("Raw Mats Scanned: -")
-        self.rightRawScanned.setObjectName("MetaValue")
+        self.rightRawScanned.setObjectName("RightMonitorValue")
         self.rightRawScanned.setWordWrap(True)
 
         self.rightTitle = QLabel("Downtime Monitor")
@@ -488,67 +625,118 @@ class ClientUI(QWidget):
         self.rightHint = QLabel("Scan ProductionDailyReport~1, then scan reason QR (01-15).")
         self.rightHint.setObjectName("RightHint")
         self.rightDowntimeTimer = QLabel("Downtime: 00:00:00")
-        self.rightDowntimeTimer.setObjectName("MetaValue")
+        self.rightDowntimeTimer.setObjectName("RightMonitorValueAccent")
         self.rightDowntimeReason = QLabel("Reason: -")
-        self.rightDowntimeReason.setObjectName("MetaValue")
+        self.rightDowntimeReason.setObjectName("RightMonitorValue")
         self.rightDowntimeReason.setWordWrap(True)
         self.rightStartupReject = QLabel("Start Up Reject: 0")
-        self.rightStartupReject.setObjectName("MetaValue")
+        self.rightStartupReject.setObjectName("RightMonitorValue")
         self.rightCycleTitle = QLabel("Cycle Monitor")
         self.rightCycleTitle.setObjectName("RightTitle")
         self.rightCycleHint = QLabel("Cycle count and cycle time status.")
         self.rightCycleHint.setObjectName("RightHint")
         self.rightCycleCount = QLabel("Cycle Count: 0")
-        self.rightCycleCount.setObjectName("MetaValue")
+        self.rightCycleCount.setObjectName("RightMonitorValue")
         self.rightCycleCurrent = QLabel("Cycle Time: ")
-        self.rightCycleCurrent.setObjectName("MetaValue")
+        self.rightCycleCurrent.setObjectName("RightMonitorValue")
         self.rightMaintenance = QLabel("Maintenance: ")
-        self.rightMaintenance.setObjectName("MetaValue")
+        self.rightMaintenance.setObjectName("RightMonitorValue")
         self.rightSupervisor = QLabel("Supervisor: ")
-        self.rightSupervisor.setObjectName("MetaValue")
+        self.rightSupervisor.setObjectName("RightMonitorValue")
+        self.rightSupervisorLeft = QLabel("Supervisor: -")
+        self.rightSupervisorLeft.setObjectName("RightMonitorValue")
 
         topRow = QHBoxLayout()
         topRow.setSpacing(12)
 
+        rawOuter = QFrame()
+        rawOuter.setObjectName("RightCardOuter")
+        rawOuterLay = QVBoxLayout()
+        rawOuterLay.setContentsMargins(8, 8, 8, 8)
+        rawOuterLay.setSpacing(0)
+        rawOuter.setLayout(rawOuterLay)
+
         rawFrame = QFrame()
-        rawFrame.setObjectName("SubPanel")
+        rawFrame.setObjectName("RightCardInner")
         rawFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         rawCol = QVBoxLayout()
-        rawCol.setContentsMargins(10, 8, 10, 8)
+        rawCol.setContentsMargins(12, 10, 12, 10)
         rawCol.setSpacing(6)
         rawFrame.setLayout(rawCol)
-        rawCol.addWidget(self.rightRawTitle)
+        rawCol.addWidget(self._make_right_title_with_icon("Raw Materials Consumption", "raw-material"))
         rawCol.addWidget(self.rightRawHint)
         rawCol.addWidget(self.rightRawSacks)
         rawCol.addWidget(self.rightRawScanned)
+        rawOuterLay.addWidget(rawFrame)
+
+        cycleOuter = QFrame()
+        cycleOuter.setObjectName("RightCardOuter")
+        cycleOuterLay = QVBoxLayout()
+        cycleOuterLay.setContentsMargins(8, 8, 8, 8)
+        cycleOuterLay.setSpacing(0)
+        cycleOuter.setLayout(cycleOuterLay)
 
         cycleFrame = QFrame()
-        cycleFrame.setObjectName("SubPanel")
+        cycleFrame.setObjectName("RightCardInner")
         cycleFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         cycleCol = QVBoxLayout()
-        cycleCol.setContentsMargins(10, 8, 10, 8)
+        cycleCol.setContentsMargins(12, 10, 12, 10)
         cycleCol.setSpacing(6)
         cycleFrame.setLayout(cycleCol)
-        cycleCol.addWidget(self.rightCycleTitle)
+        cycleCol.addWidget(self._make_right_title_with_icon("Cycle Monitor", "cycle"))
         cycleCol.addWidget(self.rightCycleHint)
         cycleCol.addWidget(self.rightCycleCount)
         cycleCol.addWidget(self.rightCycleCurrent)
+        cycleOuterLay.addWidget(cycleFrame)
 
-        topRow.addWidget(rawFrame, 1)
-        topRow.addWidget(cycleFrame, 1)
+        rawFrame.setMinimumHeight(140)
+        cycleFrame.setMinimumHeight(140)
+        topRow.addWidget(rawOuter, 1)
+        topRow.addWidget(cycleOuter, 1)
 
         rightLayout.addLayout(topRow)
-        rightLayout.addWidget(self.rightTitle)
-        rightLayout.addWidget(self.rightHint)
-        rightLayout.addWidget(self.rightDowntimeTimer)
-        rightLayout.addWidget(self.rightDowntimeReason)
-        rightLayout.addWidget(self.rightStartupReject)
-        rightLayout.addWidget(self.rightMaintenance)
-        rightLayout.addWidget(self.rightSupervisor)
+        rightLayout.addSpacing(10)
+        downtimeOuter = QFrame()
+        downtimeOuter.setObjectName("RightCardOuter")
+        downtimeOuterLay = QVBoxLayout()
+        downtimeOuterLay.setContentsMargins(8, 8, 8, 8)
+        downtimeOuterLay.setSpacing(0)
+        downtimeOuter.setLayout(downtimeOuterLay)
+
+        downtimeFrame = QFrame()
+        downtimeFrame.setObjectName("RightCardInner")
+        downtimeCol = QVBoxLayout()
+        downtimeCol.setContentsMargins(12, 10, 12, 10)
+        downtimeCol.setSpacing(8)
+        downtimeFrame.setLayout(downtimeCol)
+        downtimeCol.addWidget(self._make_right_title_with_icon("Downtime Monitor", "downtime"))
+        downtimeCol.addWidget(self.rightHint)
+
+        downtimeGrid = QGridLayout()
+        downtimeGrid.setContentsMargins(0, 0, 0, 0)
+        downtimeGrid.setHorizontalSpacing(8)
+        downtimeGrid.setVerticalSpacing(8)
+        downtimeGrid.addWidget(self.rightDowntimeTimer, 0, 0)
+        downtimeGrid.addWidget(self.rightDowntimeReason, 0, 1)
+        downtimeGrid.addWidget(self.rightStartupReject, 1, 0)
+        downtimeGrid.addWidget(self.rightMaintenance, 1, 1)
+        downtimeGrid.addWidget(self.rightSupervisorLeft, 2, 0)
+        downtimeGrid.addWidget(self.rightSupervisor, 2, 1)
+        downtimeCol.addLayout(downtimeGrid)
+        downtimeOuterLay.addWidget(downtimeFrame)
+
+        rightLayout.addWidget(downtimeOuter)
         rightLayout.addStretch()
 
-        root.addWidget(leftWrap, 1)
-        root.addWidget(self.rightPanel, 1)
+        contentRow = QHBoxLayout()
+        contentRow.setContentsMargins(0, 0, 0, 0)
+        contentRow.setSpacing(10)
+        contentRow.addWidget(leftWrap, 1)
+        contentRow.addWidget(self.rightPanel, 1)
+
+        root.addLayout(headerRow)
+        root.addWidget(self.headerDivider)
+        root.addLayout(contentRow, 1)
 
         self.setLayout(root)
 
@@ -616,6 +804,9 @@ class ClientUI(QWidget):
         self.productionCounter.setObjectName("ProductionCounter7")
         self.productionCounter.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.productionOverlay.layout().addWidget(self.productionCounter)
+        self.pdrPulseOverlay = HeartbeatBorderPulseOverlay(self.productionOverlay)
+        self.pdrPulseOverlay.setGeometry(self.productionOverlay.rect())
+        self.pdrPulseOverlay.raise_()
 
         self.productionFixAnim = QLabel("Repair in progress...")
         self.productionFixAnim.setObjectName("ProductionFixAnim")
@@ -807,17 +998,63 @@ class ClientUI(QWidget):
         self._finish_anim_running = False
         self._finish_pending_clear = False
 
-        # Settings overlay for runtime visual effects toggles.
+        # Settings overlay with category navigation (Graphics / Display).
         self.settingsOverlay = QFrame(self)
         self.settingsOverlay.setObjectName("SettingsOverlay")
         self.settingsOverlay.setLayout(QVBoxLayout())
-        self.settingsOverlay.layout().setContentsMargins(16, 14, 16, 14)
-        self.settingsOverlay.layout().setSpacing(10)
-        self.settingsOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.settingsTitle = QLabel("SETTINGS")
-        self.settingsTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
-        self.settingsHint = QLabel("Toggle visual effects without changing loading bars.")
-        self.settingsHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.settingsOverlay.layout().setContentsMargins(0, 0, 0, 0)
+        self.settingsOverlay.layout().setSpacing(0)
+
+        self.settingsShell = QFrame()
+        self.settingsShell.setObjectName("SettingsShell")
+        self.settingsShell.setLayout(QHBoxLayout())
+        self.settingsShell.layout().setContentsMargins(0, 0, 0, 0)
+        self.settingsShell.layout().setSpacing(0)
+
+        self.settingsNav = QFrame()
+        self.settingsNav.setObjectName("SettingsNav")
+        self.settingsNav.setLayout(QVBoxLayout())
+        self.settingsNav.layout().setContentsMargins(14, 14, 14, 14)
+        self.settingsNav.layout().setSpacing(8)
+        self.settingsTitle = QLabel("APP SETTINGS")
+        self.settingsTitle.setObjectName("SettingsNavTitle")
+        self.settingsBtnGraphics = QPushButton("Graphics")
+        self.settingsBtnGraphics.setObjectName("SettingsNavButton")
+        self.settingsBtnGraphics.setCheckable(True)
+        self.settingsBtnDisplay = QPushButton("Display")
+        self.settingsBtnDisplay.setObjectName("SettingsNavButton")
+        self.settingsBtnDisplay.setCheckable(True)
+        self.settingsNav.layout().addWidget(self.settingsTitle)
+        self.settingsNav.layout().addSpacing(8)
+        self.settingsNav.layout().addWidget(self.settingsBtnGraphics)
+        self.settingsNav.layout().addWidget(self.settingsBtnDisplay)
+        self.settingsNav.layout().addStretch(1)
+
+        self.settingsContent = QFrame()
+        self.settingsContent.setObjectName("SettingsContent")
+        self.settingsContent.setLayout(QVBoxLayout())
+        self.settingsContent.layout().setContentsMargins(14, 12, 14, 12)
+        self.settingsContent.layout().setSpacing(8)
+        self.settingsContentTop = QHBoxLayout()
+        self.settingsContentTop.setContentsMargins(0, 0, 0, 0)
+        self.settingsContentTop.setSpacing(8)
+        self.settingsContentTitle = QLabel("Graphics")
+        self.settingsContentTitle.setObjectName("SettingsContentTitle")
+        self.settingsCloseBtn = QPushButton("X")
+        self.settingsCloseBtn.setObjectName("SettingsCloseX")
+        self.settingsCloseBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settingsContentTop.addWidget(self.settingsContentTitle, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.settingsContentTop.addWidget(self.settingsCloseBtn, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.settingsContentDivider = QFrame()
+        self.settingsContentDivider.setFrameShape(QFrame.Shape.HLine)
+        self.settingsContentDivider.setFrameShadow(QFrame.Shadow.Plain)
+        self.settingsContentDivider.setObjectName("SettingsContentDivider")
+
+        self.settingsGraphicsSection = QWidget()
+        self.settingsGraphicsSection.setObjectName("SettingsPage")
+        self.settingsGraphicsSection.setLayout(QVBoxLayout())
+        self.settingsGraphicsSection.layout().setContentsMargins(0, 0, 0, 0)
+        self.settingsGraphicsSection.layout().setSpacing(8)
         self.chkCheckAnimation = QPushButton()
         self.chkCheckAnimation.setObjectName("SettingToggle")
         self.chkCheckAnimation.setCheckable(True)
@@ -830,22 +1067,68 @@ class ClientUI(QWidget):
         self.chkPulseEffects.setObjectName("SettingToggle")
         self.chkPulseEffects.setCheckable(True)
         self.chkPulseEffects.setChecked(True)
-        self._set_toggle_button_text(self.chkCheckAnimation, "Enable check animation", True)
-        self._set_toggle_button_text(self.chkFlashingLights, "Enable flashing lights", True)
-        self._set_toggle_button_text(self.chkPulseEffects, "Enable pulse / moving effects", True)
-        self.settingsCloseBtn = QPushButton("Close")
-        self.settingsCloseBtn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._set_toggle_button_text(self.chkCheckAnimation, "Check animation", True)
+        self._set_toggle_button_text(self.chkFlashingLights, "Flashing lights", True)
+        self._set_toggle_button_text(self.chkPulseEffects, "Pulse / moving effects", True)
+        for btn in (self.chkCheckAnimation, self.chkFlashingLights, self.chkPulseEffects):
+            btn.setFixedWidth(300)
+            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.graphicsSectionTitle = QLabel("Graphics")
+        self.graphicsSectionTitle.setObjectName("MetaLabel")
+        self.settingsGraphicsSection.layout().addWidget(self.graphicsSectionTitle)
+        self.settingsGraphicsSection.layout().addWidget(self.chkCheckAnimation, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsGraphicsSection.layout().addWidget(self.chkFlashingLights, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsGraphicsSection.layout().addWidget(self.chkPulseEffects, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsGraphicsSection.layout().addStretch(1)
+
+        self.settingsDisplaySection = QWidget()
+        self.settingsDisplaySection.setObjectName("SettingsPage")
+        self.settingsDisplaySection.setLayout(QVBoxLayout())
+        self.settingsDisplaySection.layout().setContentsMargins(0, 0, 0, 0)
+        self.settingsDisplaySection.layout().setSpacing(8)
+        self.displayOsLabel = QLabel("OS Profile")
+        self.displayOsLabel.setObjectName("MetaLabel")
+        self.displayOsCombo = QComboBox()
+        self.displayOsCombo.addItems(["Raspberry Pi OS", "Linux", "Windows"])
+        self.displaySizeLabel = QLabel("Monitor / Window Size")
+        self.displaySizeLabel.setObjectName("MetaLabel")
+        self.displaySizeCombo = QComboBox()
+        self.displaySizeCombo.addItems([
+            "Fullscreen",
+            "1024x600",
+            "1280x720",
+            "1366x768",
+            "1600x900",
+            "1920x1080",
+        ])
+        self.displayApplyBtn = QPushButton("Apply")
+        self.displayApplyBtn.setObjectName("SettingToggle")
+        self.displayOsCombo.setFixedWidth(190)
+        self.displaySizeCombo.setFixedWidth(190)
+        self.displayApplyBtn.setFixedWidth(190)
+        self.displayApplyBtn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.settingsDisplaySection.layout().addWidget(self.displayOsLabel)
+        self.settingsDisplaySection.layout().addWidget(self.displayOsCombo, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsDisplaySection.layout().addWidget(self.displaySizeLabel)
+        self.settingsDisplaySection.layout().addWidget(self.displaySizeCombo, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsDisplaySection.layout().addWidget(self.displayApplyBtn, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsDisplaySection.layout().addStretch(1)
+
         self.settingsCloseBtn.clicked.connect(self._hide_settings_overlay)
         self.chkCheckAnimation.toggled.connect(self._on_setting_check_animation_toggled)
         self.chkFlashingLights.toggled.connect(self._on_setting_flashing_lights_toggled)
         self.chkPulseEffects.toggled.connect(self._on_setting_pulse_effects_toggled)
-        self.settingsOverlay.layout().addWidget(self.settingsTitle)
-        self.settingsOverlay.layout().addWidget(self.settingsHint)
-        self.settingsOverlay.layout().addWidget(self.chkCheckAnimation)
-        self.settingsOverlay.layout().addWidget(self.chkFlashingLights)
-        self.settingsOverlay.layout().addWidget(self.chkPulseEffects)
-        self.settingsOverlay.layout().addStretch(1)
-        self.settingsOverlay.layout().addWidget(self.settingsCloseBtn, 0, Qt.AlignmentFlag.AlignRight)
+        self.settingsBtnGraphics.clicked.connect(lambda: self._show_settings_section("graphics"))
+        self.settingsBtnDisplay.clicked.connect(lambda: self._show_settings_section("display"))
+        self.displayApplyBtn.clicked.connect(self._apply_display_settings)
+        self.settingsContent.layout().addLayout(self.settingsContentTop)
+        self.settingsContent.layout().addWidget(self.settingsContentDivider)
+        self.settingsContent.layout().addWidget(self.settingsGraphicsSection, 1)
+        self.settingsContent.layout().addWidget(self.settingsDisplaySection, 1)
+        self.settingsShell.layout().addWidget(self.settingsNav, 0)
+        self.settingsShell.layout().addWidget(self.settingsContent, 1)
+        self.settingsOverlay.layout().addWidget(self.settingsShell)
+        self._show_settings_section("graphics")
         self.settingsOverlay.hide()
         self.settingsOverlay.raise_()
 
@@ -858,6 +1141,7 @@ class ClientUI(QWidget):
         self._overlay_mode = "select"
         self._overlay_pulse_on = False
         self._pulse_phase = 0.0
+        self._machine_idle_flash_phase = 0.0
         self._overlay_shadow = QGraphicsDropShadowEffect(self)
         self._overlay_shadow.setBlurRadius(18)
         self._overlay_shadow.setOffset(0, 0)
@@ -878,11 +1162,11 @@ class ClientUI(QWidget):
         # heartbeat timer
         self.hb = QTimer(self)
         self.hb.timeout.connect(self.send_heartbeat)
-        self.hb.start(5000)
+        self.hb.start(1000)
 
         self.motionTimer = QTimer(self)
         self.motionTimer.timeout.connect(self._tick_motion)
-        self.motionTimer.start(220)
+        self.motionTimer.start(60)
 
         self.downtimeTimer = QTimer(self)
         self.downtimeTimer.timeout.connect(self._refresh_downtime_panel)
@@ -896,22 +1180,51 @@ class ClientUI(QWidget):
         self.rejectDetailFlashTimer.timeout.connect(self._tick_reject_detail_flash)
         self.rejectDetailFlashTimer.start(450)
         self._reject_detail_flash_on = False
+        self.clockTimer = QTimer(self)
+        self.clockTimer.timeout.connect(self._update_header_datetime)
+        self.clockTimer.start(1000)
+        self._update_header_datetime()
+        QTimer.singleShot(0, self._sync_machine_status_pulse_overlay)
 
         self._refresh_ui()
+        QTimer.singleShot(0, self._sync_right_panel_top_alignment)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._sync_right_panel_top_alignment()
         self._position_invalid_overlay()
         self._position_production_overlay()
         self._position_resolve_overlay()
         self._position_raw_mats_overlay()
         self._position_reject_review_overlay()
         self._position_finish_overlay()
-        self._position_settings_overlay()
-        if self._invalid_movie is not None:
-            self._invalid_movie.setScaledSize(self._fit_movie_size(self.invalidOverlay.size()))
-        self._position_marquee()
-        self._update_repair_movie_size()
+        self._sync_machine_status_pulse_overlay()
+
+    def _sync_machine_status_pulse_overlay(self):
+        if not hasattr(self, "machinePulseOverlay"):
+            return
+        self.machinePulseOverlay.setGeometry(self.cardActivity.rect())
+        top_left = self.machineAnim.mapTo(self.cardActivity, self.machineAnim.rect().topLeft())
+        target = QRectF(
+            float(top_left.x()),
+            float(top_left.y()),
+            float(self.machineAnim.width()),
+            float(self.machineAnim.height()),
+        )
+        self.machinePulseOverlay.set_target_rect(target)
+        self.machinePulseOverlay.raise_()
+
+    def _sync_right_panel_top_alignment(self):
+        if not hasattr(self, "rightTopSpacer"):
+            return
+        try:
+            target_top = self.banner.mapTo(self, self.banner.rect().topLeft()).y()
+            right_top = self.rightPanel.mapTo(self, self.rightPanel.rect().topLeft()).y()
+            # Keep first right frame top aligned with scan banner top.
+            offset = max(0, int(target_top - right_top))
+            self.rightTopSpacer.setFixedHeight(offset)
+        except Exception:
+            self.rightTopSpacer.setFixedHeight(0)
 
     def _setup_invalid_overlay_media(self):
         gif_path = INVALID_SCAN_GIF
@@ -979,8 +1292,23 @@ class ClientUI(QWidget):
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.productionOverlay.setGeometry(x, y, w, h)
+        self._sync_pdr_pulse_overlay()
         self._position_marquee()
         self._update_repair_movie_size()
+
+    def _sync_pdr_pulse_overlay(self):
+        if not hasattr(self, "pdrPulseOverlay"):
+            return
+        self.pdrPulseOverlay.setGeometry(self.productionOverlay.rect())
+        top_left = self.productionCounter.mapTo(self.productionOverlay, self.productionCounter.rect().topLeft())
+        target = QRectF(
+            float(top_left.x()),
+            float(top_left.y()),
+            float(self.productionCounter.width()),
+            float(self.productionCounter.height()),
+        )
+        self.pdrPulseOverlay.set_target_rect(target)
+        self.pdrPulseOverlay.raise_()
 
     def _position_resolve_overlay(self):
         w = min(700, max(460, int(self.width() * 0.52)))
@@ -1015,8 +1343,8 @@ class ClientUI(QWidget):
         self.finishOverlay.setGeometry(x, y, w, h)
 
     def _position_settings_overlay(self):
-        w = min(520, max(340, int(self.width() * 0.40)))
-        h = min(320, max(220, int(self.height() * 0.34)))
+        w = min(660, max(500, int(self.width() * 0.50)))
+        h = min(460, max(320, int(self.height() * 0.48)))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.settingsOverlay.setGeometry(x, y, w, h)
@@ -1195,6 +1523,10 @@ class ClientUI(QWidget):
         self._update_repair_movie_size()
         if self._repair_movie is not None and self._overlay_mode == "active":
             self._repair_movie.start()
+        if self._overlay_mode == "active" and hasattr(self, "pdrPulseOverlay"):
+            self._sync_pdr_pulse_overlay()
+            self.pdrPulseOverlay.set_mode(True)
+            self.pdrPulseOverlay.trigger_now()
 
     def _hide_production_overlay(self):
         if self._repair_movie is not None:
@@ -1241,6 +1573,7 @@ class ClientUI(QWidget):
             self.productionCounter.hide()
             self.productionFixAnim.hide()
             self.productionMarqueeWrap.hide()
+            self.pdrPulseOverlay.advance(False)
             return
         self.productionTitle.setText("DOWNTIME ACTIVE")
         self.productionHint.setText("Machine under repair / adjustment")
@@ -1249,6 +1582,9 @@ class ClientUI(QWidget):
         self.productionCounter.show()
         self.productionFixAnim.show()
         self.productionMarqueeWrap.show()
+        self._sync_pdr_pulse_overlay()
+        self.pdrPulseOverlay.set_mode(True)
+        self.pdrPulseOverlay.trigger_now()
         self._marquee_x = self.productionMarqueeWrap.width()
         self._position_marquee()
         if self._repair_movie is not None and self.productionOverlay.isVisible():
@@ -1267,22 +1603,30 @@ class ClientUI(QWidget):
             if self.productionOverlay.isVisible():
                 self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
                 self._apply_overlay_base_style()
-            return
         if not self.productionOverlay.isVisible() or self._overlay_mode != "active":
+            if hasattr(self, "pdrPulseOverlay"):
+                self.pdrPulseOverlay.advance(False)
             return
-        self._pulse_phase += 0.16
-        level = (math.sin(self._pulse_phase) + 1.0) * 0.5
-        border_alpha = int(130 + 110 * level)
-        glow_alpha = int(45 + 155 * level)
-        blur = 18 + 16 * level
-        self.productionOverlay.setStyleSheet(
-            "QFrame#ProductionOverlay {"
-            "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
-            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(248,250,252,0.98), stop:1 rgba(226,232,240,0.98));"
-            f"border: 3px solid rgba(249,115,22,{border_alpha}); border-radius: 14px; }}"
-        )
-        self._overlay_shadow.setBlurRadius(blur)
-        self._overlay_shadow.setColor(QColor(249, 115, 22, glow_alpha))
+        if self.enable_pulse_effects:
+            self._pulse_phase += 0.16
+            level = (math.sin(self._pulse_phase) + 1.0) * 0.5
+            border_alpha = int(130 + 110 * level)
+            glow_alpha = int(45 + 155 * level)
+            blur = 18 + 16 * level
+            self.productionOverlay.setStyleSheet(
+                "QFrame#ProductionOverlay {"
+                "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
+                "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(248,250,252,0.98), stop:1 rgba(226,232,240,0.98));"
+                f"border: 3px solid rgba(249,115,22,{border_alpha}); border-radius: 14px; }}"
+            )
+            self._overlay_shadow.setBlurRadius(blur)
+            self._overlay_shadow.setColor(QColor(249, 115, 22, glow_alpha))
+        else:
+            self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
+            self._apply_overlay_base_style()
+        self._sync_pdr_pulse_overlay()
+        self.pdrPulseOverlay.set_mode(True)
+        self.pdrPulseOverlay.advance(True, dt=0.07)
         self._tick_marquee()
 
     def _tick_marquee(self):
@@ -1307,6 +1651,18 @@ class ClientUI(QWidget):
         t.setObjectName("SectionTitle")
         f.layout().addWidget(t)
         return f
+
+    def _make_double_layer_card(self, title: str) -> tuple[QFrame, QFrame]:
+        outer = QFrame()
+        outer.setObjectName("LeftCardOuter")
+        outer.setLayout(QVBoxLayout())
+        outer.layout().setContentsMargins(8, 8, 8, 8)
+        outer.layout().setSpacing(0)
+
+        inner = self._make_card(title)
+        inner.setObjectName("LeftCardInner")
+        outer.layout().addWidget(inner)
+        return outer, inner
 
     def _find_icon_path(self, key: str) -> Optional[str]:
         for candidate in self._label_icon_candidates.get(key.lower(), []):
@@ -1345,6 +1701,30 @@ class ClientUI(QWidget):
         txt = QLabel(text)
         txt.setObjectName("MetaLabel")
         txt.setStyleSheet("font-size: 14px; font-weight: 800; background: transparent;")
+        lay.addWidget(txt, 0, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        lay.addStretch(1)
+        return wrap
+
+    def _make_right_title_with_icon(self, text: str, icon_key: str) -> QWidget:
+        icon_path = self._find_icon_path(icon_key)
+        wrap = QWidget()
+        wrap.setStyleSheet("background: transparent;")
+        lay = QHBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        wrap.setLayout(lay)
+
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(26, 26)
+        if icon_path:
+            pm = QPixmap(icon_path)
+            if not pm.isNull():
+                pm = pm.scaled(26, 26, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                icon_lbl.setPixmap(pm)
+        lay.addWidget(icon_lbl, 0, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+
+        txt = QLabel(text)
+        txt.setObjectName("RightTitle")
         lay.addWidget(txt, 0, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         lay.addStretch(1)
         return wrap
@@ -1434,15 +1814,19 @@ class ClientUI(QWidget):
         )
 
     def _tick_motion(self):
-        if self._session_is_running():
-            self.machineAnim.setText("[M] ready")
-            self.banner.setText(self._banner_base_text)
-        else:
-            if not self.state.machine_code:
-                self.machineAnim.setText("[M] idle")
-            else:
-                self.machineAnim.setText("[M] ready")
-            self.banner.setText(self._banner_base_text)
+        is_active = self._session_is_running() or bool(self.state.machine_code)
+        status_text = "Active" if is_active else "Idle"
+        self.machineAnim.setText(f"Machine Status: {status_text}")
+        mode = "active" if is_active else "idle"
+        if self.machineAnim.property("mode") != mode:
+            self.machineAnim.setProperty("mode", mode)
+            self.machineAnim.setProperty("pulse", "0")
+            self.machineAnim.setStyleSheet("")
+            self.machineAnim.style().unpolish(self.machineAnim)
+            self.machineAnim.style().polish(self.machineAnim)
+        self._sync_machine_status_pulse_overlay()
+        self.machinePulseOverlay.set_mode(is_active)
+        self.machinePulseOverlay.advance(self.enable_pulse_effects, dt=0.06)
 
     def _refresh_downtime_panel(self):
         s = self.state
@@ -1457,6 +1841,9 @@ class ClientUI(QWidget):
         else:
             self.rightDowntimeReason.setText("Reason: -")
         self.rightStartupReject.setText(f"Start Up Reject: {s.startup_reject_total}")
+        self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or '-'}")
+        self.rightSupervisor.setText(f"Supervisor: {s.supervisor_name or '-'}")
+        self.rightSupervisorLeft.setText(f"Supervisor: {s.supervisor_name or '-'}")
 
         if s.downtime_started_at:
             elapsed = max(0, int(time.time() - s.downtime_started_at))
@@ -1779,11 +2166,11 @@ class ClientUI(QWidget):
 
     def _on_setting_check_animation_toggled(self, checked: bool):
         self.enable_check_animation = bool(checked)
-        self._set_toggle_button_text(self.chkCheckAnimation, "Enable check animation", self.enable_check_animation)
+        self._set_toggle_button_text(self.chkCheckAnimation, "Check animation", self.enable_check_animation)
 
     def _on_setting_flashing_lights_toggled(self, checked: bool):
         self.enable_flashing_lights = bool(checked)
-        self._set_toggle_button_text(self.chkFlashingLights, "Enable flashing lights", self.enable_flashing_lights)
+        self._set_toggle_button_text(self.chkFlashingLights, "Flashing lights", self.enable_flashing_lights)
         if not self.enable_flashing_lights:
             for item in self.reject_detail_labels.values():
                 item.setProperty("flash", "0")
@@ -1792,10 +2179,43 @@ class ClientUI(QWidget):
 
     def _on_setting_pulse_effects_toggled(self, checked: bool):
         self.enable_pulse_effects = bool(checked)
-        self._set_toggle_button_text(self.chkPulseEffects, "Enable pulse / moving effects", self.enable_pulse_effects)
+        self._set_toggle_button_text(self.chkPulseEffects, "Pulse / moving effects", self.enable_pulse_effects)
         if not self.enable_pulse_effects:
             self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
             self._apply_overlay_base_style()
+            self.machineAnim.setStyleSheet("")
+            self.machineAnim.style().unpolish(self.machineAnim)
+            self.machineAnim.style().polish(self.machineAnim)
+
+    def _show_settings_section(self, section: str):
+        is_graphics = section == "graphics"
+        self.settingsBtnGraphics.setChecked(is_graphics)
+        self.settingsBtnDisplay.setChecked(not is_graphics)
+        self.settingsGraphicsSection.setVisible(is_graphics)
+        self.settingsDisplaySection.setVisible(not is_graphics)
+        if is_graphics:
+            self.settingsContentTitle.setText("Graphics")
+        else:
+            self.settingsContentTitle.setText("Display")
+
+    def _apply_display_settings(self):
+        os_name = self.displayOsCombo.currentText().strip()
+        size_name = self.displaySizeCombo.currentText().strip()
+        self.setWindowState(Qt.WindowState.WindowNoState)
+        if size_name.lower() == "fullscreen":
+            self.showFullScreen()
+            self.status.setText(f"Display applied: {os_name} / Fullscreen")
+            return
+
+        m = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*$", size_name)
+        if m:
+            w = max(800, int(m.group(1)))
+            h = max(480, int(m.group(2)))
+            self.showNormal()
+            self.resize(w, h)
+            self.status.setText(f"Display applied: {os_name} / {w}x{h}")
+            return
+        self.status.setText("Display apply failed: invalid size preset.")
 
     def _set_toggle_button_text(self, btn: QPushButton, label: str, enabled: bool):
         btn.setText(f"{label}: {'ON' if enabled else 'OFF'}")
@@ -1887,11 +2307,11 @@ class ClientUI(QWidget):
 
     def _set_banner_text(self, text: str):
         self._banner_base_text = text
-        self.banner.setText(self._banner_base_text)
-        if not self.state.machine_code:
-            self.machineAnim.setText("[M] idle")
-        else:
-            self.machineAnim.setText("[M] active")
+        self.banner.setText((self._banner_base_text or "").strip())
+
+    def _update_header_datetime(self):
+        now_local = datetime.now()
+        self.headerDateTime.setText(now_local.strftime("%A | %b %d, %Y | %I:%M:%S %p"))
 
     def _operator_display_name(self, text: Optional[str]) -> str:
         if not text:
@@ -1954,6 +2374,13 @@ class ClientUI(QWidget):
 
     def _set_status_text(self, text: str):
         t = str(text).replace("\n", " ").strip()
+        # Hide scanner transport diagnostics from UI for now.
+        if (
+            t.startswith("Scanner serial ")
+            or t.startswith("Scanner input:")
+            or "could not open port" in t.lower()
+        ):
+            return
         if len(t) > 120:
             short = t[:117] + "..."
             self.status.setText(short)
@@ -2184,6 +2611,7 @@ class ClientUI(QWidget):
                 s.waiting_maintenance_qr = False
                 s.waiting_supervisor_qr = True
                 self.resolveHint.setText("Scan Supervisor QR (3000001)")
+                self._refresh_downtime_panel()
                 return
             self.status.setText("Scan valid Maintenance QR (2000001).")
             return
@@ -2195,6 +2623,7 @@ class ClientUI(QWidget):
                 s.waiting_supervisor_qr = False
                 s.waiting_operator_downtime_confirm = True
                 self.resolveHint.setText("Scan Operator QR to confirm.")
+                self._refresh_downtime_panel()
                 return
             self.status.setText("Scan valid Supervisor QR (3000001).")
             return
@@ -2353,6 +2782,7 @@ class ClientUI(QWidget):
                     f"Recovered ongoing session for {self.state.machine_name} / {self.state.job_name or self.state.job_code}."
                 )
                 self.push_event({"type": "SESSION_RESUME"}, "SESSION RESUMED")
+                self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (RESUME)")
                 return
             s.machine_code = raw_s
             s.machine_name = res.value
@@ -2386,6 +2816,7 @@ class ClientUI(QWidget):
             self._refresh_ui()
             self._save_active_session_snapshot()
             self.push_event({"type": "MACHINE_SET"}, f"MACHINE {s.machine_name}")
+            self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (FIRST SCAN)")
             return
 
         if res.kind in ("JOB", "JOB_STUB"):
@@ -2535,9 +2966,20 @@ class ClientUI(QWidget):
         self.status.setText(f"Scan handled: {res.kind}")
         self._refresh_ui()
     def send_heartbeat(self):
-        # heartbeat is just a lightweight state push so server keeps it "active"
+        # heartbeat carries a full session snapshot so server can recover after restart
         if self.state.machine_code:
-            self.push_event({"type": "HEARTBEAT"}, "HEARTBEAT", silent=True)
+            snapshot = self._state_to_active_snapshot()
+            self.push_event(
+                {"type": "HEARTBEAT", "session_snapshot": snapshot},
+                "HEARTBEAT",
+                silent=True,
+            )
+
+    def sync_session_snapshot_to_server(self, note: str = "SESSION SYNC"):
+        if not self.state.machine_code:
+            return
+        snapshot = self._state_to_active_snapshot()
+        self.push_event({"type": "SESSION_SYNC", "session_snapshot": snapshot}, note)
 
     def push_event(self, event: Dict[str, Any], last_event: str, silent: bool = False):
         s = self.state
@@ -2583,4 +3025,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

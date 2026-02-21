@@ -21,7 +21,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 APP = FastAPI(title="Machine Dashboard Server")
 
-ACTIVE_TTL_SECONDS = 30  # client considered offline after 30s no heartbeat/event
+ACTIVE_TTL_SECONDS = 2  # aggressive monitoring: mark disconnected quickly
+STATE_TICK_SECONDS = 0.25
 FINISHED_JOBS_FILE = Path(__file__).resolve().parent / "Database" / "finished_jobs_server.json"
 CLIENT_FINISHED_JOBS_FILE = Path(__file__).resolve().parent / "Database" / "finished_jobs_client.json"
 PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"
@@ -51,6 +52,7 @@ class MachineSession:
     job_name: Optional[str] = None
     operator_id: Optional[str] = None
     pack_total: int = 0
+    good_total: int = 0
     butal_total: int = 0
     reject_total: int = 0
     reject_breakdown: Dict[str, int] = None
@@ -65,6 +67,7 @@ class MachineSession:
 
 SESSIONS: Dict[str, MachineSession] = {}  # key = machine_code
 WS_CLIENTS: List[WebSocket] = []
+STATE_TICK_TASK: Optional[asyncio.Task] = None
 
 
 def _read_json_list(path: Path) -> List[Dict[str, Any]]:
@@ -697,21 +700,14 @@ def utc_now() -> datetime:
 
 
 def prune_dead_sessions():
-    cutoff = utc_now() - timedelta(seconds=ACTIVE_TTL_SECONDS)
-    dead = []
-    for k, s in SESSIONS.items():
-        try:
-            t = datetime.fromisoformat(s.last_seen_utc)
-        except Exception:
-            t = utc_now()
-        if t < cutoff:
-            dead.append(k)
-    for k in dead:
-        del SESSIONS[k]
+    """
+    Keep sessions so dashboard can show stale machines as DISCONNECTED.
+    (No hard delete on heartbeat timeout.)
+    """
+    return
 
 
 async def broadcast_state():
-    prune_dead_sessions()
     payload = {
         "type": "STATE",
         "active_ttl_seconds": ACTIVE_TTL_SECONDS,
@@ -727,6 +723,15 @@ async def broadcast_state():
         except Exception:
             pass
     WS_CLIENTS[:] = living
+
+
+async def _state_tick_loop():
+    while True:
+        try:
+            await broadcast_state()
+        except Exception:
+            pass
+        await asyncio.sleep(STATE_TICK_SECONDS)
 
 
 DASHBOARD_HTML = """
@@ -756,7 +761,7 @@ DASHBOARD_HTML = """
     .grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 12px; }
     .card { background: #fff; border-radius: 12px; padding: 16px; border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     .card.active { border-color: #4CAF50; }
-    .card.stopped { border-color: #f44336; }
+    .card.disconnected { border-color: #f44336; }
     .card.maintenance { border-color: #FF9800; }
     .card h3 { margin: 0 0 10px; font-size: 1.05rem; border-bottom: 1px solid #eee; padding-bottom: 8px; }
     .card p { margin: 6px 0; font-size: 0.9rem; }
@@ -967,7 +972,7 @@ DASHBOARD_HTML = """
   const overlayIndex = document.getElementById("overlayIndex");
   const overlayTotal = document.getElementById("overlayTotal");
   const overlayLotNumber = document.getElementById("overlayLotNumber");
-  const MACHINE_CODES = Array.from({length: 23}, (_, i) => `M${String(i + 1).padStart(5, "0")}`);
+  const DEFAULT_MACHINE_CODES = Array.from({length: 23}, (_, i) => `M${String(i + 1).padStart(5, "0")}`);
   let finishedJobsState = [];
   let productItems = [];
   let activeJobRow = null;
@@ -986,12 +991,12 @@ DASHBOARD_HTML = """
 
   function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;"); }
 
-  function statusClass(lastSeenUtc){
-    if(!lastSeenUtc) return "stopped";
+  function statusClass(lastSeenUtc, activeTtlSeconds = 30){
+    if(!lastSeenUtc) return "disconnected";
     const seen = new Date(lastSeenUtc).getTime();
-    if(Number.isNaN(seen)) return "stopped";
+    if(Number.isNaN(seen)) return "disconnected";
     const ageSec = (Date.now() - seen) / 1000;
-    return ageSec <= 30 ? "active" : "stopped";
+    return ageSec <= Number(activeTtlSeconds || 30) ? "active" : "disconnected";
   }
 
   function scoreProduct(item, q){
@@ -1076,7 +1081,7 @@ DASHBOARD_HTML = """
     finishedJobsList.innerHTML = sorted.map((r, idx) => {
       const rawLogs = Array.isArray(r.raw_material_logs) ? r.raw_material_logs : [];
       const rawText = rawLogs.length
-        ? rawLogs.map((x, idx) => `${idx+1}. ${x.material || "-"} | qty=${x.qty || 0} | key=${x.unique_key || "-"}`).join("\\n")
+        ? rawLogs.map((x, idx) => `${idx+1}. ${x.material || "-"} | qty=${x.qty || 0}`).join("\\n")
         : "No raw materials scanned.";
       return `
         <div class="finished-item">
@@ -1160,35 +1165,50 @@ DASHBOARD_HTML = """
     timeEl.textContent = "Server UTC: " + state.server_time_utc;
     machineGrid.innerHTML = "";
     const sessions = state.sessions || [];
+    const activeTtlSeconds = Number(state.active_ttl_seconds || 30);
     const byCode = Object.fromEntries(sessions.map(s => [String(s.machine_code || "").trim(), s]));
-    machineCountEl.textContent = String(MACHINE_CODES.length);
+    const sessionCodes = sessions
+      .map(s => String(s.machine_code || "").trim())
+      .filter(Boolean);
+    const allCodes = Array.from(new Set([...DEFAULT_MACHINE_CODES, ...sessionCodes])).sort();
+    machineCountEl.textContent = String(allCodes.length);
 
-    for(const code of MACHINE_CODES){
+    for(const code of allCodes){
       const s = byCode[code] || {
         machine_code: code,
         machine_name: `Machine ${parseInt(code.slice(1), 10) || code}`,
+        job_code: "",
         job_name: "",
         operator_id: "",
+        client_id: "",
         pack_total: 0,
+        good_total: 0,
         butal_total: 0,
         reject_total: 0,
         last_event: "No data yet",
         last_seen_utc: "",
       };
-      const css = statusClass(s.last_seen_utc) || "stopped";
+      const css = statusClass(s.last_seen_utc, activeTtlSeconds) || "disconnected";
       const card = document.createElement("div");
       card.className = `card ${css}`;
-      const total = Number(s.pack_total||0) + Number(s.butal_total||0) + Number(s.reject_total||0);
+      const total = Number(s.good_total||0) + Number(s.butal_total||0);
+      const jobLabel = s.job_name
+        ? (s.job_code ? `${s.job_name} (${s.job_code})` : s.job_name)
+        : (s.job_code || "No Job Set");
+      const seenLabel = s.last_seen_utc ? new Date(s.last_seen_utc).toLocaleString() : "-";
       card.innerHTML = `
         <h3>${esc(s.machine_name || s.machine_code)}</h3>
         <p>Machine: <strong>${esc(s.machine_code || code)}</strong></p>
-        <p>Job: <strong>${esc(s.job_name || "No Job Set")}</strong></p>
+        <p>Job: <strong>${esc(jobLabel)}</strong></p>
         <p>Operator: <strong>${esc(s.operator_id || "-")}</strong></p>
+        <p>Client: <strong>${esc(s.client_id || "-")}</strong></p>
         <p>Status: <strong>${css.toUpperCase()}</strong></p>
         <p>Pack: <strong>${esc(s.pack_total)}</strong></p>
+        <p>Good: <strong>${esc(s.good_total)}</strong></p>
         <p>Butal: <strong>${esc(s.butal_total)}</strong></p>
         <p>Reject: <strong>${esc(s.reject_total)}</strong></p>
         <p>Total: <strong>${esc(total)}</strong></p>
+        <p class="muted">Last Seen: ${esc(seenLabel)}</p>
         <p class="muted">Last Event: ${esc(s.last_event || "-")}</p>
       `;
       machineGrid.appendChild(card);
@@ -1448,8 +1468,23 @@ async def api_event(req: Request):
             save_finished_jobs(FINISHED_JOBS)
         if machine_code in SESSIONS:
             del SESSIONS[machine_code]
+    elif ev_type in ("SESSION_SYNC", "HEARTBEAT"):
+        snap = ev.get("session_snapshot")
+        if isinstance(snap, dict):
+            sess.machine_name = str(snap.get("machine_name") or sess.machine_name or machine_code)
+            sess.job_code = snap.get("job_code", sess.job_code)
+            sess.job_name = snap.get("job_name", sess.job_name)
+            sess.operator_id = snap.get("operator_id", sess.operator_id)
+            sess.pack_total = int(snap.get("pack_count", sess.pack_total) or 0)
+            sess.good_total = int(snap.get("good_total", sess.good_total) or 0)
+            sess.butal_total = int(snap.get("butal_total", sess.butal_total) or 0)
+            sess.reject_total = int(snap.get("reject_total", sess.reject_total) or 0)
+            if isinstance(snap.get("reject_breakdown"), dict):
+                sess.reject_breakdown = dict(snap.get("reject_breakdown") or {})
     elif ev_type == "PACK":
-        sess.pack_total += int(ev.get("qty", 0) or 0)
+        qty = int(ev.get("qty", 0) or 0)
+        sess.pack_total += qty
+        sess.good_total += qty
     elif ev_type == "BUTAL":
         sess.butal_total += int(ev.get("qty", 0) or 0)
     elif ev_type == "REJECT":
@@ -1600,6 +1635,25 @@ async def ws_endpoint(ws: WebSocket):
     finally:
         if ws in WS_CLIENTS:
             WS_CLIENTS.remove(ws)
+
+
+@APP.on_event("startup")
+async def on_startup():
+    global STATE_TICK_TASK
+    if STATE_TICK_TASK is None or STATE_TICK_TASK.done():
+        STATE_TICK_TASK = asyncio.create_task(_state_tick_loop())
+
+
+@APP.on_event("shutdown")
+async def on_shutdown():
+    global STATE_TICK_TASK
+    if STATE_TICK_TASK is not None:
+        STATE_TICK_TASK.cancel()
+        try:
+            await STATE_TICK_TASK
+        except Exception:
+            pass
+        STATE_TICK_TASK = None
 
 
 if __name__ == "__main__":

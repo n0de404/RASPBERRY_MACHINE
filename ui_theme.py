@@ -17,10 +17,37 @@ QFrame#Panel {
     border-radius: 20px;
 }
 
+QFrame#RightPanel {
+    background: transparent;
+    border: none;
+    border-radius: 20px;
+}
+
 /* Optional: use this objectName for inner sub-panels */
 QFrame#SubPanel {
     background: #f8fbff;
     border: 1px solid #e3eaf5;
+    border-radius: 16px;
+}
+
+QFrame#RightCardOuter {
+    background: #ffffff;
+    border: 1px solid #d8dee8;
+    border-radius: 20px;
+}
+QFrame#RightCardInner {
+    background: #f0f4fd;
+    border: 1px solid #cfd6e1;
+    border-radius: 16px;
+}
+QFrame#LeftCardOuter {
+    background: #ffffff;
+    border: 1px solid #d8dee8;
+    border-radius: 20px;
+}
+QFrame#LeftCardInner {
+    background: #f0f4fd;
+    border: 1px solid #cfd6e1;
     border-radius: 16px;
 }
 
@@ -40,6 +67,23 @@ QLabel#RightTitle {
 QLabel#RightHint {
     color: #6b7280;
     font-size: 12px;
+}
+QLabel#RightMonitorValue,
+QLabel#RightMonitorValueAccent {
+    color: #1e293b;
+    font-size: 15px;
+    font-weight: 800;
+    background: #ffffff;
+    border: 1px solid #dbe4f0;
+    border-radius: 14px;
+    padding: 8px 16px;
+}
+QLabel#RightMonitorValueAccent {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                stop:0 #a7c4ff,
+                                stop:0.42 #d7e4ff,
+                                stop:1 #ffffff);
+    border: 1px solid #cfd5df;
 }
 QLabel#ProductionLiveReason {
     color: #0f172a;
@@ -125,13 +169,33 @@ QLabel#StatusBar {
 
 /* Machine state badge */
 QLabel#MachineAnim {
-    color: #0369a1;
+    color: #14532d;
     font-size: 14px;
     font-weight: 800;
-    background: #e0f2fe;
-    border: 1px solid #7dd3fc;
+    background: #dcfce7;
+    border: 1px solid #86efac;
     border-radius: 14px;
     padding: 8px 12px;
+}
+QLabel#MachineAnim[mode="active"][pulse="1"] {
+    background: #16ff6f;
+    border: 1px solid #22c55e;
+    color: #052e16;
+}
+QLabel#MachineAnim[mode="active"][pulse="0"] {
+    background: #b9fbcf;
+    border: 1px solid #4ade80;
+    color: #14532d;
+}
+QLabel#MachineAnim[mode="idle"][pulse="1"] {
+    background: #ff9f1a;
+    border: 1px solid #f97316;
+    color: #7c2d12;
+}
+QLabel#MachineAnim[mode="idle"][pulse="0"] {
+    background: #ffd08a;
+    border: 1px solid #fb923c;
+    color: #9a3412;
 }
 
 /* ===== Meta fields (Machine/Job/Operator) ===== */
@@ -186,7 +250,7 @@ QLabel#StatTitle {
 }
 QLabel#StatValue {
     font-family: "Segoe UI Variable Display", "Bahnschrift", "Inter";
-    font-size: 50px;
+    font-size: 46px;
     font-weight: 800;
     color: #22d3ee;
 }
@@ -317,24 +381,160 @@ QCheckBox {
 }
 
 QFrame#SettingsOverlay {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                                stop:0 #ffffff, stop:1 #eef2ff);
-    border: 2px solid #94a3b8;
-    border-radius: 16px;
+    background: #f2f3f5;
+    border: 1px solid #d6d7dc;
+    border-radius: 18px;
+}
+QFrame#SettingsShell {
+    background: #f3f4f6;
+    border: none;
+    border-radius: 18px;
+}
+QFrame#SettingsNav {
+    min-width: 150px;
+    max-width: 170px;
+    background: #e7e7ea;
+    border-right: 1px solid #dcdee3;
+    border-top-left-radius: 18px;
+    border-bottom-left-radius: 18px;
+}
+QLabel#SettingsNavTitle {
+    color: #50545c;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    padding: 6px 8px 10px 8px;
+}
+QPushButton#SettingsNavButton {
+    background: transparent;
+    color: #474b53;
+    border: 1px solid transparent;
+    border-radius: 9px;
+    text-align: left;
+    padding: 9px 12px;
+    font-size: 15px;
+    font-weight: 600;
+}
+QPushButton#SettingsNavButton:hover {
+    background: #f4f4f6;
+    border: 1px solid #dddee3;
+}
+QPushButton#SettingsNavButton:checked {
+    background: #ffffff;
+    color: #2e3137;
+    border: 1px solid #d8dae0;
+}
+QFrame#SettingsContent {
+    background: #ffffff;
+    border-top-right-radius: 18px;
+    border-bottom-right-radius: 18px;
+}
+QWidget#SettingsPage {
+    background: #ffffff;
+}
+QLabel#SettingsContentTitle {
+    color: #2f333a;
+    font-size: 18px;
+    font-weight: 700;
+}
+QLabel#SettingsFieldLabel {
+    color: #3d434d;
+    font-size: 13px;
+    font-weight: 700;
+    padding-top: 4px;
+}
+QFrame#SettingsContentDivider {
+    background: #e7e8ec;
+    min-height: 1px;
+    max-height: 1px;
+    border: none;
+}
+QPushButton#SettingsCloseX {
+    background: #eff0f2;
+    color: #7b8089;
+    border: 1px solid #d8dbe1;
+    border-radius: 10px;
+    min-width: 38px;
+    max-width: 38px;
+    min-height: 38px;
+    max-height: 38px;
+    font-size: 20px;
+    font-weight: 500;
+    padding: 0px;
+}
+QPushButton#SettingsCloseX:hover {
+    background: #e7e8eb;
+    color: #565b64;
 }
 QPushButton#SettingToggle {
-    background: #f8fafc;
-    color: #0f172a;
-    border: 1px solid #cbd5e1;
-    border-radius: 12px;
+    background: #ffffff;
+    color: #3a3e45;
+    border: 1px solid #d9dde4;
+    border-radius: 10px;
     text-align: left;
-    padding: 8px 12px;
-    font-size: 14px;
-    font-weight: 800;
+    padding: 8px 11px;
+    font-size: 13px;
+    font-weight: 700;
 }
 QPushButton#SettingToggle:checked {
-    background: #ecfeff;
-    color: #0f766e;
-    border: 1px solid #99f6e4;
+    background: #e4e6ea;
+    color: #2f3339;
+    border: 1px solid #ccd0d7;
+}
+QFrame#SettingsSegmentWrap {
+    background: #f4f4f6;
+    border: 1px solid #d7dbe2;
+    border-radius: 10px;
+    max-width: 370px;
+}
+QPushButton#SettingsSegmentBtn {
+    background: transparent;
+    border: none;
+    border-radius: 10px;
+    color: #646b75;
+    min-height: 32px;
+    font-size: 14px;
+    font-weight: 600;
+}
+QPushButton#SettingsSegmentBtn:checked {
+    background: #dbdde2;
+    color: #4a5059;
+    border: 1px solid #d1d3da;
+}
+QWidget#SettingsSwitchRow {
+    border-top: 1px solid #e7e8ec;
+    padding-top: 10px;
+}
+QLabel#SettingsSwitchLabel {
+    color: #454b55;
+    font-size: 16px;
+    font-weight: 600;
+}
+QPushButton#SettingsSwitch {
+    min-width: 46px;
+    max-width: 46px;
+    min-height: 26px;
+    max-height: 26px;
+    border-radius: 13px;
+    background: #e4e5e9;
+    border: 1px solid #d3d6dd;
+    color: transparent;
+}
+QPushButton#SettingsSwitch:checked {
+    background: #6ea4ee;
+    border: 1px solid #5e92d8;
+}
+QComboBox {
+    background: #ffffff;
+    border: 1px solid #d9dde4;
+    border-radius: 10px;
+    padding: 8px 10px;
+    color: #3c4047;
+    min-width: 140px;
+    max-width: 180px;
+}
+QComboBox:focus {
+    border: 1px solid #c8cdd6;
 }
 """
