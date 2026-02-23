@@ -21,7 +21,8 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QMovie, QPixmap, QColor, QPainter, QPen, QFont
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy,
-    QGraphicsDropShadowEffect, QGraphicsBlurEffect, QProgressBar, QPushButton, QComboBox, QScrollArea
+    QGraphicsDropShadowEffect, QGraphicsBlurEffect, QProgressBar, QPushButton, QComboBox, QScrollArea,
+    QLineEdit
 )
 
 from mappings import parse_scan, MACHINE_MAP, JOB_MAP, REJECT_REASON_MAP
@@ -43,6 +44,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ANIMATIONS_DIR = os.path.join(BASE_DIR, "Animations")
 IMAGES_DIR = os.path.join(BASE_DIR, "Images")
 DATABASE_DIR = os.path.join(BASE_DIR, "Database")
+CLIENT_SETTINGS_FILE = os.path.join(DATABASE_DIR, "client_settings.json")
 INVALID_SCAN_GIF = os.environ.get(
     "MACHINE_INVALID_SCAN_GIF",
     os.path.join(ANIMATIONS_DIR, "slap-virtual-slap.gif"),
@@ -54,6 +56,56 @@ REPAIR_GIF = os.environ.get(
 SUPERVISOR_BADGES = {"3000001": "Charlie Brown"}
 QC_BADGES = {"4000001": "Lucy Van Pelt"}
 REJECT_REVIEW_REQUIRED_ROTATIONS = 4
+
+
+def _load_client_config() -> Dict[str, Any]:
+    defaults = {
+        "server_url": SERVER_URL,
+        "client_id": CLIENT_ID,
+        "scanner_mode": SCANNER_MODE,
+        "scanner_com_port": SCANNER_COM_PORT,
+        "scanner_baudrate": SCANNER_BAUDRATE,
+        "scanner_timeout": SCANNER_TIMEOUT,
+    }
+    try:
+        if os.path.exists(CLIENT_SETTINGS_FILE):
+            with open(CLIENT_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                defaults.update(raw)
+    except Exception:
+        pass
+
+    defaults["server_url"] = str(defaults.get("server_url", SERVER_URL)).strip().rstrip("/")
+    defaults["client_id"] = str(defaults.get("client_id", CLIENT_ID)).strip() or CLIENT_ID
+    defaults["scanner_mode"] = str(defaults.get("scanner_mode", SCANNER_MODE)).strip().lower()
+    defaults["scanner_com_port"] = str(defaults.get("scanner_com_port", SCANNER_COM_PORT)).strip() or SCANNER_COM_PORT
+    try:
+        defaults["scanner_baudrate"] = int(defaults.get("scanner_baudrate", SCANNER_BAUDRATE))
+    except Exception:
+        defaults["scanner_baudrate"] = SCANNER_BAUDRATE
+    try:
+        defaults["scanner_timeout"] = float(defaults.get("scanner_timeout", SCANNER_TIMEOUT))
+    except Exception:
+        defaults["scanner_timeout"] = SCANNER_TIMEOUT
+    return defaults
+
+
+def _save_client_config(cfg: Dict[str, Any]):
+    try:
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        with open(CLIENT_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _machine_display_name(machine_code: Optional[str], machine_name: Optional[str] = None) -> str:
+    code = str(machine_code or "").strip()
+    if code and code in MACHINE_MAP:
+        return MACHINE_MAP[code]
+    name = str(machine_name or "").strip()
+    return name or (code if code else "-")
 
 REJECT_DETAIL_ITEMS = [
     ("BM", "BURN MARK"),
@@ -139,6 +191,12 @@ class ClientState:
     reject_review_actor_name: Optional[str] = None
     reject_review_actor_role: Optional[str] = None
     reject_review_logs: List[Dict[str, Any]] = None
+    waiting_linkage_job_scan: bool = False
+    linkage_enabled: bool = False
+    linkage_job_code: Optional[str] = None
+    linkage_job_name: Optional[str] = None
+    linkage_job_payload: Dict[str, Any] = None
+    linkage_jobs: List[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.reject_breakdown is None:
@@ -153,6 +211,10 @@ class ClientState:
             self.raw_material_unique_keys = set()
         if self.reject_review_logs is None:
             self.reject_review_logs = []
+        if self.linkage_job_payload is None:
+            self.linkage_job_payload = {}
+        if self.linkage_jobs is None:
+            self.linkage_jobs = []
 
 
 @dataclass
@@ -364,6 +426,7 @@ class ClientUI(QWidget):
     def __init__(self):
         super().__init__()
         self.state = ClientState()
+        self.client_config = _load_client_config()
         self._serial_stop = threading.Event()
         self._serial_thread: Optional[threading.Thread] = None
         self._motion_index = 0
@@ -726,6 +789,40 @@ QWidget#ClientUIRoot {{
         downtimeOuterLay.addWidget(downtimeFrame)
 
         rightLayout.addWidget(downtimeOuter)
+        rightLayout.addSpacing(8)
+
+        linkageOuter = QFrame()
+        linkageOuter.setObjectName("RightCardOuter")
+        linkageOuterLay = QVBoxLayout()
+        linkageOuterLay.setContentsMargins(8, 8, 8, 8)
+        linkageOuterLay.setSpacing(0)
+        linkageOuter.setLayout(linkageOuterLay)
+
+        linkageFrame = QFrame()
+        linkageFrame.setObjectName("RightCardInner")
+        linkageFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        linkageCol = QVBoxLayout()
+        linkageCol.setContentsMargins(12, 10, 12, 10)
+        linkageCol.setSpacing(6)
+        linkageFrame.setLayout(linkageCol)
+        linkageCol.addWidget(self._make_right_title_with_icon("Linkage Mirror", "job"))
+        self.linkageMirrorHint = QLabel('Scan "joblinkage~1" then scan another JOB QR.')
+        self.linkageMirrorHint.setObjectName("RightHint")
+        self.linkageMirrorJob = QLabel("Linked Job: -")
+        self.linkageMirrorJob.setObjectName("RightMonitorValue")
+        self.linkageMirrorCounts = QLabel("Pack: 0 | Good: 0 | Butal: 0 | Reject: 0 | Total Good: 0")
+        self.linkageMirrorCounts.setObjectName("RightMonitorValue")
+        self.linkageMirrorCounts.setWordWrap(True)
+        self.linkageMirrorRejects = QLabel("Reject Details: -")
+        self.linkageMirrorRejects.setObjectName("RightMonitorValue")
+        self.linkageMirrorRejects.setWordWrap(True)
+        linkageCol.addWidget(self.linkageMirrorHint)
+        linkageCol.addWidget(self.linkageMirrorJob)
+        linkageCol.addWidget(self.linkageMirrorCounts)
+        linkageCol.addWidget(self.linkageMirrorRejects)
+        linkageOuterLay.addWidget(linkageFrame)
+        self.linkageMirrorOuter = linkageOuter
+        rightLayout.addWidget(linkageOuter)
         rightLayout.addStretch()
 
         contentRow = QHBoxLayout()
@@ -1024,10 +1121,14 @@ QWidget#ClientUIRoot {{
         self.settingsBtnDisplay = QPushButton("Display")
         self.settingsBtnDisplay.setObjectName("SettingsNavButton")
         self.settingsBtnDisplay.setCheckable(True)
+        self.settingsBtnApi = QPushButton("API Config")
+        self.settingsBtnApi.setObjectName("SettingsNavButton")
+        self.settingsBtnApi.setCheckable(True)
         self.settingsNav.layout().addWidget(self.settingsTitle)
         self.settingsNav.layout().addSpacing(8)
         self.settingsNav.layout().addWidget(self.settingsBtnGraphics)
         self.settingsNav.layout().addWidget(self.settingsBtnDisplay)
+        self.settingsNav.layout().addWidget(self.settingsBtnApi)
         self.settingsNav.layout().addStretch(1)
 
         self.settingsContent = QFrame()
@@ -1049,6 +1150,90 @@ QWidget#ClientUIRoot {{
         self.settingsContentDivider.setFrameShape(QFrame.Shape.HLine)
         self.settingsContentDivider.setFrameShadow(QFrame.Shadow.Plain)
         self.settingsContentDivider.setObjectName("SettingsContentDivider")
+
+        self.settingsScroll = QScrollArea()
+        self.settingsScroll.setObjectName("SettingsScroll")
+        self.settingsScroll.setWidgetResizable(True)
+        self.settingsScroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.settingsScroll.setStyleSheet(
+            """
+            QScrollArea#SettingsScroll {
+                background: transparent;
+                border: none;
+            }
+            QScrollArea#SettingsScroll > QWidget > QWidget {
+                background: transparent;
+            }
+            QScrollBar:vertical {
+                background: rgba(15, 23, 42, 0.22);
+                width: 12px;
+                margin: 4px 2px 4px 2px;
+                border-radius: 6px;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(148, 163, 184, 0.92),
+                    stop:1 rgba(100, 116, 139, 0.95)
+                );
+                min-height: 34px;
+                border-radius: 6px;
+                border: 1px solid rgba(255, 255, 255, 0.20);
+            }
+            QScrollBar::handle:vertical:hover {
+                background: qlineargradient(
+                    x1:0, y1:0, x2:1, y2:1,
+                    stop:0 rgba(203, 213, 225, 0.96),
+                    stop:1 rgba(148, 163, 184, 0.98)
+                );
+            }
+            QScrollBar::handle:vertical:pressed {
+                background: rgba(226, 232, 240, 0.95);
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+                background: transparent;
+                border: none;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            QScrollBar:horizontal {
+                background: rgba(15, 23, 42, 0.18);
+                height: 12px;
+                margin: 2px 4px 2px 4px;
+                border-radius: 6px;
+                border: none;
+            }
+            QScrollBar::handle:horizontal {
+                background: rgba(148, 163, 184, 0.9);
+                min-width: 34px;
+                border-radius: 6px;
+                border: 1px solid rgba(255, 255, 255, 0.20);
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: rgba(203, 213, 225, 0.95);
+            }
+            QScrollBar::add-line:horizontal,
+            QScrollBar::sub-line:horizontal {
+                width: 0px;
+                background: transparent;
+                border: none;
+            }
+            QScrollBar::add-page:horizontal,
+            QScrollBar::sub-page:horizontal {
+                background: transparent;
+            }
+            """
+        )
+        self.settingsScrollContent = QWidget()
+        self.settingsScrollContent.setObjectName("SettingsScrollContent")
+        self.settingsScrollContent.setLayout(QVBoxLayout())
+        self.settingsScrollContent.layout().setContentsMargins(0, 0, 4, 0)
+        self.settingsScrollContent.layout().setSpacing(0)
 
         self.settingsGraphicsSection = QWidget()
         self.settingsGraphicsSection.setObjectName("SettingsPage")
@@ -1114,20 +1299,91 @@ QWidget#ClientUIRoot {{
         self.settingsDisplaySection.layout().addWidget(self.displayApplyBtn, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsDisplaySection.layout().addStretch(1)
 
+        self.settingsApiSection = QWidget()
+        self.settingsApiSection.setObjectName("SettingsPage")
+        self.settingsApiSection.setLayout(QVBoxLayout())
+        self.settingsApiSection.layout().setContentsMargins(0, 0, 0, 0)
+        self.settingsApiSection.layout().setSpacing(8)
+
+        self.apiServerUrlLabel = QLabel("Server URL")
+        self.apiServerUrlLabel.setObjectName("MetaLabel")
+        self.apiServerUrlInput = QLineEdit()
+        self.apiServerUrlInput.setPlaceholderText("http://192.168.1.178:8000")
+
+        self.apiClientIdLabel = QLabel("Client ID")
+        self.apiClientIdLabel.setObjectName("MetaLabel")
+        self.apiClientIdInput = QLineEdit()
+        self.apiClientIdInput.setPlaceholderText(socket.gethostname())
+
+        self.apiScannerModeLabel = QLabel("Scanner Mode")
+        self.apiScannerModeLabel.setObjectName("MetaLabel")
+        self.apiScannerModeCombo = QComboBox()
+        self.apiScannerModeCombo.addItems(["auto", "keyboard", "serial"])
+
+        self.apiScannerPortLabel = QLabel("Scanner COM Port")
+        self.apiScannerPortLabel.setObjectName("MetaLabel")
+        self.apiScannerPortInput = QLineEdit()
+        self.apiScannerPortInput.setPlaceholderText("/dev/ttyACM0 or COM3")
+
+        self.apiScannerBaudLabel = QLabel("Scanner Baudrate")
+        self.apiScannerBaudLabel.setObjectName("MetaLabel")
+        self.apiScannerBaudInput = QLineEdit()
+        self.apiScannerBaudInput.setPlaceholderText("9600")
+
+        self.apiScannerTimeoutLabel = QLabel("Scanner Timeout (sec)")
+        self.apiScannerTimeoutLabel.setObjectName("MetaLabel")
+        self.apiScannerTimeoutInput = QLineEdit()
+        self.apiScannerTimeoutInput.setPlaceholderText("1.0")
+
+        self.apiApplyBtn = QPushButton("Apply API Config")
+        self.apiApplyBtn.setObjectName("SettingToggle")
+        for w in (
+            self.apiServerUrlInput,
+            self.apiClientIdInput,
+            self.apiScannerModeCombo,
+            self.apiScannerPortInput,
+            self.apiScannerBaudInput,
+            self.apiScannerTimeoutInput,
+            self.apiApplyBtn,
+        ):
+            w.setFixedWidth(320)
+
+        self.settingsApiSection.layout().addWidget(self.apiServerUrlLabel)
+        self.settingsApiSection.layout().addWidget(self.apiServerUrlInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiClientIdLabel)
+        self.settingsApiSection.layout().addWidget(self.apiClientIdInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiScannerModeLabel)
+        self.settingsApiSection.layout().addWidget(self.apiScannerModeCombo, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiScannerPortLabel)
+        self.settingsApiSection.layout().addWidget(self.apiScannerPortInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiScannerBaudLabel)
+        self.settingsApiSection.layout().addWidget(self.apiScannerBaudInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiScannerTimeoutLabel)
+        self.settingsApiSection.layout().addWidget(self.apiScannerTimeoutInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiApplyBtn, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addStretch(1)
+
         self.settingsCloseBtn.clicked.connect(self._hide_settings_overlay)
         self.chkCheckAnimation.toggled.connect(self._on_setting_check_animation_toggled)
         self.chkFlashingLights.toggled.connect(self._on_setting_flashing_lights_toggled)
         self.chkPulseEffects.toggled.connect(self._on_setting_pulse_effects_toggled)
         self.settingsBtnGraphics.clicked.connect(lambda: self._show_settings_section("graphics"))
         self.settingsBtnDisplay.clicked.connect(lambda: self._show_settings_section("display"))
+        self.settingsBtnApi.clicked.connect(lambda: self._show_settings_section("api"))
         self.displayApplyBtn.clicked.connect(self._apply_display_settings)
+        self.apiApplyBtn.clicked.connect(self._apply_api_settings)
         self.settingsContent.layout().addLayout(self.settingsContentTop)
         self.settingsContent.layout().addWidget(self.settingsContentDivider)
-        self.settingsContent.layout().addWidget(self.settingsGraphicsSection, 1)
-        self.settingsContent.layout().addWidget(self.settingsDisplaySection, 1)
+        self.settingsScrollContent.layout().addWidget(self.settingsGraphicsSection)
+        self.settingsScrollContent.layout().addWidget(self.settingsDisplaySection)
+        self.settingsScrollContent.layout().addWidget(self.settingsApiSection)
+        self.settingsScrollContent.layout().addStretch(1)
+        self.settingsScroll.setWidget(self.settingsScrollContent)
+        self.settingsContent.layout().addWidget(self.settingsScroll, 1)
         self.settingsShell.layout().addWidget(self.settingsNav, 0)
         self.settingsShell.layout().addWidget(self.settingsContent, 1)
         self.settingsOverlay.layout().addWidget(self.settingsShell)
+        self._load_api_settings_form()
         self._show_settings_section("graphics")
         self.settingsOverlay.hide()
         self.settingsOverlay.raise_()
@@ -1739,7 +1995,13 @@ QWidget#ClientUIRoot {{
         t = QLabel(title)
         t.setObjectName("StatTitle")
         value_label.setObjectName("StatValue")
-        value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if isinstance(value_label, QLabel):
+            value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        else:
+            try:
+                value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            except Exception:
+                pass
         f.layout().addWidget(t)
         f.layout().addWidget(value_label)
         return f
@@ -1763,7 +2025,7 @@ QWidget#ClientUIRoot {{
 
     def _refresh_ui(self):
         s = self.state
-        self.lblMachine.setText(s.machine_name or "-")
+        self.lblMachine.setText(_machine_display_name(s.machine_code, s.machine_name))
         self.lblJob.setText(s.job_name or "-")
         self.lblOperator.setText(self._operator_display_name(s.operator_id))
 
@@ -1802,6 +2064,7 @@ QWidget#ClientUIRoot {{
             self._set_banner_text("Ready: Scan PACK / BUTAL / Reject~1")
         self._refresh_job_details()
         self._refresh_downtime_panel()
+        self._refresh_linkage_panel()
 
     def _session_is_running(self) -> bool:
         s = self.state
@@ -1866,6 +2129,33 @@ QWidget#ClientUIRoot {{
                 self.productionCounter.setText("00:00:00")
                 if self._repair_movie is None:
                     self.productionFixAnim.setText("Repair in progress...")
+
+    def _refresh_linkage_panel(self):
+        s = self.state
+        if getattr(self, "linkageMirrorOuter", None) is None:
+            return
+        if s.waiting_linkage_job_scan:
+            self.linkageMirrorHint.setText("Linkage mode active: scan another JOB QR to mirror current session.")
+        elif s.linkage_enabled:
+            self.linkageMirrorHint.setText("Mirroring current session counters/reject details to linked job.")
+        else:
+            self.linkageMirrorHint.setText('Scan "joblinkage~1" then scan another JOB QR.')
+
+        linked_rows = list(s.linkage_jobs or [])
+        if linked_rows:
+            linked_name = ", ".join(
+                [str(r.get("job_name") or r.get("job_code") or "-") for r in linked_rows[:2]]
+            )
+            if len(linked_rows) > 2:
+                linked_name += f" (+{len(linked_rows) - 2})"
+        else:
+            linked_name = s.linkage_job_name or s.linkage_job_code or "-"
+        self.linkageMirrorJob.setText(f"Linked Job(s): {linked_name}")
+        self.linkageMirrorCounts.setText(
+            f"Pack: {s.pack_count} | Good: {s.good_total} | Butal: {s.butal_total} | Total Good: {s.good_total + s.butal_total}"
+        )
+        self.linkageMirrorRejects.setText("Reject Details: not mirrored (finish goods linkage only)")
+        self.linkageMirrorOuter.setVisible(bool(s.machine_code))
 
     def _save_finished_job_local(self, payload: Dict[str, Any]):
         os.makedirs(DATABASE_DIR, exist_ok=True)
@@ -1946,6 +2236,12 @@ QWidget#ClientUIRoot {{
             "reject_review_actor_name": s.reject_review_actor_name,
             "reject_review_actor_role": s.reject_review_actor_role,
             "reject_review_logs": list(s.reject_review_logs or []),
+            "waiting_linkage_job_scan": bool(s.waiting_linkage_job_scan),
+            "linkage_enabled": bool(s.linkage_enabled),
+            "linkage_job_code": s.linkage_job_code,
+            "linkage_job_name": s.linkage_job_name,
+            "linkage_job_payload": dict(s.linkage_job_payload or {}),
+            "linkage_jobs": list(s.linkage_jobs or []),
         }
 
     def _save_active_session_snapshot(self):
@@ -1976,7 +2272,7 @@ QWidget#ClientUIRoot {{
     def _restore_state_from_snapshot(self, snap: Dict[str, Any]):
         s = self.state
         s.machine_code = snap.get("machine_code")
-        s.machine_name = snap.get("machine_name")
+        s.machine_name = _machine_display_name(snap.get("machine_code"), snap.get("machine_name"))
         s.job_code = snap.get("job_code")
         s.job_name = snap.get("job_name")
         s.operator_id = snap.get("operator_id")
@@ -2013,6 +2309,12 @@ QWidget#ClientUIRoot {{
         s.reject_review_actor_name = snap.get("reject_review_actor_name")
         s.reject_review_actor_role = snap.get("reject_review_actor_role")
         s.reject_review_logs = list(snap.get("reject_review_logs") or [])
+        s.waiting_linkage_job_scan = bool(snap.get("waiting_linkage_job_scan"))
+        s.linkage_enabled = bool(snap.get("linkage_enabled"))
+        s.linkage_job_code = snap.get("linkage_job_code")
+        s.linkage_job_name = snap.get("linkage_job_name")
+        s.linkage_job_payload = dict(snap.get("linkage_job_payload") or {})
+        s.linkage_jobs = list(snap.get("linkage_jobs") or [])
         self._refresh_ui()
 
     def _build_finished_job_payload(self) -> Dict[str, Any]:
@@ -2021,7 +2323,7 @@ QWidget#ClientUIRoot {{
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
             "client_id": CLIENT_ID,
             "machine_code": s.machine_code,
-            "machine_name": s.machine_name,
+            "machine_name": _machine_display_name(s.machine_code, s.machine_name),
             "job_code": s.job_code,
             "job_name": s.job_name,
             "operator_id": s.operator_id,
@@ -2043,7 +2345,50 @@ QWidget#ClientUIRoot {{
             "cycle_time_current": s.cycle_time_current,
             "maintenance_name": s.maintenance_name,
             "supervisor_name": s.supervisor_name,
+            "linkage_enabled": bool(s.linkage_enabled),
+            "linkage_job_code": s.linkage_job_code,
+            "linkage_job_name": s.linkage_job_name,
+            "linkage_job_payload": s.linkage_job_payload or {},
+            "linkage_jobs": list(s.linkage_jobs or []),
+            "linkage_mirror": {
+                "pack_count": int(s.pack_count or 0),
+                "good_total": int(s.good_total or 0),
+                "butal_total": int(s.butal_total or 0),
+                "total_good": int((s.good_total or 0) + (s.butal_total or 0)),
+            } if s.linkage_enabled else None,
         }
+
+    def _build_linked_finished_job_payloads(self, main_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        s = self.state
+        linked_rows = list(s.linkage_jobs or [])
+        if not linked_rows:
+            return []
+        total_jobs_in_group = 1 + len(linked_rows)
+        out: List[Dict[str, Any]] = []
+        for idx, row in enumerate(linked_rows, start=2):
+            linked_payload = dict(main_payload)
+            linked_payload["job_code"] = row.get("job_code") or linked_payload.get("job_code")
+            linked_payload["job_name"] = row.get("job_name") or linked_payload.get("job_name")
+            linked_payload["job_payload"] = dict(row.get("job_payload") or {})
+            # Linked jobs mirror only finish-goods counters, not rejects.
+            linked_payload["pack_count"] = int(s.pack_count or 0)
+            linked_payload["good_total"] = int(s.good_total or 0)
+            linked_payload["butal_total"] = int(s.butal_total or 0)
+            linked_payload["reject_total"] = 0
+            linked_payload["reject_breakdown"] = {}
+            linked_payload["total_good"] = int((s.good_total or 0) + (s.butal_total or 0))
+            linked_payload["startup_reject_total"] = 0
+            linked_payload["linkage_enabled"] = True
+            linked_payload["linkage_role"] = "LINKED"
+            linked_payload["linkage_group_total_jobs"] = total_jobs_in_group
+            linked_payload["linkage_main_job_code"] = main_payload.get("job_code")
+            linked_payload["linkage_main_job_name"] = main_payload.get("job_name")
+            linked_payload["linkage_note"] = (
+                f"Linked job {idx} of {total_jobs_in_group}. "
+                f"Main job is {main_payload.get('job_name') or main_payload.get('job_code') or '-'} (1 of {total_jobs_in_group})."
+            )
+            out.append(linked_payload)
+        return out
 
     def _clear_full_session(self):
         s = self.state
@@ -2076,6 +2421,12 @@ QWidget#ClientUIRoot {{
         s.raw_material_unique_keys = set()
         s.startup_reject_total = 0
         s.reject_review_logs = []
+        s.waiting_linkage_job_scan = False
+        s.linkage_enabled = False
+        s.linkage_job_code = None
+        s.linkage_job_name = None
+        s.linkage_job_payload = {}
+        s.linkage_jobs = []
         self._reset_downtime_resolution_state()
         self._hide_resolve_overlay()
         self._hide_production_overlay()
@@ -2189,14 +2540,83 @@ QWidget#ClientUIRoot {{
 
     def _show_settings_section(self, section: str):
         is_graphics = section == "graphics"
+        is_display = section == "display"
+        is_api = section == "api"
         self.settingsBtnGraphics.setChecked(is_graphics)
-        self.settingsBtnDisplay.setChecked(not is_graphics)
+        self.settingsBtnDisplay.setChecked(is_display)
+        self.settingsBtnApi.setChecked(is_api)
         self.settingsGraphicsSection.setVisible(is_graphics)
-        self.settingsDisplaySection.setVisible(not is_graphics)
+        self.settingsDisplaySection.setVisible(is_display)
+        self.settingsApiSection.setVisible(is_api)
         if is_graphics:
             self.settingsContentTitle.setText("Graphics")
-        else:
+        elif is_display:
             self.settingsContentTitle.setText("Display")
+        else:
+            self.settingsContentTitle.setText("API Config")
+
+    def _load_api_settings_form(self):
+        cfg = self.client_config
+        self.apiServerUrlInput.setText(str(cfg.get("server_url", SERVER_URL)))
+        self.apiClientIdInput.setText(str(cfg.get("client_id", CLIENT_ID)))
+        mode = str(cfg.get("scanner_mode", SCANNER_MODE)).strip().lower()
+        idx = self.apiScannerModeCombo.findText(mode, Qt.MatchFlag.MatchFixedString)
+        self.apiScannerModeCombo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.apiScannerPortInput.setText(str(cfg.get("scanner_com_port", SCANNER_COM_PORT)))
+        self.apiScannerBaudInput.setText(str(cfg.get("scanner_baudrate", SCANNER_BAUDRATE)))
+        self.apiScannerTimeoutInput.setText(str(cfg.get("scanner_timeout", SCANNER_TIMEOUT)))
+
+    def _apply_api_settings(self):
+        server_url = self.apiServerUrlInput.text().strip().rstrip("/")
+        client_id = self.apiClientIdInput.text().strip() or socket.gethostname()
+        scanner_mode = self.apiScannerModeCombo.currentText().strip().lower()
+        scanner_port = self.apiScannerPortInput.text().strip()
+        if not server_url:
+            self.status.setText("API config failed: Server URL is required.")
+            return
+        if scanner_mode not in ("auto", "keyboard", "serial"):
+            self.status.setText("API config failed: invalid scanner mode.")
+            return
+        try:
+            scanner_baudrate = int(self.apiScannerBaudInput.text().strip())
+            if scanner_baudrate <= 0:
+                raise ValueError()
+        except Exception:
+            self.status.setText("API config failed: Scanner baudrate must be a positive integer.")
+            return
+        try:
+            scanner_timeout = float(self.apiScannerTimeoutInput.text().strip())
+            if scanner_timeout < 0:
+                raise ValueError()
+        except Exception:
+            self.status.setText("API config failed: Scanner timeout must be 0 or greater.")
+            return
+
+        self.client_config.update({
+            "server_url": server_url,
+            "client_id": client_id,
+            "scanner_mode": scanner_mode,
+            "scanner_com_port": scanner_port or SCANNER_COM_PORT,
+            "scanner_baudrate": scanner_baudrate,
+            "scanner_timeout": scanner_timeout,
+        })
+        _save_client_config(self.client_config)
+        self._restart_scanner_input()
+        self.status.setText("API/Scanner configuration applied.")
+
+    def _restart_scanner_input(self):
+        self._serial_stop.set()
+        if self._serial_thread and self._serial_thread.is_alive():
+            self._serial_thread.join(timeout=1.0)
+        self._serial_thread = None
+        if hasattr(self, "filter"):
+            try:
+                self.removeEventFilter(self.filter)
+            except Exception:
+                pass
+            self.filter = None
+        self._serial_stop = threading.Event()
+        self._setup_scanner_input()
 
     def _apply_display_settings(self):
         os_name = self.displayOsCombo.currentText().strip()
@@ -2390,7 +2810,10 @@ QWidget#ClientUIRoot {{
             self.status.setToolTip("")
 
     def _setup_scanner_input(self):
-        mode = SCANNER_MODE
+        mode = str(self.client_config.get("scanner_mode", SCANNER_MODE)).strip().lower()
+        scanner_port = str(self.client_config.get("scanner_com_port", SCANNER_COM_PORT)).strip() or SCANNER_COM_PORT
+        scanner_baudrate = int(self.client_config.get("scanner_baudrate", SCANNER_BAUDRATE))
+        scanner_timeout = float(self.client_config.get("scanner_timeout", SCANNER_TIMEOUT))
         if mode not in ("auto", "keyboard", "serial"):
             mode = "auto"
 
@@ -2413,20 +2836,23 @@ QWidget#ClientUIRoot {{
         self._serial_thread = threading.Thread(target=self._serial_reader_loop, daemon=True)
         self._serial_thread.start()
         if mode == "auto":
-            self._set_status_text(f"Scanner input: Auto mode (keyboard + serial {SCANNER_COM_PORT})")
+            self._set_status_text(f"Scanner input: Auto mode (keyboard + serial {scanner_port})")
         else:
-            self._set_status_text(f"Scanner input: Serial mode ({SCANNER_COM_PORT})")
+            self._set_status_text(f"Scanner input: Serial mode ({scanner_port})")
 
     def _serial_reader_loop(self):
         while not self._serial_stop.is_set():
+            scanner_port = str(self.client_config.get("scanner_com_port", SCANNER_COM_PORT)).strip() or SCANNER_COM_PORT
+            scanner_baudrate = int(self.client_config.get("scanner_baudrate", SCANNER_BAUDRATE))
+            scanner_timeout = float(self.client_config.get("scanner_timeout", SCANNER_TIMEOUT))
             try:
                 with serial.Serial(
-                    port=SCANNER_COM_PORT,
-                    baudrate=SCANNER_BAUDRATE,
-                    timeout=SCANNER_TIMEOUT,
+                    port=scanner_port,
+                    baudrate=scanner_baudrate,
+                    timeout=scanner_timeout,
                 ) as ser:
                     self.scanner_status.emit(
-                        f"Scanner serial connected: {SCANNER_COM_PORT} @ {SCANNER_BAUDRATE}"
+                        f"Scanner serial connected: {scanner_port} @ {scanner_baudrate}"
                     )
                     while not self._serial_stop.is_set():
                         raw = ser.readline()
@@ -2436,7 +2862,7 @@ QWidget#ClientUIRoot {{
                         if text:
                             self.scan_received.emit(text)
             except Exception as e:
-                self.scanner_status.emit(f"Scanner serial retry ({SCANNER_COM_PORT}): {e}")
+                self.scanner_status.emit(f"Scanner serial retry ({scanner_port}): {e}")
                 self._serial_stop.wait(2.0)
 
     def can_accept_production_scans(self) -> bool:
@@ -2716,17 +3142,50 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Cannot finish while downtime/reject flow is active.")
                 return
             finished_payload = self._build_finished_job_payload()
+            if self.state.linkage_enabled and (self.state.linkage_jobs or []):
+                total_jobs_in_group = 1 + len(self.state.linkage_jobs or [])
+                finished_payload["linkage_role"] = "MAIN"
+                finished_payload["linkage_group_total_jobs"] = total_jobs_in_group
+                finished_payload["linkage_note"] = (
+                    f"Main job (1 of {total_jobs_in_group}) with {len(self.state.linkage_jobs or [])} linked job(s)."
+                )
+            linked_finished_payloads = self._build_linked_finished_job_payloads(finished_payload)
             try:
                 self._save_finished_job_local(finished_payload)
+                for lp in linked_finished_payloads:
+                    self._save_finished_job_local(lp)
             except Exception as e:
                 self.status.setText(f"Finish saved to server only (local JSON failed: {e})")
             self.push_event(
                 {"type": "FINISH_JOB", "finished_job": finished_payload},
                 f"FINISH JOB {s.job_name or s.job_code or ''}".strip(),
             )
+            for lp in linked_finished_payloads:
+                self.push_event(
+                    {"type": "FINISH_JOB", "finished_job": lp},
+                    f"FINISH LINKED JOB {lp.get('job_name') or lp.get('job_code') or ''}".strip(),
+                    silent=True,
+                )
             self.status.setText("Finishing job...")
             self._finish_pending_clear = True
             self._show_finish_overlay()
+            return
+
+        if res.kind == "JOB_LINKAGE_TRIGGER":
+            if not self.can_accept_production_scans():
+                self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+                return
+            if s.waiting_reject_reason or s.waiting_production_report_reason or s.downtime_active:
+                self.status.setText("Cannot start linkage while reject/downtime flow is active.")
+                return
+            s.waiting_linkage_job_scan = True
+            s.linkage_enabled = False
+            s.linkage_job_code = None
+            s.linkage_job_name = None
+            s.linkage_job_payload = {}
+            s.linkage_jobs = []
+            self.status.setText("Linkage mode enabled. Scan another JOB QR to mirror current session.")
+            self._refresh_ui()
             return
 
         if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
@@ -2777,7 +3236,7 @@ QWidget#ClientUIRoot {{
             if snap is not None and str(snap.get("job_code") or "").strip():
                 self._restore_state_from_snapshot(snap)
                 if not self.state.machine_name:
-                    self.state.machine_name = res.value
+                    self.state.machine_name = _machine_display_name(self.state.machine_code, res.value)
                 self.status.setText(
                     f"Recovered ongoing session for {self.state.machine_name} / {self.state.job_name or self.state.job_code}."
                 )
@@ -2785,7 +3244,7 @@ QWidget#ClientUIRoot {{
                 self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (RESUME)")
                 return
             s.machine_code = raw_s
-            s.machine_name = res.value
+            s.machine_name = _machine_display_name(s.machine_code, res.value)
             s.job_code = None
             s.job_name = None
             s.operator_id = None
@@ -2807,6 +3266,12 @@ QWidget#ClientUIRoot {{
             s.raw_material_unique_keys = set()
             s.startup_reject_total = 0
             s.reject_review_logs = []
+            s.waiting_linkage_job_scan = False
+            s.linkage_enabled = False
+            s.linkage_job_code = None
+            s.linkage_job_name = None
+            s.linkage_job_payload = {}
+            s.linkage_jobs = []
             self._reset_downtime_resolution_state()
             self._hide_resolve_overlay()
             self._hide_production_overlay()
@@ -2820,6 +3285,65 @@ QWidget#ClientUIRoot {{
             return
 
         if res.kind in ("JOB", "JOB_STUB"):
+            if s.waiting_linkage_job_scan:
+                if not (s.machine_code and s.job_code and s.operator_id):
+                    s.waiting_linkage_job_scan = False
+                    self.status.setText("Linkage cancelled: complete current session first.")
+                    self._refresh_ui()
+                    return
+                linked_job_code = ""
+                linked_job_name = ""
+                linked_job_payload: Dict[str, Any] = {}
+                if res.kind == "JOB":
+                    po_from_meta = ""
+                    if isinstance(res.meta, dict):
+                        po_from_meta = self._safe_text(res.meta.get("po_number"), "")
+                    linked_job_code = po_from_meta or raw_s
+                    linked_job_name = res.value
+                else:
+                    payload = res.meta or {}
+                    linked_job_payload = payload if isinstance(payload, dict) else {}
+                    job = {}
+                    if isinstance(linked_job_payload.get("data"), dict) and isinstance(linked_job_payload["data"].get("job"), dict):
+                        job = linked_job_payload["data"]["job"]
+                    elif isinstance(linked_job_payload.get("job"), dict):
+                        job = linked_job_payload["job"]
+                    linked_job_code = (
+                        self._safe_text(job.get("id"), "")
+                        or self._safe_text(job.get("ref_no"), "")
+                        or self._safe_text(linked_job_payload.get("job_code"), "")
+                        or "QR-STUB"
+                    )
+                    linked_job_name = (
+                        self._safe_text(job.get("ref_no"), "")
+                        or self._safe_text(linked_job_payload.get("job_name"), "")
+                        or "Job Stub"
+                    )
+                if self._normalize_job_code(linked_job_code) == self._normalize_job_code(s.job_code):
+                    s.waiting_linkage_job_scan = False
+                    self.status.setText("Linkage cancelled: linked job must be different from current job.")
+                    self._show_invalid_overlay()
+                    self._refresh_ui()
+                    return
+                normalized_new = self._normalize_job_code(linked_job_code)
+                if any(self._normalize_job_code(x.get("job_code")) == normalized_new for x in (s.linkage_jobs or [])):
+                    self.status.setText("Linked job already added. Scan another JOB or scan PACK/BUTAL to continue.")
+                    self._show_invalid_overlay()
+                    self._refresh_ui()
+                    return
+                s.linkage_enabled = True
+                s.linkage_job_code = linked_job_code
+                s.linkage_job_name = linked_job_name
+                s.linkage_job_payload = linked_job_payload
+                s.linkage_jobs.append({
+                    "job_code": linked_job_code,
+                    "job_name": linked_job_name,
+                    "job_payload": linked_job_payload,
+                })
+                self.status.setText(f"Linked job added: {linked_job_name or linked_job_code}. Scan more jobs or scan PACK/BUTAL to continue.")
+                self._refresh_ui()
+                self._save_active_session_snapshot()
+                return
             if s.machine_code and s.job_code and s.operator_id:
                 self.status.setText("Finish your current job first before changing machine or job.")
                 return
@@ -2866,6 +3390,12 @@ QWidget#ClientUIRoot {{
             s.raw_material_unique_keys = set()
             s.startup_reject_total = 0
             s.reject_review_logs = []
+            s.waiting_linkage_job_scan = False
+            s.linkage_enabled = False
+            s.linkage_job_code = None
+            s.linkage_job_name = None
+            s.linkage_job_payload = {}
+            s.linkage_jobs = []
             self._reset_downtime_resolution_state()
             self._hide_resolve_overlay()
             self._hide_production_overlay()
@@ -2908,6 +3438,15 @@ QWidget#ClientUIRoot {{
             if not self.can_accept_production_scans():
                 self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
                 return
+            if s.waiting_linkage_job_scan:
+                if s.linkage_jobs:
+                    s.waiting_linkage_job_scan = False
+                    s.linkage_enabled = True
+                    self.status.setText(f"Linkage finalized with {len(s.linkage_jobs)} linked job(s).")
+                    self._refresh_ui()
+                else:
+                    self.status.setText("Linkage mode active: scan at least one JOB QR first.")
+                    return
 
             if res.kind == "PRODUCTION_DAILY_REPORT_TRIGGER":
                 s.waiting_production_report_reason = True
@@ -2988,7 +3527,7 @@ QWidget#ClientUIRoot {{
         self._save_active_session_snapshot()
 
         payload = {
-            "client_id": CLIENT_ID,
+            "client_id": str(self.client_config.get("client_id", CLIENT_ID)).strip() or CLIENT_ID,
             "machine_code": s.machine_code,
             "machine_name": s.machine_name or s.machine_code,
             "job_code": s.job_code,
@@ -3000,7 +3539,8 @@ QWidget#ClientUIRoot {{
 
         def _send():
             try:
-                requests.post(f"{SERVER_URL}/api/event", json=payload, timeout=3)
+                server_url = str(self.client_config.get("server_url", SERVER_URL)).strip().rstrip("/")
+                requests.post(f"{server_url}/api/event", json=payload, timeout=3)
                 if not silent:
                     pass
             except Exception as e:

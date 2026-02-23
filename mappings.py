@@ -9,9 +9,26 @@ from typing import Optional, Dict, Any
 
 
 MACHINE_MAP: Dict[str, str] = {
-    "M00001": "Machine 01",
-    "M00002": "Machine 02",
-    "M00003": "Machine 03",
+    "M00001": "IMM 301",
+    "M00002": "IMM 302",
+    "M00004": "IMM 303",
+    "M00005": "IMM 304",
+    "M00006": "IMM 305",
+    "M00007": "IMM 306",
+    "M00008": "IMM 307",
+    "M00009": "IMM 308",
+    "M00010": "IMM 309",
+    "M00011": "IMM 310",
+    "M00012": "IMM 311",
+    "M00013": "IMM 312",
+    "M00014": "IMM 314",
+    "M00015": "IMM 315",
+    "M00016": "IMM 316",
+    "M00017": "IMM 317",
+    "M00018": "IMM 318",
+    "M00019": "IMM 319",
+    "M00020": "IMM 320",
+    "M00021": "IMM 321",
 }
 
 JOB_MAP: Dict[str, str] = {
@@ -148,6 +165,8 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_RESOLVE", raw=raw, value="Production daily report resolve")
     if s_l in ("finishjob", "finishjob~1", "jobfinish"):
         return ScanResult(kind="FINISH_JOB", raw=raw, value="Finish current job session")
+    if s_l == "joblinkage~1":
+        return ScanResult(kind="JOB_LINKAGE_TRIGGER", raw=raw, value="Linkage mode")
 
     # Reject summary trigger
     if s_l == "rejectsummary":

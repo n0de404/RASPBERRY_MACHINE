@@ -1,0 +1,8 @@
+{
+  "server_url": "http://192.168.1.178:8000",
+  "client_id": "philtop-it-001",
+  "scanner_mode": "auto",
+  "scanner_com_port": "Com6",
+  "scanner_baudrate": 9600,
+  "scanner_timeout": 1.0
+}

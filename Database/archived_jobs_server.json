@@ -1,0 +1,296 @@
+[
+  {
+    "finished_at_utc": "2026-02-23T06:21:09.999462+00:00",
+    "client_id": "rpi-d1-001",
+    "machine_code": "M00001",
+    "machine_name": "IMM 301",
+    "job_code": "102378",
+    "job_name": "J021-9233",
+    "operator_id": "1000001 - Snoopy Von Peanuts",
+    "pack_count": 0,
+    "good_total": 0,
+    "butal_total": 1,
+    "reject_total": 0,
+    "total_good": 1,
+    "reject_breakdown": {},
+    "startup_reject_total": 0,
+    "raw_sacks_count": 1,
+    "raw_material_scans": [
+      "Raw Material 5210"
+    ],
+    "raw_material_logs": [
+      {
+        "material": "Raw Material 5210",
+        "qty": 1,
+        "unique_key": "I00000000001T00000000003L20260218131830-000000102378",
+        "raw_job_code": "102378",
+        "scanned_at": "2026-02-23T04:28:44.770240+00:00"
+      }
+    ],
+    "job_payload": {},
+    "reject_review_logs": [],
+    "downtime_last_seconds": null,
+    "downtime_reason_code": null,
+    "downtime_reason_text": null,
+    "cycle_time_current": null,
+    "maintenance_name": null,
+    "supervisor_name": null,
+    "review_history": [
+      {
+        "action": "APPROVE",
+        "remarks": "123",
+        "actor_name": "Charlie Brown",
+        "actor_code": "3000001",
+        "actor_role": "Supervisor",
+        "timestamp_utc": "2026-02-23T06:23:11.857591+00:00"
+      },
+      {
+        "action": "APPROVE",
+        "remarks": "DONE DONE",
+        "actor_name": "Charlie Brown",
+        "actor_code": "3000001",
+        "actor_role": "Supervisor",
+        "timestamp_utc": "2026-02-23T06:42:10.496703+00:00"
+      },
+      {
+        "action": "APPROVE",
+        "remarks": "DONE",
+        "actor_name": "Charlie Brown",
+        "actor_code": "3000001",
+        "actor_role": "Supervisor",
+        "timestamp_utc": "2026-02-23T06:42:23.192893+00:00"
+      },
+      {
+        "action": "APPROVE",
+        "remarks": "12312",
+        "actor_name": "Charlie Brown",
+        "actor_code": "3000001",
+        "actor_role": "Supervisor",
+        "timestamp_utc": "2026-02-23T06:46:54.996990+00:00"
+      },
+      {
+        "action": "ARCHIVE_AFTER_PRINT",
+        "timestamp_utc": "2026-02-23T06:47:01.099048+00:00"
+      }
+    ],
+    "approved_by": "Charlie Brown",
+    "approved_by_code": "3000001",
+    "approved_by_role": "Supervisor",
+    "approved_remarks": "12312",
+    "approved_at_utc": "2026-02-23T06:46:54.996990+00:00",
+    "review_status": "APPROVED",
+    "printed_at_utc": "2026-02-23T06:47:01.099048+00:00",
+    "archived_at_utc": "2026-02-23T06:47:01.099048+00:00",
+    "print_request_payload": {
+      "product_name": "[-B-001-BLUE] Baker's Crate Blue",
+      "quantity": "1",
+      "total": "1",
+      "po_number": "102341",
+      "product_desc": "J021-9233",
+      "requested_at_ph": "",
+      "lot_number": "20260223144658-000000102341"
+    },
+    "printed_qr_payload": "O000000000240000010237800000000000V2P00000000015Q00000000001I00000000001T00000000001L20260223144658-000000102341\n\nPrint request sent.",
+    "archive_status": "PRINTED_ARCHIVED"
+  },
+  {
+    "finished_at_utc": "2026-02-20T09:21:11.789351+00:00",
+    "client_id": "philtop-it-001",
+    "machine_code": "M00001",
+    "machine_name": "Machine 01",
+    "job_code": "102378",
+    "job_name": "J021-9233",
+    "operator_id": "1000001 - Snoopy Von Peanuts",
+    "pack_count": 0,
+    "good_total": 0,
+    "butal_total": 0,
+    "reject_total": 4,
+    "total_good": 0,
+    "reject_breakdown": {
+      "COLOR STREAK": 1,
+      "CRACK/BRITTLE": 1,
+      "CONTAMINATION": 1,
+      "BURN MARK": 1
+    },
+    "startup_reject_total": 0,
+    "raw_sacks_count": 0,
+    "raw_material_scans": [],
+    "raw_material_logs": [],
+    "job_payload": {},
+    "reject_review_logs": [],
+    "downtime_last_seconds": null,
+    "downtime_reason_code": null,
+    "downtime_reason_text": null,
+    "cycle_time_current": null,
+    "maintenance_name": null,
+    "supervisor_name": null,
+    "review_history": [
+      {
+        "action": "APPROVE",
+        "remarks": "123",
+        "actor_name": "Charlie Brown",
+        "actor_code": "3000001",
+        "actor_role": "Supervisor",
+        "timestamp_utc": "2026-02-23T06:56:04.605473+00:00"
+      },
+      {
+        "action": "ARCHIVE_AFTER_PRINT",
+        "timestamp_utc": "2026-02-23T06:56:10.315312+00:00"
+      }
+    ],
+    "approved_by": "Charlie Brown",
+    "approved_by_code": "3000001",
+    "approved_by_role": "Supervisor",
+    "approved_remarks": "123",
+    "approved_at_utc": "2026-02-23T06:56:04.605473+00:00",
+    "review_status": "APPROVED",
+    "printed_at_utc": "2026-02-23T06:56:10.315312+00:00",
+    "archived_at_utc": "2026-02-23T06:56:10.315312+00:00",
+    "print_request_payload": {
+      "product_name": "[-B-001-BLUE] Baker's Crate Blue",
+      "quantity": "1",
+      "total": "1",
+      "po_number": "123133",
+      "product_desc": "J021-9233",
+      "requested_at_ph": "",
+      "lot_number": "20260223145609-000000123133"
+    },
+    "printed_qr_payload": "O000000000240000010237800000000000V2P00000000015Q00000000001I00000000001T00000000001L20260223145609-000000123133\n\nPrint request sent.",
+    "archive_status": "PRINTED_ARCHIVED"
+  },
+  {
+    "finished_at_utc": "2026-02-20T09:01:06.836116+00:00",
+    "client_id": "philtop-it-001",
+    "machine_code": "M00001",
+    "machine_name": "Machine 01",
+    "job_code": "102378",
+    "job_name": "J021-9233",
+    "operator_id": "1000001 - Snoopy Von Peanuts",
+    "pack_count": 0,
+    "good_total": 0,
+    "butal_total": 0,
+    "reject_total": 1,
+    "total_good": 0,
+    "reject_breakdown": {
+      "CONTAMINATION": 1
+    },
+    "startup_reject_total": 0,
+    "raw_sacks_count": 0,
+    "raw_material_scans": [],
+    "raw_material_logs": [],
+    "job_payload": {},
+    "reject_review_logs": [],
+    "downtime_last_seconds": null,
+    "downtime_reason_code": null,
+    "downtime_reason_text": null,
+    "cycle_time_current": null,
+    "maintenance_name": null,
+    "supervisor_name": null,
+    "review_history": [
+      {
+        "action": "APPROVE",
+        "remarks": "31231",
+        "actor_name": "Charlie Brown",
+        "actor_code": "3000001",
+        "actor_role": "Supervisor",
+        "timestamp_utc": "2026-02-23T07:06:18.031093+00:00"
+      },
+      {
+        "action": "APPROVE",
+        "remarks": "Approve rejects + Cycle Counts",
+        "actor_name": "Bryan Sampaga",
+        "actor_code": "10186",
+        "actor_role": "Supervisor/QC",
+        "timestamp_utc": "2026-02-23T09:07:08.070578+00:00"
+      },
+      {
+        "action": "ARCHIVE_AFTER_PRINT",
+        "timestamp_utc": "2026-02-23T09:07:20.304601+00:00"
+      }
+    ],
+    "approved_by": "Bryan Sampaga",
+    "approved_by_code": "10186",
+    "approved_by_role": "Supervisor/QC",
+    "approved_remarks": "Approve rejects + Cycle Counts",
+    "approved_at_utc": "2026-02-23T09:07:08.070578+00:00",
+    "review_status": "APPROVED",
+    "printed_at_utc": "2026-02-23T09:07:20.304601+00:00",
+    "archived_at_utc": "2026-02-23T09:07:20.304601+00:00",
+    "print_request_payload": {
+      "product_name": "[Z-FS-LB-9759-M-DAISO] Shoemate Daiso Label Medium",
+      "quantity": "1",
+      "total": "1",
+      "po_number": "102341",
+      "product_desc": "J021-9233",
+      "requested_at_ph": "",
+      "lot_number": "20260223170717-000000102341"
+    },
+    "printed_qr_payload": "O000000000240000010237800000000000V2P00000009060Q00000000001I00000000001T00000000001L20260223170717-000000102341\n\nPrint request sent.",
+    "archive_status": "PRINTED_ARCHIVED"
+  },
+  {
+    "finished_at_utc": "2026-02-20T09:21:11.789351+00:00",
+    "client_id": "philtop-it-001",
+    "machine_code": "M00001",
+    "machine_name": "Machine 01",
+    "job_code": "102378",
+    "job_name": "J021-9233",
+    "operator_id": "1000001 - Snoopy Von Peanuts",
+    "pack_count": 0,
+    "good_total": 0,
+    "butal_total": 0,
+    "reject_total": 4,
+    "total_good": 0,
+    "reject_breakdown": {
+      "COLOR STREAK": 1,
+      "CRACK/BRITTLE": 1,
+      "CONTAMINATION": 1,
+      "BURN MARK": 1
+    },
+    "startup_reject_total": 0,
+    "raw_sacks_count": 0,
+    "raw_material_scans": [],
+    "raw_material_logs": [],
+    "job_payload": {},
+    "reject_review_logs": [],
+    "downtime_last_seconds": null,
+    "downtime_reason_code": null,
+    "downtime_reason_text": null,
+    "cycle_time_current": null,
+    "maintenance_name": null,
+    "supervisor_name": null,
+    "review_history": [
+      {
+        "action": "APPROVE",
+        "remarks": "test",
+        "actor_name": "Bryan Sampaga",
+        "actor_code": "10186",
+        "actor_role": "Supervisor/QC",
+        "timestamp_utc": "2026-02-23T09:15:43.046651+00:00"
+      },
+      {
+        "action": "ARCHIVE_AFTER_PRINT",
+        "timestamp_utc": "2026-02-23T09:15:51.190493+00:00"
+      }
+    ],
+    "approved_by": "Bryan Sampaga",
+    "approved_by_code": "10186",
+    "approved_by_role": "Supervisor/QC",
+    "approved_remarks": "test",
+    "approved_at_utc": "2026-02-23T09:15:43.046651+00:00",
+    "review_status": "APPROVED",
+    "printed_at_utc": "2026-02-23T09:15:51.190493+00:00",
+    "archived_at_utc": "2026-02-23T09:15:51.190493+00:00",
+    "print_request_payload": {
+      "product_name": "[Z-FS-LB-9759-M-DAISO] Shoemate Daiso Label Medium",
+      "quantity": "1",
+      "total": "1",
+      "po_number": "102341",
+      "product_desc": "J021-9233",
+      "requested_at_ph": "",
+      "lot_number": "20260223171548-000000102341"
+    },
+    "printed_qr_payload": "O000000000240000010237800000000000V2P00000009060Q00000000001I00000000001T00000000001L20260223171548-000000102341\n\nPrint request sent.",
+    "archive_status": "PRINTED_ARCHIVED"
+  }
+]
