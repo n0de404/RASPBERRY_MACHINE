@@ -19,6 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 @asynccontextmanager
 async def _app_lifespan(app: FastAPI):
@@ -40,15 +41,19 @@ async def _app_lifespan(app: FastAPI):
 
 
 APP = FastAPI(title="Machine Dashboard Server", lifespan=_app_lifespan)
+APP.mount("/Images", StaticFiles(directory=str(Path(__file__).resolve().parent / "Images")), name="images")
 
 ACTIVE_TTL_SECONDS = 2  # aggressive monitoring: mark disconnected quickly
 STATE_TICK_SECONDS = 0.25
 FINISHED_JOBS_FILE = Path(__file__).resolve().parent / "Database" / "finished_jobs_server.json"
 CLIENT_FINISHED_JOBS_FILE = Path(__file__).resolve().parent / "Database" / "finished_jobs_client.json"
 ARCHIVED_JOBS_FILE = Path(__file__).resolve().parent / "Database" / "archived_jobs_server.json"
-PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"
+PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"  # legacy fallback
+PRODUCT_API_CONFIG_FILE = Path(__file__).resolve().parent / "Database" / "product_api_config.json"
 PRODUCT_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "product_catalog_cache.json"
 SERVER_SETTINGS_FILE = Path(__file__).resolve().parent / "Database" / "server_settings.json"
+MACHINE_STATUS_OVERRIDES_FILE = Path(__file__).resolve().parent / "Database" / "machine_status_overrides.json"
+MACHINE_STATUS_ARCHIVE_FILE = Path(__file__).resolve().parent / "Database" / "machine_status_archive.json"
 DAILY_ROLE_ASSIGNMENTS_FILE = Path(__file__).resolve().parent / "Database" / "daily_role_assignments.json"
 PROFILES_FILE = Path(__file__).resolve().parent / "Database" / "user_qr_profiles.json"
 PROFILE_REPRINT_ADMIN_PASSWORD = "0t1docmtl$tm"
@@ -90,6 +95,14 @@ MACHINE_NAME_MAP: Dict[str, str] = {
 }
 SUPERVISOR_BADGES: Dict[str, str] = {"3000001": "Charlie Brown"}
 QC_BADGES: Dict[str, str] = {"4000001": "Lucy Van Pelt"}
+APP_BASE_DIR = Path(__file__).resolve().parent
+
+
+def _app_relative_path_str(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(APP_BASE_DIR)).replace("\\", "/")
+    except Exception:
+        return path.name
 
 
 def _machine_display_name(machine_code: str, machine_name: Any = "") -> str:
@@ -142,6 +155,8 @@ class MachineSession:
 SESSIONS: Dict[str, MachineSession] = {}  # key = machine_code
 WS_CLIENTS: List[WebSocket] = []
 STATE_TICK_TASK: Optional[asyncio.Task] = None
+MACHINE_STATUS_OVERRIDES: Dict[str, Dict[str, Any]] = {}
+MACHINE_STATUS_ARCHIVE: List[Dict[str, Any]] = []
 
 
 def _read_json_list(path: Path) -> List[Dict[str, Any]]:
@@ -153,6 +168,139 @@ def _read_json_list(path: Path) -> List[Dict[str, Any]]:
     except Exception:
         pass
     return []
+
+
+def load_machine_status_overrides() -> Dict[str, Dict[str, Any]]:
+    try:
+        if MACHINE_STATUS_OVERRIDES_FILE.exists():
+            raw = json.loads(MACHINE_STATUS_OVERRIDES_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                out: Dict[str, Dict[str, Any]] = {}
+                for k, v in raw.items():
+                    code = str(k or "").strip()
+                    if not code or not isinstance(v, dict):
+                        continue
+                    status = str(v.get("status") or "").strip()
+                    if not status:
+                        continue
+                    out[code] = {
+                        "status": status,
+                        "reason": str(v.get("reason") or "").strip(),
+                        "updated_at_utc": str(v.get("updated_at_utc") or ""),
+                        "started_at_utc": str(v.get("started_at_utc") or v.get("updated_at_utc") or ""),
+                        "set_by_badge": str(v.get("set_by_badge") or "").strip(),
+                        "set_by_name": str(v.get("set_by_name") or "").strip(),
+                        "set_by_role": str(v.get("set_by_role") or "").strip(),
+                    }
+                return out
+    except Exception:
+        pass
+    return {}
+
+
+def save_machine_status_overrides(rows: Dict[str, Dict[str, Any]]):
+    try:
+        MACHINE_STATUS_OVERRIDES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MACHINE_STATUS_OVERRIDES_FILE.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_machine_status_archive() -> List[Dict[str, Any]]:
+    rows = _read_json_list(MACHINE_STATUS_ARCHIVE_FILE)
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        machine_code = str(row.get("machine_code") or "").strip()
+        status = str(row.get("status") or "").strip()
+        if not machine_code or not status:
+            continue
+        out.append(
+            {
+                "machine_code": machine_code,
+                "machine_name": str(row.get("machine_name") or "").strip(),
+                "status": status,
+                "reason": str(row.get("reason") or "").strip(),
+                "set_by_badge": str(row.get("set_by_badge") or "").strip(),
+                "set_by_name": str(row.get("set_by_name") or "").strip(),
+                "set_by_role": str(row.get("set_by_role") or "").strip(),
+                "started_at_utc": str(row.get("started_at_utc") or row.get("updated_at_utc") or "").strip(),
+                "ended_at_utc": str(row.get("ended_at_utc") or "").strip(),
+                "duration_seconds": row.get("duration_seconds"),
+                "closed_by_badge": str(row.get("closed_by_badge") or "").strip(),
+                "closed_by_name": str(row.get("closed_by_name") or "").strip(),
+                "closed_by_role": str(row.get("closed_by_role") or "").strip(),
+                "closed_reason": str(row.get("closed_reason") or "").strip(),
+                "closed_action": str(row.get("closed_action") or "").strip(),
+            }
+        )
+    return out
+
+
+def save_machine_status_archive(rows: List[Dict[str, Any]]):
+    try:
+        MACHINE_STATUS_ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MACHINE_STATUS_ARCHIVE_FILE.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _parse_iso_utc(iso: Any) -> Optional[datetime]:
+    s = str(iso or "").strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _close_machine_status_archive_entries(
+    machine_code: str,
+    *,
+    closed_by_badge: str = "",
+    closed_by_name: str = "",
+    closed_by_role: str = "",
+    closed_reason: str = "",
+    closed_action: str = "",
+    ended_at: Optional[datetime] = None,
+) -> bool:
+    code = str(machine_code or "").strip()
+    if not code:
+        return False
+    ended_dt = ended_at or utc_now()
+    changed = False
+    for row in MACHINE_STATUS_ARCHIVE:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("machine_code") or "").strip() != code:
+            continue
+        if str(row.get("ended_at_utc") or "").strip():
+            continue
+        started_dt = _parse_iso_utc(row.get("started_at_utc"))
+        duration_seconds: Optional[int] = None
+        if started_dt is not None:
+            try:
+                duration_seconds = max(0, int((ended_dt - started_dt).total_seconds()))
+            except Exception:
+                duration_seconds = None
+        row["ended_at_utc"] = ended_dt.isoformat()
+        row["duration_seconds"] = duration_seconds
+        row["closed_by_badge"] = str(closed_by_badge or "").strip()
+        row["closed_by_name"] = str(closed_by_name or "").strip()
+        row["closed_by_role"] = str(closed_by_role or "").strip()
+        row["closed_reason"] = str(closed_reason or "").strip()
+        row["closed_action"] = str(closed_action or "").strip()
+        changed = True
+    if changed:
+        save_machine_status_archive(MACHINE_STATUS_ARCHIVE)
+    return changed
 
 
 def _finished_job_key(row: Dict[str, Any]) -> str:
@@ -194,6 +342,32 @@ def _reviewer_from_badge(code: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _person_from_badge_any(code: str) -> Optional[Dict[str, str]]:
+    badge = str(code or "").strip()
+    if not badge:
+        return None
+    today = get_today_role_assignments()
+    assigned = today.get(badge) if isinstance(today, dict) else None
+    if isinstance(assigned, dict):
+        rights = str(assigned.get("rights", "")).strip().lower()
+        company_role = _normalize_company_role(assigned.get("company_role", ""))
+        role = company_role or (rights.upper() if rights else "")
+        name = (
+            str(assigned.get("name", "")).strip()
+            or (str(_find_profile_by_id_number(badge).get("name", "")).strip() if _find_profile_by_id_number(badge) else "")
+            or badge
+        )
+        return {"code": badge, "name": name, "role": role or "User", "rights": rights or "viewer"}
+    profile = _find_profile_by_id_number(badge)
+    if isinstance(profile, dict):
+        company_role = _normalize_company_role(profile.get("company_role", ""))
+        extra = str(profile.get("extra_privilege", "") or "").strip().lower()
+        rights = _combine_privileges(_base_privilege_from_company_role(company_role), extra)
+        name = str(profile.get("name", "") or "").strip() or badge
+        return {"code": badge, "name": name, "role": company_role or "User", "rights": rights}
+    return None
+
+
 def _find_profile_by_id_number(id_number: str) -> Optional[Dict[str, Any]]:
     code = str(id_number or "").strip()
     if not code:
@@ -213,6 +387,8 @@ def _normalize_company_role(value: Any) -> str:
         return "QA/QC"
     if low == "supervisor":
         return "Supervisor"
+    if low == "operator":
+        return "Operator"
     if low == "maintenance":
         return "Maintenance"
     if low == "planner":
@@ -228,6 +404,8 @@ def _base_privilege_from_company_role(company_role: str) -> str:
         return "supervisor"
     if low in {"qa/qc", "qa", "qc"}:
         return "qc"
+    if low == "operator":
+        return "operator"
     if low == "maintenance":
         return "maintenance"
     if low in {"planner", "production manager"}:
@@ -238,7 +416,7 @@ def _base_privilege_from_company_role(company_role: str) -> str:
 def _combine_privileges(base_privilege: str, extra_privilege: str) -> str:
     base = str(base_privilege or "").strip().lower() or "viewer"
     extra = str(extra_privilege or "").strip().lower()
-    if extra not in {"", "none", "supervisor", "qc"}:
+    if extra not in {"", "none", "supervisor", "qc", "operator", "maintenance"}:
         extra = ""
     pair = {base}
     if extra and extra != "none":
@@ -251,6 +429,8 @@ def _combine_privileges(base_privilege: str, extra_privilege: str) -> str:
         return "qc"
     if "maintenance" in pair:
         return "maintenance"
+    if "operator" in pair:
+        return "operator"
     return "viewer"
 
 
@@ -738,6 +918,22 @@ def _load_product_cache() -> Dict[str, Any]:
     return cache
 
 
+def _load_product_source_config() -> Dict[str, Any]:
+    cfg = _load_json_object(PRODUCT_API_CONFIG_FILE)
+    if isinstance(cfg, dict) and cfg:
+        return cfg
+    # Backward-compatible fallback to the older file.
+    legacy = _load_json_object(PRODUCT_SOURCE_FILE)
+    if isinstance(legacy, dict) and legacy:
+        try:
+            PRODUCT_API_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            PRODUCT_API_CONFIG_FILE.write_text(json.dumps(legacy, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return legacy
+    return {}
+
+
 def _save_product_cache(items: List[Dict[str, str]], source_meta: Optional[Dict[str, Any]] = None):
     PRODUCT_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -750,7 +946,7 @@ def _save_product_cache(items: List[Dict[str, str]], source_meta: Optional[Dict[
 
 
 def _fetch_products_from_source() -> List[Dict[str, str]]:
-    cfg = _load_json_object(PRODUCT_SOURCE_FILE)
+    cfg = _load_product_source_config()
     if not cfg:
         return []
 
@@ -976,7 +1172,7 @@ def get_products(force_refresh: bool = False) -> Dict[str, Any]:
             if fetched_upgrade:
                 _save_product_cache(
                     fetched_upgrade,
-                    {"source_file": str(PRODUCT_SOURCE_FILE), "cache_upgrade": True},
+                    {"source_file": str(PRODUCT_API_CONFIG_FILE), "cache_upgrade": True},
                 )
                 return {"items": fetched_upgrade, "from_cache": False, "updated": True, "error": ""}
         except Exception:
@@ -993,7 +1189,7 @@ def get_products(force_refresh: bool = False) -> Dict[str, Any]:
         old_set = {(str(x.get("id", "")), str(x.get("name", ""))) for x in cached_items if isinstance(x, dict)}
         new_set = {(str(x.get("id", "")), str(x.get("name", ""))) for x in fetched}
         updated = old_set != new_set
-        _save_product_cache(fetched, {"source_file": str(PRODUCT_SOURCE_FILE)})
+        _save_product_cache(fetched, {"source_file": str(PRODUCT_API_CONFIG_FILE)})
         return {"items": fetched, "from_cache": False, "updated": updated, "error": ""}
 
     return {"items": cached_items, "from_cache": True, "updated": False, "error": fetch_error}
@@ -1002,6 +1198,8 @@ def get_products(force_refresh: bool = False) -> Dict[str, Any]:
 FINISHED_JOBS: List[Dict[str, Any]] = load_finished_jobs()
 ARCHIVED_JOBS: List[Dict[str, Any]] = load_archived_jobs()
 PROFILES: List[Dict[str, Any]] = load_profiles()
+MACHINE_STATUS_OVERRIDES = load_machine_status_overrides()
+MACHINE_STATUS_ARCHIVE = load_machine_status_archive()
 
 
 def utc_now() -> datetime:
@@ -1021,6 +1219,8 @@ async def broadcast_state():
         "type": "STATE",
         "active_ttl_seconds": ACTIVE_TTL_SECONDS,
         "sessions": [s.to_dict() for s in SESSIONS.values()],
+        "machine_status_overrides": MACHINE_STATUS_OVERRIDES,
+        "machine_status_archive": MACHINE_STATUS_ARCHIVE,
         "finished_jobs": FINISHED_JOBS,
         "archived_jobs": ARCHIVED_JOBS,
         "server_time_utc": utc_now().isoformat(),
@@ -1066,6 +1266,7 @@ DASHBOARD_HTML = """
     .server-menu-icon span:nth-child(1){ top: 0; }
     .server-menu-icon span:nth-child(2){ top: 6px; }
     .server-menu-icon span:nth-child(3){ top: 12px; }
+    .menu-ico-img { width: 20px; height: 20px; display: block; object-fit: contain; }
     .person-menu-icon { width: 20px; height: 20px; position: relative; }
     .person-menu-icon::before { content: ""; position: absolute; top: 1px; left: 5px; width: 10px; height: 10px; border: 2px solid #334155; border-radius: 50%; box-sizing: border-box; }
     .person-menu-icon::after { content: ""; position: absolute; bottom: 1px; left: 2px; width: 16px; height: 8px; border: 2px solid #334155; border-top-left-radius: 10px; border-top-right-radius: 10px; border-bottom: none; box-sizing: border-box; }
@@ -1083,12 +1284,12 @@ DASHBOARD_HTML = """
     .main-tab-button.active { background: #1f8ef1; color: #fff; }
     .main-tab-content { display: none; padding: 0 20px 20px; }
     .main-tab-content.active { display: block; }
-    .grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 18px; }
     .card { background: #fff; border-radius: 12px; padding: 16px; border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform .12s ease, box-shadow .12s ease; }
     .card:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(0,0,0,0.12); }
-    .card.active { border-color: #4CAF50; }
+    .card.active { border-color: #4CAF50; animation: cardPulseGreen 1.5s ease-in-out infinite; }
     .card.disconnected { border-color: #f44336; }
-    .card.maintenance { border-color: #FF9800; }
+    .card.maintenance { border-color: #FF9800; animation: cardPulseOrange 1.5s ease-in-out infinite; }
     .card h3 { margin: 0 0 10px; font-size: 1.05rem; border-bottom: 1px solid #eee; padding-bottom: 8px; }
     .card p { margin: 6px 0; font-size: 0.9rem; }
     .panel { margin-top: 14px; background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
@@ -1276,6 +1477,49 @@ DASHBOARD_HTML = """
     #overlayReviewRemarks { min-height: 58px; height: 58px; }
     #editRejectBreakdown { min-height: 58px; height: 58px; }
     @keyframes reviewSlideIn { from { opacity: .45; transform: translateX(6px); } to { opacity: 1; transform: translateX(0); } }
+    @keyframes cardPulseGreen {
+      0% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(76,175,80,0.30); }
+      50% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 7px rgba(76,175,80,0.12); }
+      100% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(76,175,80,0.00); }
+    }
+    @keyframes cardPulseGreenDark {
+      0% { box-shadow: 0 2px 8px rgba(0,0,0,0.22), 0 0 0 0 rgba(34,255,136,0.42), 0 0 14px rgba(34,255,136,.10); }
+      50% { box-shadow: 0 2px 8px rgba(0,0,0,0.22), 0 0 0 8px rgba(34,255,136,0.16), 0 0 18px rgba(34,255,136,.22); }
+      100% { box-shadow: 0 2px 8px rgba(0,0,0,0.22), 0 0 0 0 rgba(34,255,136,0.00), 0 0 14px rgba(34,255,136,.08); }
+    }
+    @keyframes cardPulseGreenPastel {
+      0% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(143,211,177,0.34); }
+      50% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 7px rgba(143,211,177,0.14); }
+      100% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(143,211,177,0.00); }
+    }
+    @keyframes cardPulseGreenMuted {
+      0% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(123,191,154,0.30); }
+      50% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 7px rgba(123,191,154,0.12); }
+      100% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(123,191,154,0.00); }
+    }
+    @keyframes cardPulseOrange {
+      0% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(255,152,0,0.30); }
+      50% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 8px rgba(255,152,0,0.14); }
+      100% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(255,152,0,0.00); }
+    }
+    .overlay-head-actions { display:flex; align-items:center; gap:8px; }
+    .icon-btn {
+      width: 38px; height: 38px; border-radius: 12px; border: 1px solid #c7d0dd; background: #f8fafc;
+      color: #334155; cursor: pointer; font-size: 18px; font-weight: 700;
+    }
+    .icon-btn:hover { background:#fff; box-shadow:0 6px 14px rgba(15,23,42,.08); }
+    .machine-detail-status-panel { background:#f8fbff; border:1px solid #d9e6f6; border-radius:12px; padding:10px; display:grid; gap:8px; }
+    .machine-detail-status-panel .row { display:grid; grid-template-columns: 160px 1fr auto; gap:8px; align-items:center; }
+    .machine-detail-status-panel label { font-weight:700; color:#475569; font-size:.86rem; }
+    .machine-detail-status-panel select { border:1px solid #cbd5e1; border-radius:10px; padding:8px 10px; font:inherit; background:#fff; }
+    .machine-detail-status-panel textarea { border:1px solid #cbd5e1; border-radius:10px; padding:8px 10px; font:inherit; background:#fff; min-height:54px; resize:vertical; }
+    .machine-detail-status-panel .hint { color:#64748b; font-size:.82rem; }
+    .machine-status-save-feedback { display:none; align-items:center; gap:8px; }
+    .machine-status-save-feedback.active { display:flex; }
+    .machine-status-save-track { flex:1; height:10px; border-radius:999px; border:1px solid #cbd5e1; background:#fff; overflow:hidden; }
+    .machine-status-save-bar { height:100%; width:0%; background: linear-gradient(90deg, #f97316, #22c55e); transition: width .10s linear; }
+    .machine-status-save-check { width:22px; height:22px; border-radius:999px; border:2px solid #16a34a; color:#16a34a; display:flex; align-items:center; justify-content:center; font-weight:900; opacity:.15; transform:scale(.92); transition: all .16s ease; background:#fff; }
+    .machine-status-save-check.done { opacity:1; transform:scale(1); background:#ecfdf5; }
     .machine-detail-card { width: min(980px, 100%); max-height: min(88vh, 860px); display: flex; flex-direction: column; }
     .machine-detail-body { padding: 14px; overflow: auto; display: grid; gap: 12px; }
     .machine-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
@@ -1288,6 +1532,104 @@ DASHBOARD_HTML = """
     .machine-detail-list { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
     .machine-detail-list li { font-size: .88rem; color: #1f2937; }
     .machine-detail-empty { color: #64748b; font-size: .88rem; }
+    body[data-theme="Soft Gray"] { background: #eef1f4; color: #243041; }
+    body[data-theme="Soft Gray"] .diag-item,
+    body[data-theme="Soft Gray"] .card,
+    body[data-theme="Soft Gray"] .panel { background: #f8fafc; border-color: #d7dee8; }
+    body[data-theme="Soft Gray"] .card.active { border-color: #7bbf9a; animation: cardPulseGreenMuted 1.5s ease-in-out infinite; }
+    body[data-theme="Soft Gray"] .card.disconnected { border-color: #d28b8b; }
+    body[data-theme="Soft Gray"] .card.maintenance { border-color: #d6a56a; animation: cardPulseOrange 1.5s ease-in-out infinite; }
+    body[data-theme="Soft Gray"] .main-tab-button.active { background: #64748b; color: #fff; }
+    body[data-theme="Soft Gray"] .main-tab-content { background: linear-gradient(180deg, rgba(248,250,252,.92), rgba(241,245,249,.82)); border-radius: 16px; }
+    body[data-theme="Soft Gray"] .finished-item { background: linear-gradient(160deg, #ffffff 0%, #f8fafc 60%, #eef2f7 100%); border-color: #dbe2eb; box-shadow: 0 5px 14px rgba(51,65,85,.10); }
+    body[data-theme="Soft Gray"] .finished-item h4 { color: #1f2937; }
+    body[data-theme="Soft Gray"] .finished-grid div { background: #fff; border-color: #e5e7eb; color: #334155; }
+    body[data-theme="Soft Gray"] .raw-list { background: #fff; border-color: #e5e7eb; color: #475569; }
+    body[data-theme="Soft Gray"] .approve-print-btn { background: linear-gradient(135deg, #64748b 0%, #475569 100%); }
+    body[data-theme="Dark"] { background: #0b1220; color: #e5e7eb; }
+    body[data-theme="Dark"] .diag-item { background: #111827; color: #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
+    body[data-theme="Dark"] .diag-item .value { color: #f8fafc; }
+    body[data-theme="Dark"] .main-tab-button { background: #1f2937; color: #d1d5db; }
+    body[data-theme="Dark"] .main-tab-button.active { background: #2563eb; color: #fff; }
+    body[data-theme="Dark"] .main-tab-content { background: linear-gradient(180deg, rgba(2,6,23,.42), rgba(2,6,23,.22)); border-radius: 16px; }
+    body[data-theme="Dark"] .card,
+    body[data-theme="Dark"] .panel,
+    body[data-theme="Dark"] .table-wrap { background: #111827; color: #e5e7eb; border-color: #334155; }
+    body[data-theme="Dark"] .card.active { border-color: #22ff88; animation: cardPulseGreenDark 1.5s ease-in-out infinite; }
+    body[data-theme="Dark"] .card.disconnected { border-color: #ff4d6d; box-shadow: 0 2px 8px rgba(0,0,0,0.22), 0 0 0 1px rgba(255,77,109,.12) inset; }
+    body[data-theme="Dark"] .card.maintenance { border-color:#f59e0b; animation: cardPulseOrange 1.5s ease-in-out infinite; }
+    body[data-theme="Dark"] .card h3 { border-bottom-color: #334155; }
+    body[data-theme="Dark"] .muted { color: #94a3b8; }
+    body[data-theme="Dark"] .placeholder { background: #0f172a; border-color: #334155; color: #94a3b8; }
+    body[data-theme="Dark"] .finished-item { background: linear-gradient(160deg, #0f172a 0%, #111827 60%, #0b1220 100%); border-color: #334155; box-shadow: 0 10px 22px rgba(0,0,0,.30); }
+    body[data-theme="Dark"] .finished-item h4 { color: #e5e7eb; }
+    body[data-theme="Dark"] .finished-badge { color: #bfdbfe; background: rgba(30,64,175,.25); border-color: #3b82f6; }
+    body[data-theme="Dark"] .finished-grid div { background: rgba(15,23,42,.85); border-color: #334155; color: #d1d5db; }
+    body[data-theme="Dark"] .raw-list { background: #0f172a; border-color: #334155; color: #cbd5e1; }
+    body[data-theme="Dark"] .finished-linkage-note { background: rgba(60,20,10,.35); border-color: #fdba74; color: #fed7aa; }
+    body[data-theme="Dark"] .approve-print-btn { background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); box-shadow: inset 0 0 0 1px rgba(147,197,253,.18); }
+    body[data-theme="Dark"] .approve-print-btn:hover { box-shadow: 0 10px 24px rgba(37,99,235,.35), inset 0 0 0 1px rgba(147,197,253,.18); }
+    body[data-theme="Dark"] .data-table th { background: #1f2937; color: #e5e7eb; }
+    body[data-theme="Dark"] .data-table td { border-bottom-color: #253041; }
+    body[data-theme="Dark"] .data-table tr:hover td { background: #172033; }
+    body[data-theme="Dark"] .mini-btn { background: #0f172a; color: #e5e7eb; border-color: #334155; }
+    body[data-theme="Dark"] .settings-overlay { background: rgba(2,6,23,0.46); }
+    body[data-theme="Dark"] .settings-card { background: #0f172a; border-color: #334155; box-shadow: 0 24px 48px rgba(0,0,0,0.38); }
+    body[data-theme="Dark"] .settings-head { border-bottom-color: #334155; }
+    body[data-theme="Dark"] .settings-head-title { color: #e5e7eb; }
+    body[data-theme="Dark"] .settings-nav { background: #111827; border-right-color: #334155; }
+    body[data-theme="Dark"] .settings-nav-btn { background: #0f172a; color: #d1d5db; border-color: #334155; }
+    body[data-theme="Dark"] .settings-nav-btn.active { background: #1e3a8a; border-color: #3b82f6; color: #dbeafe; }
+    body[data-theme="Dark"] .settings-row label { color: #cbd5e1; }
+    body[data-theme="Dark"] .settings-row input, body[data-theme="Dark"] .settings-row select { background: #111827; color: #e5e7eb; border-color: #334155; }
+    body[data-theme="Dark"] .settings-note { color: #94a3b8; }
+    body[data-theme="Dark"] .people-role-list, body[data-theme="Dark"] .settings-table-wrap { background: #111827; border-color: #334155; }
+    body[data-theme="Dark"] .people-role-row { border-bottom-color: #253041; color: #d1d5db; }
+    body[data-theme="Dark"] .people-role-row.head { background: #1f2937; color: #cbd5e1; }
+    body[data-theme="Dark"] .settings-table th { background: #1f2937; color: #cbd5e1; }
+    body[data-theme="Dark"] .settings-table td { border-bottom-color: #253041; color: #e5e7eb; }
+    body[data-theme="Red"] { background: #fff4f4; color: #3b0a0a; }
+    body[data-theme="Red"] .diag-item,
+    body[data-theme="Red"] .card,
+    body[data-theme="Red"] .panel { background: #fff; border-color: #fecaca; }
+    body[data-theme="Red"] .card.active { border-color: #8fd3b1; animation: cardPulseGreenPastel 1.5s ease-in-out infinite; }
+    body[data-theme="Red"] .card.disconnected { border-color: #f3a6b3; }
+    body[data-theme="Red"] .card.maintenance { border-color:#fb923c; animation: cardPulseOrange 1.5s ease-in-out infinite; }
+    body[data-theme="Red"] .main-tab-button { background: #fee2e2; color: #7f1d1d; }
+    body[data-theme="Red"] .main-tab-button.active { background: #dc2626; color: #fff; }
+    body[data-theme="Red"] .main-tab-content { background: linear-gradient(180deg, rgba(254,242,242,.95), rgba(255,255,255,.88)); border-radius: 16px; }
+    body[data-theme="Red"] .finished-item { border-color: #fecaca; background: linear-gradient(160deg, #fff 0%, #fff1f2 66%, #ffe4e6 100%); }
+    body[data-theme="Red"] .finished-item h4 { color: #7f1d1d; }
+    body[data-theme="Red"] .finished-grid div { border-color: #fecdd3; background: rgba(255,255,255,.95); color: #7f1d1d; }
+    body[data-theme="Red"] .raw-list { border-color: #fecdd3; background: #fff; color: #7f1d1d; }
+    body[data-theme="Red"] .approve-print-btn { background: linear-gradient(135deg, #ef4444 0%, #b91c1c 100%); }
+    body[data-theme="Red"] .table-wrap { border-color: #fecaca; }
+    body[data-theme="Red"] .data-table th { background: #fef2f2; color: #7f1d1d; }
+    body[data-theme="Red"] .settings-overlay { background: rgba(127,29,29,0.18); }
+    body[data-theme="Red"] .settings-card { background: #fff7f7; border-color: #fecaca; }
+    body[data-theme="Red"] .settings-head { border-bottom-color: #fecaca; }
+    body[data-theme="Red"] .settings-head-title { color: #7f1d1d; }
+    body[data-theme="Red"] .settings-nav { background: #fef2f2; border-right-color: #fecaca; }
+    body[data-theme="Red"] .settings-nav-btn { background: #fff; color: #7f1d1d; border-color: #fecaca; }
+    body[data-theme="Red"] .settings-nav-btn.active { background: #fee2e2; border-color: #fca5a5; color: #b91c1c; }
+    body[data-theme="Red"] .settings-row label { color: #7f1d1d; }
+    body[data-theme="Red"] .settings-row input, body[data-theme="Red"] .settings-row select { border-color: #fecaca; background: #fff; color: #7f1d1d; }
+    body[data-theme="Red"] .settings-note { color: #991b1b; }
+    body[data-theme="Red"] .people-role-list, body[data-theme="Red"] .settings-table-wrap { border-color: #fecaca; background: #fff; }
+    body[data-theme="Red"] .people-role-row { border-bottom-color: #fee2e2; color: #7f1d1d; }
+    body[data-theme="Red"] .people-role-row.head { background: #fef2f2; color: #991b1b; }
+    body[data-theme="Red"] .settings-table th { background: #fef2f2; color: #991b1b; }
+    body[data-theme="Red"] .settings-table td { border-bottom-color: #fee2e2; color: #7f1d1d; }
+    body[data-theme="Soft Gray"] .settings-card { background: #f8fafc; border-color: #dbe2eb; }
+    body[data-theme="Soft Gray"] .settings-head { border-bottom-color: #dbe2eb; }
+    body[data-theme="Soft Gray"] .settings-head-title { color: #334155; }
+    body[data-theme="Soft Gray"] .settings-nav { background: #eef2f7; border-right-color: #dbe2eb; }
+    body[data-theme="Soft Gray"] .settings-nav-btn { background: #fff; color: #475569; border-color: #dbe2eb; }
+    body[data-theme="Soft Gray"] .settings-nav-btn.active { background: #e2e8f0; border-color: #cbd5e1; color: #334155; }
+    body[data-theme="Soft Gray"] .settings-row input, body[data-theme="Soft Gray"] .settings-row select { border-color: #dbe2eb; background: #fff; color: #334155; }
+    body[data-theme="Soft Gray"] .people-role-list, body[data-theme="Soft Gray"] .settings-table-wrap { border-color: #dbe2eb; }
+    body[data-theme="Soft Gray"] .people-role-row { border-bottom-color: #e5e7eb; color: #475569; }
+    body[data-theme="Soft Gray"] .people-role-row.head { background: #f8fafc; color: #475569; }
     @media (max-width: 900px) { .machine-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     @media (max-width: 1400px) { .grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
     @media (max-width: 1100px) { .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
@@ -1301,7 +1643,7 @@ DASHBOARD_HTML = """
       <div class="server-menu-icon"><span></span><span></span><span></span></div>
     </button>
     <button id="dailyRolesBtn" class="server-menu-btn" type="button" aria-label="Open people roles">
-      <div class="person-menu-icon"></div>
+      <img class="menu-ico-img" src="/Images/admin.ico" alt="" />
     </button>
     <button id="profileCreatorBtn" class="server-menu-btn" type="button" aria-label="Open profile creator">
       <div class="person-menu-icon with-plus"><div class="person-plus-badge">+</div></div>
@@ -1317,6 +1659,7 @@ DASHBOARD_HTML = """
     <button class="main-tab-button" data-target="jobQueueTab">Job Queue</button>
     <button class="main-tab-button" data-target="finishedJobsTab">Finished Jobs</button>
     <button class="main-tab-button" data-target="archivedJobsTab">Archived Jobs</button>
+    <button class="main-tab-button" data-target="machineArchiveTab">Machine Archive</button>
     <button class="main-tab-button" data-target="pdrTab">PDR Reports</button>
   </div>
 
@@ -1349,6 +1692,19 @@ DASHBOARD_HTML = """
       <h3>Archived Jobs</h3>
       <div class="muted">Printed finished jobs archived in row format.</div>
       <div id="archivedJobsTableWrap" class="table-wrap"></div>
+    </div>
+  </div>
+
+  <div id="machineArchiveTab" class="main-tab-content">
+    <div class="panel">
+      <h3>Machine Status Archive</h3>
+      <div class="muted">Manual machine status overrides with reason, user, and duration.</div>
+      <div id="machineStatusArchiveTableWrap" class="table-wrap"></div>
+    </div>
+    <div class="panel">
+      <h3>Downtime Archive</h3>
+      <div class="muted">Downtime summaries collected from finished/archived job records (read-only).</div>
+      <div id="downtimeArchiveTableWrap" class="table-wrap"></div>
     </div>
   </div>
 
@@ -1485,7 +1841,35 @@ DASHBOARD_HTML = """
     <div class="overlay-card machine-detail-card">
       <div class="overlay-head">
         <div class="overlay-title" id="machineDetailTitle">Machine Details</div>
-        <button id="machineDetailCloseBtn" class="overlay-close" type="button">Close</button>
+        <div class="overlay-head-actions">
+          <button id="machineDetailSettingsBtn" class="icon-btn" type="button" title="Machine status settings" aria-label="Machine status settings">⚙</button>
+          <button id="machineDetailCloseBtn" class="overlay-close" type="button">Close</button>
+        </div>
+      </div>
+      <div id="machineDetailStatusPanel" class="machine-detail-status-panel" style="display:none; margin: 12px 14px 0;">
+        <div class="row">
+          <label for="machineDetailStatusSelect">Machine Status Override</label>
+          <select id="machineDetailStatusSelect">
+            <option value="">Auto (Live Status)</option>
+            <option value="No schedule">No schedule</option>
+            <option value="Scheduled for fix">Scheduled for fix</option>
+            <option value="Not working">Not working</option>
+          </select>
+          <button id="machineDetailStatusSaveBtn" class="btn-primary" type="button">Save</button>
+        </div>
+        <div class="row" style="grid-template-columns: 160px 1fr;">
+          <label for="machineDetailStatusReason">Reason (Required)</label>
+          <textarea id="machineDetailStatusReason" placeholder="Enter reason (e.g. waiting parts, no schedule, breakdown details)..."></textarea>
+        </div>
+        <div class="row" style="grid-template-columns: 160px 1fr;">
+          <label for="machineDetailStatusSetterBadge">User QR (Required)</label>
+          <input id="machineDetailStatusSetterBadge" type="text" placeholder="Scan user QR badge to confirm..." />
+        </div>
+        <div id="machineStatusSaveFeedback" class="machine-status-save-feedback">
+          <div class="machine-status-save-track"><div id="machineStatusSaveBar" class="machine-status-save-bar"></div></div>
+          <div id="machineStatusSaveCheck" class="machine-status-save-check">✓</div>
+        </div>
+        <div class="hint">Override affects the machine flashcard status label and pulse color (orange) on the dashboard.</div>
       </div>
       <div class="machine-detail-body" id="machineDetailBody"></div>
     </div>
@@ -1537,6 +1921,8 @@ DASHBOARD_HTML = """
                   <option value="Default">Default</option>
                   <option value="Soft Gray">Soft Gray</option>
                   <option value="Blue Accent">Blue Accent</option>
+                  <option value="Dark">Dark</option>
+                  <option value="Red">Red</option>
                 </select>
               </div>
               <div class="settings-note">Theme setting is saved on the server and can be used for future dashboard styling variants.</div>
@@ -1549,7 +1935,28 @@ DASHBOARD_HTML = """
                 <input id="settingsQrApiBaseUrl" type="text" placeholder="http://192.168.1.149:5000" />
               </div>
               <div class="settings-note">This is used by Request Print (`/api/qrgen/pending-request`) forwarding to your QR system.</div>
+              <div class="settings-row" style="margin-top:8px;">
+                <label>Product Items Cache (used by QR/product selection)</label>
+                <input id="settingsProductsCount" type="text" readonly value="Loading..." />
+              </div>
+              <div class="settings-row">
+                <label>Products Cache Updated</label>
+                <input id="settingsProductsUpdated" type="text" readonly value="-" />
+              </div>
+              <div class="settings-row">
+                <label>Products Source File</label>
+                <input id="settingsProductsSourceFile" type="text" readonly value="-" />
+              </div>
+              <div class="settings-row">
+                <label>Products Cache File</label>
+                <input id="settingsProductsCacheFile" type="text" readonly value="-" />
+              </div>
+              <div class="settings-row">
+                <label>Products Cache Status</label>
+                <input id="settingsProductsStatus" type="text" readonly value="-" />
+              </div>
               <div class="settings-actions">
+                <button id="settingsProductsRefreshBtn" class="btn-secondary" type="button">Update Product Items</button>
                 <button id="serverSettingsSaveBtn" class="btn-primary" type="button">Apply Settings</button>
               </div>
             </div>
@@ -1630,6 +2037,12 @@ DASHBOARD_HTML = """
   const settingsServerHost = document.getElementById("settingsServerHost");
   const settingsThemeSelect = document.getElementById("settingsThemeSelect");
   const settingsQrApiBaseUrl = document.getElementById("settingsQrApiBaseUrl");
+  const settingsProductsCount = document.getElementById("settingsProductsCount");
+  const settingsProductsUpdated = document.getElementById("settingsProductsUpdated");
+  const settingsProductsSourceFile = document.getElementById("settingsProductsSourceFile");
+  const settingsProductsCacheFile = document.getElementById("settingsProductsCacheFile");
+  const settingsProductsStatus = document.getElementById("settingsProductsStatus");
+  const settingsProductsRefreshBtn = document.getElementById("settingsProductsRefreshBtn");
   const settingsProfilesTableBody = document.getElementById("settingsProfilesTableBody");
   const serverSettingsSaveBtn = document.getElementById("serverSettingsSaveBtn");
   const dailyRolesOverlay = document.getElementById("dailyRolesOverlay");
@@ -1647,6 +2060,8 @@ DASHBOARD_HTML = """
   const machineGrid = document.getElementById("machineGrid");
   const finishedJobsList = document.getElementById("finishedJobsList");
   const archivedJobsTableWrap = document.getElementById("archivedJobsTableWrap");
+  const machineStatusArchiveTableWrap = document.getElementById("machineStatusArchiveTableWrap");
+  const downtimeArchiveTableWrap = document.getElementById("downtimeArchiveTableWrap");
   const approvePrintOverlay = document.getElementById("approvePrintOverlay");
   const overlayCloseBtn = document.getElementById("overlayCloseBtn");
   const overlayCancelBtn = document.getElementById("overlayCancelBtn");
@@ -1700,8 +2115,17 @@ DASHBOARD_HTML = """
   const overlayTotal = document.getElementById("overlayTotal");
   const overlayLotNumber = document.getElementById("overlayLotNumber");
   const machineDetailOverlay = document.getElementById("machineDetailOverlay");
+  const machineDetailSettingsBtn = document.getElementById("machineDetailSettingsBtn");
   const machineDetailCloseBtn = document.getElementById("machineDetailCloseBtn");
   const machineDetailTitle = document.getElementById("machineDetailTitle");
+  const machineDetailStatusPanel = document.getElementById("machineDetailStatusPanel");
+  const machineDetailStatusSelect = document.getElementById("machineDetailStatusSelect");
+  const machineDetailStatusReason = document.getElementById("machineDetailStatusReason");
+  const machineDetailStatusSetterBadge = document.getElementById("machineDetailStatusSetterBadge");
+  const machineDetailStatusSaveBtn = document.getElementById("machineDetailStatusSaveBtn");
+  const machineStatusSaveFeedback = document.getElementById("machineStatusSaveFeedback");
+  const machineStatusSaveBar = document.getElementById("machineStatusSaveBar");
+  const machineStatusSaveCheck = document.getElementById("machineStatusSaveCheck");
   const machineDetailBody = document.getElementById("machineDetailBody");
   const qrScanCaptureOverlay = document.getElementById("qrScanCaptureOverlay");
   const qrScanCaptureInput = document.getElementById("qrScanCaptureInput");
@@ -1730,8 +2154,12 @@ DASHBOARD_HTML = """
   };
   const DEFAULT_MACHINE_CODES = Object.keys(MACHINE_NAME_MAP);
   let latestState = { sessions: [], active_ttl_seconds: 30 };
+  const machineCardEls = new Map();
   let finishedJobsState = [];
   let archivedJobsState = [];
+  let machineStatusArchiveState = [];
+  let finishedJobsInteractionLock = false;
+  let pendingFinishedJobsRows = null;
   let productItems = [];
   let activeJobRow = null;
   let productsHydrated = false;
@@ -1751,13 +2179,16 @@ DASHBOARD_HTML = """
   let serverSettingsState = { theme: "Default", qrgen_base_url: "" };
   let dailyRolesState = {};
   let settingsProfilesState = [];
+  let machineStatusOverridesState = {};
+  let activeMachineDetailCode = "";
 
   function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;"); }
   function escJson(v){
     try { return esc(JSON.stringify(v ?? {}, null, 2)); } catch { return esc(String(v ?? "")); }
   }
 
-  function statusClass(lastSeenUtc, activeTtlSeconds = 30){
+  function statusClass(lastSeenUtc, activeTtlSeconds = 30, manualStatus = ""){
+    if(String(manualStatus || "").trim()) return "maintenance";
     if(!lastSeenUtc) return "disconnected";
     const seen = new Date(lastSeenUtc).getTime();
     if(Number.isNaN(seen)) return "disconnected";
@@ -1793,10 +2224,19 @@ DASHBOARD_HTML = """
     return `<div class="machine-detail-item"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
   }
 
+  function machineStatusOverrideFor(code){
+    const c = String(code || "").trim();
+    return (machineStatusOverridesState && machineStatusOverridesState[c]) || null;
+  }
+
   function openMachineDetail(session){
     if(!session) return;
+    activeMachineDetailCode = String(session.machine_code || "").trim();
     const activeTtlSeconds = Number((latestState && latestState.active_ttl_seconds) || 30);
-    const status = statusClass(session.last_seen_utc, activeTtlSeconds).toUpperCase();
+    const manual = machineStatusOverrideFor(activeMachineDetailCode);
+    const manualStatus = String((manual && manual.status) || "").trim();
+    const manualReason = String((manual && manual.reason) || "").trim();
+    const status = manualStatus || statusClass(session.last_seen_utc, activeTtlSeconds).toUpperCase();
     const totalGood = Number(session.good_total || 0) + Number(session.butal_total || 0);
     const job = extractJobRecord(session) || {};
     const rejectBreakdown = (session && typeof session.reject_breakdown === "object" && session.reject_breakdown) || {};
@@ -1811,6 +2251,10 @@ DASHBOARD_HTML = """
       : `<div class="machine-detail-empty">No reject details recorded.</div>`;
 
     machineDetailTitle.textContent = `${session.machine_name || session.machine_code || "Machine"} Details`;
+    if(machineDetailStatusSelect) machineDetailStatusSelect.value = manualStatus;
+    if(machineDetailStatusReason) machineDetailStatusReason.value = manualReason;
+    if(machineDetailStatusSetterBadge) machineDetailStatusSetterBadge.value = "";
+    if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
     machineDetailBody.innerHTML = `
       <div class="machine-detail-section">
         <h4>Overview</h4>
@@ -1818,10 +2262,13 @@ DASHBOARD_HTML = """
           ${detailItem("Machine", session.machine_code || "-")}
           ${detailItem("Machine Name", session.machine_name || "-")}
           ${detailItem("Status", status)}
-          ${detailItem("Client", session.client_id || "-")}
+          ${detailItem("Status Reason", manualReason || "-")}
+          ${detailItem("Status Set By", (manual && manual.set_by_name) ? `${manual.set_by_name}${manual.set_by_role ? ` (${manual.set_by_role})` : ""}` : "-")}
+          ${detailItem("Status Set At", fmtDateLocal((manual && (manual.started_at_utc || manual.updated_at_utc)) || ""))}
+          ${detailItem("Client", displayNameForId(session.client_id || "-"))}
           ${detailItem("Job Code", session.job_code || "-")}
           ${detailItem("Job Name", session.job_name || "-")}
-          ${detailItem("Operator", session.operator_id || "-")}
+          ${detailItem("Operator", displayNameForId(session.operator_id || "-"))}
           ${detailItem("Last Seen", fmtDateLocal(session.last_seen_utc))}
           ${detailItem("Last Event", session.last_event || "-")}
         </div>
@@ -1879,6 +2326,20 @@ DASHBOARD_HTML = """
 
   function closeMachineDetail(){
     machineDetailOverlay.classList.remove("active");
+    activeMachineDetailCode = "";
+    if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
+    if(machineStatusSaveFeedback) machineStatusSaveFeedback.classList.remove("active");
+    if(machineStatusSaveBar) machineStatusSaveBar.style.width = "0%";
+    if(machineStatusSaveCheck) machineStatusSaveCheck.classList.remove("done");
+  }
+
+  function applyDashboardTheme(themeName){
+    const t = String(themeName || "Default").trim() || "Default";
+    if(t === "Default" || t === "Blue Accent"){
+      delete document.body.dataset.theme;
+    } else {
+      document.body.dataset.theme = t;
+    }
   }
 
   function showServerSettingsPage(key){
@@ -1900,6 +2361,7 @@ DASHBOARD_HTML = """
     if(["qa", "qc", "qa/qc"].includes(low)) return "QA/QC";
     if(low === "production manager") return "Production Manager";
     if(low === "supervisor") return "Supervisor";
+    if(low === "operator") return "Operator";
     if(low === "maintenance") return "Maintenance";
     if(low === "planner") return "Planner";
     return String(role || "").trim();
@@ -1974,7 +2436,7 @@ DASHBOARD_HTML = """
     refreshDailyRoleDerivedUi();
   }
 
-  async function loadServerSettingsUi(){
+  async function loadServerSettingsUi(applyTheme = true){
     settingsServerHost && (settingsServerHost.value = location.origin);
     try {
       const resp = await fetch("/api/server-settings");
@@ -1985,9 +2447,39 @@ DASHBOARD_HTML = """
         theme: s.theme || "Default",
         qrgen_base_url: s.qrgen_base_url || "",
       };
+      if(applyTheme) applyDashboardTheme(serverSettingsState.theme);
       if(settingsThemeSelect) settingsThemeSelect.value = serverSettingsState.theme;
       if(settingsQrApiBaseUrl) settingsQrApiBaseUrl.value = serverSettingsState.qrgen_base_url;
     } catch {}
+    await loadProductsSettingsInfo(false);
+  }
+
+  async function loadProductsSettingsInfo(forceRefresh = false){
+    if(settingsProductsStatus) settingsProductsStatus.value = forceRefresh ? "Refreshing product items..." : "Loading product cache info...";
+    try {
+      const url = forceRefresh ? "/api/products?refresh=1" : "/api/products";
+      const resp = await fetch(url);
+      const out = await resp.json();
+      if(!out.ok){
+        if(settingsProductsStatus) settingsProductsStatus.value = out.error || "Failed to load products.";
+        return;
+      }
+      const items = Array.isArray(out.items) ? out.items : [];
+      if(settingsProductsCount) settingsProductsCount.value = `${items.length} item(s)${out.from_cache ? " (from cache)" : " (fresh)"}`;
+      if(settingsProductsUpdated) settingsProductsUpdated.value = out.updated ? fmtDateLocal(out.updated) : "-";
+      if(settingsProductsSourceFile) settingsProductsSourceFile.value = out.source_file || "-";
+      if(settingsProductsCacheFile) settingsProductsCacheFile.value = out.cache_file || "-";
+      if(settingsProductsStatus){
+        const base = out.error ? `Loaded with warning: ${out.error}` : "OK";
+        settingsProductsStatus.value = base;
+      }
+      if(forceRefresh){
+        productItems = items;
+        productsHydrated = items.length > 0;
+      }
+    } catch (e) {
+      if(settingsProductsStatus) settingsProductsStatus.value = `Failed: ${e}`;
+    }
   }
 
   async function saveServerSettingsUi(){
@@ -2011,6 +2503,7 @@ DASHBOARD_HTML = """
       return;
     }
     serverSettingsState = out.settings || payload;
+    applyDashboardTheme(serverSettingsState.theme);
     alert("Server settings applied.");
   }
 
@@ -2021,6 +2514,22 @@ DASHBOARD_HTML = """
       "4000001": "Lucy Van Pelt",
     };
     return map[c] || "";
+  }
+
+  function displayNameForId(idValue){
+    const raw = String(idValue || "").trim();
+    if(!raw) return "-";
+    const combinedMatch = raw.match(/^\s*[\w-]+\s*-\s*(.+)\s*$/);
+    if(combinedMatch && String(combinedMatch[1] || "").trim()){
+      return String(combinedMatch[1] || "").trim();
+    }
+    const code = raw;
+    if(!code) return "-";
+    const profile = findSettingsProfileById(code);
+    if(profile && String(profile.name || "").trim()) return String(profile.name || "").trim();
+    const daily = (dailyRolesState && typeof dailyRolesState === "object") ? dailyRolesState[code] : null;
+    if(daily && String(daily.name || "").trim()) return String(daily.name || "").trim();
+    return knownPersonNameFromBadge(code) || code;
   }
 
   function renderDailyRolesList(items){
@@ -2263,6 +2772,12 @@ DASHBOARD_HTML = """
 
   function renderFinishedJobs(rows){
     const items = Array.isArray(rows) ? rows : [];
+    if(finishedJobsInteractionLock){
+      pendingFinishedJobsRows = items;
+      finishedJobsState = items;
+      return;
+    }
+    pendingFinishedJobsRows = null;
     finishedJobsState = items;
     if(!items.length){
       finishedJobsList.innerHTML = '<div class="placeholder">No finished jobs yet.</div>';
@@ -2288,7 +2803,7 @@ DASHBOARD_HTML = """
           </div>
           <div class="finished-grid">
             <div><strong>Finished UTC:</strong> ${esc(r.finished_at_utc || "-")}</div>
-            <div><strong>Operator:</strong> ${esc(r.operator_id || "-")}</div>
+            <div><strong>Operator:</strong> ${esc(displayNameForId(r.operator_id || "-"))}</div>
             <div><strong>Pack Count:</strong> ${esc(r.pack_count ?? 0)}</div>
             <div><strong>Good:</strong> ${esc(r.good_total ?? 0)}</div>
             <div><strong>Butal:</strong> ${esc(r.butal_total ?? 0)}</div>
@@ -2374,7 +2889,7 @@ DASHBOARD_HTML = """
               <tr>
                 <td>${esc(machineName)}<br><span class="muted">${esc(machineCode)}</span></td>
                 <td>${esc(r.job_name || r.job_code || "-")}${linkageRole ? ` <span class="linkage-pill">${esc(linkageRole)}${linkageTotal ? ` (${linkageTotal})` : ""}</span>` : ""}<br><span class="muted">${esc(r.job_code || "-")}${linkageNote ? ` | ${esc(linkageNote)}` : ""}</span></td>
-                <td>${esc(r.operator_id || "-")}</td>
+                <td>${esc(displayNameForId(r.operator_id || "-"))}</td>
                 <td>${esc(fmtDateLocal(r.finished_at_utc || ""))}</td>
                 <td>${esc(fmtDateLocal(r.printed_at_utc || r.archived_at_utc || ""))}</td>
                 <td>${esc(r.review_status || "ARCHIVED")}</td>
@@ -2386,6 +2901,155 @@ DASHBOARD_HTML = """
         </tbody>
       </table>
     `;
+  }
+
+  function machineStatusArchiveDurationLabel(r){
+    const ended = String(r?.ended_at_utc || "").trim();
+    const dur = Number(r?.duration_seconds);
+    if(Number.isFinite(dur) && dur >= 0) return fmtDowntimeSeconds(dur);
+    const startedIso = String(r?.started_at_utc || "").trim();
+    const startedMs = startedIso ? new Date(startedIso).getTime() : NaN;
+    if(!ended && Number.isFinite(startedMs)){
+      const liveSec = Math.max(0, Math.floor((Date.now() - startedMs) / 1000));
+      return `${fmtDowntimeSeconds(liveSec)} (ongoing)`;
+    }
+    return "-";
+  }
+
+  function renderMachineStatusArchive(rows){
+    const items = Array.isArray(rows) ? rows : [];
+    machineStatusArchiveState = items;
+    if(!machineStatusArchiveTableWrap) return;
+    if(!items.length){
+      machineStatusArchiveTableWrap.innerHTML = '<div class="placeholder">No machine status archive logs yet.</div>';
+      return;
+    }
+    const sorted = [...items].reverse();
+    machineStatusArchiveTableWrap.innerHTML = `
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Machine</th>
+            <th>Status</th>
+            <th>Reason</th>
+            <th>Set By</th>
+            <th>Start</th>
+            <th>End</th>
+            <th>Duration</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${sorted.map((r) => {
+            const machineCode = String(r.machine_code || "").trim();
+            const machineName = r.machine_name || MACHINE_NAME_MAP[machineCode] || machineCode || "-";
+            const by = `${r.set_by_name || "-"}${r.set_by_role ? ` (${r.set_by_role})` : ""}`;
+            return `
+              <tr>
+                <td>${esc(machineName)}<br><span class="muted">${esc(machineCode)}</span></td>
+                <td>${esc(r.status || "-")}</td>
+                <td>${esc(r.reason || "-")}</td>
+                <td>${esc(by)}<br><span class="muted">${esc(r.set_by_badge || "-")}</span></td>
+                <td>${esc(fmtDateLocal(r.started_at_utc || ""))}</td>
+                <td>${esc(fmtDateLocal(r.ended_at_utc || ""))}</td>
+                <td>${esc(machineStatusArchiveDurationLabel(r))}</td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function buildDowntimeArchiveRows(finishedRows, archivedRows){
+    const all = [...(Array.isArray(finishedRows) ? finishedRows : []), ...(Array.isArray(archivedRows) ? archivedRows : [])];
+    const seen = new Set();
+    const out = [];
+    for(const r of all){
+      if(!r || typeof r !== "object") continue;
+      const sec = Number(r.downtime_last_seconds);
+      const active = Boolean(r.downtime_active);
+      const reasonCode = String(r.downtime_reason_code || "").trim();
+      const reasonText = String(r.downtime_reason_text || "").trim();
+      if(!(Number.isFinite(sec) && sec > 0) && !active) continue;
+      if(!reasonCode && !reasonText && !(Number.isFinite(sec) && sec > 0)) continue;
+      const key = [
+        String(r.machine_code || ""),
+        String(r.job_code || ""),
+        String(r.finished_at_utc || r.printed_at_utc || r.archived_at_utc || ""),
+        String(reasonCode),
+        String(reasonText),
+        String(Number.isFinite(sec) ? sec : ""),
+      ].join("|");
+      if(seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        machine_code: String(r.machine_code || "").trim(),
+        machine_name: String(r.machine_name || "").trim(),
+        job_code: String(r.job_code || "").trim(),
+        job_name: String(r.job_name || "").trim(),
+        operator_id: String(r.operator_id || "").trim(),
+        reason_code: reasonCode,
+        reason_text: reasonText,
+        duration_seconds: Number.isFinite(sec) ? Math.max(0, Math.floor(sec)) : null,
+        at_utc: String(r.finished_at_utc || r.printed_at_utc || r.archived_at_utc || r.last_seen_utc || "").trim(),
+        source: String(r.printed_at_utc || r.archived_at_utc ? "Archived Job" : "Finished Job"),
+      });
+    }
+    return out.sort((a, b) => {
+      const ta = new Date(a.at_utc || 0).getTime() || 0;
+      const tb = new Date(b.at_utc || 0).getTime() || 0;
+      return tb - ta;
+    });
+  }
+
+  function renderDowntimeArchive(finishedRows, archivedRows){
+    if(!downtimeArchiveTableWrap) return;
+    const rows = buildDowntimeArchiveRows(finishedRows, archivedRows);
+    if(!rows.length){
+      downtimeArchiveTableWrap.innerHTML = '<div class="placeholder">No downtime archive rows yet.</div>';
+      return;
+    }
+    downtimeArchiveTableWrap.innerHTML = `
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Machine</th>
+            <th>Job</th>
+            <th>Operator</th>
+            <th>Reason</th>
+            <th>Duration</th>
+            <th>Recorded</th>
+            <th>Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map((r) => {
+            const machineName = r.machine_name || MACHINE_NAME_MAP[r.machine_code] || r.machine_code || "-";
+            const reason = [r.reason_code, r.reason_text].filter(Boolean).join(" - ") || "-";
+            return `
+              <tr>
+                <td>${esc(machineName)}<br><span class="muted">${esc(r.machine_code || "-")}</span></td>
+                <td>${esc(r.job_name || r.job_code || "-")}<br><span class="muted">${esc(r.job_code || "-")}</span></td>
+                <td>${esc(displayNameForId(r.operator_id || "-"))}</td>
+                <td>${esc(reason)}</td>
+                <td>${esc(fmtDowntimeSeconds(r.duration_seconds))}</td>
+                <td>${esc(fmtDateLocal(r.at_utc || ""))}</td>
+                <td>${esc(r.source || "-")}</td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function setFinishedJobsInteractionLock(locked){
+    finishedJobsInteractionLock = Boolean(locked);
+    if(!finishedJobsInteractionLock && pendingFinishedJobsRows){
+      const rows = pendingFinishedJobsRows;
+      pendingFinishedJobsRows = null;
+      renderFinishedJobs(rows);
+    }
   }
 
   async function loadProducts(forceRefresh = false){
@@ -2486,10 +3150,53 @@ DASHBOARD_HTML = """
     setOverlayStep("review");
   }
 
+  function machineCardHtml(s, code, css, statusLabel){
+    const linkageJobs = Array.isArray(s.linkage_jobs) ? s.linkage_jobs : [];
+    const hasLinkage = Boolean(s.linkage_enabled) && linkageJobs.length > 0;
+    const total = Number(s.good_total||0) + Number(s.butal_total||0);
+    const jobLabel = s.job_name
+      ? (s.job_code ? `${s.job_name} (${s.job_code})` : s.job_name)
+      : (s.job_code || "No Job Set");
+    const seenLabel = s.last_seen_utc ? new Date(s.last_seen_utc).toLocaleString() : "-";
+    return `
+      ${hasLinkage ? `<div class="machine-linkage-flag">LINKED JOBS: ${esc(linkageJobs.length)}</div>` : ""}
+      <h3>${esc(s.machine_name || s.machine_code)}</h3>
+      <p>Machine: <strong>${esc(s.machine_code || code)}</strong></p>
+      <p>Job: <strong>${esc(jobLabel)}</strong></p>
+      <p>Operator: <strong>${esc(displayNameForId(s.operator_id || "-"))}</strong></p>
+      <p>Client: <strong>${esc(displayNameForId(s.client_id || "-"))}</strong></p>
+      <p>Status: <strong>${esc(statusLabel || css.toUpperCase())}</strong></p>
+      <p>Pack: <strong>${esc(s.pack_total)}</strong></p>
+      <p>Good: <strong>${esc(s.good_total)}</strong></p>
+      <p>Butal: <strong>${esc(s.butal_total)}</strong></p>
+      <p>Reject: <strong>${esc(s.reject_total)}</strong></p>
+      <p>Total: <strong>${esc(total)}</strong></p>
+      <p class="muted">Last Seen: ${esc(seenLabel)}</p>
+      <p class="muted">Last Event: ${esc(s.last_event || "-")}</p>
+    `;
+  }
+
+  function upsertMachineCard(s, code, css, statusLabel){
+    let card = machineCardEls.get(code);
+    if(!card){
+      card = document.createElement("div");
+      card.dataset.machineCode = code;
+      card.addEventListener("click", () => {
+        const fresh = (latestState.sessions || []).find(x => String(x.machine_code || "").trim() === code) || s;
+        openMachineDetail(fresh);
+      });
+      machineCardEls.set(code, card);
+    }
+    card.className = `card ${css}`;
+    card.innerHTML = machineCardHtml(s, code, css, statusLabel);
+    return card;
+  }
+
   function render(state){
     latestState = state || { sessions: [] };
-    timeEl.textContent = "Server UTC: " + state.server_time_utc;
-    machineGrid.innerHTML = "";
+    machineStatusOverridesState = (state && state.machine_status_overrides && typeof state.machine_status_overrides === "object") ? state.machine_status_overrides : {};
+    machineStatusArchiveState = (state && Array.isArray(state.machine_status_archive)) ? state.machine_status_archive : [];
+    timeEl.textContent = "Server UTC: " + (state.server_time_utc || "-");
     const sessions = state.sessions || [];
     const activeTtlSeconds = Number(state.active_ttl_seconds || 30);
     const byCode = Object.fromEntries(sessions.map(s => [String(s.machine_code || "").trim(), s]));
@@ -2499,6 +3206,7 @@ DASHBOARD_HTML = """
     const allCodes = Array.from(new Set([...DEFAULT_MACHINE_CODES, ...sessionCodes])).sort();
     machineCountEl.textContent = String(allCodes.length);
 
+    const desiredCodes = new Set(allCodes);
     for(const code of allCodes){
       const s = byCode[code] || {
         machine_code: code,
@@ -2514,38 +3222,26 @@ DASHBOARD_HTML = """
         last_event: "No data yet",
         last_seen_utc: "",
       };
-      const css = statusClass(s.last_seen_utc, activeTtlSeconds) || "disconnected";
+      const manual = machineStatusOverrideFor(code);
+      const manualStatus = String((manual && manual.status) || "").trim();
+      const css = statusClass(s.last_seen_utc, activeTtlSeconds, manualStatus) || "disconnected";
+      const statusLabel = manualStatus || css.toUpperCase();
       s.machine_name = s.machine_name || MACHINE_NAME_MAP[code] || code;
-      const linkageJobs = Array.isArray(s.linkage_jobs) ? s.linkage_jobs : [];
-      const hasLinkage = Boolean(s.linkage_enabled) && linkageJobs.length > 0;
-      const card = document.createElement("div");
-      card.className = `card ${css}`;
-      const total = Number(s.good_total||0) + Number(s.butal_total||0);
-      const jobLabel = s.job_name
-        ? (s.job_code ? `${s.job_name} (${s.job_code})` : s.job_name)
-        : (s.job_code || "No Job Set");
-      const seenLabel = s.last_seen_utc ? new Date(s.last_seen_utc).toLocaleString() : "-";
-      card.innerHTML = `
-        ${hasLinkage ? `<div class="machine-linkage-flag">LINKED JOBS: ${esc(linkageJobs.length)}</div>` : ""}
-        <h3>${esc(s.machine_name || s.machine_code)}</h3>
-        <p>Machine: <strong>${esc(s.machine_code || code)}</strong></p>
-        <p>Job: <strong>${esc(jobLabel)}</strong></p>
-        <p>Operator: <strong>${esc(s.operator_id || "-")}</strong></p>
-        <p>Client: <strong>${esc(s.client_id || "-")}</strong></p>
-        <p>Status: <strong>${css.toUpperCase()}</strong></p>
-        <p>Pack: <strong>${esc(s.pack_total)}</strong></p>
-        <p>Good: <strong>${esc(s.good_total)}</strong></p>
-        <p>Butal: <strong>${esc(s.butal_total)}</strong></p>
-        <p>Reject: <strong>${esc(s.reject_total)}</strong></p>
-        <p>Total: <strong>${esc(total)}</strong></p>
-        <p class="muted">Last Seen: ${esc(seenLabel)}</p>
-        <p class="muted">Last Event: ${esc(s.last_event || "-")}</p>
-      `;
-      card.addEventListener("click", () => openMachineDetail(s));
-      machineGrid.appendChild(card);
+      const card = upsertMachineCard(s, code, css, statusLabel);
+      if(card.parentNode !== machineGrid){
+        machineGrid.appendChild(card);
+      }
+    }
+
+    for(const [code, card] of machineCardEls.entries()){
+      if(desiredCodes.has(code)) continue;
+      if(card && card.parentNode) card.parentNode.removeChild(card);
+      machineCardEls.delete(code);
     }
     renderFinishedJobs(state.finished_jobs || []);
     renderArchivedJobs(state.archived_jobs || []);
+    renderMachineStatusArchive(machineStatusArchiveState);
+    renderDowntimeArchive(state.finished_jobs || [], state.archived_jobs || []);
   }
 
   // tab handling
@@ -2561,7 +3257,7 @@ DASHBOARD_HTML = """
 
   if(serverSettingsBtn){
     serverSettingsBtn.addEventListener("click", async () => {
-      await loadServerSettingsUi();
+      await loadServerSettingsUi(false);
       await loadSettingsProfilesUi();
       showServerSettingsPage("general");
       serverSettingsOverlay?.classList.add("active");
@@ -2581,8 +3277,24 @@ DASHBOARD_HTML = """
     });
   }
   if(profileCreatorBtn){
-    profileCreatorBtn.addEventListener("click", () => {
-      window.open("/profiles", "_blank");
+    profileCreatorBtn.addEventListener("click", async () => {
+      const pw = window.prompt("Admin password required to open Profile Creation:", "");
+      if(pw === null) return;
+      try{
+        const r = await fetch('/api/profiles/authorize-open', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ admin_password: pw })
+        });
+        const j = await r.json().catch(() => ({}));
+        if(!r.ok || !j.ok){
+          alert(j.error || 'Invalid admin password');
+          return;
+        }
+        window.open("/profiles", "_blank");
+      }catch(err){
+        alert(`Failed to authorize profile creation: ${err}`);
+      }
     });
   }
   if(dailyRolesCloseBtn) dailyRolesCloseBtn.addEventListener("click", () => dailyRolesOverlay?.classList.remove("active"));
@@ -2622,11 +3334,16 @@ DASHBOARD_HTML = """
   settingsNavTheme?.addEventListener("click", () => showServerSettingsPage("theme"));
   settingsNavApi?.addEventListener("click", () => showServerSettingsPage("api"));
   settingsNavProfile?.addEventListener("click", async () => { await loadSettingsProfilesUi(); showServerSettingsPage("profile"); });
+  settingsThemeSelect?.addEventListener("change", () => applyDashboardTheme(settingsThemeSelect.value));
   serverSettingsSaveBtn?.addEventListener("click", saveServerSettingsUi);
+  settingsProductsRefreshBtn?.addEventListener("click", async () => {
+    await loadProductsSettingsInfo(true);
+  });
 
   finishedJobsList.addEventListener("click", async (ev) => {
     const btn = ev.target.closest(".approve-print-btn");
     if(!btn) return;
+    setFinishedJobsInteractionLock(true);
     const idx = Number(btn.getAttribute("data-row-index"));
     if(Number.isNaN(idx) || idx < 0) return;
     const sorted = [...(finishedJobsState || [])].reverse();
@@ -2636,6 +3353,20 @@ DASHBOARD_HTML = """
     if(!productItems.length){
       loadProducts(false);
     }
+    setTimeout(() => setFinishedJobsInteractionLock(false), 0);
+  });
+  finishedJobsList.addEventListener("mouseover", (ev) => {
+    if(ev.target.closest(".approve-print-btn")) setFinishedJobsInteractionLock(true);
+  });
+  finishedJobsList.addEventListener("mouseout", (ev) => {
+    const btn = ev.target.closest(".approve-print-btn");
+    if(!btn) return;
+    const nextEl = ev.relatedTarget instanceof Element ? ev.relatedTarget : null;
+    if(nextEl && btn.contains(nextEl)) return;
+    setFinishedJobsInteractionLock(false);
+  });
+  finishedJobsList.addEventListener("mousedown", (ev) => {
+    if(ev.target.closest(".approve-print-btn")) setFinishedJobsInteractionLock(true);
   });
   archivedJobsTableWrap?.addEventListener("click", (ev) => {
     const btn = ev.target.closest(".archived-view-btn");
@@ -2697,6 +3428,69 @@ DASHBOARD_HTML = """
   }
   if(overlayBackToReviewBtn) overlayBackToReviewBtn.addEventListener("click", () => setOverlayStep("review"));
   machineDetailCloseBtn.addEventListener("click", closeMachineDetail);
+  machineDetailSettingsBtn?.addEventListener("click", () => {
+    if(!machineDetailStatusPanel) return;
+    machineDetailStatusPanel.style.display = (machineDetailStatusPanel.style.display === "none") ? "" : "none";
+  });
+  machineDetailStatusSaveBtn?.addEventListener("click", async () => {
+    const machineCode = String(activeMachineDetailCode || "").trim();
+    if(!machineCode) return;
+    const status = String(machineDetailStatusSelect?.value || "").trim();
+    const reason = String(machineDetailStatusReason?.value || "").trim();
+    const setterBadge = String(machineDetailStatusSetterBadge?.value || "").trim();
+    if(!reason){
+      alert("Reason is required before confirming machine status.");
+      machineDetailStatusReason?.focus();
+      return;
+    }
+    if(!setterBadge){
+      alert("Scan user QR first before confirming machine status.");
+      machineDetailStatusSetterBadge?.focus();
+      return;
+    }
+    if(machineDetailStatusSaveBtn) machineDetailStatusSaveBtn.disabled = true;
+    if(machineStatusSaveFeedback) machineStatusSaveFeedback.classList.add("active");
+    if(machineStatusSaveBar) machineStatusSaveBar.style.width = "8%";
+    if(machineStatusSaveCheck) machineStatusSaveCheck.classList.remove("done");
+    let progress = 8;
+    const anim = window.setInterval(() => {
+      progress = Math.min(92, progress + 11);
+      if(machineStatusSaveBar) machineStatusSaveBar.style.width = `${progress}%`;
+    }, 70);
+    try{
+      const r = await fetch('/api/machines/status', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ machine_code: machineCode, status, reason, setter_badge: setterBadge })
+      });
+      const j = await r.json().catch(() => ({}));
+      window.clearInterval(anim);
+      if(!r.ok || !j.ok){
+        if(machineStatusSaveFeedback) machineStatusSaveFeedback.classList.remove("active");
+        if(machineStatusSaveBar) machineStatusSaveBar.style.width = "0%";
+        alert(j.error || "Failed to save machine status");
+        if(machineDetailStatusSaveBtn) machineDetailStatusSaveBtn.disabled = false;
+        return;
+      }
+      if(machineStatusSaveBar) machineStatusSaveBar.style.width = "100%";
+      if(machineStatusSaveCheck) machineStatusSaveCheck.classList.add("done");
+      if(lastMessageEl) lastMessageEl.textContent = `Machine status updated: ${machineCode} -> ${status || "Auto (Live Status)"} by ${j?.actor?.name || setterBadge}`;
+      setTimeout(() => {
+        if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
+        if(machineStatusSaveFeedback) machineStatusSaveFeedback.classList.remove("active");
+        if(machineStatusSaveBar) machineStatusSaveBar.style.width = "0%";
+        if(machineStatusSaveCheck) machineStatusSaveCheck.classList.remove("done");
+        if(machineDetailStatusSetterBadge) machineDetailStatusSetterBadge.value = "";
+      }, 650);
+    }catch(err){
+      window.clearInterval(anim);
+      if(machineStatusSaveFeedback) machineStatusSaveFeedback.classList.remove("active");
+      if(machineStatusSaveBar) machineStatusSaveBar.style.width = "0%";
+      alert(`Failed to save machine status: ${err}`);
+    } finally {
+      if(machineDetailStatusSaveBtn) machineDetailStatusSaveBtn.disabled = false;
+    }
+  });
   approvePrintOverlay.addEventListener("click", (_ev) => {
     // Keep the review/print popup open unless user uses explicit Close/Cancel buttons.
   });
@@ -2961,6 +3755,9 @@ DASHBOARD_HTML = """
     if(msg.type === "STATE") render(msg);
   };
 
+  // Apply saved dashboard theme/settings immediately on page load.
+  loadServerSettingsUi(true).catch(() => {});
+
   // Warm product cache on page load so overlay opens fast.
   loadProducts(false).then(() => {
     // Optional background refresh; does not block UI.
@@ -2985,27 +3782,28 @@ PROFILE_CREATOR_HTML = """
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Profile QR Creator</title>
   <style>
-    body { margin: 0; font-family: Poppins, Segoe UI, sans-serif; background: #eef2f7; color: #1f2937; }
+    body { margin: 0; font-family: Poppins, Segoe UI, sans-serif; background: #eef2f7 url('/Images/bgbg.png') center / cover fixed no-repeat; color: #1f2937; }
     .wrap { max-width: 980px; margin: 22px auto; padding: 0 14px; }
-    .card { background: #fff; border: 1px solid #dbe4f0; border-radius: 16px; box-shadow: 0 10px 24px rgba(15,23,42,.08); overflow: hidden; }
+    .card { background: rgba(255,255,255,.96); border: 1px solid #dbe4f0; border-radius: 16px; box-shadow: 0 20px 48px rgba(15,23,42,.18), 0 6px 16px rgba(15,23,42,.10); overflow: hidden; }
     .head { padding: 16px 18px; border-bottom: 1px solid #e5e7eb; font-weight: 800; font-size: 1.05rem; }
     .body { padding: 16px 18px; display: grid; grid-template-columns: 1fr 380px; gap: 16px; }
     .form { display: grid; gap: 10px; }
     .row { display: grid; gap: 6px; }
     label { font-size: .86rem; font-weight: 700; color: #475569; }
-    input, select { border: 1px solid #cbd5e1; border-radius: 10px; padding: 10px 12px; font: inherit; }
+    input, select { border: 1px solid #cbd5e1; border-radius: 10px; padding: 10px 12px; font: inherit; background: rgba(255,255,255,.98); box-shadow: 0 10px 22px rgba(15,23,42,.18), 0 2px 6px rgba(15,23,42,.08), inset 0 1px 0 rgba(255,255,255,.75); }
+    input:focus, select:focus { outline: none; border-color: #60a5fa; box-shadow: 0 0 0 4px rgba(59,130,246,.22), 0 14px 28px rgba(15,23,42,.20); }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
     button { border: none; border-radius: 12px; padding: 10px 14px; cursor: pointer; font-weight: 600; transition: transform .12s ease, box-shadow .16s ease; }
     button:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(15,23,42,.10); }
     button:active { transform: translateY(0) scale(.985); }
     .primary { background: #1d4ed8; color: #fff; }
     .secondary { background: #fff; color: #1f2937; border: 1px solid #cbd5e1; }
-    .preview { border: 1px solid #dbe4f0; border-radius: 14px; background: #f8fafc; padding: 12px; }
+    .preview { border: 1px solid #dbe4f0; border-radius: 14px; background: rgba(248,250,252,.95); padding: 12px; box-shadow: 0 14px 30px rgba(15,23,42,.14), inset 0 1px 0 rgba(255,255,255,.7); }
     .preview h4 { margin: 0 0 8px; }
     .preview img { width: 100%; height: auto; border: 1px solid #dbe4f0; border-radius: 10px; background: #fff; }
     .mono { font-family: Consolas, monospace; font-size: .75rem; white-space: pre-wrap; word-break: break-all; margin-top: 8px; background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:8px; }
     .status { font-size: .85rem; color: #334155; min-height: 20px; }
-    .table { margin-top: 14px; border: 1px solid #dbe4f0; border-radius: 12px; overflow: auto; background:#fff; }
+    .table { margin-top: 14px; border: 1px solid #dbe4f0; border-radius: 12px; overflow: auto; background: rgba(255,255,255,.96); box-shadow: 0 18px 38px rgba(15,23,42,.15), 0 4px 12px rgba(15,23,42,.08); }
     table { width: 100%; border-collapse: collapse; min-width: 720px; }
     th, td { border-bottom: 1px solid #edf2f7; padding: 8px 10px; text-align: left; font-size: .84rem; }
     th { background: #f8fafc; }
@@ -3013,6 +3811,39 @@ PROFILE_CREATOR_HTML = """
     .mini-btn.primary { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
     .mini-btn.danger { background: #fff1f2; color: #be123c; border-color: #fecdd3; }
     .mini-actions { display:flex; gap:6px; flex-wrap:wrap; }
+    body[data-theme="Soft Gray"] { background: #eef1f4 url('/Images/bgbg.png') center / cover fixed no-repeat; color: #243041; }
+    body[data-theme="Soft Gray"] .card, body[data-theme="Soft Gray"] .table { background: rgba(248,250,252,.96); border-color: #dbe2eb; }
+    body[data-theme="Soft Gray"] .head { border-bottom-color: #dbe2eb; color: #334155; }
+    body[data-theme="Soft Gray"] label { color: #475569; }
+    body[data-theme="Soft Gray"] input, body[data-theme="Soft Gray"] select { border-color: #dbe2eb; color: #334155; }
+    body[data-theme="Soft Gray"] .preview { border-color: #dbe2eb; background: rgba(248,250,252,.95); }
+    body[data-theme="Soft Gray"] th { background: #f8fafc; color: #475569; }
+    body[data-theme="Dark"] { background: #0b1220 url('/Images/bgbg.png') center / cover fixed no-repeat; color: #e5e7eb; }
+    body[data-theme="Dark"] .card, body[data-theme="Dark"] .table { background: rgba(15,23,42,.96); border-color: #334155; box-shadow: 0 20px 48px rgba(0,0,0,.40), 0 6px 16px rgba(0,0,0,.25); }
+    body[data-theme="Dark"] .head { border-bottom-color: #334155; color: #e5e7eb; }
+    body[data-theme="Dark"] label { color: #cbd5e1; }
+    body[data-theme="Dark"] input, body[data-theme="Dark"] select { background: rgba(17,24,39,.96); border-color: #334155; color: #e5e7eb; box-shadow: 0 10px 22px rgba(0,0,0,.28), 0 2px 6px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.03); }
+    body[data-theme="Dark"] input:focus, body[data-theme="Dark"] select:focus { border-color: #60a5fa; box-shadow: 0 0 0 4px rgba(59,130,246,.22), 0 14px 28px rgba(0,0,0,.30); }
+    body[data-theme="Dark"] .secondary { background: #111827; color: #e5e7eb; border-color: #334155; }
+    body[data-theme="Dark"] .primary { background: #2563eb; }
+    body[data-theme="Dark"] .preview { border-color: #334155; background: rgba(17,24,39,.92); }
+    body[data-theme="Dark"] .preview h4, body[data-theme="Dark"] .status { color: #e5e7eb; }
+    body[data-theme="Dark"] .preview img, body[data-theme="Dark"] .mono { background: #0f172a; border-color: #334155; color: #cbd5e1; }
+    body[data-theme="Dark"] th { background: #1f2937; color: #cbd5e1; }
+    body[data-theme="Dark"] td { border-bottom-color: #253041; color: #e5e7eb; }
+    body[data-theme="Dark"] .mini-btn { background: #111827; color: #e5e7eb; border-color: #334155; }
+    body[data-theme="Dark"] .mini-btn.primary { background: #1d4ed8; border-color: #3b82f6; }
+    body[data-theme="Dark"] .mini-btn.danger { background: rgba(127,29,29,.22); color: #fecdd3; border-color: #7f1d1d; }
+    body[data-theme="Red"] { background: #fff4f4 url('/Images/bgbg.png') center / cover fixed no-repeat; color: #7f1d1d; }
+    body[data-theme="Red"] .card, body[data-theme="Red"] .table { background: rgba(255,255,255,.96); border-color: #fecaca; }
+    body[data-theme="Red"] .head { border-bottom-color: #fecaca; color: #7f1d1d; }
+    body[data-theme="Red"] label { color: #991b1b; }
+    body[data-theme="Red"] input, body[data-theme="Red"] select { border-color: #fecaca; color: #7f1d1d; }
+    body[data-theme="Red"] .preview { border-color: #fecaca; background: rgba(255,247,247,.95); }
+    body[data-theme="Red"] th { background: #fef2f2; color: #991b1b; }
+    body[data-theme="Red"] td { border-bottom-color: #fee2e2; color: #7f1d1d; }
+    body[data-theme="Red"] .secondary { border-color: #fecaca; color: #7f1d1d; }
+    body[data-theme="Red"] .primary { background: #dc2626; }
     @media (max-width: 900px) { .body { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -3029,6 +3860,7 @@ PROFILE_CREATOR_HTML = """
               <select id="pfRole">
                 <option>Supervisor</option>
                 <option>QA/QC</option>
+                <option>Operator</option>
                 <option>Maintenance</option>
                 <option>Planner</option>
                 <option>Production Manager</option>
@@ -3078,6 +3910,21 @@ PROFILE_CREATOR_HTML = """
   function esc(s){ return (s ?? '').toString().replaceAll('&','&amp;').replaceAll('<','&lt;'); }
   function escAttr(s){ return esc(s).replaceAll('\"','&quot;'); }
   function setStatus(t){ pfStatus.textContent = t || ''; }
+  function applyProfileTheme(theme){
+    const t = String(theme || 'Default').trim() || 'Default';
+    if(t === 'Default' || t === 'Blue Accent'){
+      delete document.body.dataset.theme;
+    } else {
+      document.body.dataset.theme = t;
+    }
+  }
+  async function loadProfilePageTheme(){
+    try{
+      const r = await fetch('/api/server-settings');
+      const out = await r.json();
+      if(out && out.ok && out.settings) applyProfileTheme(out.settings.theme || 'Default');
+    }catch(_e){}
+  }
   function getForm(){
     return {
       name: (pfName.value || '').trim(),
@@ -3221,6 +4068,7 @@ PROFILE_CREATOR_HTML = """
       await printExistingProfile(id, btn.getAttribute('data-name') || '', btn.getAttribute('data-role') || '');
     }
   });
+  loadProfilePageTheme();
   loadProfiles();
 </script>
 </body>
@@ -3326,6 +4174,100 @@ async def api_profiles_delete(req: Request):
     removed = PROFILES.pop(idx)
     save_profiles(PROFILES)
     return {"ok": True, "item": removed}
+
+
+@APP.post("/api/profiles/authorize-open")
+async def api_profiles_authorize_open(req: Request):
+    data = await req.json()
+    admin_password = str(data.get("admin_password", "") or "")
+    if admin_password != PROFILE_REPRINT_ADMIN_PASSWORD:
+        return JSONResponse({"ok": False, "error": "Invalid admin password"}, status_code=403)
+    return {"ok": True}
+
+
+@APP.post("/api/machines/status")
+async def api_machine_status_set(req: Request):
+    global MACHINE_STATUS_OVERRIDES, MACHINE_STATUS_ARCHIVE
+    data = await req.json()
+    machine_code = str(data.get("machine_code", "")).strip()
+    status = str(data.get("status", "")).strip()
+    reason = str(data.get("reason", "")).strip()
+    setter_badge = str(data.get("setter_badge", "")).strip()
+    valid = {"", "No schedule", "Scheduled for fix", "Not working"}
+    if not machine_code:
+        return JSONResponse({"ok": False, "error": "machine_code is required"}, status_code=400)
+    if status not in valid:
+        return JSONResponse({"ok": False, "error": "Invalid machine status"}, status_code=400)
+    if not reason:
+        return JSONResponse({"ok": False, "error": "Reason is required before confirming machine status"}, status_code=400)
+    if not setter_badge:
+        return JSONResponse({"ok": False, "error": "User QR is required before confirming machine status"}, status_code=400)
+    setter = _person_from_badge_any(setter_badge)
+    if not setter:
+        return JSONResponse({"ok": False, "error": "Scanned user QR is not registered on server profiles/roles"}, status_code=403)
+    now = utc_now()
+    machine_name = _machine_display_name(machine_code, MACHINE_NAME_MAP.get(machine_code, machine_code))
+    previous = MACHINE_STATUS_OVERRIDES.get(machine_code) if isinstance(MACHINE_STATUS_OVERRIDES, dict) else None
+    previous_status = str((previous or {}).get("status") or "").strip()
+    if not status:
+        _close_machine_status_archive_entries(
+            machine_code,
+            closed_by_badge=setter["code"],
+            closed_by_name=setter["name"],
+            closed_by_role=setter.get("role", ""),
+            closed_reason=reason,
+            closed_action="cleared",
+            ended_at=now,
+        )
+        MACHINE_STATUS_OVERRIDES.pop(machine_code, None)
+    else:
+        if previous_status:
+            _close_machine_status_archive_entries(
+                machine_code,
+                closed_by_badge=setter["code"],
+                closed_by_name=setter["name"],
+                closed_by_role=setter.get("role", ""),
+                closed_reason=reason,
+                closed_action="changed" if previous_status != status else "updated",
+                ended_at=now,
+            )
+        MACHINE_STATUS_OVERRIDES[machine_code] = {
+            "status": status,
+            "reason": reason,
+            "updated_at_utc": now.isoformat(),
+            "started_at_utc": now.isoformat(),
+            "set_by_badge": setter["code"],
+            "set_by_name": setter["name"],
+            "set_by_role": setter.get("role", ""),
+        }
+        MACHINE_STATUS_ARCHIVE.append(
+            {
+                "machine_code": machine_code,
+                "machine_name": machine_name,
+                "status": status,
+                "reason": reason,
+                "set_by_badge": setter["code"],
+                "set_by_name": setter["name"],
+                "set_by_role": setter.get("role", ""),
+                "started_at_utc": now.isoformat(),
+                "ended_at_utc": "",
+                "duration_seconds": None,
+                "closed_by_badge": "",
+                "closed_by_name": "",
+                "closed_by_role": "",
+                "closed_reason": "",
+                "closed_action": "",
+            }
+        )
+        save_machine_status_archive(MACHINE_STATUS_ARCHIVE)
+    save_machine_status_overrides(MACHINE_STATUS_OVERRIDES)
+    await broadcast_state()
+    return {
+        "ok": True,
+        "machine_code": machine_code,
+        "item": MACHINE_STATUS_OVERRIDES.get(machine_code),
+        "actor": setter,
+    }
 
 
 @APP.post("/api/event")
@@ -3651,8 +4593,8 @@ def api_products(refresh: int = 0):
         "from_cache": result["from_cache"],
         "updated": result["updated"],
         "error": result.get("error", ""),
-        "source_file": str(PRODUCT_SOURCE_FILE),
-        "cache_file": str(PRODUCT_CACHE_FILE),
+        "source_file": _app_relative_path_str(PRODUCT_API_CONFIG_FILE),
+        "cache_file": _app_relative_path_str(PRODUCT_CACHE_FILE),
     }
 
 

@@ -251,7 +251,23 @@
     "downtime_reason_text": null,
     "cycle_time_current": null,
     "maintenance_name": null,
-    "supervisor_name": null
+    "supervisor_name": null,
+    "review_history": [
+      {
+        "action": "APPROVE",
+        "remarks": "asdadsa",
+        "actor_name": "Charlie Brown",
+        "actor_code": "3000001",
+        "actor_role": "Supervisor",
+        "timestamp_utc": "2026-02-24T05:18:54.736705+00:00"
+      }
+    ],
+    "approved_by": "Charlie Brown",
+    "approved_by_code": "3000001",
+    "approved_by_role": "Supervisor",
+    "approved_remarks": "asdadsa",
+    "approved_at_utc": "2026-02-24T05:18:54.736705+00:00",
+    "review_status": "APPROVED"
   },
   {
     "finished_at_utc": "2026-02-20T09:01:06.836116+00:00",

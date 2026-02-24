@@ -31,12 +31,8 @@ MACHINE_MAP: Dict[str, str] = {
     "M00021": "IMM 321",
 }
 
-JOB_MAP: Dict[str, str] = {
-    "101245": "J024-0305",
-    "250424": "JO22-0100",
-    "56675":  "J023-1122",
-    "102378": "J021-9233",
-}
+# Job display names are now sourced from the live Job API response in client.py.
+JOB_MAP: Dict[str, str] = {}
 
 REJECT_REASON_MAP: Dict[str, str] = {
     "BM01": "BURN MARK",
@@ -66,7 +62,9 @@ def _load_job_stubs() -> Dict[str, Any]:
     return {}
 
 
-JOB_STUBS: Dict[str, Any] = _load_job_stubs()
+# Disable local job stub lookup by default now that live Job API fetching is used in client.py.
+# Keep the loader function for backward compatibility if needed later.
+JOB_STUBS: Dict[str, Any] = {}
 
 
 def now_iso() -> str:
@@ -134,15 +132,24 @@ def _parse_structured_raw_material(payload: str) -> Optional[Dict[str, Any]]:
 def _extract_po_from_job_qr(payload: str) -> Optional[str]:
     """
     Parse job QR format like: O000000000240000010237800000000000
-    The PO number is in the middle 11-digit segment.
+    Extract the 11-digit job/PO segment immediately after the literal "24".
+    Example:
+      O00000000024 00000102378 00000000000
+                  ^^^^^^^^^^^
     """
     s = str(payload).strip()
+    # Exact parse for the common format:
+    # O + (9 digits + "24") + (11-digit job id) + (11 trailing digits)
+    # Example: O00000000024 00000034589 00000000000
+    m_after_24 = re.fullmatch(r"O\d{9}24(\d{11})\d{11}", s)
+    if m_after_24:
+        return m_after_24.group(1).lstrip("0") or "0"
+
+    # Fallback (legacy assumption): middle 11-digit segment.
     m = re.fullmatch(r"O(\d{11})(\d{11})(\d{11})", s)
-    if not m:
-        return None
-    mid_block = m.group(2)
-    po = mid_block.lstrip("0") or "0"
-    return po
+    if m:
+        return m.group(2).lstrip("0") or "0"
+    return None
 
 
 @dataclass
@@ -187,45 +194,18 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="MACHINE", raw=raw, value=MACHINE_MAP[s])
 
     # Job
-    if s in JOB_MAP:
-        return ScanResult(kind="JOB", raw=raw, value=JOB_MAP[s])
+    m_job_url = re.search(r"/v1/jobs/(\d+)\s*$", s_l)
+    if m_job_url:
+        job_id = m_job_url.group(1).lstrip("0") or "0"
+        return ScanResult(kind="JOB", raw=raw, value=job_id, meta={"po_number": job_id})
     po_from_structured_job = _extract_po_from_job_qr(s)
     if po_from_structured_job is not None:
         return ScanResult(
             kind="JOB",
             raw=raw,
-            value=JOB_MAP.get(po_from_structured_job, f"PO-{po_from_structured_job}"),
+            value=po_from_structured_job,
             meta={"po_number": po_from_structured_job},
         )
-
-    # Job stub by key value from local stub file
-    if s in JOB_STUBS and isinstance(JOB_STUBS[s], dict):
-        payload = JOB_STUBS[s]
-        job = {}
-        if isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("job"), dict):
-            job = payload["data"]["job"]
-        job_ref = str(job.get("ref_no", "")).strip() or s
-        return ScanResult(kind="JOB_STUB", raw=raw, value=f"Job payload: {job_ref}", meta=payload)
-
-    # Job payload / API stub (JSON in QR)
-    try:
-        parsed = json.loads(s)
-        if isinstance(parsed, dict):
-            has_job_shape = any(
-                k in parsed
-                for k in ("job_code", "job_name", "job", "summary", "reject_summary", "rejects")
-            )
-            if has_job_shape:
-                job_code = str(parsed.get("job_code", "")).strip()
-                job_name = str(parsed.get("job_name", "")).strip()
-                label = "Job payload"
-                if job_name:
-                    label = f"Job payload: {job_name}"
-                elif job_code:
-                    label = f"Job payload: {job_code}"
-                return ScanResult(kind="JOB_STUB", raw=raw, value=label, meta=parsed)
-    except Exception:
-        pass
 
     # Operator
     if is_operator_badge(s):

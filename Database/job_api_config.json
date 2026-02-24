@@ -1,0 +1,10 @@
+{
+  "base_url": "https://sbk-ptii.net/philtop/IMS/v1",
+  "user": "svcapiroleprod",
+  "password": "0t1docmtl$tm",
+  "bearer_token": "7e4f3751ee42de03d1d6f492943bf76728d3176c991eb696107d64d7112fe4b8",
+  "token_expires_at_epoch": 1772517281,
+  "ttl_seconds": 604800,
+  "force_new_token": true,
+  "username": "svcapiroleprod"
+}

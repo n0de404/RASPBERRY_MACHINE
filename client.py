@@ -22,10 +22,10 @@ from PyQt6.QtGui import QMovie, QPixmap, QColor, QPainter, QPen, QFont
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy,
     QGraphicsDropShadowEffect, QGraphicsBlurEffect, QProgressBar, QPushButton, QComboBox, QScrollArea,
-    QLineEdit
+    QLineEdit, QInputDialog, QTableWidget, QTableWidgetItem, QHeaderView
 )
 
-from mappings import parse_scan, MACHINE_MAP, JOB_MAP, REJECT_REASON_MAP
+from mappings import parse_scan, ScanResult, MACHINE_MAP, JOB_MAP, REJECT_REASON_MAP
 from ui_theme import APP_STYLESHEET
 
 try:
@@ -45,6 +45,7 @@ ANIMATIONS_DIR = os.path.join(BASE_DIR, "Animations")
 IMAGES_DIR = os.path.join(BASE_DIR, "Images")
 DATABASE_DIR = os.path.join(BASE_DIR, "Database")
 CLIENT_SETTINGS_FILE = os.path.join(DATABASE_DIR, "client_settings.json")
+JOB_API_CONFIG_FILE = os.path.join(DATABASE_DIR, "job_api_config.json")
 INVALID_SCAN_GIF = os.environ.get(
     "MACHINE_INVALID_SCAN_GIF",
     os.path.join(ANIMATIONS_DIR, "slap-virtual-slap.gif"),
@@ -56,6 +57,8 @@ REPAIR_GIF = os.environ.get(
 SUPERVISOR_BADGES = {"3000001": "Charlie Brown"}
 QC_BADGES = {"4000001": "Lucy Van Pelt"}
 REJECT_REVIEW_REQUIRED_ROTATIONS = 4
+USER_QR_PROFILES_FILE = os.path.join(DATABASE_DIR, "user_qr_profiles.json")
+DAILY_ROLE_ASSIGNMENTS_FILE = os.path.join(DATABASE_DIR, "daily_role_assignments.json")
 
 
 def _load_client_config() -> Dict[str, Any]:
@@ -89,6 +92,68 @@ def _load_client_config() -> Dict[str, Any]:
     except Exception:
         defaults["scanner_timeout"] = SCANNER_TIMEOUT
     return defaults
+
+
+def _load_job_api_config() -> Dict[str, Any]:
+    cfg = {
+        "base_url": "",
+        "user": "svcapiroleprod",
+        "password": "0t1docmtl$tm",
+        "bearer_token": "",
+        "token_expires_at_epoch": 0,
+        "ttl_seconds": 604800,
+        "force_new_token": True,
+    }
+    try:
+        if os.path.exists(JOB_API_CONFIG_FILE):
+            # Accept files saved with UTF-8 BOM (common from some Windows editors).
+            with open(JOB_API_CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                # Load top-level values first, then fill missing values from a Product_ID.json-like shape:
+                # { "bms": { "base_url": ".../IMS/v1", "username": "...", "password": "...", ... } }
+                cfg.update(raw)
+                if not str(cfg.get("user", "")).strip():
+                    cfg["user"] = raw.get("username") or raw.get("user") or cfg["user"]
+                if isinstance(raw.get("bms"), dict):
+                    bms = raw.get("bms") or {}
+                    if not str(cfg.get("base_url", "")).strip():
+                        cfg["base_url"] = bms.get("base_url", cfg["base_url"])
+                    if not str(cfg.get("user", "")).strip():
+                        cfg["user"] = bms.get("username") or bms.get("user") or cfg["user"]
+                    if not str(cfg.get("password", "")):
+                        cfg["password"] = bms.get("password", cfg["password"])
+                    if "ttl_seconds" not in raw and "ttl_seconds" in bms:
+                        cfg["ttl_seconds"] = bms.get("ttl_seconds", cfg["ttl_seconds"])
+                    if "force_new_token" not in raw and "force_new_token" in bms:
+                        cfg["force_new_token"] = bms.get("force_new_token", cfg["force_new_token"])
+    except Exception:
+        pass
+    cfg["base_url"] = str(cfg.get("base_url", "")).strip().rstrip("/")
+    if cfg["base_url"].endswith("/jobs"):
+        cfg["base_url"] = cfg["base_url"][:-5].rstrip("/")
+    cfg["user"] = str(cfg.get("user", "")).strip()
+    cfg["password"] = str(cfg.get("password", ""))
+    cfg["bearer_token"] = str(cfg.get("bearer_token", ""))
+    try:
+        cfg["token_expires_at_epoch"] = int(float(cfg.get("token_expires_at_epoch", 0) or 0))
+    except Exception:
+        cfg["token_expires_at_epoch"] = 0
+    try:
+        cfg["ttl_seconds"] = int(cfg.get("ttl_seconds", 604800) or 604800)
+    except Exception:
+        cfg["ttl_seconds"] = 604800
+    cfg["force_new_token"] = bool(cfg.get("force_new_token", True))
+    return cfg
+
+
+def _save_job_api_config(cfg: Dict[str, Any]):
+    try:
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        with open(JOB_API_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def _save_client_config(cfg: Dict[str, Any]):
@@ -166,6 +231,9 @@ class ClientState:
     waiting_reject_reason: bool = False
     waiting_production_report_reason: bool = False
     waiting_cycle_time_input: bool = False
+    waiting_initial_cycle_time_input: bool = False
+    waiting_initial_cycle_qc_confirm: bool = False
+    waiting_cycle_time_confirm_popup: bool = False
     waiting_maintenance_qr: bool = False
     waiting_supervisor_qr: bool = False
     waiting_operator_downtime_confirm: bool = False
@@ -178,6 +246,10 @@ class ClientState:
     downtime_active: bool = False
     cycle_time_current: Optional[str] = None
     cycle_time_new_input: str = ""
+    cycle_time_confirmed_by: Optional[str] = None
+    cycle_time_confirm_actor_code: Optional[str] = None
+    cycle_time_confirm_actor_name: Optional[str] = None
+    cycle_time_confirm_actor_role: Optional[str] = None
     maintenance_name: Optional[str] = None
     supervisor_name: Optional[str] = None
     raw_sacks_count: int = 0
@@ -427,6 +499,7 @@ class ClientUI(QWidget):
         super().__init__()
         self.state = ClientState()
         self.client_config = _load_client_config()
+        self.job_api_config = _load_job_api_config()
         self._serial_stop = threading.Event()
         self._serial_thread: Optional[threading.Thread] = None
         self._motion_index = 0
@@ -607,8 +680,10 @@ QWidget#ClientUIRoot {{
             ("Product ID", "product_id"),
             ("Mold", "mold"),
             ("Color", "color"),
-            ("System Code", "system_code"),
             ("Cavities", "cavities"),
+            ("Sticker Label", "sticker_label"),
+            ("Std Cycle Time", "std_cycle_time"),
+            ("Qty / Shift", "qty_per_shift"),
         ]
         for idx, (title, key) in enumerate(fields):
             card = QFrame()
@@ -636,8 +711,7 @@ QWidget#ClientUIRoot {{
 
         self.cardJobDetails.layout().addLayout(self.jobDetailGrid)
         self.cardJobDetails.layout().addStretch(1)
-        self.cardJobDetailsOuter.setFixedHeight(236)
-        grid.addWidget(self.cardJobDetailsOuter, 3, 0, 1, 2)
+        self.cardJobDetailsOuter.setFixedHeight(320)
 
         # Activity panel
         self.cardActivityOuter, self.cardActivity = self._make_double_layer_card("Activity")
@@ -657,9 +731,15 @@ QWidget#ClientUIRoot {{
 
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
-        left.addLayout(grid)
+        grid.setRowStretch(3, 1)
+        left.addLayout(grid, 1)
 
-        left.addStretch(1)
+        # Keep in-memory logging, but remove the temporary visible Job API logs panel.
+        self.cardJobApiLogsOuter = None
+        self.cardJobApiLogs = None
+        self.jobApiLogLabel = None
+
+        # Let the main grid consume remaining height so the bottom cards can expand on taller screens.
 
         # Right side panel (downtime reason + timer).
         self.rightPanel = QFrame()
@@ -681,7 +761,7 @@ QWidget#ClientUIRoot {{
         self.rightRawSacks.setObjectName("RightMonitorValue")
         self.rightRawScanned = QLabel("Raw Mats Scanned: -")
         self.rightRawScanned.setObjectName("RightMonitorValue")
-        self.rightRawScanned.setWordWrap(True)
+        self.rightRawScanned.setWordWrap(False)
 
         self.rightTitle = QLabel("Downtime Monitor")
         self.rightTitle.setObjectName("RightTitle")
@@ -698,10 +778,12 @@ QWidget#ClientUIRoot {{
         self.rightCycleTitle.setObjectName("RightTitle")
         self.rightCycleHint = QLabel("Cycle count and cycle time status.")
         self.rightCycleHint.setObjectName("RightHint")
-        self.rightCycleCount = QLabel("Cycle Count: 0")
+        self.rightCycleCount = QLabel("Confirmed by: -")
         self.rightCycleCount.setObjectName("RightMonitorValue")
         self.rightCycleCurrent = QLabel("Cycle Time: ")
         self.rightCycleCurrent.setObjectName("RightMonitorValue")
+        self.rightCycleStd = QLabel("Std Cycle Time: -")
+        self.rightCycleStd.setObjectName("RightMonitorValue")
         self.rightMaintenance = QLabel("Maintenance: ")
         self.rightMaintenance.setObjectName("RightMonitorValue")
         self.rightSupervisor = QLabel("Supervisor: ")
@@ -710,6 +792,7 @@ QWidget#ClientUIRoot {{
         self.rightSupervisorLeft.setObjectName("RightMonitorValue")
 
         topRow = QHBoxLayout()
+        topRow.setContentsMargins(0, 0, 0, 0)
         topRow.setSpacing(12)
 
         rawOuter = QFrame()
@@ -721,7 +804,7 @@ QWidget#ClientUIRoot {{
 
         rawFrame = QFrame()
         rawFrame.setObjectName("RightCardInner")
-        rawFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        rawFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         rawCol = QVBoxLayout()
         rawCol.setContentsMargins(12, 10, 12, 10)
         rawCol.setSpacing(6)
@@ -741,7 +824,7 @@ QWidget#ClientUIRoot {{
 
         cycleFrame = QFrame()
         cycleFrame.setObjectName("RightCardInner")
-        cycleFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        cycleFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         cycleCol = QVBoxLayout()
         cycleCol.setContentsMargins(12, 10, 12, 10)
         cycleCol.setSpacing(6)
@@ -750,14 +833,18 @@ QWidget#ClientUIRoot {{
         cycleCol.addWidget(self.rightCycleHint)
         cycleCol.addWidget(self.rightCycleCount)
         cycleCol.addWidget(self.rightCycleCurrent)
+        cycleCol.addWidget(self.rightCycleStd)
         cycleOuterLay.addWidget(cycleFrame)
 
-        rawFrame.setMinimumHeight(140)
-        cycleFrame.setMinimumHeight(140)
+        rawOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        cycleOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        rawFrame.setMinimumHeight(154)
+        cycleFrame.setMinimumHeight(154)
         topRow.addWidget(rawOuter, 1)
         topRow.addWidget(cycleOuter, 1)
 
-        rightLayout.addLayout(topRow)
+        # Swap positions: show Job Details in the right panel top section.
+        rightLayout.addWidget(self.cardJobDetailsOuter)
         rightLayout.addSpacing(10)
         downtimeOuter = QFrame()
         downtimeOuter.setObjectName("RightCardOuter")
@@ -825,6 +912,14 @@ QWidget#ClientUIRoot {{
         rightLayout.addWidget(linkageOuter)
         rightLayout.addStretch()
 
+        # Swap positions: place Raw Materials + Cycle Monitor where Job Details used to be.
+        rawCycleSwapWrap = QWidget()
+        rawCycleSwapWrap.setLayout(topRow)
+        rawCycleSwapWrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        rawCycleSwapWrap.setMinimumHeight(190)
+        self.rawCycleSwapWrap = rawCycleSwapWrap
+        grid.addWidget(rawCycleSwapWrap, 3, 0, 1, 2)
+
         contentRow = QHBoxLayout()
         contentRow.setContentsMargins(0, 0, 0, 0)
         contentRow.setSpacing(10)
@@ -849,21 +944,42 @@ QWidget#ClientUIRoot {{
         self.invalidOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.invalidGifLabel = QLabel()
         self.invalidGifLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.invalidGifLabel.setStyleSheet("background: rgba(255,255,255,0.04); border: 2px solid rgba(0,0,0,0.78);")
         self.invalidTextLabel = QLabel("INVALID SCAN")
         self.invalidTextLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.invalidTextLabel.setStyleSheet("color: #ffffff; font-size: 28px; font-weight: 900;")
+        self.invalidTextLabel.setStyleSheet(
+            "background: transparent; border: none; color: #ffffff; font-size: 28px; font-weight: 900;"
+        )
+        self.invalidReasonLabel = QLabel("")
+        self.invalidReasonLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.invalidReasonLabel.setWordWrap(True)
+        self.invalidReasonLabel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.invalidReasonLabel.setStyleSheet(
+            "background: transparent; border: none; color: #fde68a; font-size: 15px; font-weight: 700;"
+        )
+        self.invalidTextBand = QFrame()
+        self.invalidTextBand.setObjectName("InvalidTextBand")
+        self.invalidTextBand.setStyleSheet(
+            "QFrame#InvalidTextBand {"
+            "background: rgba(127, 29, 29, 0.94);"
+            "border: none;"
+            "border-radius: 2px;"
+            "}"
+        )
+        self.invalidTextBand.setLayout(QVBoxLayout())
+        self.invalidTextBand.layout().setContentsMargins(8, 6, 8, 6)
+        self.invalidTextBand.layout().setSpacing(4)
         gif_shadow = QGraphicsDropShadowEffect(self)
         gif_shadow.setBlurRadius(10)
         gif_shadow.setOffset(0, 0)
         gif_shadow.setColor(Qt.GlobalColor.black)
         self.invalidGifLabel.setGraphicsEffect(gif_shadow)
-        text_shadow = QGraphicsDropShadowEffect(self)
-        text_shadow.setBlurRadius(8)
-        text_shadow.setOffset(0, 0)
-        text_shadow.setColor(Qt.GlobalColor.black)
-        self.invalidTextLabel.setGraphicsEffect(text_shadow)
+        self.invalidTextLabel.setGraphicsEffect(None)
+        self.invalidReasonLabel.setGraphicsEffect(None)
         self.invalidOverlay.layout().addWidget(self.invalidGifLabel, 0, Qt.AlignmentFlag.AlignCenter)
-        self.invalidOverlay.layout().addWidget(self.invalidTextLabel, 0, Qt.AlignmentFlag.AlignCenter)
+        self.invalidTextBand.layout().addWidget(self.invalidTextLabel, 0, Qt.AlignmentFlag.AlignCenter)
+        self.invalidTextBand.layout().addWidget(self.invalidReasonLabel, 0, Qt.AlignmentFlag.AlignCenter)
+        self.invalidOverlay.layout().addWidget(self.invalidTextBand)
         self.invalidOverlay.hide()
         self.invalidOverlay.raise_()
         self._invalid_movie: Optional[QMovie] = None
@@ -926,23 +1042,51 @@ QWidget#ClientUIRoot {{
 
         self.resolveOverlay = QFrame(self)
         self.resolveOverlay.setObjectName("ProductionOverlay")
-        self.resolveOverlay.setStyleSheet("")
+        self.resolveOverlay.setStyleSheet(
+            "QFrame#ProductionOverlay {"
+            "background: qradialgradient(cx:0.42, cy:0.26, radius:1.0, fx:0.42, fy:0.26,"
+            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(239,246,255,0.98), stop:1 rgba(219,234,254,0.97));"
+            "border: 2px solid #f97316; border-radius: 16px; }"
+            "QFrame#ResolveInfoCard {"
+            "background: rgba(255,255,255,0.88); border: 1px solid rgba(148,163,184,0.45); border-radius: 12px; }"
+            "QLabel#ResolveInfoTitle { color: #64748b; font-size: 11px; font-weight: 800; }"
+            "QLabel#ResolveInfoValue { color: #0f172a; font-size: 19px; font-weight: 900; }"
+        )
         self.resolveOverlay.setLayout(QVBoxLayout())
-        self.resolveOverlay.layout().setContentsMargins(14, 12, 14, 12)
-        self.resolveOverlay.layout().setSpacing(8)
+        self.resolveOverlay.layout().setContentsMargins(16, 14, 16, 14)
+        self.resolveOverlay.layout().setSpacing(10)
         self.resolveOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.resolveTitle = QLabel("DOWNTIME RESOLUTION")
         self.resolveTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
         self.resolveHint = QLabel("Scan cycle time digits (num_0..num_9), backspace, then confirm")
         self.resolveHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.resolveHint.setWordWrap(True)
         self.resolveOldCycle = QLabel("Old Cycle Time: -")
-        self.resolveOldCycle.setObjectName("MetaValue")
+        self.resolveOldCycle.setObjectName("ResolveInfoValue")
         self.resolveNewCycle = QLabel("Cycle Time: ")
-        self.resolveNewCycle.setObjectName("MetaValue")
+        self.resolveNewCycle.setObjectName("ResolveInfoValue")
+        self.resolveOldCycleTitle = QLabel("REFERENCE")
+        self.resolveOldCycleTitle.setObjectName("ResolveInfoTitle")
+        self.resolveNewCycleTitle = QLabel("CURRENT INPUT")
+        self.resolveNewCycleTitle.setObjectName("ResolveInfoTitle")
+        self.resolveOldCard = QFrame()
+        self.resolveOldCard.setObjectName("ResolveInfoCard")
+        self.resolveOldCard.setLayout(QVBoxLayout())
+        self.resolveOldCard.layout().setContentsMargins(12, 10, 12, 10)
+        self.resolveOldCard.layout().setSpacing(4)
+        self.resolveOldCard.layout().addWidget(self.resolveOldCycleTitle)
+        self.resolveOldCard.layout().addWidget(self.resolveOldCycle)
+        self.resolveNewCard = QFrame()
+        self.resolveNewCard.setObjectName("ResolveInfoCard")
+        self.resolveNewCard.setLayout(QVBoxLayout())
+        self.resolveNewCard.layout().setContentsMargins(12, 10, 12, 10)
+        self.resolveNewCard.layout().setSpacing(4)
+        self.resolveNewCard.layout().addWidget(self.resolveNewCycleTitle)
+        self.resolveNewCard.layout().addWidget(self.resolveNewCycle)
         self.resolveOverlay.layout().addWidget(self.resolveTitle)
         self.resolveOverlay.layout().addWidget(self.resolveHint)
-        self.resolveOverlay.layout().addWidget(self.resolveOldCycle)
-        self.resolveOverlay.layout().addWidget(self.resolveNewCycle)
+        self.resolveOverlay.layout().addWidget(self.resolveOldCard)
+        self.resolveOverlay.layout().addWidget(self.resolveNewCard)
         self.resolveOverlay.hide()
         self.resolveOverlay.raise_()
 
@@ -955,12 +1099,29 @@ QWidget#ClientUIRoot {{
         self.rawMatsOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.rawMatsTitle = QLabel("RAW MATERIALS SCANNED")
         self.rawMatsTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
-        self.rawMatsHint = QLabel('Scan "showrawmats" again to close')
+        self.rawMatsHint = QLabel('Scan "rawmatsummary~1" (or "showrawmats") again to close')
         self.rawMatsHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
-        self.rawMatsList = QLabel("No raw materials scanned yet.")
-        self.rawMatsList.setObjectName("ProductionLiveReason")
-        self.rawMatsList.setWordWrap(True)
-        self.rawMatsList.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.rawMatsList = QTableWidget(0, 4)
+        self.rawMatsList.setHorizontalHeaderLabels(["#", "Raw Material", "Qty", "Timestamp"])
+        self.rawMatsList.setAlternatingRowColors(True)
+        self.rawMatsList.setWordWrap(False)
+        self.rawMatsList.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.rawMatsList.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.rawMatsList.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.rawMatsList.verticalHeader().setVisible(False)
+        self.rawMatsList.verticalHeader().setDefaultSectionSize(28)
+        self.rawMatsList.horizontalHeader().setStretchLastSection(False)
+        self.rawMatsList.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.rawMatsList.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.rawMatsList.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.rawMatsList.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.rawMatsList.setMinimumHeight(240)
+        self.rawMatsList.setStyleSheet(
+            "QTableWidget { background: rgba(255,255,255,0.78); border: 1px solid rgba(148,163,184,0.45);"
+            " border-radius: 10px; gridline-color: rgba(148,163,184,0.28); }"
+            "QHeaderView::section { background: rgba(226,232,240,0.9); color: #0f172a; font-weight: 800;"
+            " border: none; border-bottom: 1px solid rgba(148,163,184,0.5); padding: 6px; }"
+        )
         self.rawMatsOverlay.layout().addWidget(self.rawMatsTitle)
         self.rawMatsOverlay.layout().addWidget(self.rawMatsHint)
         self.rawMatsOverlay.layout().addWidget(self.rawMatsList)
@@ -1335,6 +1496,30 @@ QWidget#ClientUIRoot {{
         self.apiScannerTimeoutInput = QLineEdit()
         self.apiScannerTimeoutInput.setPlaceholderText("1.0")
 
+        self.apiJobApiBaseUrlLabel = QLabel("Job API Base URL")
+        self.apiJobApiBaseUrlLabel.setObjectName("MetaLabel")
+        self.apiJobApiBaseUrlInput = QLineEdit()
+        self.apiJobApiBaseUrlInput.setPlaceholderText("http://<host>")
+
+        self.apiJobApiUserLabel = QLabel("Job API Username")
+        self.apiJobApiUserLabel.setObjectName("MetaLabel")
+        self.apiJobApiUserInput = QLineEdit()
+        self.apiJobApiUserInput.setPlaceholderText("svcapiroleprod")
+
+        self.apiJobApiTokenLabel = QLabel("Job API Bearer Token")
+        self.apiJobApiTokenLabel.setObjectName("MetaLabel")
+        self.apiJobApiTokenInput = QLineEdit()
+        self.apiJobApiTokenInput.setEchoMode(QLineEdit.EchoMode.Password)
+        self.apiJobApiTokenInput.setPlaceholderText("<API_TOKEN>")
+
+        self.apiJobApiPasswordLabel = QLabel("Job API Password")
+        self.apiJobApiPasswordLabel.setObjectName("MetaLabel")
+        self.apiJobApiPasswordInput = QLineEdit()
+        self.apiJobApiPasswordInput.setEchoMode(QLineEdit.EchoMode.Password)
+        self.apiJobApiPasswordInput.setPlaceholderText("Password")
+
+        self.apiJobApiTestBtn = QPushButton("Test Job API (GET)")
+        self.apiJobApiTestBtn.setObjectName("SettingToggle")
         self.apiApplyBtn = QPushButton("Apply API Config")
         self.apiApplyBtn.setObjectName("SettingToggle")
         for w in (
@@ -1344,6 +1529,11 @@ QWidget#ClientUIRoot {{
             self.apiScannerPortInput,
             self.apiScannerBaudInput,
             self.apiScannerTimeoutInput,
+            self.apiJobApiBaseUrlInput,
+            self.apiJobApiUserInput,
+            self.apiJobApiTokenInput,
+            self.apiJobApiPasswordInput,
+            self.apiJobApiTestBtn,
             self.apiApplyBtn,
         ):
             w.setFixedWidth(320)
@@ -1360,8 +1550,19 @@ QWidget#ClientUIRoot {{
         self.settingsApiSection.layout().addWidget(self.apiScannerBaudInput, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsApiSection.layout().addWidget(self.apiScannerTimeoutLabel)
         self.settingsApiSection.layout().addWidget(self.apiScannerTimeoutInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiJobApiBaseUrlLabel)
+        self.settingsApiSection.layout().addWidget(self.apiJobApiBaseUrlInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiJobApiUserLabel)
+        self.settingsApiSection.layout().addWidget(self.apiJobApiUserInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiJobApiTokenLabel)
+        self.settingsApiSection.layout().addWidget(self.apiJobApiTokenInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiJobApiPasswordLabel)
+        self.settingsApiSection.layout().addWidget(self.apiJobApiPasswordInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiJobApiTestBtn, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsApiSection.layout().addWidget(self.apiApplyBtn, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsApiSection.layout().addStretch(1)
+
+        # Job API settings are available in the client Settings > API Config section.
 
         self.settingsCloseBtn.clicked.connect(self._hide_settings_overlay)
         self.chkCheckAnimation.toggled.connect(self._on_setting_check_animation_toggled)
@@ -1371,6 +1572,7 @@ QWidget#ClientUIRoot {{
         self.settingsBtnDisplay.clicked.connect(lambda: self._show_settings_section("display"))
         self.settingsBtnApi.clicked.connect(lambda: self._show_settings_section("api"))
         self.displayApplyBtn.clicked.connect(self._apply_display_settings)
+        self.apiJobApiTestBtn.clicked.connect(self._test_job_api_settings)
         self.apiApplyBtn.clicked.connect(self._apply_api_settings)
         self.settingsContent.layout().addLayout(self.settingsContentTop)
         self.settingsContent.layout().addWidget(self.settingsContentDivider)
@@ -1418,7 +1620,7 @@ QWidget#ClientUIRoot {{
         # heartbeat timer
         self.hb = QTimer(self)
         self.hb.timeout.connect(self.send_heartbeat)
-        self.hb.start(1000)
+        self.hb.start(1500)
 
         self.motionTimer = QTimer(self)
         self.motionTimer.timeout.connect(self._tick_motion)
@@ -1505,25 +1707,51 @@ QWidget#ClientUIRoot {{
             return container
         max_w = max(1, int(container.width() * 0.82))
         max_h = max(1, int(container.height() * 0.82))
-        ratio = min(max_w / frame.width(), max_h / frame.height())
+        # Keep aspect ratio and do not upscale the GIF (prevents stretched-looking frames).
+        ratio = min(1.0, max_w / frame.width(), max_h / frame.height())
         return QSize(max(1, int(frame.width() * ratio)), max(1, int(frame.height() * ratio)))
 
     def _position_invalid_overlay(self):
         fm = self.invalidTextLabel.fontMetrics()
         text_w = fm.horizontalAdvance("INVALID SCAN") + 24
         text_h = fm.height() + 12
+        reason_text = str(self.invalidReasonLabel.text() or "").strip()
+
+        max_overlay_w = max(360, int(self.width() * 0.94))
+        max_overlay_h = max(220, int(self.height() * 0.90))
+        max_reason_w = max(280, min(int(self.width() * 0.86), 980))
+        reason_w = 0
+        reason_h = 0
+        if reason_text:
+            rfm = self.invalidReasonLabel.fontMetrics()
+            reason_rect = rfm.boundingRect(
+                0, 0, max_reason_w, max(120, int(self.height() * 0.42)),
+                int(Qt.TextFlag.TextWordWrap),
+                reason_text,
+            )
+            reason_w = max(260, min(max_reason_w, reason_rect.width() + 20))
+            reason_h = max(26, reason_rect.height() + 10)
+
         gif_size = QSize(220, 140)
         if self._invalid_movie is not None:
             f = self._invalid_movie.currentPixmap().size()
             if f.isValid():
                 gif_size = QSize(max(180, min(320, f.width())), max(100, min(240, f.height())))
-        w = max(text_w, gif_size.width()) + 30
-        h = gif_size.height() + text_h + 34
+
+        band_w = max(text_w, reason_w, 260) + 20
+        w = min(max_overlay_w, max(gif_size.width(), band_w) + 34)
+        h = min(max_overlay_h, gif_size.height() + text_h + reason_h + 62)
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.invalidOverlay.setGeometry(x, y, w, h)
+        band_inner_w = max(240, w - 28)
+        self.invalidTextBand.setMinimumWidth(band_inner_w)
+        self.invalidReasonLabel.setMinimumWidth(max(220, band_inner_w - 16))
+        self.invalidReasonLabel.setMaximumWidth(max(220, band_inner_w - 16))
 
-    def _show_invalid_overlay(self):
+    def _show_invalid_overlay(self, reason: str = ""):
+        msg = str(reason or "").strip()
+        self.invalidReasonLabel.setText(msg)
         self._position_invalid_overlay()
         if self._invalid_movie is not None:
             self._invalid_movie.stop()
@@ -1535,7 +1763,10 @@ QWidget#ClientUIRoot {{
         self.invalidTextLabel.setText("INVALID SCAN")
         self.invalidOverlay.show()
         self.invalidOverlay.raise_()
-        self._invalid_hide_timer.start(3000)
+        self.invalidOverlay.layout().activate()
+        # Longer messages need more time to read.
+        hide_ms = 3000 + min(5000, max(0, len(msg) - 40) * 35)
+        self._invalid_hide_timer.start(hide_ms)
 
     def _hide_invalid_overlay(self):
         if self._invalid_movie is not None:
@@ -1567,8 +1798,11 @@ QWidget#ClientUIRoot {{
         self.pdrPulseOverlay.raise_()
 
     def _position_resolve_overlay(self):
-        w = min(700, max(460, int(self.width() * 0.52)))
-        h = min(360, max(250, int(self.height() * 0.42)))
+        self.resolveOverlay.adjustSize()
+        hint_h = self.resolveOverlay.sizeHint().height()
+        hint_w = self.resolveOverlay.sizeHint().width()
+        w = min(max(560, int(self.width() * 0.95)), max(520, hint_w + 24, int(self.width() * 0.58)))
+        h = min(max(320, int(self.height() * 0.90)), max(260, hint_h + 16))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.resolveOverlay.setGeometry(x, y, w, h)
@@ -1600,7 +1834,7 @@ QWidget#ClientUIRoot {{
 
     def _position_settings_overlay(self):
         w = min(660, max(500, int(self.width() * 0.50)))
-        h = min(460, max(320, int(self.height() * 0.48)))
+        h = min(620, max(360, int(self.height() * 0.64)))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.settingsOverlay.setGeometry(x, y, w, h)
@@ -1617,11 +1851,46 @@ QWidget#ClientUIRoot {{
             self._set_background_blur(False)
 
     def _refresh_raw_mats_overlay(self):
-        mats = self.state.raw_material_scans or []
-        if not mats:
-            self.rawMatsList.setText("No raw materials scanned yet.")
+        logs = self.state.raw_material_logs or []
+        table = self.rawMatsList
+        table.setRowCount(0)
+        valid_rows: List[Dict[str, Any]] = [x for x in logs if isinstance(x, dict)]
+        if not valid_rows:
+            table.setRowCount(1)
+            empty_item = QTableWidgetItem("No raw materials scanned yet.")
+            table.setItem(0, 0, empty_item)
+            table.setSpan(0, 0, 1, 4)
+            for c in range(1, 4):
+                table.setItem(0, c, QTableWidgetItem(""))
+            table.resizeRowsToContents()
             return
-        self.rawMatsList.setText("\n".join(f"{i}. {name}" for i, name in enumerate(mats, start=1)))
+
+        table.setRowCount(len(valid_rows))
+        for row_idx, item in enumerate(valid_rows):
+            name = str(item.get("material_name") or item.get("material") or "-").strip() or "-"
+            qty = int(item.get("qty") or 1)
+            ts_raw = str(item.get("scanned_at") or "").strip()
+            ts_text = ts_raw
+            try:
+                ts_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                ts_text = ts_dt.astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
+            except Exception:
+                pass
+
+            values = [str(row_idx + 1), name, str(qty), ts_text]
+            for col_idx, val in enumerate(values):
+                cell = QTableWidgetItem(val)
+                if col_idx in (0, 2):
+                    cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                else:
+                    cell.setTextAlignment(int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft))
+                table.setItem(row_idx, col_idx, cell)
+
+        table.clearSpans()
+        table.resizeRowsToContents()
+        table.resizeColumnToContents(0)
+        table.resizeColumnToContents(2)
+        table.resizeColumnToContents(3)
 
     def _show_raw_mats_overlay(self):
         self._refresh_raw_mats_overlay()
@@ -1635,13 +1904,116 @@ QWidget#ClientUIRoot {{
         if not self._should_keep_background_blur():
             self._set_background_blur(False)
 
-    def _reviewer_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
+    def _load_json_file(self, path: str, fallback: Any) -> Any:
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return fallback
+
+    def _role_caps_from_text(self, text: Any) -> Set[str]:
+        s = str(text or "").strip().lower()
+        caps: Set[str] = set()
+        if not s:
+            return caps
+        if "supervisor" in s:
+            caps.add("supervisor")
+        if "maintenance" in s:
+            caps.add("maintenance")
+        if "operator" in s:
+            caps.add("operator")
+        if "qa/qc" in s or "qaqc" in s or ("qa" in s and "qc" in s) or s in ("qc", "qa"):
+            caps.add("qc")
+        return caps
+
+    def _authorized_person_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
         code = str(raw).strip()
+        if not code:
+            return None
+
+        caps: Set[str] = set()
+        display_name = ""
+
+        # Fallback/static local badges.
         if code in SUPERVISOR_BADGES:
-            return {"code": code, "name": SUPERVISOR_BADGES[code], "role": "SUPERVISOR"}
+            caps.add("supervisor")
+            display_name = SUPERVISOR_BADGES[code]
         if code in QC_BADGES:
-            return {"code": code, "name": QC_BADGES[code], "role": "QC"}
+            caps.add("qc")
+            display_name = display_name or QC_BADGES[code]
+
+        # Profile-based role from server-generated local profile cache.
+        profiles = self._load_json_file(USER_QR_PROFILES_FILE, [])
+        if isinstance(profiles, list):
+            for row in profiles:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("id_number") or "").strip() != code:
+                    continue
+                display_name = display_name or str(row.get("name") or "").strip()
+                caps.update(self._role_caps_from_text(row.get("role")))
+                break
+
+        # Daily assignments can grant temporary rights (including both).
+        daily_map = self._load_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, {})
+        if isinstance(daily_map, dict):
+            today_key = datetime.now().date().isoformat()
+            today_rows = daily_map.get(today_key)
+            if isinstance(today_rows, dict):
+                today_info = today_rows.get(code)
+                if isinstance(today_info, dict):
+                    display_name = display_name or str(today_info.get("name") or "").strip()
+                    rights = str(today_info.get("rights") or "").strip().lower()
+                    if rights == "both":
+                        caps.update({"supervisor", "qc"})
+                    else:
+                        caps.update(self._role_caps_from_text(rights))
+                    caps.update(self._role_caps_from_text(today_info.get("company_role")))
+                    extra_priv = str(today_info.get("extra_privilege") or "").strip().lower()
+                    if extra_priv in ("qc", "qa/qc", "qaqc"):
+                        caps.add("qc")
+                    if extra_priv == "supervisor":
+                        caps.add("supervisor")
+
+        if not caps:
+            return None
+        if {"supervisor", "qc"}.issubset(caps):
+            role_text = "SUPERVISOR/QC"
+        elif "supervisor" in caps:
+            role_text = "SUPERVISOR"
+        elif "qc" in caps:
+            role_text = "QC"
+        elif "maintenance" in caps:
+            role_text = "MAINTENANCE"
+        else:
+            role_text = "AUTHORIZED"
+        return {
+            "code": code,
+            "name": display_name or code,
+            "role": role_text,
+            "can_supervisor": "1" if "supervisor" in caps else "0",
+            "can_qc": "1" if "qc" in caps else "0",
+            "can_maintenance": "1" if "maintenance" in caps else "0",
+            "can_operator": "1" if "operator" in caps else "0",
+        }
+
+    def _reviewer_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
+        person = self._authorized_person_from_scan(raw)
+        if not person:
+            return None
+        if str(person.get("can_supervisor", "0")) == "1" or str(person.get("can_qc", "0")) == "1":
+            return person
         return None
+
+    def _operator_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
+        person = self._authorized_person_from_scan(raw)
+        if not person:
+            return None
+        if str(person.get("can_operator", "0")) != "1":
+            return None
+        return person
 
     def _get_non_zero_rejects(self) -> List[tuple]:
         rows = []
@@ -2050,12 +2422,18 @@ QWidget#ClientUIRoot {{
             self._set_banner_text("Reject mode: Scan reason (BM01/CS02/CO03/CR04/DI05) or SUR")
         elif s.waiting_production_report_reason:
             self._set_banner_text("Production Daily Report mode: Scan reason QR (01-15)")
+        elif s.waiting_initial_cycle_time_input:
+            self._set_banner_text("Initial setup: Scan cycle time digits, then confirm")
+        elif s.waiting_cycle_time_confirm_popup:
+            self._set_banner_text("Cycle time confirmation: Scan same Supervisor badge again")
+        elif s.waiting_initial_cycle_qc_confirm:
+            self._set_banner_text("Initial setup: Scan QC badge to confirm cycle time")
         elif s.waiting_cycle_time_input:
             self._set_banner_text("Downtime resolve: Scan cycle time digits, then confirm")
         elif s.waiting_maintenance_qr:
-            self._set_banner_text("Downtime resolve: Scan Maintenance QR (2000001)")
+            self._set_banner_text("Downtime resolve: Scan Maintenance QR")
         elif s.waiting_supervisor_qr:
-            self._set_banner_text("Downtime resolve: Scan Supervisor QR (3000001)")
+            self._set_banner_text("Downtime resolve: Scan Supervisor QR")
         elif s.waiting_operator_downtime_confirm:
             self._set_banner_text("Downtime resolve: Scan Operator QR to confirm")
         elif s.downtime_active:
@@ -2094,8 +2472,10 @@ QWidget#ClientUIRoot {{
     def _refresh_downtime_panel(self):
         s = self.state
         self.rightRawSacks.setText(f"Sacks Count: {s.raw_sacks_count}")
-        if s.raw_material_scans:
-            self.rightRawScanned.setText(f"Raw Mats Scanned: {', '.join(s.raw_material_scans[-8:])}")
+        raw_logs = [x for x in (s.raw_material_logs or []) if isinstance(x, dict)]
+        if raw_logs:
+            recent_names = [str(x.get("material_name") or x.get("material") or "-").strip() or "-" for x in raw_logs[-4:]]
+            self.rightRawScanned.setText(f"Raw Mats Scanned: {', '.join(recent_names)}")
         else:
             self.rightRawScanned.setText("Raw Mats Scanned: -")
 
@@ -2220,6 +2600,13 @@ QWidget#ClientUIRoot {{
             "cycle_time_current": s.cycle_time_current,
             "cycle_time_new_input": s.cycle_time_new_input,
             "waiting_cycle_time_input": bool(s.waiting_cycle_time_input),
+            "waiting_initial_cycle_time_input": bool(s.waiting_initial_cycle_time_input),
+            "waiting_initial_cycle_qc_confirm": bool(s.waiting_initial_cycle_qc_confirm),
+            "waiting_cycle_time_confirm_popup": bool(s.waiting_cycle_time_confirm_popup),
+            "cycle_time_confirmed_by": s.cycle_time_confirmed_by,
+            "cycle_time_confirm_actor_code": s.cycle_time_confirm_actor_code,
+            "cycle_time_confirm_actor_name": s.cycle_time_confirm_actor_name,
+            "cycle_time_confirm_actor_role": s.cycle_time_confirm_actor_role,
             "waiting_maintenance_qr": bool(s.waiting_maintenance_qr),
             "waiting_supervisor_qr": bool(s.waiting_supervisor_qr),
             "waiting_operator_downtime_confirm": bool(s.waiting_operator_downtime_confirm),
@@ -2293,6 +2680,13 @@ QWidget#ClientUIRoot {{
         s.cycle_time_current = snap.get("cycle_time_current")
         s.cycle_time_new_input = str(snap.get("cycle_time_new_input") or "")
         s.waiting_cycle_time_input = bool(snap.get("waiting_cycle_time_input"))
+        s.waiting_initial_cycle_time_input = bool(snap.get("waiting_initial_cycle_time_input"))
+        s.waiting_initial_cycle_qc_confirm = bool(snap.get("waiting_initial_cycle_qc_confirm"))
+        s.waiting_cycle_time_confirm_popup = bool(snap.get("waiting_cycle_time_confirm_popup"))
+        s.cycle_time_confirmed_by = snap.get("cycle_time_confirmed_by")
+        s.cycle_time_confirm_actor_code = snap.get("cycle_time_confirm_actor_code")
+        s.cycle_time_confirm_actor_name = snap.get("cycle_time_confirm_actor_name")
+        s.cycle_time_confirm_actor_role = snap.get("cycle_time_confirm_actor_role")
         s.waiting_maintenance_qr = bool(snap.get("waiting_maintenance_qr"))
         s.waiting_supervisor_qr = bool(snap.get("waiting_supervisor_qr"))
         s.waiting_operator_downtime_confirm = bool(snap.get("waiting_operator_downtime_confirm"))
@@ -2316,6 +2710,30 @@ QWidget#ClientUIRoot {{
         s.linkage_job_payload = dict(snap.get("linkage_job_payload") or {})
         s.linkage_jobs = list(snap.get("linkage_jobs") or [])
         self._refresh_ui()
+        # Re-open pending overlays after reconnect/resume so the user can continue the interrupted step.
+        if s.waiting_initial_cycle_time_input:
+            std_cycle = "-"
+            try:
+                payload = s.job_payload or {}
+                data = payload.get("data") if isinstance(payload, dict) else {}
+                job_details = data.get("job_details") if isinstance(data, dict) else {}
+                if isinstance(job_details, dict):
+                    std_cycle = self._safe_text(job_details.get("std_cycle_time"), "-")
+            except Exception:
+                pass
+            self.resolveTitle.setText("INITIAL CYCLE TIME SETUP")
+            self.resolveHint.setText("Scan cycle time digits (num_0..num_9), backspace, then confirm")
+            self.resolveOldCycleTitle.setText("JOB STD CYCLE TIME")
+            self.resolveNewCycleTitle.setText("CYCLE TIME INPUT")
+            self.resolveOldCycle.setText(f"Job Std Cycle Time: {std_cycle}")
+            self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_new_input}")
+            self._show_resolve_overlay()
+        elif s.waiting_cycle_time_confirm_popup:
+            self.resolveTitle.setText("CYCLE TIME CONFIRMATION")
+            self.resolveHint.setText("Scan the same Supervisor badge again to confirm")
+            self.resolveOldCycleTitle.setText("STD CYCLE TIME")
+            self.resolveNewCycleTitle.setText("CURRENT CYCLE TIME")
+            self._show_resolve_overlay()
 
     def _build_finished_job_payload(self) -> Dict[str, Any]:
         s = self.state
@@ -2413,6 +2831,13 @@ QWidget#ClientUIRoot {{
         s.downtime_last_seconds = None
         s.downtime_active = False
         s.cycle_time_current = None
+        s.cycle_time_confirmed_by = None
+        s.waiting_initial_cycle_time_input = False
+        s.waiting_initial_cycle_qc_confirm = False
+        s.waiting_cycle_time_confirm_popup = False
+        s.cycle_time_confirm_actor_code = None
+        s.cycle_time_confirm_actor_name = None
+        s.cycle_time_confirm_actor_role = None
         s.maintenance_name = None
         s.supervisor_name = None
         s.raw_sacks_count = 0
@@ -2434,7 +2859,7 @@ QWidget#ClientUIRoot {{
         self._hide_reject_review_overlay()
         self._clear_active_session_snapshot(active_machine_code)
         self._refresh_ui()
-        self.rightCycleCount.setText(f"Cycle Count: {s.pack_count}")
+        self.rightCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
         self.rightCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
         self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or ''}")
         self.rightSupervisor.setText(f"Supervisor: {s.supervisor_name or ''}")
@@ -2464,6 +2889,61 @@ QWidget#ClientUIRoot {{
         s.waiting_operator_downtime_confirm = False
         s.cycle_time_new_input = ""
 
+    def _begin_initial_cycle_time_setup(self):
+        s = self.state
+        s.waiting_initial_cycle_time_input = True
+        s.waiting_initial_cycle_qc_confirm = False
+        s.cycle_time_new_input = ""
+        s.cycle_time_confirmed_by = None
+        self._hide_production_overlay()
+        self.resolveTitle.setText("INITIAL CYCLE TIME SETUP")
+        self.resolveHint.setText("Scan cycle time digits (num_0..num_9), backspace, then confirm")
+        self.resolveOldCycleTitle.setText("JOB STD CYCLE TIME")
+        self.resolveNewCycleTitle.setText("CYCLE TIME INPUT")
+        std_cycle = "-"
+        try:
+            payload = s.job_payload or {}
+            data = payload.get("data") if isinstance(payload, dict) else {}
+            job_details = data.get("job_details") if isinstance(data, dict) else {}
+            if isinstance(job_details, dict):
+                std_cycle = self._safe_text(job_details.get("std_cycle_time"), "-")
+        except Exception:
+            std_cycle = "-"
+        self.resolveOldCycle.setText(f"Job Std Cycle Time: {std_cycle}")
+        self.resolveNewCycle.setText("Cycle Time: ")
+        self._show_resolve_overlay()
+
+    def _show_cycle_time_confirm_popup(self, reviewer: Dict[str, str]):
+        s = self.state
+        s.waiting_cycle_time_confirm_popup = True
+        s.cycle_time_confirm_actor_code = reviewer.get("code")
+        s.cycle_time_confirm_actor_name = reviewer.get("name")
+        s.cycle_time_confirm_actor_role = reviewer.get("role")
+        std_cycle = "-"
+        try:
+            payload = s.job_payload or {}
+            data = payload.get("data") if isinstance(payload, dict) else {}
+            job_details = data.get("job_details") if isinstance(data, dict) else {}
+            if isinstance(job_details, dict):
+                std_cycle = self._safe_text(job_details.get("std_cycle_time"), "-")
+        except Exception:
+            pass
+        self.resolveTitle.setText("CYCLE TIME CONFIRMATION")
+        self.resolveHint.setText("Scan the same Supervisor badge again to confirm")
+        self.resolveOldCycleTitle.setText("STD CYCLE TIME")
+        self.resolveNewCycleTitle.setText("CURRENT CYCLE TIME")
+        self.resolveOldCycle.setText(f"Std Cycle Time: {std_cycle}")
+        self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_current or '-'}")
+        self._show_resolve_overlay()
+
+    def _hide_cycle_time_confirm_popup(self):
+        s = self.state
+        s.waiting_cycle_time_confirm_popup = False
+        s.cycle_time_confirm_actor_code = None
+        s.cycle_time_confirm_actor_name = None
+        s.cycle_time_confirm_actor_role = None
+        self._hide_resolve_overlay()
+
     def _begin_downtime_resolution(self):
         s = self.state
         self._reset_downtime_resolution_state()
@@ -2472,6 +2952,8 @@ QWidget#ClientUIRoot {{
         self._hide_production_overlay()
         self.resolveTitle.setText("DOWNTIME RESOLUTION")
         self.resolveHint.setText("Scan cycle time digits (num_0..num_9), backspace, then confirm")
+        self.resolveOldCycleTitle.setText("OLD CYCLE TIME")
+        self.resolveNewCycleTitle.setText("CYCLE TIME INPUT")
         self.resolveOldCycle.setText(f"Old Cycle Time: {s.cycle_time_current or '-'}")
         self.resolveNewCycle.setText("Cycle Time: ")
         self._show_resolve_overlay()
@@ -2565,12 +3047,21 @@ QWidget#ClientUIRoot {{
         self.apiScannerPortInput.setText(str(cfg.get("scanner_com_port", SCANNER_COM_PORT)))
         self.apiScannerBaudInput.setText(str(cfg.get("scanner_baudrate", SCANNER_BAUDRATE)))
         self.apiScannerTimeoutInput.setText(str(cfg.get("scanner_timeout", SCANNER_TIMEOUT)))
+        jcfg = getattr(self, "job_api_config", {}) or {}
+        self.apiJobApiBaseUrlInput.setText(str(jcfg.get("base_url", "")))
+        self.apiJobApiUserInput.setText(str(jcfg.get("user") or jcfg.get("username") or ""))
+        self.apiJobApiTokenInput.setText(str(jcfg.get("bearer_token", "")))
+        self.apiJobApiPasswordInput.setText(str(jcfg.get("password", "")))
 
     def _apply_api_settings(self):
         server_url = self.apiServerUrlInput.text().strip().rstrip("/")
         client_id = self.apiClientIdInput.text().strip() or socket.gethostname()
         scanner_mode = self.apiScannerModeCombo.currentText().strip().lower()
         scanner_port = self.apiScannerPortInput.text().strip()
+        job_api_base_url = self.apiJobApiBaseUrlInput.text().strip().rstrip("/")
+        job_api_user = self.apiJobApiUserInput.text().strip()
+        job_api_token = self.apiJobApiTokenInput.text()
+        job_api_password = self.apiJobApiPasswordInput.text()
         if not server_url:
             self.status.setText("API config failed: Server URL is required.")
             return
@@ -2600,9 +3091,81 @@ QWidget#ClientUIRoot {{
             "scanner_baudrate": scanner_baudrate,
             "scanner_timeout": scanner_timeout,
         })
+        self.job_api_config.update({
+            "base_url": job_api_base_url,
+            "user": job_api_user,
+            "username": job_api_user,
+            "password": job_api_password,
+            "bearer_token": job_api_token,
+        })
         _save_client_config(self.client_config)
+        _save_job_api_config(self.job_api_config)
         self._restart_scanner_input()
         self.status.setText("API/Scanner configuration applied.")
+
+    def _test_job_api_settings(self):
+        base = self.apiJobApiBaseUrlInput.text().strip().rstrip("/")
+        user = self.apiJobApiUserInput.text().strip()
+        token = self.apiJobApiTokenInput.text().strip()
+        password = self.apiJobApiPasswordInput.text()
+        if not base:
+            self.status.setText("Job API test failed: Job API Base URL is required.")
+            return
+        if not token and not user:
+            self.status.setText("Job API test failed: Bearer token or username is required.")
+            return
+        job_id, ok = QInputDialog.getText(self, "Test Job API", "Enter Job ID to test (GET /v1/jobs/{id}):")
+        if not ok:
+            self.status.setText("Job API test cancelled.")
+            return
+        job_id = str(job_id).strip()
+        if not job_id:
+            self.status.setText("Job API test failed: Job ID is required.")
+            return
+        try:
+            if not token and user and password:
+                token = self._get_job_api_bearer_token(base=base, user=user, password=password) or ""
+                if not token:
+                    self.status.setText("Job API test failed: login did not return a bearer token.")
+                    self._append_job_api_log("TEST FAIL: login did not return bearer token")
+                    return
+            elif token:
+                self.job_api_config.update({
+                    "base_url": base,
+                    "user": user,
+                    "username": user,
+                    "password": password,
+                    "bearer_token": token,
+                })
+                _save_job_api_config(self.job_api_config)
+            headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+            resp = requests.get(
+                self._job_api_url(base, f"/jobs/{job_id}"),
+                headers=headers,
+                timeout=5,
+            )
+            self._append_job_api_log(f"TEST GET {self._job_api_url(base, f'/jobs/{job_id}')} -> HTTP {resp.status_code}")
+            print(f"[JobAPI] TEST GET {self._job_api_url(base, f'/jobs/{job_id}')} -> HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                self.status.setText(
+                    f"Job API test failed HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}"
+                )
+                self._append_job_api_log(f"TEST FAIL: {self._http_error_snippet(resp) or 'No response body'}")
+                print(f"[JobAPI] TEST FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
+                return
+            data = resp.json()
+            job = {}
+            if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                job = data["data"].get("job") or {}
+            ref = str((job or {}).get("ref_no", "")).strip()
+            jid = str((job or {}).get("id", "")).strip() or job_id
+            self.status.setText(f"Job API test OK (GET): {jid}{' / ' + ref if ref else ''}")
+            self._append_job_api_log(f"TEST OK: {jid}{' / ' + ref if ref else ''}")
+            print(f"[JobAPI] TEST OK: {jid}{' / ' + ref if ref else ''}")
+        except Exception as e:
+            self.status.setText(f"Job API test failed: {e}")
+            self._append_job_api_log(f"TEST ERROR: {e}")
+            print(f"[JobAPI] TEST ERROR: {e}")
 
     def _restart_scanner_input(self):
         self._serial_stop.set()
@@ -2656,6 +3219,25 @@ QWidget#ClientUIRoot {{
         s = str(v).strip()
         return s if s else fallback
 
+    def _http_error_snippet(self, resp: Any, max_len: int = 180) -> str:
+        try:
+            txt = str(getattr(resp, "text", "") or "").strip()
+        except Exception:
+            txt = ""
+        if not txt:
+            return ""
+        txt = re.sub(r"\s+", " ", txt)
+        return txt[:max_len] + ("..." if len(txt) > max_len else "")
+
+    def _append_job_api_log(self, msg: str):
+        line = f"[{time.strftime('%H:%M:%S')}] {str(msg or '').strip()}"
+        rows = list(getattr(self, "_job_api_logs", []) or [])
+        rows.append(line)
+        rows = rows[-8:]
+        self._job_api_logs = rows
+        if hasattr(self, "jobApiLogLabel") and self.jobApiLogLabel is not None:
+            self.jobApiLogLabel.setText("\n".join(rows) if rows else "No Job API logs yet.")
+
     def _extract_job_record(self) -> Dict[str, Any]:
         payload = self.state.job_payload or {}
         if isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("job"), dict):
@@ -2664,18 +3246,195 @@ QWidget#ClientUIRoot {{
             return payload["job"]
         return payload if isinstance(payload, dict) else {}
 
+    def _get_job_api_bearer_token(self, *, base: str, user: str, password: str) -> Optional[str]:
+        base_url = str(base or "").strip().rstrip("/")
+        username = str(user or "").strip()
+        pwd = str(password or "")
+        if not (base_url and username and pwd):
+            self._append_job_api_log(
+                f"LOGIN skipped: missing config (base={'set' if base_url else 'empty'}, user={'set' if username else 'empty'}, pass={'set' if pwd else 'empty'})"
+            )
+            print(
+                f"[JobAPI] LOGIN skipped: missing config (base={'set' if base_url else 'empty'}, user={'set' if username else 'empty'}, pass={'set' if pwd else 'empty'})"
+            )
+            return None
+        cfg = getattr(self, "job_api_config", {}) or {}
+        cached_base = str(cfg.get("base_url", "")).strip().rstrip("/")
+        cached_user = str(cfg.get("user", "")).strip()
+        cached_token = str(cfg.get("bearer_token", "")).strip()
+        try:
+            cached_exp = int(float(cfg.get("token_expires_at_epoch", 0) or 0))
+        except Exception:
+            cached_exp = 0
+        now_epoch = int(time.time())
+        if cached_token and cached_base == base_url and cached_user == username and cached_exp > (now_epoch + 30):
+            self._append_job_api_log("LOGIN skipped (cached bearer token reused)")
+            return cached_token
+        login_url = f"{base_url}/auth/login"
+        self._append_job_api_log(f"LOGIN preparing {login_url} (user={username}, ttl={cfg.get('ttl_seconds', 604800) if isinstance(cfg, dict) else 604800})")
+        print(f"[JobAPI] LOGIN preparing {login_url} (user={username})")
+        try:
+            ttl_seconds = int(cfg.get("ttl_seconds", 604800) or 604800) if isinstance(cfg, dict) else 604800
+            force_new_token = bool(cfg.get("force_new_token", True)) if isinstance(cfg, dict) else True
+            resp = requests.post(
+                login_url,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                json={
+                    "identity": username,
+                    "password": pwd,
+                    "ttlSeconds": ttl_seconds,
+                    "forceNewToken": force_new_token,
+                },
+                timeout=5,
+            )
+            self._append_job_api_log(f"LOGIN POST {login_url} -> HTTP {resp.status_code}")
+            print(f"[JobAPI] LOGIN POST {login_url} -> HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                self.status.setText(
+                    f"Job API login failed HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}"
+                )
+                self._append_job_api_log(f"LOGIN FAIL: {self._http_error_snippet(resp) or 'No response body'}")
+                print(f"[JobAPI] LOGIN FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
+                return None
+            data = resp.json()
+            if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                token = str(data["data"].get("token", "") or "").strip()
+                if token and isinstance(cfg, dict):
+                    cfg["base_url"] = base_url
+                    cfg["user"] = username
+                    cfg["password"] = pwd
+                    cfg["bearer_token"] = token
+                    cfg["token_expires_at_epoch"] = int(time.time()) + max(60, ttl_seconds)
+                    self.job_api_config = cfg
+                    _save_job_api_config(cfg)
+                self._append_job_api_log("LOGIN OK (bearer token received)")
+                print("[JobAPI] LOGIN OK (bearer token received)")
+                return token or None
+            self._append_job_api_log("LOGIN FAIL: response JSON has no data.token")
+            print(f"[JobAPI] LOGIN FAIL: response JSON has no data.token payload={self._http_error_snippet(resp)}")
+        except Exception as e:
+            self._append_job_api_log(f"LOGIN ERROR: {e}")
+            print(f"[JobAPI] LOGIN ERROR: {e}")
+            pass
+        return None
+
+    def _job_api_url(self, base: str, path: str) -> str:
+        base_url = str(base or "").strip().rstrip("/")
+        p = "/" + str(path or "").lstrip("/")
+        if base_url.endswith("/jobs"):
+            base_url = base_url[:-5].rstrip("/")
+        if base_url.endswith("/v1"):
+            if p.startswith("/v1/"):
+                return f"{base_url}{p[3:]}"
+            return f"{base_url}{p}"
+        if p.startswith("/v1/"):
+            return f"{base_url}{p}"
+        return f"{base_url}/v1{p}"
+
+    def _fetch_job_payload_from_api(self, job_identifier: str) -> Optional[Dict[str, Any]]:
+        # Reload from disk so config edits apply without restarting the client.
+        try:
+            self.job_api_config = _load_job_api_config()
+            try:
+                _dbg_cfg = self.job_api_config if isinstance(self.job_api_config, dict) else {}
+                print(
+                    "[JobAPI] FETCH reload cfg "
+                    f"keys={list(_dbg_cfg.keys())} "
+                    f"base={str(_dbg_cfg.get('base_url', ''))!r} "
+                    f"bms_base={str((_dbg_cfg.get('bms') or {}).get('base_url', '')) if isinstance(_dbg_cfg.get('bms'), dict) else ''!r}"
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[JobAPI] FETCH reload config error: {e}")
+        raw_job_id = str(job_identifier or "").strip()
+        print(f"[JobAPI] FETCH requested job_identifier={raw_job_id!r}")
+        m_job_url = re.search(r"/v1/jobs/(\d+)\s*$", raw_job_id, flags=re.IGNORECASE)
+        job_id = (m_job_url.group(1) if m_job_url else raw_job_id).strip()
+        if not job_id:
+            print("[JobAPI] FETCH skipped: empty job_id after parsing")
+            return None
+        jcfg = getattr(self, "job_api_config", {}) or {}
+        bms = jcfg.get("bms") if isinstance(jcfg.get("bms"), dict) else {}
+        base = str(jcfg.get("base_url") or bms.get("base_url") or "").strip().rstrip("/")
+        token = str(jcfg.get("bearer_token", "")).strip()
+        user = str(jcfg.get("user") or bms.get("username") or bms.get("user") or "").strip()
+        password = str(jcfg.get("password") or bms.get("password") or "")
+        print(f"[JobAPI] FETCH config base={base!r} user={'set' if user else 'empty'} token={'set' if token else 'empty'}")
+        if not base or (not token and not user):
+            print("[JobAPI] FETCH skipped: missing base_url or auth config")
+            return None
+        url = self._job_api_url(base, f"/jobs/{job_id}")
+        try:
+            if not token and user and password:
+                print("[JobAPI] FETCH no cached token; requesting new token via login")
+                token = self._get_job_api_bearer_token(base=base, user=user, password=password) or ""
+                if not token:
+                    self.status.setText("Job API login failed; using local job mapping/stub.")
+                    return None
+            headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+            resp = requests.get(
+                url,
+                headers=headers,
+                timeout=5,
+            )
+            self._append_job_api_log(f"GET {url} -> HTTP {resp.status_code}")
+            print(f"[JobAPI] GET {url} -> HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                self.status.setText(
+                    f"Job API GET failed HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}"
+                )
+                self._append_job_api_log(f"GET FAIL: {self._http_error_snippet(resp) or 'No response body'}")
+                print(f"[JobAPI] GET FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
+                return None
+            data = resp.json()
+            if not isinstance(data, dict):
+                self.status.setText("Job API fetch returned invalid response; using local job mapping/stub.")
+                return None
+            payload = data.get("data")
+            if not isinstance(payload, dict):
+                self.status.setText("Job API fetch has no job payload; using local job mapping/stub.")
+                return None
+            # Keep a consistent shape with existing JOB_STUB handling.
+            wrapped = {"code": data.get("code"), "message": data.get("message"), "data": payload}
+            self._append_job_api_log(f"GET OK: job {job_id}")
+            print(f"[JobAPI] GET OK: job {job_id}")
+            return wrapped
+        except Exception as e:
+            self.status.setText(f"Job API fetch error: {e}; using local job mapping/stub.")
+            self._append_job_api_log(f"GET ERROR: {e}")
+            print(f"[JobAPI] GET ERROR: {e}")
+            return None
+
     def _refresh_job_details(self):
         job = self._extract_job_record()
+        payload = self.state.job_payload or {}
+        job_details = {}
+        if isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("job_details"), dict):
+            job_details = payload["data"]["job_details"]
+        elif isinstance(payload.get("job_details"), dict):
+            job_details = payload.get("job_details") or {}
+
+        # Keep these in payload/state for downstream use, but do not display them in Job Details cards.
+        _stored_machine_num = self._safe_text(job_details.get("machine_num"), "")
+        _stored_special_instructions = self._safe_text(job_details.get("special_instructions"), "")
+        _stored_machine_tons = self._safe_text(job_details.get("machine_tons"), "")
+        _ = (_stored_machine_num, _stored_special_instructions, _stored_machine_tons)
+
         fields = {
             "job_ref": self._safe_text(job.get("ref_no") or self.state.job_name),
-            "product_id": self._safe_text(job.get("product_id")),
-            "mold": self._safe_text(job.get("custom_05")),
-            "color": self._safe_text(job.get("custom_06"), "N/A"),
-            "system_code": self._safe_text(job.get("custom_09")),
-            "cavities": self._safe_text(job.get("custom_11")),
+            "product_id": self._safe_text(job_details.get("product_id") or job.get("product_id")),
+            "mold": self._safe_text(job_details.get("mold") or job.get("custom_05")),
+            "color": self._safe_text(job_details.get("color") or job.get("custom_06"), "N/A"),
+            "cavities": self._safe_text(job_details.get("no_of_cavity") or job.get("custom_11")),
+            "sticker_label": self._safe_text(job_details.get("sticker_label"), "N/A"),
+            "std_cycle_time": self._safe_text(job_details.get("std_cycle_time"), "N/A"),
+            "qty_per_shift": self._safe_text(job_details.get("qty_per_shift"), "N/A"),
         }
         for key, label in self.job_detail_labels.items():
             label.setText(fields.get(key, "-"))
+        if hasattr(self, "rightCycleStd") and self.rightCycleStd is not None:
+            self.rightCycleStd.setText(f"Std Cycle Time: {fields.get('std_cycle_time', 'N/A')}")
 
     def _build_reject_summary_text(self) -> str:
         s = self.state
@@ -2867,7 +3626,20 @@ QWidget#ClientUIRoot {{
 
     def can_accept_production_scans(self) -> bool:
         s = self.state
-        return bool(s.machine_code and s.job_code and s.operator_id)
+        return bool(
+            s.machine_code and s.job_code and s.operator_id
+            and not s.waiting_initial_cycle_time_input
+        )
+
+    def _missing_session_prereq_message(self) -> Optional[str]:
+        s = self.state
+        if not s.machine_code:
+            return "Scan machine QR first."
+        if not s.job_code:
+            return "Scan job QR first."
+        if not s.operator_id:
+            return "Scan operator QR first."
+        return None
 
     def on_scanned(self, raw: str):
         if self._finish_anim_running:
@@ -2877,8 +3649,33 @@ QWidget#ClientUIRoot {{
         raw_l = raw_s.lower()
         s = self.state
 
+        if s.waiting_cycle_time_confirm_popup:
+            if raw_s != (s.cycle_time_confirm_actor_code or ""):
+                self.status.setText("Cycle time confirmation active: scan the same Supervisor badge again.")
+                return
+            actor_name = s.cycle_time_confirm_actor_name or raw_s
+            actor_role = s.cycle_time_confirm_actor_role or "QC"
+            s.cycle_time_confirmed_by = actor_name
+            self._hide_cycle_time_confirm_popup()
+            self.status.setText(f"Cycle time confirmed by {actor_name}")
+            self._refresh_ui()
+            self._save_active_session_snapshot()
+            self.push_event(
+                {
+                    "type": "CYCLE_TIME_CONFIRMED",
+                    "cycle_time": s.cycle_time_current,
+                    "confirmed_by_role": actor_role,
+                    "confirmed_by_name": actor_name,
+                    "confirmed_by_code": raw_s,
+                },
+                f"CYCLE TIME CONFIRMED {actor_name}",
+            )
+            return
+
         reviewer = self._reviewer_from_scan(raw_s)
         if reviewer is not None:
+            reviewer_can_supervisor = str(reviewer.get("can_supervisor", "0")) == "1"
+            reviewer_can_qc = str(reviewer.get("can_qc", "0")) == "1"
             in_downtime_flow = (
                 s.waiting_production_report_reason
                 or s.waiting_cycle_time_input
@@ -2890,6 +3687,14 @@ QWidget#ClientUIRoot {{
             if not in_downtime_flow:
                 if not self.can_accept_production_scans():
                     self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+                    return
+                # Supervisor confirms cycle time (QA/QC is view-only for now).
+                if reviewer_can_supervisor and s.cycle_time_current and not s.cycle_time_confirmed_by:
+                    self._show_cycle_time_confirm_popup(reviewer)
+                    self.status.setText("Cycle time confirmation opened. Scan the same Supervisor badge again to confirm.")
+                    return
+                if not reviewer_can_supervisor:
+                    self.status.setText("Authorized badge scanned. No supervisor action pending.")
                     return
                 if not s.reject_review_open:
                     rows = self._get_non_zero_rejects()
@@ -2943,13 +3748,13 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Reject review confirmed.")
                     return
 
-        if raw_l == "showrawmats":
+        if raw_l in ("showrawmats", "rawmatsummary~1"):
             if self.rawMatsOverlay.isVisible():
                 self._hide_raw_mats_overlay()
-                self.status.setText("Raw materials list closed.")
+                self.status.setText("Raw materials summary closed.")
             else:
                 self._show_raw_mats_overlay()
-                self.status.setText("Raw materials list opened.")
+                self.status.setText("Raw materials summary opened.")
             return
 
         if self.rawMatsOverlay.isVisible():
@@ -2957,10 +3762,36 @@ QWidget#ClientUIRoot {{
 
         res_pre = parse_scan(raw_s)
 
+        if s.waiting_initial_cycle_time_input:
+            if raw_l.startswith("num_") and raw_l[-1:].isdigit():
+                s.cycle_time_new_input += raw_l[-1]
+                self._update_cycle_input_display()
+                return
+            if raw_l == "backspace":
+                s.cycle_time_new_input = s.cycle_time_new_input[:-1]
+                self._update_cycle_input_display()
+                return
+            if raw_l == "confirm":
+                if not s.cycle_time_new_input:
+                    self.status.setText("Cycle Time is empty. Scan digits first.")
+                    return
+                s.cycle_time_current = s.cycle_time_new_input
+                s.waiting_initial_cycle_time_input = False
+                s.waiting_initial_cycle_qc_confirm = False
+                self._hide_resolve_overlay()
+                self.status.setText("Cycle time saved. Production can continue; Supervisor may confirm later.")
+                self._refresh_ui()
+                self._save_active_session_snapshot()
+                return
+            self.status.setText("Cycle Time setup: scan num_0..num_9, backspace, confirm.")
+            return
+
         # Raw material scanning: no mode/state required, only needs active session.
         if res_pre and res_pre.kind == "RAW_MATERIAL":
             if not self.can_accept_production_scans():
-                self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+                msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
+                self.status.setText(msg[:1].upper() + msg[1:])
+                self._show_invalid_overlay(msg)
                 return
             meta = res_pre.meta if isinstance(res_pre.meta, dict) else {}
             raw_job_code = self._normalize_job_code(meta.get("job_code")) if meta.get("job_code") else ""
@@ -2969,21 +3800,23 @@ QWidget#ClientUIRoot {{
                 self.status.setText(
                     f"Invalid RAW MATERIAL QR: job code {raw_job_code} does not match current job {s.job_code}."
                 )
-                self._show_invalid_overlay()
+                self._show_invalid_overlay("This QR is not for this job.")
                 return
 
             unique_key = str(meta.get("unique_key") or "").strip()
             if unique_key and unique_key in s.raw_material_unique_keys:
                 self.status.setText("Invalid RAW MATERIAL QR: duplicate serial already scanned.")
-                self._show_invalid_overlay()
+                self._show_invalid_overlay("QR code already scanned.")
                 return
 
             qty = int(res_pre.qty or 1)
             s.raw_sacks_count += qty
-            s.raw_material_scans.append(res_pre.value)
+            material_name = str((meta.get("material_name") if isinstance(meta, dict) else None) or res_pre.value or "Raw Material").strip()
+            s.raw_material_scans.append(material_name)
             s.raw_material_logs.append(
                 {
-                    "material": res_pre.value,
+                    "material": material_name,
+                    "material_name": material_name,
                     "qty": qty,
                     "unique_key": unique_key or None,
                     "raw_job_code": raw_job_code or None,
@@ -2993,17 +3826,17 @@ QWidget#ClientUIRoot {{
             if unique_key:
                 s.raw_material_unique_keys.add(unique_key)
             self.log_last(self._scan_display_text(res_pre, raw_s))
-            self.status.setText(f"Raw material scanned: {res_pre.value} (+{qty})")
+            self.status.setText(f"Raw material scanned: {material_name} (+{qty})")
             self._refresh_ui()
             self.push_event(
                 {
                     "type": "RAW_MATERIAL",
-                    "material": res_pre.value,
+                    "material": material_name,
                     "qty": qty,
                     "unique_key": unique_key or None,
                     "raw_job_code": raw_job_code or None,
                 },
-                f"RAW MATERIAL {res_pre.value} +{qty}",
+                f"RAW MATERIAL {material_name} +{qty}",
             )
             return
 
@@ -3024,7 +3857,9 @@ QWidget#ClientUIRoot {{
                 s.cycle_time_current = s.cycle_time_new_input
                 s.waiting_cycle_time_input = False
                 s.waiting_maintenance_qr = True
-                self.resolveHint.setText("Scan Maintenance QR (2000001)")
+                self.resolveOldCycleTitle.setText("RESOLVED CYCLE TIME")
+                self.resolveNewCycleTitle.setText("NEXT STEP")
+                self.resolveHint.setText("Scan Maintenance QR")
                 self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_current}")
                 return
             self.status.setText("Cycle Time input mode: scan num_0..num_9, backspace, confirm.")
@@ -3032,33 +3867,40 @@ QWidget#ClientUIRoot {{
 
         # Resolution step 2: Maintenance
         if s.waiting_maintenance_qr:
-            if raw_s == "2000001":
-                s.maintenance_name = "Lucy Van Pelt"
+            auth = self._authorized_person_from_scan(raw_s)
+            if auth and str(auth.get("can_maintenance", "0")) == "1":
+                s.maintenance_name = str(auth.get("name") or raw_s)
                 s.waiting_maintenance_qr = False
                 s.waiting_supervisor_qr = True
-                self.resolveHint.setText("Scan Supervisor QR (3000001)")
+                self.resolveOldCycleTitle.setText("MAINTENANCE")
+                self.resolveNewCycleTitle.setText("NEXT STEP")
+                self.resolveHint.setText("Scan Supervisor QR")
                 self._refresh_downtime_panel()
                 return
-            self.status.setText("Scan valid Maintenance QR (2000001).")
+            self.status.setText("Scan valid Maintenance QR.")
             return
 
         # Resolution step 3: Supervisor
         if s.waiting_supervisor_qr:
-            if raw_s == "3000001":
-                s.supervisor_name = "Charlie Brown"
+            auth = self._authorized_person_from_scan(raw_s)
+            if auth and str(auth.get("can_supervisor", "0")) == "1":
+                s.supervisor_name = str(auth.get("name") or raw_s)
                 s.waiting_supervisor_qr = False
                 s.waiting_operator_downtime_confirm = True
+                self.resolveOldCycleTitle.setText("SUPERVISOR")
+                self.resolveNewCycleTitle.setText("NEXT STEP")
                 self.resolveHint.setText("Scan Operator QR to confirm.")
                 self._refresh_downtime_panel()
                 return
-            self.status.setText("Scan valid Supervisor QR (3000001).")
+            self.status.setText("Scan valid Supervisor QR.")
             return
 
         # Resolution step 4: Operator confirmation
         if s.waiting_operator_downtime_confirm:
-            res_op = parse_scan(raw_s)
-            if res_op and res_op.kind == "OPERATOR":
-                scanned_operator_code = self._operator_code_only(res_op.value)
+            op_auth = self._operator_from_scan(raw_s)
+            if op_auth:
+                op_value = f"{op_auth.get('code', raw_s)} - {op_auth.get('name', raw_s)}"
+                scanned_operator_code = self._operator_code_only(op_value)
                 current_operator_code = self._operator_code_only(s.operator_id)
                 if scanned_operator_code != current_operator_code:
                     self.status.setText("Operator confirmation failed: must be current operator.")
@@ -3084,6 +3926,11 @@ QWidget#ClientUIRoot {{
                 )
                 self._refresh_ui()
                 return
+            known_auth = self._authorized_person_from_scan(raw_s)
+            if known_auth is not None:
+                self.status.setText("Operator confirmation failed: scanned badge is not an Operator.")
+                self._show_invalid_overlay("Only Operator role can confirm this step.")
+                return
             self.status.setText("Scan operator QR to confirm.")
             return
 
@@ -3093,6 +3940,20 @@ QWidget#ClientUIRoot {{
             return
 
         res = parse_scan(raw_s)
+        op_auth = self._operator_from_scan(raw_s)
+        if op_auth is not None:
+            res = ScanResult(kind="OPERATOR", raw=raw_s, value=f"{op_auth.get('code', raw_s)} - {op_auth.get('name', raw_s)}")
+        elif res is not None and res.kind == "OPERATOR":
+            # Reject legacy/static operator QR unless it exists in the server profile data with Operator role.
+            self.status.setText("Invalid operator QR: badge is not registered as Operator.")
+            self._show_invalid_overlay("Operator badge is not registered on server.")
+            return
+        elif res is None and s.machine_code and s.job_code and not s.operator_id:
+            known_auth = self._authorized_person_from_scan(raw_s)
+            if known_auth is not None:
+                self.status.setText("Invalid operator QR: scanned badge is not an Operator role.")
+                self._show_invalid_overlay("Only Operator role can be used as operator on client.")
+                return
         self.log_last(self._scan_display_text(res, raw_s))
 
         if s.waiting_production_report_reason:
@@ -3123,7 +3984,8 @@ QWidget#ClientUIRoot {{
             return
 
         if res is None:
-            self.status.setText("Unknown scan (ignored).")
+            self.status.setText("Invalid scan: QR code is not recognized.")
+            self._show_invalid_overlay("QR code is not recognized.")
             return
 
         if res.kind == "FINISH_JOB":
@@ -3173,7 +4035,9 @@ QWidget#ClientUIRoot {{
 
         if res.kind == "JOB_LINKAGE_TRIGGER":
             if not self.can_accept_production_scans():
-                self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+                msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
+                self.status.setText(msg[:1].upper() + msg[1:])
+                self._show_invalid_overlay(msg)
                 return
             if s.waiting_reject_reason or s.waiting_production_report_reason or s.downtime_active:
                 self.status.setText("Cannot start linkage while reject/downtime flow is active.")
@@ -3219,7 +4083,9 @@ QWidget#ClientUIRoot {{
 
         if res.kind == "STARTUP_REJECT":
             if not self.can_accept_production_scans():
-                self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+                msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
+                self.status.setText(msg[:1].upper() + msg[1:])
+                self._show_invalid_overlay(msg)
                 return
             s.startup_reject_total += 1
             self.status.setText("Start Up Reject recorded.")
@@ -3230,7 +4096,7 @@ QWidget#ClientUIRoot {{
         if res.kind == "MACHINE":
             if s.machine_code:
                 self.status.setText("Finish your current job first before changing machine.")
-                self._show_invalid_overlay()
+                self._show_invalid_overlay("Cannot change machine while current job is active.")
                 return
             snap = self._load_active_session_snapshot(raw_s)
             if snap is not None and str(snap.get("job_code") or "").strip():
@@ -3258,6 +4124,13 @@ QWidget#ClientUIRoot {{
             s.downtime_last_seconds = None
             s.downtime_active = False
             s.cycle_time_current = None
+            s.cycle_time_confirmed_by = None
+            s.waiting_initial_cycle_time_input = False
+            s.waiting_initial_cycle_qc_confirm = False
+            s.waiting_cycle_time_confirm_popup = False
+            s.cycle_time_confirm_actor_code = None
+            s.cycle_time_confirm_actor_name = None
+            s.cycle_time_confirm_actor_role = None
             s.maintenance_name = None
             s.supervisor_name = None
             s.raw_sacks_count = 0
@@ -3285,6 +4158,7 @@ QWidget#ClientUIRoot {{
             return
 
         if res.kind in ("JOB", "JOB_STUB"):
+            print(f"[SCAN] Job-like scan detected kind={res.kind} raw={raw_s!r} value={res.value!r}")
             if s.waiting_linkage_job_scan:
                 if not (s.machine_code and s.job_code and s.operator_id):
                     s.waiting_linkage_job_scan = False
@@ -3322,13 +4196,13 @@ QWidget#ClientUIRoot {{
                 if self._normalize_job_code(linked_job_code) == self._normalize_job_code(s.job_code):
                     s.waiting_linkage_job_scan = False
                     self.status.setText("Linkage cancelled: linked job must be different from current job.")
-                    self._show_invalid_overlay()
+                    self._show_invalid_overlay("This QR is for the current job. Scan a different linked job.")
                     self._refresh_ui()
                     return
                 normalized_new = self._normalize_job_code(linked_job_code)
                 if any(self._normalize_job_code(x.get("job_code")) == normalized_new for x in (s.linkage_jobs or [])):
                     self.status.setText("Linked job already added. Scan another JOB or scan PACK/BUTAL to continue.")
-                    self._show_invalid_overlay()
+                    self._show_invalid_overlay("Linked job QR already scanned.")
                     self._refresh_ui()
                     return
                 s.linkage_enabled = True
@@ -3348,15 +4222,33 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Finish your current job first before changing machine or job.")
                 return
             if not s.machine_code:
-                self.status.setText("Scan MACHINE first.")
+                self.status.setText("Scan MACHINE QR first.")
+                self._show_invalid_overlay("Scan machine QR first.")
                 return
             if res.kind == "JOB":
                 po_from_meta = ""
                 if isinstance(res.meta, dict):
                     po_from_meta = self._safe_text(res.meta.get("po_number"), "")
-                s.job_code = po_from_meta or raw_s
-                s.job_name = res.value
-                s.job_payload = {}
+                requested_job_id = po_from_meta or raw_s
+                print(f"[SCAN] JOB fetch path requested_job_id={requested_job_id!r}")
+                fetched_payload = self._fetch_job_payload_from_api(requested_job_id)
+                if isinstance(fetched_payload, dict):
+                    s.job_payload = fetched_payload
+                    api_job = self._extract_job_record()
+                    s.job_code = (
+                        self._safe_text(api_job.get("id"), "")
+                        or self._safe_text(api_job.get("ref_no"), "")
+                        or requested_job_id
+                    )
+                    s.job_name = (
+                        self._safe_text(api_job.get("ref_no"), "")
+                        or res.value
+                    )
+                    self.status.setText(f"Job set (API): {s.job_name}")
+                else:
+                    s.job_code = requested_job_id
+                    s.job_name = res.value
+                    s.job_payload = {}
             else:
                 payload = res.meta or {}
                 s.job_payload = payload
@@ -3382,6 +4274,14 @@ QWidget#ClientUIRoot {{
             s.downtime_started_at = None
             s.downtime_last_seconds = None
             s.downtime_active = False
+            s.cycle_time_current = None
+            s.cycle_time_confirmed_by = None
+            s.waiting_initial_cycle_time_input = False
+            s.waiting_initial_cycle_qc_confirm = False
+            s.waiting_cycle_time_confirm_popup = False
+            s.cycle_time_confirm_actor_code = None
+            s.cycle_time_confirm_actor_name = None
+            s.cycle_time_confirm_actor_role = None
             s.maintenance_name = None
             s.supervisor_name = None
             s.raw_sacks_count = 0
@@ -3401,18 +4301,27 @@ QWidget#ClientUIRoot {{
             self._hide_production_overlay()
             self._hide_raw_mats_overlay()
             self._hide_reject_review_overlay()
-            self.status.setText(f"Job set: {s.job_name}")
+            if not str(self.status.text() or "").startswith("Job set (API):"):
+                self.status.setText(f"Job set: {s.job_name}")
             self._refresh_ui()
             self._save_active_session_snapshot()
             if res.kind == "JOB":
-                self.push_event({"type": "JOB_SET"}, f"JOB {s.job_name}")
+                ev = {"type": "JOB_SET"}
+                if s.job_payload:
+                    ev["job_payload"] = s.job_payload
+                self.push_event(ev, f"JOB {s.job_name}")
             else:
                 self.push_event({"type": "JOB_STUB_SET", "stub": s.job_payload}, f"JOB STUB {s.job_name}")
             return
 
         if res.kind == "REJECT_SUMMARY":
             if not s.machine_code or not s.job_code:
-                self.status.setText("Scan MACHINE and JOB first.")
+                if not s.machine_code:
+                    self.status.setText("Scan MACHINE QR first.")
+                    self._show_invalid_overlay("Scan machine QR first.")
+                else:
+                    self.status.setText("Scan JOB QR first.")
+                    self._show_invalid_overlay("Scan job QR first.")
                 return
             s.showing_reject_summary = True
             s.waiting_reject_reason = False
@@ -3425,10 +4334,16 @@ QWidget#ClientUIRoot {{
 
         if res.kind == "OPERATOR":
             if not s.machine_code or not s.job_code:
-                self.status.setText("Scan MACHINE then JOB first.")
+                if not s.machine_code:
+                    self.status.setText("Scan MACHINE QR first.")
+                    self._show_invalid_overlay("Scan machine QR first.")
+                else:
+                    self.status.setText("Scan JOB QR first.")
+                    self._show_invalid_overlay("Scan job QR first.")
                 return
             s.operator_id = res.value
-            self.status.setText(f"Operator set: {s.operator_id}")
+            self._begin_initial_cycle_time_setup()
+            self.status.setText(f"Operator set: {s.operator_id}. Enter cycle time now.")
             self._refresh_ui()
             self._save_active_session_snapshot()
             self.push_event({"type": "OPERATOR_SET"}, f"OPERATOR {s.operator_id}")
@@ -3436,7 +4351,9 @@ QWidget#ClientUIRoot {{
 
         if res.kind in ("PACK", "BUTAL", "REJECT_TRIGGER", "PRODUCTION_DAILY_REPORT_TRIGGER"):
             if not self.can_accept_production_scans():
-                self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+                msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
+                self.status.setText(msg[:1].upper() + msg[1:])
+                self._show_invalid_overlay(msg)
                 return
             if s.waiting_linkage_job_scan:
                 if s.linkage_jobs:
@@ -3472,13 +4389,13 @@ QWidget#ClientUIRoot {{
                 current_job_code = self._normalize_job_code(s.job_code)
                 if scanned_job_code is None:
                     self.status.setText("Invalid PACK QR format: missing job code segment.")
-                    self._show_invalid_overlay()
+                    self._show_invalid_overlay("PACK QR format is invalid.")
                     return
                 if current_job_code and scanned_job_code != current_job_code:
                     self.status.setText(
                         f"Invalid PACK QR: job code {scanned_job_code} does not match current job {s.job_code}."
                     )
-                    self._show_invalid_overlay()
+                    self._show_invalid_overlay("This QR is not for this job.")
                     return
 
                 qty = int(res.qty or 0)
