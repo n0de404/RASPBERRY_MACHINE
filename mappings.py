@@ -110,15 +110,15 @@ def _parse_structured_raw_material(payload: str) -> Optional[Dict[str, Any]]:
 
     p_match = re.search(r"P(\d{11})", s)
     q_match = re.search(r"QRM(\d{11})", s)
-    uniq_match = re.search(r"(I\d{11}T\d{11}L\d{14}-\d+)\s*$", s)
-    job_match = re.search(r"-0*(\d+)\s*$", s)
-    if not p_match or not q_match or not uniq_match or not job_match:
+    tail_match = re.search(r"I(\d{11})T(\d{11})L(\d{14})-(\d+)\s*$", s)
+    if not p_match or not q_match or not tail_match:
         return None
 
+    i_digits, t_digits, lot_digits, po_digits = tail_match.groups()
     material_code_digits = p_match.group(1).lstrip("0") or "0"
     qty = int(q_match.group(1))
-    unique_key = uniq_match.group(1)
-    job_code = job_match.group(1).lstrip("0") or "0"
+    unique_key = f"I{i_digits}T{t_digits}L{lot_digits}-{po_digits}"
+    job_code = po_digits.lstrip("0") or "0"
     material_name = f"Raw Material {material_code_digits}"
     return {
         "material_code": material_code_digits,
@@ -126,6 +126,10 @@ def _parse_structured_raw_material(payload: str) -> Optional[Dict[str, Any]]:
         "qty": qty,
         "unique_key": unique_key,
         "job_code": job_code,
+        "index": str(int(i_digits)),
+        "total_labels": str(int(t_digits)),
+        "lot_number": lot_digits,
+        "po_number": po_digits,
     }
 
 

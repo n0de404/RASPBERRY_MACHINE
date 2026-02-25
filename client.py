@@ -234,10 +234,12 @@ class ClientState:
     waiting_initial_cycle_time_input: bool = False
     waiting_initial_cycle_qc_confirm: bool = False
     waiting_cycle_time_confirm_popup: bool = False
+    cycle_time_confirm_phase: int = 0
     waiting_maintenance_qr: bool = False
     waiting_supervisor_qr: bool = False
     waiting_operator_downtime_confirm: bool = False
     showing_reject_summary: bool = False
+    reject_summary_last_scanned_at: Optional[str] = None
     job_payload: Dict[str, Any] = None
     downtime_reason_code: Optional[str] = None
     downtime_reason_text: Optional[str] = None
@@ -256,6 +258,7 @@ class ClientState:
     raw_material_scans: List[str] = None
     raw_material_logs: List[Dict[str, Any]] = None
     raw_material_unique_keys: Set[str] = None
+    product_pack_history_logs: List[Dict[str, Any]] = None
     startup_reject_total: int = 0
     reject_review_open: bool = False
     reject_review_phase: int = 0
@@ -281,6 +284,8 @@ class ClientState:
             self.raw_material_logs = []
         if self.raw_material_unique_keys is None:
             self.raw_material_unique_keys = set()
+        if self.product_pack_history_logs is None:
+            self.product_pack_history_logs = []
         if self.reject_review_logs is None:
             self.reject_review_logs = []
         if self.linkage_job_payload is None:
@@ -500,6 +505,10 @@ class ClientUI(QWidget):
         self.state = ClientState()
         self.client_config = _load_client_config()
         self.job_api_config = _load_job_api_config()
+        self._identity_sync_lock = threading.Lock()
+        self._identity_sync_inflight = False
+        self._identity_sync_last_attempt = 0.0
+        self._identity_sync_last_ok = 0.0
         self._serial_stop = threading.Event()
         self._serial_thread: Optional[threading.Thread] = None
         self._motion_index = 0
@@ -1101,8 +1110,8 @@ QWidget#ClientUIRoot {{
         self.rawMatsTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
         self.rawMatsHint = QLabel('Scan "rawmatsummary~1" (or "showrawmats") again to close')
         self.rawMatsHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
-        self.rawMatsList = QTableWidget(0, 4)
-        self.rawMatsList.setHorizontalHeaderLabels(["#", "Raw Material", "Qty", "Timestamp"])
+        self.rawMatsList = QTableWidget(0, 8)
+        self.rawMatsList.setHorizontalHeaderLabels(["#", "Raw Material", "Qty", "Index", "Total Labels", "Lot", "PO No.", "Timestamp"])
         self.rawMatsList.setAlternatingRowColors(True)
         self.rawMatsList.setWordWrap(False)
         self.rawMatsList.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1112,9 +1121,13 @@ QWidget#ClientUIRoot {{
         self.rawMatsList.verticalHeader().setDefaultSectionSize(28)
         self.rawMatsList.horizontalHeader().setStretchLastSection(False)
         self.rawMatsList.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.rawMatsList.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.rawMatsList.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.rawMatsList.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.rawMatsList.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.rawMatsList.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.rawMatsList.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.rawMatsList.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.rawMatsList.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.rawMatsList.setMinimumHeight(240)
         self.rawMatsList.setStyleSheet(
             "QTableWidget { background: rgba(255,255,255,0.78); border: 1px solid rgba(148,163,184,0.45);"
@@ -1127,6 +1140,74 @@ QWidget#ClientUIRoot {{
         self.rawMatsOverlay.layout().addWidget(self.rawMatsList)
         self.rawMatsOverlay.hide()
         self.rawMatsOverlay.raise_()
+
+        # Center overlay for reject summary snapshot (triggered by "rejectsummary").
+        self.rejectSummaryOverlay = QFrame(self)
+        self.rejectSummaryOverlay.setObjectName("ProductionOverlay")
+        self.rejectSummaryOverlay.setLayout(QVBoxLayout())
+        self.rejectSummaryOverlay.layout().setContentsMargins(14, 12, 14, 12)
+        self.rejectSummaryOverlay.layout().setSpacing(8)
+        self.rejectSummaryOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.rejectSummaryTitle = QLabel("REJECT SUMMARY")
+        self.rejectSummaryTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
+        self.rejectSummaryHint = QLabel('Scan "rejectsummary" again to refresh')
+        self.rejectSummaryHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.rejectSummaryStamp = QLabel("Scanned at: -")
+        self.rejectSummaryStamp.setObjectName("MetaValue")
+        self.rejectSummaryConfirmedBy = QLabel("Confirmed by: -")
+        self.rejectSummaryConfirmedBy.setObjectName("MetaValue")
+        self.rejectSummaryDetails = QLabel("No reject data yet.")
+        self.rejectSummaryDetails.setObjectName("ProductionLiveReason")
+        self.rejectSummaryDetails.setWordWrap(True)
+        self.rejectSummaryDetails.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryTitle)
+        self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryHint)
+        self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryStamp)
+        self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryConfirmedBy)
+        self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryDetails, 1)
+        self.rejectSummaryOverlay.hide()
+        self.rejectSummaryOverlay.raise_()
+
+        # Center overlay for scanned PACK QR history (toggle with "prodhistory~1").
+        self.productHistoryOverlay = QFrame(self)
+        self.productHistoryOverlay.setObjectName("ProductionOverlay")
+        self.productHistoryOverlay.setLayout(QVBoxLayout())
+        self.productHistoryOverlay.layout().setContentsMargins(14, 12, 14, 12)
+        self.productHistoryOverlay.layout().setSpacing(8)
+        self.productHistoryOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.productHistoryTitle = QLabel("SCANNED PACK HISTORY")
+        self.productHistoryTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
+        self.productHistoryHint = QLabel('Scan "prodhistory~1" again to close')
+        self.productHistoryHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.productHistoryList = QTableWidget(0, 7)
+        self.productHistoryList.setHorizontalHeaderLabels(["#", "Product", "Index", "Total Labels", "Lot", "PO No.", "Timestamp"])
+        self.productHistoryList.setAlternatingRowColors(True)
+        self.productHistoryList.setWordWrap(False)
+        self.productHistoryList.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.productHistoryList.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.productHistoryList.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.productHistoryList.verticalHeader().setVisible(False)
+        self.productHistoryList.verticalHeader().setDefaultSectionSize(28)
+        self.productHistoryList.horizontalHeader().setStretchLastSection(False)
+        self.productHistoryList.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.productHistoryList.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.productHistoryList.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.productHistoryList.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.productHistoryList.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.productHistoryList.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.productHistoryList.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.productHistoryList.setMinimumHeight(260)
+        self.productHistoryList.setStyleSheet(
+            "QTableWidget { background: rgba(255,255,255,0.78); border: 1px solid rgba(148,163,184,0.45);"
+            " border-radius: 10px; gridline-color: rgba(148,163,184,0.28); }"
+            "QHeaderView::section { background: rgba(226,232,240,0.9); color: #0f172a; font-weight: 800;"
+            " border: none; border-bottom: 1px solid rgba(148,163,184,0.5); padding: 6px; }"
+        )
+        self.productHistoryOverlay.layout().addWidget(self.productHistoryTitle)
+        self.productHistoryOverlay.layout().addWidget(self.productHistoryHint)
+        self.productHistoryOverlay.layout().addWidget(self.productHistoryList)
+        self.productHistoryOverlay.hide()
+        self.productHistoryOverlay.raise_()
 
         # Center overlay for reject confirmation by Supervisor/QC.
         self.rejectReviewOverlay = QFrame(self)
@@ -1622,6 +1703,12 @@ QWidget#ClientUIRoot {{
         self.hb.timeout.connect(self.send_heartbeat)
         self.hb.start(1500)
 
+        # Keep profile/role cache synced from server so remote profile creation is recognized by scans.
+        self.identitySyncTimer = QTimer(self)
+        self.identitySyncTimer.timeout.connect(lambda: self._trigger_identity_cache_sync(force=False))
+        self.identitySyncTimer.start(3000)
+        QTimer.singleShot(250, lambda: self._trigger_identity_cache_sync(force=True))
+
         self.motionTimer = QTimer(self)
         self.motionTimer.timeout.connect(self._tick_motion)
         self.motionTimer.start(60)
@@ -1654,6 +1741,8 @@ QWidget#ClientUIRoot {{
         self._position_production_overlay()
         self._position_resolve_overlay()
         self._position_raw_mats_overlay()
+        self._position_reject_summary_overlay()
+        self._position_product_history_overlay()
         self._position_reject_review_overlay()
         self._position_finish_overlay()
         self._sync_machine_status_pulse_overlay()
@@ -1808,11 +1897,25 @@ QWidget#ClientUIRoot {{
         self.resolveOverlay.setGeometry(x, y, w, h)
 
     def _position_raw_mats_overlay(self):
-        w = min(760, max(520, int(self.width() * 0.58)))
+        w = min(1100, max(700, int(self.width() * 0.82)))
         h = min(640, max(360, int(self.height() * 0.65)))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.rawMatsOverlay.setGeometry(x, y, w, h)
+
+    def _position_reject_summary_overlay(self):
+        w = min(720, max(460, int(self.width() * 0.52)))
+        h = min(520, max(260, int(self.height() * 0.42)))
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
+        self.rejectSummaryOverlay.setGeometry(x, y, w, h)
+
+    def _position_product_history_overlay(self):
+        w = min(1040, max(680, int(self.width() * 0.78)))
+        h = min(660, max(360, int(self.height() * 0.68)))
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
+        self.productHistoryOverlay.setGeometry(x, y, w, h)
 
     def _position_reject_review_overlay(self):
         self.rejectReviewOverlay.adjustSize()
@@ -1859,8 +1962,8 @@ QWidget#ClientUIRoot {{
             table.setRowCount(1)
             empty_item = QTableWidgetItem("No raw materials scanned yet.")
             table.setItem(0, 0, empty_item)
-            table.setSpan(0, 0, 1, 4)
-            for c in range(1, 4):
+            table.setSpan(0, 0, 1, 8)
+            for c in range(1, 8):
                 table.setItem(0, c, QTableWidgetItem(""))
             table.resizeRowsToContents()
             return
@@ -1877,10 +1980,19 @@ QWidget#ClientUIRoot {{
             except Exception:
                 pass
 
-            values = [str(row_idx + 1), name, str(qty), ts_text]
+            values = [
+                str(row_idx + 1),
+                name,
+                str(qty),
+                str(item.get("index") or "-"),
+                str(item.get("total_labels") or "-"),
+                str(item.get("lot_number") or "-"),
+                str(item.get("po_number") or item.get("raw_job_code") or "-"),
+                ts_text,
+            ]
             for col_idx, val in enumerate(values):
                 cell = QTableWidgetItem(val)
-                if col_idx in (0, 2):
+                if col_idx in (0, 2, 3, 4):
                     cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
                 else:
                     cell.setTextAlignment(int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft))
@@ -1888,9 +2000,8 @@ QWidget#ClientUIRoot {{
 
         table.clearSpans()
         table.resizeRowsToContents()
-        table.resizeColumnToContents(0)
-        table.resizeColumnToContents(2)
-        table.resizeColumnToContents(3)
+        for col in range(0, 7):
+            table.resizeColumnToContents(col)
 
     def _show_raw_mats_overlay(self):
         self._refresh_raw_mats_overlay()
@@ -1904,6 +2015,108 @@ QWidget#ClientUIRoot {{
         if not self._should_keep_background_blur():
             self._set_background_blur(False)
 
+    def _refresh_reject_summary_overlay(self):
+        s = self.state
+        stamp_raw = str(s.reject_summary_last_scanned_at or "").strip()
+        stamp_text = stamp_raw
+        if stamp_raw:
+            try:
+                dt = datetime.fromisoformat(stamp_raw.replace("Z", "+00:00"))
+                stamp_text = dt.astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
+            except Exception:
+                pass
+        self.rejectSummaryStamp.setText(f"Scanned at: {stamp_text or '-'}")
+        pending_name = ""
+        if s.waiting_cycle_time_confirm_popup and int(s.cycle_time_confirm_phase or 0) == 2:
+            pending_name = str(s.cycle_time_confirm_actor_name or "").strip()
+        confirmed_name = pending_name or str(s.cycle_time_confirmed_by or "").strip() or "-"
+        self.rejectSummaryConfirmedBy.setText(f"Confirmed by: {confirmed_name}")
+
+        rows = self._get_non_zero_rejects()
+        lines = [
+            f"Reject Total: {int(s.reject_total or 0)}",
+            f"Start Up Reject: {int(s.startup_reject_total or 0)}",
+        ]
+        if rows:
+            lines.append("")
+            lines.append("Breakdown:")
+            lines.extend([f"{name}: {qty}" for name, qty in rows])
+        else:
+            lines.append("")
+            lines.append("Breakdown: No rejects recorded.")
+        self.rejectSummaryDetails.setText("\n".join(lines))
+
+    def _show_reject_summary_overlay(self):
+        self._refresh_reject_summary_overlay()
+        self._position_reject_summary_overlay()
+        self._set_background_blur(True)
+        self.rejectSummaryOverlay.show()
+        self.rejectSummaryOverlay.raise_()
+
+    def _hide_reject_summary_overlay(self):
+        self.rejectSummaryOverlay.hide()
+        if not self._should_keep_background_blur():
+            self._set_background_blur(False)
+
+    def _refresh_product_history_overlay(self):
+        logs = self.state.product_pack_history_logs or []
+        table = self.productHistoryList
+        table.setRowCount(0)
+        valid_rows: List[Dict[str, Any]] = [x for x in logs if isinstance(x, dict)]
+        if not valid_rows:
+            table.setRowCount(1)
+            empty_item = QTableWidgetItem("No PACK QR scans recorded yet.")
+            table.setItem(0, 0, empty_item)
+            table.setSpan(0, 0, 1, 7)
+            for c in range(1, 7):
+                table.setItem(0, c, QTableWidgetItem(""))
+            table.resizeRowsToContents()
+            return
+
+        table.setRowCount(len(valid_rows))
+        for row_idx, item in enumerate(valid_rows):
+            ts_raw = str(item.get("scanned_at") or "").strip()
+            ts_text = ts_raw
+            try:
+                ts_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                ts_text = ts_dt.astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
+            except Exception:
+                pass
+
+            values = [
+                str(row_idx + 1),
+                str(item.get("product_name") or "-"),
+                str(item.get("index") or "-"),
+                str(item.get("total_labels") or "-"),
+                str(item.get("lot_number") or "-"),
+                str(item.get("po_number") or "-"),
+                ts_text or "-",
+            ]
+            for col_idx, val in enumerate(values):
+                cell = QTableWidgetItem(val)
+                if col_idx in (0, 2, 3):
+                    cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                else:
+                    cell.setTextAlignment(int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft))
+                table.setItem(row_idx, col_idx, cell)
+
+        table.clearSpans()
+        table.resizeRowsToContents()
+        for col in range(0, 6):
+            table.resizeColumnToContents(col)
+
+    def _show_product_history_overlay(self):
+        self._refresh_product_history_overlay()
+        self._position_product_history_overlay()
+        self._set_background_blur(True)
+        self.productHistoryOverlay.show()
+        self.productHistoryOverlay.raise_()
+
+    def _hide_product_history_overlay(self):
+        self.productHistoryOverlay.hide()
+        if not self._should_keep_background_blur():
+            self._set_background_blur(False)
+
     def _load_json_file(self, path: str, fallback: Any) -> Any:
         try:
             if os.path.exists(path):
@@ -1912,6 +2125,80 @@ QWidget#ClientUIRoot {{
         except Exception:
             pass
         return fallback
+
+    def _save_json_file(self, path: str, payload: Any):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _trigger_identity_cache_sync(self, force: bool = False):
+        server_url = str(self.client_config.get("server_url", SERVER_URL)).strip().rstrip("/")
+        if not server_url:
+            return
+        now_ts = time.time()
+        if not force and (now_ts - float(self._identity_sync_last_attempt or 0.0)) < 1.0:
+            return
+        with self._identity_sync_lock:
+            if self._identity_sync_inflight:
+                return
+            self._identity_sync_inflight = True
+            self._identity_sync_last_attempt = now_ts
+
+        def _worker():
+            ok = False
+            try:
+                headers = {"Accept": "application/json"}
+                # Profiles cache (list)
+                resp_profiles = requests.get(f"{server_url}/api/profiles", headers=headers, timeout=2.5)
+                if resp_profiles.status_code == 200:
+                    out_profiles = resp_profiles.json()
+                    items = out_profiles.get("items") if isinstance(out_profiles, dict) else None
+                    if isinstance(items, list):
+                        self._save_json_file(USER_QR_PROFILES_FILE, items)
+                        ok = True
+
+                # Daily roles cache (stored locally as {date: items})
+                resp_roles = requests.get(f"{server_url}/api/daily-roles", headers=headers, timeout=2.5)
+                if resp_roles.status_code == 200:
+                    out_roles = resp_roles.json()
+                    if isinstance(out_roles, dict):
+                        date_key = str(out_roles.get("date") or "").strip()
+                        items = out_roles.get("items")
+                        if date_key and isinstance(items, dict):
+                            local_daily = self._load_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, {})
+                            if not isinstance(local_daily, dict):
+                                local_daily = {}
+                            local_daily[date_key] = items
+                            self._save_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, local_daily)
+                            ok = True
+                        elif isinstance(items, dict):
+                            # Fallback if date key missing.
+                            local_daily = self._load_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, {})
+                            if not isinstance(local_daily, dict):
+                                local_daily = {}
+                            local_daily[datetime.now().date().isoformat()] = items
+                            self._save_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, local_daily)
+                            ok = True
+
+                # Consider success if at least profiles synced, even with no daily roles.
+                if not ok:
+                    try:
+                        if os.path.exists(USER_QR_PROFILES_FILE):
+                            ok = True
+                    except Exception:
+                        ok = False
+            except Exception:
+                ok = False
+            finally:
+                with self._identity_sync_lock:
+                    if ok:
+                        self._identity_sync_last_ok = time.time()
+                    self._identity_sync_inflight = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _role_caps_from_text(self, text: Any) -> Set[str]:
         s = str(text or "").strip().lower()
@@ -1932,6 +2219,7 @@ QWidget#ClientUIRoot {{
         code = str(raw).strip()
         if not code:
             return None
+        self._trigger_identity_cache_sync(force=False)
 
         caps: Set[str] = set()
         display_name = ""
@@ -2406,6 +2694,8 @@ QWidget#ClientUIRoot {{
         self.lblButal.setText(str(s.butal_total))
         self.lblReject.setText(str(s.reject_total))
         self.lblTotalGood.setText(str(s.good_total + s.butal_total))
+        self.rightCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
+        self.rightCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
 
         self._refresh_reject_detail_grid()
 
@@ -2532,9 +2822,9 @@ QWidget#ClientUIRoot {{
             linked_name = s.linkage_job_name or s.linkage_job_code or "-"
         self.linkageMirrorJob.setText(f"Linked Job(s): {linked_name}")
         self.linkageMirrorCounts.setText(
-            f"Pack: {s.pack_count} | Good: {s.good_total} | Butal: {s.butal_total} | Total Good: {s.good_total + s.butal_total}"
+            f"Pack: {s.pack_count} | Good: {s.good_total} | Total Good (Pack Only): {s.good_total}"
         )
-        self.linkageMirrorRejects.setText("Reject Details: not mirrored (finish goods linkage only)")
+        self.linkageMirrorRejects.setText("Reject/Butal: main job only (linked job mirrors Pack/Good only)")
         self.linkageMirrorOuter.setVisible(bool(s.machine_code))
 
     def _save_finished_job_local(self, payload: Dict[str, Any]):
@@ -2591,6 +2881,7 @@ QWidget#ClientUIRoot {{
             "waiting_reject_reason": bool(s.waiting_reject_reason),
             "waiting_production_report_reason": bool(s.waiting_production_report_reason),
             "showing_reject_summary": bool(s.showing_reject_summary),
+            "reject_summary_last_scanned_at": s.reject_summary_last_scanned_at,
             "job_payload": s.job_payload or {},
             "downtime_reason_code": s.downtime_reason_code,
             "downtime_reason_text": s.downtime_reason_text,
@@ -2603,6 +2894,7 @@ QWidget#ClientUIRoot {{
             "waiting_initial_cycle_time_input": bool(s.waiting_initial_cycle_time_input),
             "waiting_initial_cycle_qc_confirm": bool(s.waiting_initial_cycle_qc_confirm),
             "waiting_cycle_time_confirm_popup": bool(s.waiting_cycle_time_confirm_popup),
+            "cycle_time_confirm_phase": int(s.cycle_time_confirm_phase or 0),
             "cycle_time_confirmed_by": s.cycle_time_confirmed_by,
             "cycle_time_confirm_actor_code": s.cycle_time_confirm_actor_code,
             "cycle_time_confirm_actor_name": s.cycle_time_confirm_actor_name,
@@ -2616,6 +2908,7 @@ QWidget#ClientUIRoot {{
             "raw_material_scans": list(s.raw_material_scans or []),
             "raw_material_logs": list(s.raw_material_logs or []),
             "raw_material_unique_keys": sorted(list(s.raw_material_unique_keys or set())),
+            "product_pack_history_logs": list(s.product_pack_history_logs or []),
             "startup_reject_total": int(s.startup_reject_total or 0),
             "reject_review_open": bool(s.reject_review_open),
             "reject_review_phase": int(s.reject_review_phase or 0),
@@ -2671,6 +2964,7 @@ QWidget#ClientUIRoot {{
         s.waiting_reject_reason = bool(snap.get("waiting_reject_reason"))
         s.waiting_production_report_reason = bool(snap.get("waiting_production_report_reason"))
         s.showing_reject_summary = bool(snap.get("showing_reject_summary"))
+        s.reject_summary_last_scanned_at = snap.get("reject_summary_last_scanned_at")
         s.job_payload = snap.get("job_payload") or {}
         s.downtime_reason_code = snap.get("downtime_reason_code")
         s.downtime_reason_text = snap.get("downtime_reason_text")
@@ -2683,6 +2977,7 @@ QWidget#ClientUIRoot {{
         s.waiting_initial_cycle_time_input = bool(snap.get("waiting_initial_cycle_time_input"))
         s.waiting_initial_cycle_qc_confirm = bool(snap.get("waiting_initial_cycle_qc_confirm"))
         s.waiting_cycle_time_confirm_popup = bool(snap.get("waiting_cycle_time_confirm_popup"))
+        s.cycle_time_confirm_phase = int(snap.get("cycle_time_confirm_phase") or 0)
         s.cycle_time_confirmed_by = snap.get("cycle_time_confirmed_by")
         s.cycle_time_confirm_actor_code = snap.get("cycle_time_confirm_actor_code")
         s.cycle_time_confirm_actor_name = snap.get("cycle_time_confirm_actor_name")
@@ -2696,6 +2991,7 @@ QWidget#ClientUIRoot {{
         s.raw_material_scans = list(snap.get("raw_material_scans") or [])
         s.raw_material_logs = list(snap.get("raw_material_logs") or [])
         s.raw_material_unique_keys = set(snap.get("raw_material_unique_keys") or [])
+        s.product_pack_history_logs = list(snap.get("product_pack_history_logs") or [])
         s.startup_reject_total = int(snap.get("startup_reject_total") or 0)
         s.reject_review_open = bool(snap.get("reject_review_open"))
         s.reject_review_phase = int(snap.get("reject_review_phase") or 0)
@@ -2729,10 +3025,21 @@ QWidget#ClientUIRoot {{
             self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_new_input}")
             self._show_resolve_overlay()
         elif s.waiting_cycle_time_confirm_popup:
-            self.resolveTitle.setText("CYCLE TIME CONFIRMATION")
-            self.resolveHint.setText("Scan the same Supervisor badge again to confirm")
+            self.resolveTitle.setText("SUPERVISOR CYCLE TIME REVIEW")
+            if int(s.cycle_time_confirm_phase or 0) == 2:
+                self.resolveHint.setText("Cycle time updated. Reject summary is open. Scan the same Supervisor badge again to confirm all.")
+                self.resolveOldCycleTitle.setText("STD CYCLE TIME")
+                self.resolveNewCycleTitle.setText("CURRENT CYCLE TIME")
+                self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_current or '-'}")
+            else:
+                self.resolveHint.setText(
+                    f"Current Cycle Time: {s.cycle_time_current or '-'}\n"
+                    "Scan num_0..num_9, backspace, then confirm to update."
+                )
+                self.resolveOldCycleTitle.setText("STD CYCLE TIME")
+                self.resolveNewCycleTitle.setText("NEW CYCLE TIME INPUT")
+                self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_new_input}")
             self.resolveOldCycleTitle.setText("STD CYCLE TIME")
-            self.resolveNewCycleTitle.setText("CURRENT CYCLE TIME")
             self._show_resolve_overlay()
 
     def _build_finished_job_payload(self) -> Dict[str, Any]:
@@ -2755,6 +3062,7 @@ QWidget#ClientUIRoot {{
             "raw_sacks_count": int(s.raw_sacks_count or 0),
             "raw_material_scans": list(s.raw_material_scans or []),
             "raw_material_logs": list(s.raw_material_logs or []),
+            "product_pack_history_logs": list(s.product_pack_history_logs or []),
             "job_payload": s.job_payload or {},
             "reject_review_logs": list(s.reject_review_logs or []),
             "downtime_last_seconds": s.downtime_last_seconds,
@@ -2791,10 +3099,10 @@ QWidget#ClientUIRoot {{
             # Linked jobs mirror only finish-goods counters, not rejects.
             linked_payload["pack_count"] = int(s.pack_count or 0)
             linked_payload["good_total"] = int(s.good_total or 0)
-            linked_payload["butal_total"] = int(s.butal_total or 0)
+            linked_payload["butal_total"] = 0
             linked_payload["reject_total"] = 0
             linked_payload["reject_breakdown"] = {}
-            linked_payload["total_good"] = int((s.good_total or 0) + (s.butal_total or 0))
+            linked_payload["total_good"] = int(s.good_total or 0)
             linked_payload["startup_reject_total"] = 0
             linked_payload["linkage_enabled"] = True
             linked_payload["linkage_role"] = "LINKED"
@@ -2824,6 +3132,7 @@ QWidget#ClientUIRoot {{
         s.waiting_reject_reason = False
         s.waiting_production_report_reason = False
         s.showing_reject_summary = False
+        s.reject_summary_last_scanned_at = None
         s.job_payload = {}
         s.downtime_reason_code = None
         s.downtime_reason_text = None
@@ -2835,6 +3144,7 @@ QWidget#ClientUIRoot {{
         s.waiting_initial_cycle_time_input = False
         s.waiting_initial_cycle_qc_confirm = False
         s.waiting_cycle_time_confirm_popup = False
+        s.cycle_time_confirm_phase = 0
         s.cycle_time_confirm_actor_code = None
         s.cycle_time_confirm_actor_name = None
         s.cycle_time_confirm_actor_role = None
@@ -2844,6 +3154,7 @@ QWidget#ClientUIRoot {{
         s.raw_material_scans = []
         s.raw_material_logs = []
         s.raw_material_unique_keys = set()
+        s.product_pack_history_logs = []
         s.startup_reject_total = 0
         s.reject_review_logs = []
         s.waiting_linkage_job_scan = False
@@ -2856,6 +3167,8 @@ QWidget#ClientUIRoot {{
         self._hide_resolve_overlay()
         self._hide_production_overlay()
         self._hide_raw_mats_overlay()
+        self._hide_reject_summary_overlay()
+        self._hide_product_history_overlay()
         self._hide_reject_review_overlay()
         self._clear_active_session_snapshot(active_machine_code)
         self._refresh_ui()
@@ -2916,9 +3229,11 @@ QWidget#ClientUIRoot {{
     def _show_cycle_time_confirm_popup(self, reviewer: Dict[str, str]):
         s = self.state
         s.waiting_cycle_time_confirm_popup = True
+        s.cycle_time_confirm_phase = 1
         s.cycle_time_confirm_actor_code = reviewer.get("code")
         s.cycle_time_confirm_actor_name = reviewer.get("name")
         s.cycle_time_confirm_actor_role = reviewer.get("role")
+        s.cycle_time_new_input = str(s.cycle_time_current or "")
         std_cycle = "-"
         try:
             payload = s.job_payload or {}
@@ -2928,17 +3243,21 @@ QWidget#ClientUIRoot {{
                 std_cycle = self._safe_text(job_details.get("std_cycle_time"), "-")
         except Exception:
             pass
-        self.resolveTitle.setText("CYCLE TIME CONFIRMATION")
-        self.resolveHint.setText("Scan the same Supervisor badge again to confirm")
+        self.resolveTitle.setText("SUPERVISOR CYCLE TIME REVIEW")
+        self.resolveHint.setText(
+            f"Current Cycle Time: {s.cycle_time_current or '-'}\n"
+            "Scan num_0..num_9, backspace, then confirm to update."
+        )
         self.resolveOldCycleTitle.setText("STD CYCLE TIME")
-        self.resolveNewCycleTitle.setText("CURRENT CYCLE TIME")
+        self.resolveNewCycleTitle.setText("NEW CYCLE TIME INPUT")
         self.resolveOldCycle.setText(f"Std Cycle Time: {std_cycle}")
-        self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_current or '-'}")
+        self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_new_input or ''}")
         self._show_resolve_overlay()
 
     def _hide_cycle_time_confirm_popup(self):
         s = self.state
         s.waiting_cycle_time_confirm_popup = False
+        s.cycle_time_confirm_phase = 0
         s.cycle_time_confirm_actor_code = None
         s.cycle_time_confirm_actor_name = None
         s.cycle_time_confirm_actor_role = None
@@ -3101,6 +3420,7 @@ QWidget#ClientUIRoot {{
         _save_client_config(self.client_config)
         _save_job_api_config(self.job_api_config)
         self._restart_scanner_input()
+        self._trigger_identity_cache_sync(force=True)
         self.status.setText("API/Scanner configuration applied.")
 
     def _test_job_api_settings(self):
@@ -3208,6 +3528,8 @@ QWidget#ClientUIRoot {{
             self.productionOverlay.isVisible()
             or self.resolveOverlay.isVisible()
             or self.rawMatsOverlay.isVisible()
+            or self.rejectSummaryOverlay.isVisible()
+            or self.productHistoryOverlay.isVisible()
             or self.rejectReviewOverlay.isVisible()
             or self.finishOverlay.isVisible()
             or self.settingsOverlay.isVisible()
@@ -3515,6 +3837,25 @@ QWidget#ClientUIRoot {{
             return None
         return m.group(1).lstrip("0") or "0"
 
+    def _extract_pack_history_fields(self, raw: str) -> Optional[Dict[str, str]]:
+        s = str(raw).strip()
+        if "V2" not in s or "QB" in s:
+            return None
+        m = re.search(r"P(\d{11})Q(\d{11})I(\d{11})T(\d{11})L(\d{14})-(\d+)\s*$", s)
+        if not m:
+            return None
+        p_digits, q_digits, i_digits, t_digits, lot_digits, po_digits = m.groups()
+        product_code = p_digits.lstrip("0") or "0"
+        return {
+            "product_name": f"Product {product_code}",
+            "product_p": p_digits,
+            "qty_q": str(int(q_digits)),
+            "index": str(int(i_digits)),
+            "total_labels": str(int(t_digits)),
+            "lot_number": lot_digits,  # preserve QR formatting
+            "po_number": po_digits,    # preserve QR formatting
+        }
+
     def _scan_display_text(self, res, raw: str) -> str:
         if res is None:
             return "Unknown scan"
@@ -3650,14 +3991,52 @@ QWidget#ClientUIRoot {{
         s = self.state
 
         if s.waiting_cycle_time_confirm_popup:
+            phase = int(s.cycle_time_confirm_phase or 1)
+            if phase == 1:
+                if raw_l.startswith("num_") and raw_l[-1:].isdigit():
+                    s.cycle_time_new_input += raw_l[-1]
+                    self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_new_input}")
+                    return
+                if raw_l == "backspace":
+                    s.cycle_time_new_input = s.cycle_time_new_input[:-1]
+                    self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_new_input}")
+                    return
+                if raw_l == "confirm":
+                    if not s.cycle_time_new_input:
+                        self.status.setText("Cycle Time is empty. Scan digits first.")
+                        return
+                    s.cycle_time_current = s.cycle_time_new_input
+                    s.cycle_time_confirm_phase = 2
+                    s.reject_summary_last_scanned_at = datetime.now(timezone.utc).isoformat()
+                    self._hide_resolve_overlay()
+                    s.showing_reject_summary = True
+                    self._show_reject_summary_overlay()
+                    self.status.setText("Cycle time updated. Scan the same Supervisor badge again to confirm all.")
+                    self._refresh_ui()
+                    self._save_active_session_snapshot()
+                    return
+                self.status.setText("Supervisor cycle review: scan num_0..num_9, backspace, confirm.")
+                return
+
             if raw_s != (s.cycle_time_confirm_actor_code or ""):
-                self.status.setText("Cycle time confirmation active: scan the same Supervisor badge again.")
+                self.status.setText("Confirmation active: scan the same Supervisor badge again.")
                 return
             actor_name = s.cycle_time_confirm_actor_name or raw_s
-            actor_role = s.cycle_time_confirm_actor_role or "QC"
+            actor_role = s.cycle_time_confirm_actor_role or "SUPERVISOR"
             s.cycle_time_confirmed_by = actor_name
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            s.reject_review_logs.append(
+                {
+                    "timestamp": stamp,
+                    "status": "CONFIRMED",
+                    "actor_role": actor_role,
+                    "actor_name": actor_name,
+                    "actor_code": raw_s,
+                }
+            )
             self._hide_cycle_time_confirm_popup()
-            self.status.setText(f"Cycle time confirmed by {actor_name}")
+            self._hide_reject_summary_overlay()
+            self.status.setText(f"Cycle time and reject summary confirmed by {actor_name}")
             self._refresh_ui()
             self._save_active_session_snapshot()
             self.push_event(
@@ -3669,6 +4048,18 @@ QWidget#ClientUIRoot {{
                     "confirmed_by_code": raw_s,
                 },
                 f"CYCLE TIME CONFIRMED {actor_name}",
+            )
+            self.push_event(
+                {
+                    "type": "REJECT_REVIEW_CONFIRM",
+                    "timestamp": stamp,
+                    "status": "CONFIRMED",
+                    "actor_role": actor_role,
+                    "actor_name": actor_name,
+                    "rotation_count": len(s.reject_review_logs),
+                },
+                f"REJECT REVIEW CONFIRMED {actor_name} ({actor_role})",
+                silent=True,
             )
             return
 
@@ -3688,10 +4079,10 @@ QWidget#ClientUIRoot {{
                 if not self.can_accept_production_scans():
                     self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
                     return
-                # Supervisor confirms cycle time (QA/QC is view-only for now).
-                if reviewer_can_supervisor and s.cycle_time_current and not s.cycle_time_confirmed_by:
+                # Supervisor can review/update cycle time any time, then confirm with a second scan.
+                if reviewer_can_supervisor and s.cycle_time_current:
                     self._show_cycle_time_confirm_popup(reviewer)
-                    self.status.setText("Cycle time confirmation opened. Scan the same Supervisor badge again to confirm.")
+                    self.status.setText("Supervisor cycle review opened. Enter new cycle time, then confirm.")
                     return
                 if not reviewer_can_supervisor:
                     self.status.setText("Authorized badge scanned. No supervisor action pending.")
@@ -3753,12 +4144,29 @@ QWidget#ClientUIRoot {{
                 self._hide_raw_mats_overlay()
                 self.status.setText("Raw materials summary closed.")
             else:
+                if self.productHistoryOverlay.isVisible():
+                    self._hide_product_history_overlay()
                 self._show_raw_mats_overlay()
                 self.status.setText("Raw materials summary opened.")
             return
 
+        if raw_l == "prodhistory~1":
+            if self.productHistoryOverlay.isVisible():
+                self._hide_product_history_overlay()
+                self.status.setText("Product PACK history closed.")
+            else:
+                if self.rawMatsOverlay.isVisible():
+                    self._hide_raw_mats_overlay()
+                self._show_product_history_overlay()
+                self.status.setText("Product PACK history opened.")
+            return
+
         if self.rawMatsOverlay.isVisible():
             self._hide_raw_mats_overlay()
+        if self.rejectSummaryOverlay.isVisible() and raw_l != "rejectsummary":
+            self._hide_reject_summary_overlay()
+        if self.productHistoryOverlay.isVisible():
+            self._hide_product_history_overlay()
 
         res_pre = parse_scan(raw_s)
 
@@ -3818,6 +4226,10 @@ QWidget#ClientUIRoot {{
                     "material": material_name,
                     "material_name": material_name,
                     "qty": qty,
+                    "index": str(meta.get("index") or "") if isinstance(meta, dict) else None,
+                    "total_labels": str(meta.get("total_labels") or "") if isinstance(meta, dict) else None,
+                    "lot_number": str(meta.get("lot_number") or "") if isinstance(meta, dict) else None,
+                    "po_number": str(meta.get("po_number") or "") if isinstance(meta, dict) else None,
                     "unique_key": unique_key or None,
                     "raw_job_code": raw_job_code or None,
                     "scanned_at": datetime.now(timezone.utc).isoformat(),
@@ -4117,6 +4529,7 @@ QWidget#ClientUIRoot {{
             s.waiting_reject_reason = False
             s.waiting_production_report_reason = False
             s.showing_reject_summary = False
+            s.reject_summary_last_scanned_at = None
             s.job_payload = {}
             s.downtime_reason_code = None
             s.downtime_reason_text = None
@@ -4128,6 +4541,7 @@ QWidget#ClientUIRoot {{
             s.waiting_initial_cycle_time_input = False
             s.waiting_initial_cycle_qc_confirm = False
             s.waiting_cycle_time_confirm_popup = False
+            s.cycle_time_confirm_phase = 0
             s.cycle_time_confirm_actor_code = None
             s.cycle_time_confirm_actor_name = None
             s.cycle_time_confirm_actor_role = None
@@ -4137,6 +4551,7 @@ QWidget#ClientUIRoot {{
             s.raw_material_scans = []
             s.raw_material_logs = []
             s.raw_material_unique_keys = set()
+            s.product_pack_history_logs = []
             s.startup_reject_total = 0
             s.reject_review_logs = []
             s.waiting_linkage_job_scan = False
@@ -4149,6 +4564,8 @@ QWidget#ClientUIRoot {{
             self._hide_resolve_overlay()
             self._hide_production_overlay()
             self._hide_raw_mats_overlay()
+            self._hide_reject_summary_overlay()
+            self._hide_product_history_overlay()
             self._hide_reject_review_overlay()
             self.status.setText(f"Machine set: {s.machine_name}")
             self._refresh_ui()
@@ -4172,8 +4589,28 @@ QWidget#ClientUIRoot {{
                     po_from_meta = ""
                     if isinstance(res.meta, dict):
                         po_from_meta = self._safe_text(res.meta.get("po_number"), "")
-                    linked_job_code = po_from_meta or raw_s
-                    linked_job_name = res.value
+                    requested_job_id = po_from_meta or raw_s
+                    fetched_linked_payload = self._fetch_job_payload_from_api(requested_job_id)
+                    if isinstance(fetched_linked_payload, dict):
+                        linked_job_payload = fetched_linked_payload
+                        api_job = {}
+                        if isinstance(fetched_linked_payload.get("data"), dict) and isinstance(fetched_linked_payload["data"].get("job"), dict):
+                            api_job = fetched_linked_payload["data"]["job"]
+                        elif isinstance(fetched_linked_payload.get("job"), dict):
+                            api_job = fetched_linked_payload["job"]
+                        linked_job_code = (
+                            self._safe_text(api_job.get("id"), "")
+                            or self._safe_text(api_job.get("ref_no"), "")
+                            or requested_job_id
+                        )
+                        linked_job_name = (
+                            self._safe_text(api_job.get("ref_no"), "")
+                            or self._safe_text(res.value, "")
+                            or requested_job_id
+                        )
+                    else:
+                        linked_job_code = requested_job_id
+                        linked_job_name = res.value
                 else:
                     payload = res.meta or {}
                     linked_job_payload = payload if isinstance(payload, dict) else {}
@@ -4269,6 +4706,7 @@ QWidget#ClientUIRoot {{
             s.operator_id = None
             s.showing_reject_summary = False
             s.waiting_production_report_reason = False
+            s.reject_summary_last_scanned_at = None
             s.downtime_reason_code = None
             s.downtime_reason_text = None
             s.downtime_started_at = None
@@ -4279,6 +4717,7 @@ QWidget#ClientUIRoot {{
             s.waiting_initial_cycle_time_input = False
             s.waiting_initial_cycle_qc_confirm = False
             s.waiting_cycle_time_confirm_popup = False
+            s.cycle_time_confirm_phase = 0
             s.cycle_time_confirm_actor_code = None
             s.cycle_time_confirm_actor_name = None
             s.cycle_time_confirm_actor_role = None
@@ -4288,6 +4727,7 @@ QWidget#ClientUIRoot {{
             s.raw_material_scans = []
             s.raw_material_logs = []
             s.raw_material_unique_keys = set()
+            s.product_pack_history_logs = []
             s.startup_reject_total = 0
             s.reject_review_logs = []
             s.waiting_linkage_job_scan = False
@@ -4300,6 +4740,8 @@ QWidget#ClientUIRoot {{
             self._hide_resolve_overlay()
             self._hide_production_overlay()
             self._hide_raw_mats_overlay()
+            self._hide_reject_summary_overlay()
+            self._hide_product_history_overlay()
             self._hide_reject_review_overlay()
             if not str(self.status.text() or "").startswith("Job set (API):"):
                 self.status.setText(f"Job set: {s.job_name}")
@@ -4323,12 +4765,22 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Scan JOB QR first.")
                     self._show_invalid_overlay("Scan job QR first.")
                 return
+            if self.rejectSummaryOverlay.isVisible():
+                self._hide_reject_summary_overlay()
+                s.showing_reject_summary = False
+                self.status.setText("Reject summary closed.")
+                self._refresh_ui()
+                self._save_active_session_snapshot()
+                return
             s.showing_reject_summary = True
+            s.reject_summary_last_scanned_at = datetime.now(timezone.utc).isoformat()
             s.waiting_reject_reason = False
             s.waiting_production_report_reason = False
             self._hide_production_overlay()
+            self._show_reject_summary_overlay()
             self.status.setText("Reject summary loaded.")
             self._refresh_ui()
+            self._save_active_session_snapshot()
             self.push_event({"type": "REJECT_SUMMARY_VIEW"}, "REJECT SUMMARY")
             return
 
@@ -4391,14 +4843,26 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Invalid PACK QR format: missing job code segment.")
                     self._show_invalid_overlay("PACK QR format is invalid.")
                     return
-                if current_job_code and scanned_job_code != current_job_code:
+                allowed_pack_job_codes = set()
+                if current_job_code:
+                    allowed_pack_job_codes.add(current_job_code)
+                if s.linkage_enabled:
+                    for row in (s.linkage_jobs or []):
+                        linked_code_norm = self._normalize_job_code((row or {}).get("job_code"))
+                        if linked_code_norm:
+                            allowed_pack_job_codes.add(linked_code_norm)
+                if allowed_pack_job_codes and scanned_job_code not in allowed_pack_job_codes:
                     self.status.setText(
-                        f"Invalid PACK QR: job code {scanned_job_code} does not match current job {s.job_code}."
+                        f"Invalid PACK QR: job code {scanned_job_code} does not match main/linked job."
                     )
                     self._show_invalid_overlay("This QR is not for this job.")
                     return
 
                 qty = int(res.qty or 0)
+                pack_hist = self._extract_pack_history_fields(raw_s)
+                if pack_hist is not None:
+                    pack_hist["scanned_at"] = datetime.now(timezone.utc).isoformat()
+                    s.product_pack_history_logs.append(pack_hist)
                 s.pack_count += 1
                 s.good_total += qty
                 self.status.setText(f"Pack +1 (Good +{qty})")

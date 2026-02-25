@@ -15,5 +15,22 @@
     "closed_by_role": "User",
     "closed_reason": "ayos na hahgaha",
     "closed_action": "cleared"
+  },
+  {
+    "machine_code": "M00009",
+    "machine_name": "IMM 308",
+    "status": "Not working",
+    "reason": "SIRA ANG MOLDE",
+    "set_by_badge": "10186",
+    "set_by_name": "Bryan Sampaga",
+    "set_by_role": "User",
+    "started_at_utc": "2026-02-25T04:44:59.555214+00:00",
+    "ended_at_utc": "2026-02-25T05:33:33.904757+00:00",
+    "duration_seconds": 2914,
+    "closed_by_badge": "10186",
+    "closed_by_name": "Bryan Sampaga",
+    "closed_by_role": "User",
+    "closed_reason": "DONE",
+    "closed_action": "cleared"
   }
 ]

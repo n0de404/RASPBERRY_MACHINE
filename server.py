@@ -1851,6 +1851,7 @@ DASHBOARD_HTML = """
           <label for="machineDetailStatusSelect">Machine Status Override</label>
           <select id="machineDetailStatusSelect">
             <option value="">Auto (Live Status)</option>
+            <option value="Working">Working (Clear Override)</option>
             <option value="No schedule">No schedule</option>
             <option value="Scheduled for fix">Scheduled for fix</option>
             <option value="Not working">Not working</option>
@@ -3436,9 +3437,10 @@ DASHBOARD_HTML = """
     const machineCode = String(activeMachineDetailCode || "").trim();
     if(!machineCode) return;
     const status = String(machineDetailStatusSelect?.value || "").trim();
+    const isClearLikeStatus = (status === "" || status === "Working");
     const reason = String(machineDetailStatusReason?.value || "").trim();
     const setterBadge = String(machineDetailStatusSetterBadge?.value || "").trim();
-    if(!reason){
+    if(!isClearLikeStatus && !reason){
       alert("Reason is required before confirming machine status.");
       machineDetailStatusReason?.focus();
       return;
@@ -3474,7 +3476,8 @@ DASHBOARD_HTML = """
       }
       if(machineStatusSaveBar) machineStatusSaveBar.style.width = "100%";
       if(machineStatusSaveCheck) machineStatusSaveCheck.classList.add("done");
-      if(lastMessageEl) lastMessageEl.textContent = `Machine status updated: ${machineCode} -> ${status || "Auto (Live Status)"} by ${j?.actor?.name || setterBadge}`;
+      const savedStatusLabel = (status === "Working") ? "Working (Live Status)" : (status || "Auto (Live Status)");
+      if(lastMessageEl) lastMessageEl.textContent = `Machine status updated: ${machineCode} -> ${savedStatusLabel} by ${j?.actor?.name || setterBadge}`;
       setTimeout(() => {
         if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
         if(machineStatusSaveFeedback) machineStatusSaveFeedback.classList.remove("active");
@@ -4193,12 +4196,15 @@ async def api_machine_status_set(req: Request):
     status = str(data.get("status", "")).strip()
     reason = str(data.get("reason", "")).strip()
     setter_badge = str(data.get("setter_badge", "")).strip()
-    valid = {"", "No schedule", "Scheduled for fix", "Not working"}
+    clear_like = {"", "Working"}
+    valid = {"", "Working", "No schedule", "Scheduled for fix", "Not working"}
     if not machine_code:
         return JSONResponse({"ok": False, "error": "machine_code is required"}, status_code=400)
     if status not in valid:
         return JSONResponse({"ok": False, "error": "Invalid machine status"}, status_code=400)
-    if not reason:
+    if status in clear_like:
+        status = ""
+    if status and not reason:
         return JSONResponse({"ok": False, "error": "Reason is required before confirming machine status"}, status_code=400)
     if not setter_badge:
         return JSONResponse({"ok": False, "error": "User QR is required before confirming machine status"}, status_code=400)
