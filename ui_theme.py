@@ -136,12 +136,12 @@ QFrame#ProductionOverlay[pulse="1"] {
 /* ===== Top banner (scan instruction) ===== */
 QLabel#Banner {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                stop:0 #2563eb, stop:1 #1e40af);
+                                stop:0 #2f6aea, stop:1 #2454c6);
     color: #ffffff;
     border: 1px solid #1d4ed8;
     border-radius: 16px;
-    padding: 14px 16px;
-    font-size: 18px;
+    padding: 10px 14px;
+    font-size: 20px;
     font-weight: 800;
     letter-spacing: 0.2px;
 }

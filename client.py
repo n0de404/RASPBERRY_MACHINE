@@ -59,6 +59,7 @@ QC_BADGES = {"4000001": "Lucy Van Pelt"}
 REJECT_REVIEW_REQUIRED_ROTATIONS = 4
 USER_QR_PROFILES_FILE = os.path.join(DATABASE_DIR, "user_qr_profiles.json")
 DAILY_ROLE_ASSIGNMENTS_FILE = os.path.join(DATABASE_DIR, "daily_role_assignments.json")
+PRODUCT_CATALOG_CACHE_FILE = os.path.join(DATABASE_DIR, "product_catalog_cache.json")
 
 
 def _load_client_config() -> Dict[str, Any]:
@@ -497,6 +498,11 @@ class SuccessCheck(QWidget):
 
 
 class ClientUI(QWidget):
+    UI_BASE_WIDTH = 1920
+    UI_BASE_HEIGHT = 1080
+    UI_MIN_SCALE = 0.50
+    UI_MAX_SCALE = 1.35
+
     scan_received = pyqtSignal(str)
     scanner_status = pyqtSignal(str)
 
@@ -520,6 +526,13 @@ class ClientUI(QWidget):
             "cycle": ["cycle.png"],
             "downtime": ["downtime (1).png"],
         }
+        self._ui_scale = 1.0
+        self._ui_scale_applied = False
+        self._ui_scale_bases: Dict[int, Dict[str, Any]] = {}
+        self._ui_layout_scale_bases: Dict[int, Dict[str, Any]] = {}
+        self._product_history_page = 0
+        self._product_history_page_size = 15
+        self._product_catalog_name_by_id: Optional[Dict[str, str]] = None
 
         self.setWindowTitle("Machine Client Dashboard")
         self.setMinimumSize(0, 0)
@@ -541,13 +554,13 @@ QWidget#ClientUIRoot {{
 
         root = QVBoxLayout()
         root.setContentsMargins(10, 8, 10, 8)
-        root.setSpacing(8)
+        root.setSpacing(6)
 
         leftWrap = QWidget()
         self.leftWrap = leftWrap
         left = QVBoxLayout()
         left.setContentsMargins(0, 0, 0, 0)
-        left.setSpacing(8)
+        left.setSpacing(6)
         leftWrap.setLayout(left)
 
         self.pageTitle = QLabel("Machine Dashboard")
@@ -577,6 +590,10 @@ QWidget#ClientUIRoot {{
         self.banner = QLabel(self._banner_base_text)
         self.banner.setObjectName("Banner")
         self.banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.banner.setWordWrap(True)
+        self.banner.setMinimumHeight(68)
+        self.banner.setMaximumHeight(92)
+        self.banner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.status = QLabel("Waiting...")
         self.status.setObjectName("StatusBar")
         self.status.setWordWrap(True)
@@ -592,17 +609,17 @@ QWidget#ClientUIRoot {{
         self.scanSectionDivider.setFrameShadow(QFrame.Shadow.Plain)
         self.scanSectionDivider.setStyleSheet("background: rgba(148, 163, 184, 0.35); min-height: 1px; max-height: 1px; border: none;")
 
-        left.addWidget(self.banner)
+        left.addWidget(self.banner, 0)
         left.addWidget(self.scanSectionDivider)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(8)
+        grid.setVerticalSpacing(6)
 
         # Production panel
         self.cardProductionOuter, self.cardProduction = self._make_double_layer_card("Production")
         statRow = QHBoxLayout()
-        statRow.setSpacing(10)
+        statRow.setSpacing(6)
         self.lblPack = QLabel("0")
         self.lblGood = QLabel("0")
         self.lblButal = QLabel("0")
@@ -619,7 +636,8 @@ QWidget#ClientUIRoot {{
         statRow.addWidget(self.cardStatReject)
         statRow.addWidget(self.cardStatTotalGood)
         self.cardProduction.layout().addLayout(statRow)
-        self.cardProductionOuter.setFixedHeight(171)
+        self.cardProductionOuter.setMinimumHeight(154)
+        self.cardProductionOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         grid.addWidget(self.cardProductionOuter, 0, 0, 1, 2)
 
         # Session panel
@@ -649,7 +667,8 @@ QWidget#ClientUIRoot {{
             sessionGrid.addWidget(n, i, 0)
             sessionGrid.addWidget(value_lbl, i, 1)
         self.cardSession.layout().addLayout(sessionGrid)
-        self.cardSessionOuter.setFixedHeight(191)
+        self.cardSessionOuter.setMinimumHeight(191)
+        self.cardSessionOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         grid.addWidget(self.cardSessionOuter, 1, 0)
 
         # Reject detail panel
@@ -673,7 +692,8 @@ QWidget#ClientUIRoot {{
             self.rejectDetailGrid.addWidget(item, row, col)
 
         self.cardReject.layout().addLayout(self.rejectDetailGrid)
-        self.cardRejectOuter.setFixedHeight(316)
+        self.cardRejectOuter.setMinimumHeight(316)
+        self.cardRejectOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         grid.addWidget(self.cardRejectOuter, 2, 0, 1, 2)
 
         # Job details panel
@@ -725,7 +745,7 @@ QWidget#ClientUIRoot {{
         # Activity panel
         self.cardActivityOuter, self.cardActivity = self._make_double_layer_card("Activity")
         self.machineAnim.setText("Machine Status: Idle")
-        self.machineAnim.setFixedHeight(40)
+        self.machineAnim.setMinimumHeight(40)
         self.machineAnim.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.cardActivity.layout().addWidget(self.machineAnim)
         self.lblLast = QLabel("-")
@@ -735,13 +755,19 @@ QWidget#ClientUIRoot {{
         self.machinePulseOverlay = HeartbeatBorderPulseOverlay(self.cardActivity)
         self.machinePulseOverlay.setGeometry(self.cardActivity.rect())
         self.machinePulseOverlay.raise_()
-        self.cardActivityOuter.setFixedHeight(181)
+        self.cardActivityOuter.setMinimumHeight(181)
+        self.cardActivityOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         grid.addWidget(self.cardActivityOuter, 1, 1)
 
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
-        grid.setRowStretch(3, 1)
-        left.addLayout(grid, 1)
+        # Distribute extra height across left-side rows proportionally to their base panel heights.
+        # This avoids the top Production row looking over-stretched on taller displays.
+        grid.setRowStretch(0, 2)  # Production
+        grid.setRowStretch(1, 2)  # Session + Activity
+        grid.setRowStretch(2, 3)  # Reject Details (naturally taller row)
+        grid.setRowStretch(3, 2)  # Raw Materials + Cycle row
+        left.addLayout(grid, 7)
 
         # Keep in-memory logging, but remove the temporary visible Job API logs panel.
         self.cardJobApiLogsOuter = None
@@ -1170,42 +1196,215 @@ QWidget#ClientUIRoot {{
 
         # Center overlay for scanned PACK QR history (toggle with "prodhistory~1").
         self.productHistoryOverlay = QFrame(self)
-        self.productHistoryOverlay.setObjectName("ProductionOverlay")
+        self.productHistoryOverlay.setObjectName("PackHistoryOverlay")
         self.productHistoryOverlay.setLayout(QVBoxLayout())
-        self.productHistoryOverlay.layout().setContentsMargins(14, 12, 14, 12)
+        self.productHistoryOverlay.layout().setContentsMargins(12, 10, 12, 10)
         self.productHistoryOverlay.layout().setSpacing(8)
         self.productHistoryOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.productHistoryTitle = QLabel("SCANNED PACK HISTORY")
-        self.productHistoryTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
-        self.productHistoryHint = QLabel('Scan "prodhistory~1" again to close')
-        self.productHistoryHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
-        self.productHistoryList = QTableWidget(0, 7)
-        self.productHistoryList.setHorizontalHeaderLabels(["#", "Product", "Index", "Total Labels", "Lot", "PO No.", "Timestamp"])
+        self.productHistoryOverlay.setStyleSheet(
+            "QFrame#PackHistoryOverlay {"
+            " background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+            "   stop:0 rgba(247,248,250,0.985), stop:1 rgba(236,239,243,0.985));"
+            " border: 1px solid rgba(203,213,225,0.80);"
+            " border-radius: 18px;"
+            "}"
+            "QFrame#PackHistoryHeaderBand {"
+            " background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "   stop:0 #111827, stop:0.55 #1e293b, stop:1 #334155);"
+            " border: 1px solid rgba(148,163,184,0.25);"
+            " border-radius: 16px;"
+            "}"
+            "QFrame#PackHistoryStatsBand {"
+            " background: rgba(255,255,255,0.86);"
+            " border: 1px solid rgba(226,232,240,1.0);"
+            " border-radius: 14px;"
+            "}"
+            "QLabel#PackHistoryHeaderTitle { color:#f8fafc; font-size:20px; font-weight:900; }"
+            "QLabel#PackHistoryHeaderSub { color:#cbd5e1; font-size:12px; font-weight:800; }"
+            "QLabel#PackHistoryChip {"
+            " color:#e2e8f0; background: transparent;"
+            " border: none; border-radius: 12px;"
+            " padding: 4px 10px; font-size:12px; font-weight:800;"
+            "}"
+            "QWidget#PackHistoryTitleRow, QWidget#PackHistoryTopChips { background: transparent; border: none; }"
+            "QLabel#PackHistoryStatCardTitle { color:#64748b; font-size:11px; font-weight:800; }"
+            "QLabel#PackHistoryStatCardValue { color:#0f172a; font-size:15px; font-weight:900; }"
+            "QFrame#PackHistoryStatCard {"
+            " background: rgba(248,250,252,0.95);"
+            " border: 1px solid rgba(226,232,240,0.95);"
+            " border-radius: 12px;"
+            "}"
+            "QFrame#PackHistoryStatCardMissing {"
+            " background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+            "   stop:0 rgba(254,226,226,0.97), stop:1 rgba(252,165,165,0.93));"
+            " border: 1px solid rgba(239,68,68,0.30);"
+            " border-radius: 12px;"
+            "}"
+            "QLabel#PackHistoryHint { color:#64748b; font-size:11px; font-weight:700; }"
+            "QLabel#PackHistoryPageInfo { color:#475569; font-size:12px; font-weight:800; }"
+            "QTableWidget#PackHistoryTable {"
+            " background: rgba(255,255,255,0.96);"
+            " alternate-background-color: rgba(248,250,252,0.95);"
+            " border: 1px solid rgba(226,232,240,0.95);"
+            " border-radius: 14px;"
+            " color: #0f172a;"
+            " padding: 4px;"
+            "}"
+            "QTableWidget#PackHistoryTable::item {"
+            " border-bottom: 1px solid rgba(226,232,240,0.9);"
+            " padding: 8px 12px;"
+            " font-size: 14px;"
+            "}"
+            "QHeaderView::section {"
+            " background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #eef2ff, stop:1 #dbeafe);"
+            " color: #334155;"
+            " font-weight: 900;"
+            " border: none;"
+            " border-bottom: 1px solid rgba(191,219,254,0.95);"
+            " padding: 8px 10px;"
+            "}"
+        )
+
+        self.productHistoryHeaderBand = QFrame()
+        self.productHistoryHeaderBand.setObjectName("PackHistoryHeaderBand")
+        self.productHistoryHeaderBand.setLayout(QVBoxLayout())
+        self.productHistoryHeaderBand.layout().setContentsMargins(14, 12, 14, 10)
+        self.productHistoryHeaderBand.layout().setSpacing(8)
+
+        titleRow = QWidget()
+        titleRow.setObjectName("PackHistoryTitleRow")
+        titleRow.setLayout(QHBoxLayout())
+        titleRow.layout().setContentsMargins(0, 0, 0, 0)
+        titleRow.layout().setSpacing(8)
+        self.productHistoryIcon = QLabel("\u2630")
+        self.productHistoryIcon.setFixedSize(28, 28)
+        self.productHistoryIcon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productHistoryIcon.setStyleSheet(
+            "background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #60a5fa, stop:1 #2563eb);"
+            "color:#ffffff; border-radius:10px; font-size:16px; font-weight:900;"
+        )
+        self.productHistoryTitle = QLabel("Pack Scan History")
+        self.productHistoryTitle.setObjectName("PackHistoryHeaderTitle")
+        self.productHistoryIcon.hide()
+        titleRow.layout().addWidget(self.productHistoryTitle, 0, Qt.AlignmentFlag.AlignVCenter)
+        titleRow.layout().addStretch(1)
+
+        self.productHistoryTopChips = QWidget()
+        self.productHistoryTopChips.setObjectName("PackHistoryTopChips")
+        self.productHistoryTopChips.setLayout(QHBoxLayout())
+        self.productHistoryTopChips.layout().setContentsMargins(0, 0, 0, 0)
+        self.productHistoryTopChips.layout().setSpacing(8)
+        self.productHistoryTopProduct = QLabel("Product ID: -")
+        self.productHistoryTopProduct.setObjectName("PackHistoryChip")
+        self.productHistoryTopScans = QLabel("Total Scans: 0")
+        self.productHistoryTopScans.setObjectName("PackHistoryChip")
+        self.productHistoryTopQty = QLabel("Total Quantity: 0")
+        self.productHistoryTopQty.setObjectName("PackHistoryChip")
+        self.productHistoryTopChips.layout().addWidget(self.productHistoryTopProduct)
+        self.productHistoryTopChips.layout().addWidget(self.productHistoryTopScans)
+        self.productHistoryTopChips.layout().addWidget(self.productHistoryTopQty)
+        self.productHistoryTopChips.layout().addStretch(1)
+        self.productHistoryTopChips.hide()
+
+        self.productHistoryHeaderBand.layout().addWidget(titleRow)
+        self.productHistoryHeaderBand.layout().addWidget(self.productHistoryTopChips)
+
+        self.productHistorySummary = QLabel("No scans yet")
+        self.productHistorySummary.setObjectName("PackHistoryHeaderSub")
+        self.productHistoryHeaderBand.layout().addWidget(self.productHistorySummary)
+        self.productHistorySummary.hide()
+        self.productHistoryHint = QLabel('Scan "next" / "prev" to change page. Scan "prodhistory~1" again to close.')
+        self.productHistoryHint.setObjectName("PackHistoryHint")
+        self.productHistoryList = QTableWidget(0, 5)
+        self.productHistoryList.setObjectName("PackHistoryTable")
+        self.productHistoryList.setHorizontalHeaderLabels(["Label #", "Product Name", "Pack Qty", "Operator", "Scan Time"])
         self.productHistoryList.setAlternatingRowColors(True)
         self.productHistoryList.setWordWrap(False)
+        self.productHistoryList.setShowGrid(False)
+        self.productHistoryList.setCornerButtonEnabled(False)
         self.productHistoryList.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.productHistoryList.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.productHistoryList.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.productHistoryList.verticalHeader().setVisible(False)
-        self.productHistoryList.verticalHeader().setDefaultSectionSize(28)
+        self.productHistoryList.verticalHeader().setDefaultSectionSize(30)
+        self.productHistoryList.setSortingEnabled(False)
         self.productHistoryList.horizontalHeader().setStretchLastSection(False)
+        self.productHistoryList.horizontalHeader().setMinimumSectionSize(70)
+        self.productHistoryList.horizontalHeader().setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.productHistoryList.horizontalHeader().setFixedHeight(34)
         self.productHistoryList.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.productHistoryList.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.productHistoryList.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.productHistoryList.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.productHistoryList.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.productHistoryList.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.productHistoryList.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        self.productHistoryList.setMinimumHeight(260)
-        self.productHistoryList.setStyleSheet(
-            "QTableWidget { background: rgba(255,255,255,0.78); border: 1px solid rgba(148,163,184,0.45);"
-            " border-radius: 10px; gridline-color: rgba(148,163,184,0.28); }"
-            "QHeaderView::section { background: rgba(226,232,240,0.9); color: #0f172a; font-weight: 800;"
-            " border: none; border-bottom: 1px solid rgba(148,163,184,0.5); padding: 6px; }"
-        )
-        self.productHistoryOverlay.layout().addWidget(self.productHistoryTitle)
-        self.productHistoryOverlay.layout().addWidget(self.productHistoryHint)
+        self.productHistoryList.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.productHistoryList.setMinimumHeight(470)
+
+        self.productHistoryStatsBand = QFrame()
+        self.productHistoryStatsBand.setObjectName("PackHistoryStatsBand")
+        self.productHistoryStatsBand.setLayout(QHBoxLayout())
+        self.productHistoryStatsBand.layout().setContentsMargins(10, 8, 10, 8)
+        self.productHistoryStatsBand.layout().setSpacing(8)
+        def _make_ph_stat(title: str, value: str):
+            card = QFrame()
+            card.setObjectName("PackHistoryStatCard")
+            card.setLayout(QVBoxLayout())
+            card.layout().setContentsMargins(10, 6, 10, 6)
+            card.layout().setSpacing(2)
+            t = QLabel(title); t.setObjectName("PackHistoryStatCardTitle")
+            v = QLabel(value); v.setObjectName("PackHistoryStatCardValue")
+            card.layout().addWidget(t)
+            card.layout().addWidget(v)
+            return card, v
+        self.productHistoryMetricProductCard, self.productHistoryMetricProductValue = _make_ph_stat("Product ID", "-")
+        self.productHistoryMetricLabelsCard, self.productHistoryMetricLabelsValue = _make_ph_stat("Total Labels", "0")
+        self.productHistoryMetricQtyCard, self.productHistoryMetricQtyValue = _make_ph_stat("Total Quantity", "0")
+        self.productHistoryMetricMissingCard, self.productHistoryMetricMissingValue = _make_ph_stat("Missing Labels", "-")
+        self.productHistoryMetricMissingCard.setObjectName("PackHistoryStatCardMissing")
+        self.productHistoryPageInfo = QLabel("Page 1 of 1")
+        self.productHistoryPageInfo.setObjectName("PackHistoryPageInfo")
+        self.productHistoryMetricProductCard.hide()
+        self.productHistoryStatsBand.layout().addWidget(self.productHistoryMetricLabelsCard)
+        self.productHistoryStatsBand.layout().addWidget(self.productHistoryMetricQtyCard)
+        self.productHistoryStatsBand.layout().addWidget(self.productHistoryMetricMissingCard)
+        self.productHistoryStatsBand.layout().addStretch(1)
+        self.productHistoryStatsBand.layout().addWidget(self.productHistoryPageInfo, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.productHistoryOverlay.layout().addWidget(self.productHistoryHeaderBand)
         self.productHistoryOverlay.layout().addWidget(self.productHistoryList)
+        self.productHistoryOverlay.layout().addWidget(self.productHistoryStatsBand)
+        self.productHistoryOverlay.layout().addWidget(self.productHistoryHint)
+        self._product_history_shadow = QGraphicsDropShadowEffect(self.productHistoryOverlay)
+        self._product_history_shadow.setBlurRadius(26)
+        self._product_history_shadow.setOffset(0, 10)
+        self._product_history_shadow.setColor(QColor(15, 23, 42, 95))
+        self.productHistoryOverlay.setGraphicsEffect(self._product_history_shadow)
+        self.productHistoryOrderNote = QFrame(self)
+        self.productHistoryOrderNote.setObjectName("PackHistoryOrderNote")
+        self.productHistoryOrderNote.setStyleSheet(
+            "QFrame#PackHistoryOrderNote {"
+            " background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
+            "   stop:0 rgba(254,242,242,0.98), stop:1 rgba(254,202,202,0.95));"
+            " border: 1px solid rgba(239,68,68,0.30);"
+            " border-radius: 12px;"
+            "}"
+            "QLabel#PackHistoryOrderNoteText { color:#991b1b; font-size:12px; font-weight:900; }"
+        )
+        self.productHistoryOrderNote.setLayout(QVBoxLayout())
+        self.productHistoryOrderNote.layout().setContentsMargins(10, 8, 10, 8)
+        self.productHistoryOrderNote.layout().setSpacing(2)
+        self.productHistoryOrderNoteText = QLabel("Why the order of label # is not in order?")
+        self.productHistoryOrderNoteText.setObjectName("PackHistoryOrderNoteText")
+        self.productHistoryOrderNoteText.setWordWrap(True)
+        self.productHistoryOrderNote.layout().addWidget(self.productHistoryOrderNoteText)
+        self._product_history_order_note_shadow = QGraphicsDropShadowEffect(self.productHistoryOrderNote)
+        self._product_history_order_note_shadow.setBlurRadius(18)
+        self._product_history_order_note_shadow.setOffset(0, 6)
+        self._product_history_order_note_shadow.setColor(QColor(127, 29, 29, 65))
+        self.productHistoryOrderNote.setGraphicsEffect(self._product_history_order_note_shadow)
+        self.productHistoryOrderNote.hide()
+        self.productHistoryOrderNote.raise_()
         self.productHistoryOverlay.hide()
         self.productHistoryOverlay.raise_()
 
@@ -1732,6 +1931,7 @@ QWidget#ClientUIRoot {{
         QTimer.singleShot(0, self._sync_machine_status_pulse_overlay)
 
         self._refresh_ui()
+        QTimer.singleShot(0, self._apply_adaptive_ui_scale)
         QTimer.singleShot(0, self._sync_right_panel_top_alignment)
 
     def resizeEvent(self, event):
@@ -1745,6 +1945,186 @@ QWidget#ClientUIRoot {{
         self._position_product_history_overlay()
         self._position_reject_review_overlay()
         self._position_finish_overlay()
+        self._sync_machine_status_pulse_overlay()
+
+    def _screen_ui_scale(self) -> float:
+        screen = None
+        try:
+            win = self.windowHandle()
+            if win is not None:
+                screen = win.screen()
+        except Exception:
+            screen = None
+        if screen is None:
+            try:
+                screen = self.screen()
+            except Exception:
+                screen = None
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return 1.0
+        try:
+            geom = screen.geometry()
+            width = max(1, int(geom.width()))
+            height = max(1, int(geom.height()))
+        except Exception:
+            return 1.0
+        raw_scale = min(width / float(self.UI_BASE_WIDTH), height / float(self.UI_BASE_HEIGHT))
+        return max(self.UI_MIN_SCALE, min(self.UI_MAX_SCALE, raw_scale))
+
+    def _scale_px_value(self, value: float, scale: float) -> int:
+        scaled = int(round(float(value) * float(scale)))
+        if value <= 0:
+            return max(0, scaled)
+        return max(1, scaled)
+
+    def _scale_stylesheet_px(self, css: str, scale: float) -> str:
+        if not css or abs(scale - 1.0) < 0.01:
+            return css
+
+        def _repl(match):
+            try:
+                num = float(match.group(1))
+            except Exception:
+                return match.group(0)
+            return f"{self._scale_px_value(num, scale)}px"
+
+        return re.sub(r"(\d+(?:\.\d+)?)px", _repl, css)
+
+    def _capture_ui_scale_bases(self):
+        if self._ui_scale_bases:
+            return
+
+        widgets = [self] + self.findChildren(QWidget)
+        for w in widgets:
+            rec: Dict[str, Any] = {
+                "style": w.styleSheet() or "",
+                "min_w": int(w.minimumWidth()),
+                "min_h": int(w.minimumHeight()),
+                "max_w": int(w.maximumWidth()),
+                "max_h": int(w.maximumHeight()),
+                "font_pt": -1.0,
+                "font_px": -1,
+            }
+            f = w.font()
+            try:
+                rec["font_pt"] = float(f.pointSizeF())
+            except Exception:
+                rec["font_pt"] = -1.0
+            try:
+                rec["font_px"] = int(f.pixelSize())
+            except Exception:
+                rec["font_px"] = -1
+            self._ui_scale_bases[id(w)] = rec
+
+        layouts = []
+        if self.layout() is not None:
+            layouts.append(self.layout())
+        layouts.extend(self.findChildren(QVBoxLayout))
+        layouts.extend(self.findChildren(QHBoxLayout))
+        layouts.extend(self.findChildren(QGridLayout))
+        seen_layouts: Set[int] = set()
+        for layout in layouts:
+            if layout is None or id(layout) in seen_layouts:
+                continue
+            seen_layouts.add(id(layout))
+            margins = layout.contentsMargins()
+            rec = {
+                "margins": (
+                    int(margins.left()),
+                    int(margins.top()),
+                    int(margins.right()),
+                    int(margins.bottom()),
+                ),
+                "spacing": int(layout.spacing()),
+            }
+            if isinstance(layout, QGridLayout):
+                rec["h_spacing"] = int(layout.horizontalSpacing())
+                rec["v_spacing"] = int(layout.verticalSpacing())
+            self._ui_layout_scale_bases[id(layout)] = rec
+
+    def _apply_adaptive_ui_scale(self):
+        if self._ui_scale_applied:
+            return
+        scale = self._screen_ui_scale()
+        self._capture_ui_scale_bases()
+
+        widgets = [self] + self.findChildren(QWidget)
+        for w in widgets:
+            rec = self._ui_scale_bases.get(id(w))
+            if not rec:
+                continue
+
+            base_css = rec.get("style", "") or ""
+            if base_css:
+                w.setStyleSheet(self._scale_stylesheet_px(base_css, scale))
+
+            font = w.font()
+            base_font_px = int(rec.get("font_px", -1) or -1)
+            base_font_pt = float(rec.get("font_pt", -1.0) or -1.0)
+            if base_font_px > 0:
+                font.setPixelSize(max(8, self._scale_px_value(base_font_px, scale)))
+                w.setFont(font)
+            elif base_font_pt > 0:
+                font.setPointSizeF(max(6.0, base_font_pt * scale))
+                w.setFont(font)
+
+            max_default = 16777215
+            min_w = int(rec.get("min_w", 0) or 0)
+            min_h = int(rec.get("min_h", 0) or 0)
+            max_w = int(rec.get("max_w", max_default) or max_default)
+            max_h = int(rec.get("max_h", max_default) or max_default)
+
+            scaled_min_w = self._scale_px_value(min_w, scale) if min_w > 0 else 0
+            scaled_min_h = self._scale_px_value(min_h, scale) if min_h > 0 else 0
+            scaled_max_w = self._scale_px_value(max_w, scale) if 0 < max_w < max_default else max_w
+            scaled_max_h = self._scale_px_value(max_h, scale) if 0 < max_h < max_default else max_h
+
+            if 0 < scaled_max_w < scaled_min_w:
+                scaled_max_w = scaled_min_w
+            if 0 < scaled_max_h < scaled_min_h:
+                scaled_max_h = scaled_min_h
+
+            w.setMinimumSize(scaled_min_w, scaled_min_h)
+            w.setMaximumSize(scaled_max_w, scaled_max_h)
+
+        layouts = []
+        if self.layout() is not None:
+            layouts.append(self.layout())
+        layouts.extend(self.findChildren(QVBoxLayout))
+        layouts.extend(self.findChildren(QHBoxLayout))
+        layouts.extend(self.findChildren(QGridLayout))
+        seen_layouts: Set[int] = set()
+        for layout in layouts:
+            if layout is None or id(layout) in seen_layouts:
+                continue
+            seen_layouts.add(id(layout))
+            rec = self._ui_layout_scale_bases.get(id(layout))
+            if not rec:
+                continue
+            l, t, r, b = rec.get("margins", (0, 0, 0, 0))
+            layout.setContentsMargins(
+                self._scale_px_value(l, scale) if l > 0 else 0,
+                self._scale_px_value(t, scale) if t > 0 else 0,
+                self._scale_px_value(r, scale) if r > 0 else 0,
+                self._scale_px_value(b, scale) if b > 0 else 0,
+            )
+            spacing = int(rec.get("spacing", -1))
+            if spacing >= 0:
+                layout.setSpacing(self._scale_px_value(spacing, scale) if spacing > 0 else 0)
+            if isinstance(layout, QGridLayout):
+                h_spacing = int(rec.get("h_spacing", -1))
+                v_spacing = int(rec.get("v_spacing", -1))
+                if h_spacing >= 0:
+                    layout.setHorizontalSpacing(self._scale_px_value(h_spacing, scale) if h_spacing > 0 else 0)
+                if v_spacing >= 0:
+                    layout.setVerticalSpacing(self._scale_px_value(v_spacing, scale) if v_spacing > 0 else 0)
+
+        self._ui_scale = scale
+        self._ui_scale_applied = True
+        self.updateGeometry()
+        self._sync_right_panel_top_alignment()
         self._sync_machine_status_pulse_overlay()
 
     def _sync_machine_status_pulse_overlay(self):
@@ -1911,11 +2291,19 @@ QWidget#ClientUIRoot {{
         self.rejectSummaryOverlay.setGeometry(x, y, w, h)
 
     def _position_product_history_overlay(self):
-        w = min(1040, max(680, int(self.width() * 0.78)))
-        h = min(660, max(360, int(self.height() * 0.68)))
+        w = min(920, max(680, int(self.width() * 0.68)))
+        h = min(700, max(520, int(self.height() * 0.70)))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.productHistoryOverlay.setGeometry(x, y, w, h)
+        if hasattr(self, "productHistoryOrderNote") and self.productHistoryOrderNote is not None:
+            note_w = min(300, max(220, int(self.width() * 0.22)))
+            note_h = 66
+            note_x = max(8, x - note_w - 10)
+            note_y = max(8, y + 24)
+            self.productHistoryOrderNote.setGeometry(note_x, note_y, note_w, note_h)
+            if self.productHistoryOrderNote.isVisible():
+                self.productHistoryOrderNote.raise_()
 
     def _position_reject_review_overlay(self):
         self.rejectReviewOverlay.adjustSize()
@@ -2063,46 +2451,175 @@ QWidget#ClientUIRoot {{
         table = self.productHistoryList
         table.setRowCount(0)
         valid_rows: List[Dict[str, Any]] = [x for x in logs if isinstance(x, dict)]
+        page_size = max(1, int(getattr(self, "_product_history_page_size", 15) or 15))
+        total_rows = len(valid_rows)
+        total_pages = max(1, (total_rows + page_size - 1) // page_size)
+        self._product_history_page = max(0, min(int(getattr(self, "_product_history_page", 0) or 0), total_pages - 1))
+
+        def _fmt_product_id(raw_val: Any) -> str:
+            s = str(raw_val or "").strip()
+            if s.isdigit():
+                return s.lstrip("0") or "0"
+            return s
+
+        def _fmt_scan_time(ts_raw: str) -> str:
+            text = ts_raw
+            try:
+                ts_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                text = ts_dt.astimezone().strftime("%b %d, %Y, %I:%M:%S %p")
+            except Exception:
+                pass
+            return text or "-"
+
+        def _compact_product_text(product_id_text: str, product_name_text: str) -> str:
+            base = product_id_text or "-"
+            if not product_name_text or product_name_text == "-":
+                return base
+            name = str(product_name_text).strip()
+            max_name = 28
+            if len(name) > max_name:
+                name = name[: max_name - 3].rstrip() + "..."
+            return f"{base} | {name}"
+
+        def _compact_text(value: str, max_len: int) -> str:
+            s = str(value or "").strip()
+            if len(s) <= max_len:
+                return s or "-"
+            return s[: max_len - 3].rstrip() + "..."
+
         if not valid_rows:
             table.setRowCount(1)
             empty_item = QTableWidgetItem("No PACK QR scans recorded yet.")
             table.setItem(0, 0, empty_item)
-            table.setSpan(0, 0, 1, 7)
-            for c in range(1, 7):
+            table.setSpan(0, 0, 1, 5)
+            for c in range(1, 5):
                 table.setItem(0, c, QTableWidgetItem(""))
             table.resizeRowsToContents()
+            self.productHistorySummary.setText("No scans yet")
+            self.productHistoryHint.setText('Scan "next" / "prev" to change page. Scan "prodhistory~1" again to close.')
+            if hasattr(self, "productHistoryTopProduct"):
+                self.productHistoryTopProduct.setText("Product ID: -")
+                self.productHistoryTopScans.setText("Total Scans: 0")
+                self.productHistoryTopQty.setText("Total Quantity: 0")
+                self.productHistoryMetricProductValue.setText("-")
+                self.productHistoryMetricLabelsValue.setText("0")
+                self.productHistoryMetricQtyValue.setText("0")
+                self.productHistoryMetricMissingValue.setText("-")
+                self.productHistoryMetricMissingValue.setStyleSheet("color: #0f172a;")
+                self.productHistoryPageInfo.setText("Page 1 of 1")
+            if hasattr(self, "productHistoryOrderNote"):
+                self.productHistoryOrderNote.hide()
             return
 
-        table.setRowCount(len(valid_rows))
-        for row_idx, item in enumerate(valid_rows):
-            ts_raw = str(item.get("scanned_at") or "").strip()
-            ts_text = ts_raw
+        label_numbers_by_row: List[Optional[int]] = []
+        out_of_order_rows: Set[int] = set()
+        last_label_num: Optional[int] = None
+        scanned_label_set: Set[int] = set()
+        expected_total_labels = 0
+        for idx, row in enumerate(valid_rows):
+            label_num: Optional[int] = None
             try:
-                ts_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                ts_text = ts_dt.astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
+                label_num = int(str((row or {}).get("index") or "").strip())
+            except Exception:
+                label_num = None
+            label_numbers_by_row.append(label_num)
+            if label_num is not None and label_num > 0:
+                scanned_label_set.add(label_num)
+                if last_label_num is not None and label_num < last_label_num:
+                    out_of_order_rows.add(idx)
+                last_label_num = label_num
+            try:
+                tl = int(str((row or {}).get("total_labels") or "").strip())
+                if tl > expected_total_labels:
+                    expected_total_labels = tl
             except Exception:
                 pass
+        if expected_total_labels <= 0 and scanned_label_set:
+            expected_total_labels = max(scanned_label_set)
+        missing_labels: List[int] = []
+        if expected_total_labels > 0:
+            missing_labels = [n for n in range(1, expected_total_labels + 1) if n not in scanned_label_set]
 
-            values = [
-                str(row_idx + 1),
-                str(item.get("product_name") or "-"),
-                str(item.get("index") or "-"),
-                str(item.get("total_labels") or "-"),
-                str(item.get("lot_number") or "-"),
-                str(item.get("po_number") or "-"),
-                ts_text or "-",
-            ]
+        start = self._product_history_page * page_size
+        end = min(total_rows, start + page_size)
+        page_rows = valid_rows[start:end]
+
+        total_qty = 0
+        for row in valid_rows:
+            try:
+                total_qty += int(float(row.get("qty_q") or row.get("qty") or 0))
+            except Exception:
+                pass
+        self.productHistorySummary.setText(
+            f"Total Scans: {total_rows}   |   Total Qty: {total_qty}   |   Page {self._product_history_page + 1} of {total_pages}"
+        )
+        self.productHistoryHint.setText(
+            'Scan "next" / "prev" to change page. Scan "prodhistory~1" again to close.'
+        )
+
+        first_product_id = "-"
+        for row in valid_rows:
+            pid = _fmt_product_id((row or {}).get("product_p") or (row or {}).get("product_id"))
+            if pid:
+                first_product_id = pid
+                break
+        if hasattr(self, "productHistoryTopProduct"):
+            self.productHistoryTopProduct.setText(f"Product ID: {first_product_id}")
+            self.productHistoryTopScans.setText(f"Total Scans: {total_rows}")
+            self.productHistoryTopQty.setText(f"Total Quantity: {total_qty}")
+            self.productHistoryMetricProductValue.setText(first_product_id)
+            self.productHistoryMetricLabelsValue.setText(str(total_rows))
+            self.productHistoryMetricQtyValue.setText(str(total_qty))
+            if missing_labels:
+                if len(missing_labels) <= 6:
+                    missing_text = ", ".join(str(x) for x in missing_labels)
+                else:
+                    missing_text = ", ".join(str(x) for x in missing_labels[:6]) + f" (+{len(missing_labels) - 6})"
+            else:
+                missing_text = "None"
+            self.productHistoryMetricMissingValue.setText(missing_text)
+            self.productHistoryMetricMissingValue.setStyleSheet(
+                "color: #991b1b;" if missing_labels else "color: #14532d;"
+            )
+            self.productHistoryPageInfo.setText(f"Page {self._product_history_page + 1} of {total_pages}")
+            if hasattr(self, "productHistoryOrderNote"):
+                if out_of_order_rows:
+                    self.productHistoryOrderNote.show()
+                    self.productHistoryOrderNote.raise_()
+                else:
+                    self.productHistoryOrderNote.hide()
+
+        table.setRowCount(len(page_rows))
+        for row_idx, item in enumerate(page_rows):
+            product_id = _fmt_product_id(item.get("product_p") or item.get("product_id"))
+            if not product_id:
+                product_id = "-"
+            product_name = self._lookup_product_name(product_id) or str(item.get("product_name") or "-").strip() or "-"
+            label_number = str(item.get("index") or "-").strip() or "-"
+            qty_text = str(item.get("qty_q") or item.get("qty") or "-").strip() or "-"
+            operator_text = _compact_text(str(item.get("operator_name") or item.get("operator") or "-"), 18)
+            ts_text = _fmt_scan_time(str(item.get("scanned_at") or "").strip())
+            product_name_text = product_name if product_name and product_name != "-" else (product_id or "-")
+            product_name_text = _compact_text(product_name_text, 22)
+
+            values = [f"#{label_number}", product_name_text, qty_text, operator_text, ts_text]
             for col_idx, val in enumerate(values):
                 cell = QTableWidgetItem(val)
-                if col_idx in (0, 2, 3):
+                if col_idx in (0, 2):
                     cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
                 else:
                     cell.setTextAlignment(int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft))
+                if col_idx == 0 and (start + row_idx) in out_of_order_rows:
+                    cell.setForeground(QColor("#7f1d1d"))
+                    cell.setBackground(QColor(254, 202, 202))
+                    f = cell.font()
+                    f.setBold(True)
+                    cell.setFont(f)
+                    cell.setToolTip("Out of order scan sequence")
                 table.setItem(row_idx, col_idx, cell)
 
         table.clearSpans()
-        table.resizeRowsToContents()
-        for col in range(0, 6):
+        for col in range(0, 5):
             table.resizeColumnToContents(col)
 
     def _show_product_history_overlay(self):
@@ -2114,8 +2631,41 @@ QWidget#ClientUIRoot {{
 
     def _hide_product_history_overlay(self):
         self.productHistoryOverlay.hide()
+        if hasattr(self, "productHistoryOrderNote") and self.productHistoryOrderNote is not None:
+            self.productHistoryOrderNote.hide()
         if not self._should_keep_background_blur():
             self._set_background_blur(False)
+
+    def _ensure_product_catalog_index(self):
+        if isinstance(self._product_catalog_name_by_id, dict):
+            return
+        self._product_catalog_name_by_id = {}
+        raw = self._load_json_file(PRODUCT_CATALOG_CACHE_FILE, {})
+        items = []
+        if isinstance(raw, dict):
+            maybe_items = raw.get("items")
+            if isinstance(maybe_items, list):
+                items = maybe_items
+        elif isinstance(raw, list):
+            items = raw
+        for row in items:
+            if not isinstance(row, dict):
+                continue
+            pid = str(row.get("id") or "").strip()
+            name = str(row.get("name") or "").strip()
+            if not pid or not name:
+                continue
+            key = pid.lstrip("0") or "0"
+            self._product_catalog_name_by_id[key] = name
+
+    def _lookup_product_name(self, product_id: str) -> str:
+        pid = str(product_id or "").strip()
+        if not pid:
+            return ""
+        self._ensure_product_catalog_index()
+        key = pid.lstrip("0") if pid.isdigit() else pid
+        key = key or "0"
+        return str((self._product_catalog_name_by_id or {}).get(key) or "")
 
     def _load_json_file(self, path: str, fallback: Any) -> Any:
         try:
@@ -4150,6 +4700,26 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Raw materials summary opened.")
             return
 
+        if self.productHistoryOverlay.isVisible() and raw_l in ("next", "prev", "previous", "preview"):
+            logs_count = len([x for x in (self.state.product_pack_history_logs or []) if isinstance(x, dict)])
+            page_size = max(1, int(getattr(self, "_product_history_page_size", 15) or 15))
+            total_pages = max(1, (logs_count + page_size - 1) // page_size)
+            if raw_l == "next":
+                if self._product_history_page < (total_pages - 1):
+                    self._product_history_page += 1
+                    self._refresh_product_history_overlay()
+                    self.status.setText(f"Pack history page {self._product_history_page + 1} of {total_pages}.")
+                else:
+                    self.status.setText("Pack history: already on last page.")
+            else:
+                if self._product_history_page > 0:
+                    self._product_history_page -= 1
+                    self._refresh_product_history_overlay()
+                    self.status.setText(f"Pack history page {self._product_history_page + 1} of {total_pages}.")
+                else:
+                    self.status.setText("Pack history: already on first page.")
+            return
+
         if raw_l == "prodhistory~1":
             if self.productHistoryOverlay.isVisible():
                 self._hide_product_history_overlay()
@@ -4157,6 +4727,7 @@ QWidget#ClientUIRoot {{
             else:
                 if self.rawMatsOverlay.isVisible():
                     self._hide_raw_mats_overlay()
+                self._product_history_page = 0
                 self._show_product_history_overlay()
                 self.status.setText("Product PACK history opened.")
             return
@@ -4658,6 +5229,10 @@ QWidget#ClientUIRoot {{
             if s.machine_code and s.job_code and s.operator_id:
                 self.status.setText("Finish your current job first before changing machine or job.")
                 return
+            if s.machine_code and s.job_code and not s.operator_id:
+                self.status.setText("Invalid scan: scan OPERATOR badge for the current job first.")
+                self._show_invalid_overlay("Scan OPERATOR badge first. Job is already set.")
+                return
             if not s.machine_code:
                 self.status.setText("Scan MACHINE QR first.")
                 self._show_invalid_overlay("Scan machine QR first.")
@@ -4861,6 +5436,22 @@ QWidget#ClientUIRoot {{
                 qty = int(res.qty or 0)
                 pack_hist = self._extract_pack_history_fields(raw_s)
                 if pack_hist is not None:
+                    pack_hist["operator"] = str(s.operator_id or "").strip() or "-"
+                    pack_hist["operator_name"] = self._operator_display_name(s.operator_id)
+                    scan_idx = str(pack_hist.get("index") or "").strip()
+                    scan_lot = str(pack_hist.get("lot_number") or "").strip()
+                    if scan_idx and scan_lot:
+                        for prev in (s.product_pack_history_logs or []):
+                            if not isinstance(prev, dict):
+                                continue
+                            prev_idx = str(prev.get("index") or "").strip()
+                            prev_lot = str(prev.get("lot_number") or "").strip()
+                            if prev_idx == scan_idx and prev_lot == scan_lot:
+                                self.status.setText(
+                                    f"Invalid PACK QR: duplicate index {scan_idx} and lot {scan_lot}."
+                                )
+                                self._show_invalid_overlay("PACK QR index and lot number already scanned.")
+                                return
                     pack_hist["scanned_at"] = datetime.now(timezone.utc).isoformat()
                     s.product_pack_history_logs.append(pack_hist)
                 s.pack_count += 1
