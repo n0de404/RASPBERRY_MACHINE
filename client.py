@@ -273,6 +273,19 @@ class ClientState:
     linkage_job_name: Optional[str] = None
     linkage_job_payload: Dict[str, Any] = None
     linkage_jobs: List[Dict[str, Any]] = None
+    operator_shift_logs: List[Dict[str, Any]] = None
+    operator_shift_index: int = 0
+    operator_shift_started_at: Optional[str] = None
+    operator_shift_baseline_pack_count: int = 0
+    operator_shift_baseline_good_total: int = 0
+    operator_shift_baseline_butal_total: int = 0
+    operator_shift_baseline_reject_total: int = 0
+    operator_shift_baseline_startup_reject_total: int = 0
+    operator_shift_baseline_raw_sacks_count: int = 0
+    operator_shift_baseline_reject_breakdown: Dict[str, int] = None
+    operator_shift_baseline_raw_material_logs_len: int = 0
+    operator_shift_baseline_product_pack_history_logs_len: int = 0
+    operator_shift_baseline_reject_review_logs_len: int = 0
 
     def __post_init__(self):
         if self.reject_breakdown is None:
@@ -293,6 +306,10 @@ class ClientState:
             self.linkage_job_payload = {}
         if self.linkage_jobs is None:
             self.linkage_jobs = []
+        if self.operator_shift_logs is None:
+            self.operator_shift_logs = []
+        if self.operator_shift_baseline_reject_breakdown is None:
+            self.operator_shift_baseline_reject_breakdown = {}
 
 
 @dataclass
@@ -394,8 +411,8 @@ class HeartbeatBorderPulseOverlay(QWidget):
     def _draw_pulse_ring(self, p: QPainter, card: QRectF, base_radius: float, age: float):
         duration = 1.2
         u = max(0.0, min(1.0, age / duration))
-        start_out = 4.0
-        end_out = 24.0
+        start_out = 2.0
+        end_out = 14.0
         out = start_out + (end_out - start_out) * (u ** 0.85)
         alpha = int(255 * (1.0 - u) ** 1.6)
         glow_w = 7.0 * (1.0 - u) + 1.4
@@ -738,9 +755,41 @@ QWidget#ClientUIRoot {{
             col = idx % 3
             self.jobDetailGrid.addWidget(card, row, col)
 
+        part_table_card = QFrame()
+        part_table_card.setObjectName("SubPanel")
+        part_table_card.setLayout(QVBoxLayout())
+        part_table_card.layout().setContentsMargins(10, 8, 10, 8)
+        part_table_card.layout().setSpacing(4)
+        part_table_title = QLabel("Parts")
+        part_table_title.setObjectName("MetaLabel")
+        self.jobPartsTable = QTableWidget(0, 6)
+        self.jobPartsTable.setHorizontalHeaderLabels(
+            ["Part Product ID", "SKU", "Name", "Part Qty/Unit", "Request Part Qty", "Approve/Complete"]
+        )
+        self.jobPartsTable.setAlternatingRowColors(True)
+        self.jobPartsTable.setWordWrap(True)
+        self.jobPartsTable.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.jobPartsTable.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.jobPartsTable.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.jobPartsTable.verticalHeader().setVisible(False)
+        self.jobPartsTable.verticalHeader().setDefaultSectionSize(30)
+        self.jobPartsTable.horizontalHeader().setStretchLastSection(False)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.jobPartsTable.setMinimumHeight(150)
+        part_table_card.layout().addWidget(part_table_title)
+        part_table_card.layout().addWidget(self.jobPartsTable)
+        self.jobDetailGrid.addWidget(part_table_card, 3, 0, 1, 3)
+
         self.cardJobDetails.layout().addLayout(self.jobDetailGrid)
         self.cardJobDetails.layout().addStretch(1)
-        self.cardJobDetailsOuter.setFixedHeight(320)
+        self.cardJobDetailsOuter.setMinimumHeight(470)
+        self.cardJobDetailsOuter.setMaximumHeight(520)
+        self.cardJobDetailsOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
         # Activity panel
         self.cardActivityOuter, self.cardActivity = self._make_double_layer_card("Activity")
@@ -1535,6 +1584,10 @@ QWidget#ClientUIRoot {{
         self._finish_anim_value = 0
         self._finish_anim_running = False
         self._finish_pending_clear = False
+        self._operator_shift_flash_active = False
+        self._operator_shift_flash_timer = QTimer(self)
+        self._operator_shift_flash_timer.setSingleShot(True)
+        self._operator_shift_flash_timer.timeout.connect(self._hide_operator_shift_overlay)
 
         # Settings overlay with category navigation (Graphics / Display).
         self.settingsOverlay = QFrame(self)
@@ -2937,6 +2990,39 @@ QWidget#ClientUIRoot {{
             self._finish_pending_clear = False
             self._clear_full_session()
 
+    def _show_operator_shift_overlay(self, shift_payload: Dict[str, Any]):
+        name = self._safe_text(shift_payload.get("operator_name"), "-")
+        code = self._safe_text(shift_payload.get("operator_id"), "-")
+        summary = (
+            f"Operator: {name} ({code})\n"
+            f"Pack: {int(shift_payload.get('pack_count') or 0)} | "
+            f"Good: {int(shift_payload.get('good_total') or 0)} | "
+            f"Butal: {int(shift_payload.get('butal_total') or 0)} | "
+            f"Reject: {int(shift_payload.get('reject_total') or 0)} | "
+            f"Total Good: {int(shift_payload.get('total_good') or 0)}"
+        )
+        self._operator_shift_flash_active = True
+        self._position_finish_overlay()
+        self._set_background_blur(True)
+        self.finishTitle.setText("OPERATOR SHIFT SAVED")
+        self.finishStatus.setText(summary)
+        self.finishProgressBar.hide()
+        self.finishSuccessRow.hide()
+        self.finishOverlay.show()
+        self.finishOverlay.raise_()
+        self._operator_shift_flash_timer.start(5000)
+
+    def _hide_operator_shift_overlay(self):
+        if not self._operator_shift_flash_active:
+            return
+        self._operator_shift_flash_active = False
+        self.finishTitle.setText("FINISHING JOB")
+        self.finishStatus.setText("Processing...")
+        self.finishProgressBar.show()
+        self.finishOverlay.hide()
+        if not self._should_keep_background_blur():
+            self._set_background_blur(False)
+
     def _set_reject_review_blur(self, enabled: bool):
         if enabled:
             if self._reject_review_blur_effects:
@@ -3414,6 +3500,94 @@ QWidget#ClientUIRoot {{
         with open(p, "w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False, indent=2)
 
+    def _start_operator_shift_tracking(self):
+        s = self.state
+        if not (s.machine_code and s.job_code and s.operator_id):
+            return
+        s.operator_shift_index = int(s.operator_shift_index or 0) + 1
+        s.operator_shift_started_at = datetime.now(timezone.utc).isoformat()
+        s.operator_shift_baseline_pack_count = int(s.pack_count or 0)
+        s.operator_shift_baseline_good_total = int(s.good_total or 0)
+        s.operator_shift_baseline_butal_total = int(s.butal_total or 0)
+        s.operator_shift_baseline_reject_total = int(s.reject_total or 0)
+        s.operator_shift_baseline_startup_reject_total = int(s.startup_reject_total or 0)
+        s.operator_shift_baseline_raw_sacks_count = int(s.raw_sacks_count or 0)
+        s.operator_shift_baseline_reject_breakdown = dict(s.reject_breakdown or {})
+        s.operator_shift_baseline_raw_material_logs_len = len(s.raw_material_logs or [])
+        s.operator_shift_baseline_product_pack_history_logs_len = len(s.product_pack_history_logs or [])
+        s.operator_shift_baseline_reject_review_logs_len = len(s.reject_review_logs or [])
+
+    def _build_operator_shift_payload(self, reason: str) -> Optional[Dict[str, Any]]:
+        s = self.state
+        if not (s.machine_code and s.job_code and s.operator_id):
+            return None
+        ended_at_utc = datetime.now(timezone.utc).isoformat()
+        started_at_utc = s.operator_shift_started_at or ended_at_utc
+        base_rejects = dict(s.operator_shift_baseline_reject_breakdown or {})
+        now_rejects = dict(s.reject_breakdown or {})
+        reject_delta: Dict[str, int] = {}
+        for key in sorted(set(base_rejects.keys()) | set(now_rejects.keys())):
+            try:
+                delta = int(now_rejects.get(key, 0) or 0) - int(base_rejects.get(key, 0) or 0)
+            except Exception:
+                delta = 0
+            if delta > 0:
+                reject_delta[str(key)] = delta
+        raw_from = max(0, int(s.operator_shift_baseline_raw_material_logs_len or 0))
+        pack_from = max(0, int(s.operator_shift_baseline_product_pack_history_logs_len or 0))
+        review_from = max(0, int(s.operator_shift_baseline_reject_review_logs_len or 0))
+        pack_count = max(0, int(s.pack_count or 0) - int(s.operator_shift_baseline_pack_count or 0))
+        good_total = max(0, int(s.good_total or 0) - int(s.operator_shift_baseline_good_total or 0))
+        butal_total = max(0, int(s.butal_total or 0) - int(s.operator_shift_baseline_butal_total or 0))
+        reject_total = max(0, int(s.reject_total or 0) - int(s.operator_shift_baseline_reject_total or 0))
+        startup_reject_total = max(0, int(s.startup_reject_total or 0) - int(s.operator_shift_baseline_startup_reject_total or 0))
+        raw_sacks_count = max(0, int(s.raw_sacks_count or 0) - int(s.operator_shift_baseline_raw_sacks_count or 0))
+        return {
+            "shift_index": int(s.operator_shift_index or (len(s.operator_shift_logs or []) + 1)),
+            "reason": str(reason or "SHIFT_CHANGE"),
+            "started_at_utc": started_at_utc,
+            "ended_at_utc": ended_at_utc,
+            "machine_code": s.machine_code,
+            "machine_name": _machine_display_name(s.machine_code, s.machine_name),
+            "job_code": s.job_code,
+            "job_name": s.job_name,
+            "operator_id": s.operator_id,
+            "operator_name": self._operator_display_name(s.operator_id),
+            "pack_count": pack_count,
+            "good_total": good_total,
+            "butal_total": butal_total,
+            "reject_total": reject_total,
+            "total_good": int(good_total + butal_total),
+            "reject_breakdown": reject_delta,
+            "startup_reject_total": startup_reject_total,
+            "raw_sacks_count": raw_sacks_count,
+            "raw_material_logs": list((s.raw_material_logs or [])[raw_from:]),
+            "product_pack_history_logs": list((s.product_pack_history_logs or [])[pack_from:]),
+            "reject_review_logs": list((s.reject_review_logs or [])[review_from:]),
+            "downtime_active": bool(s.downtime_active),
+            "downtime_reason_code": s.downtime_reason_code,
+            "downtime_reason_text": s.downtime_reason_text,
+            "downtime_last_seconds": s.downtime_last_seconds,
+            "cycle_time_current": s.cycle_time_current,
+            "maintenance_name": s.maintenance_name,
+            "supervisor_name": s.supervisor_name,
+        }
+
+    def _finalize_current_operator_shift(self, reason: str, emit_event: bool = True) -> Optional[Dict[str, Any]]:
+        payload = self._build_operator_shift_payload(reason=reason)
+        if payload is None:
+            return None
+        s = self.state
+        rows = list(s.operator_shift_logs or [])
+        rows.append(payload)
+        s.operator_shift_logs = rows
+        if emit_event:
+            self.push_event(
+                {"type": "OPERATOR_SHIFT_SAVE", "operator_shift": payload},
+                f"OPERATOR SHIFT SAVE {payload.get('operator_name') or payload.get('operator_id') or ''}".strip(),
+            )
+        return payload
+
     def _state_to_active_snapshot(self) -> Dict[str, Any]:
         s = self.state
         return {
@@ -3472,6 +3646,19 @@ QWidget#ClientUIRoot {{
             "linkage_job_name": s.linkage_job_name,
             "linkage_job_payload": dict(s.linkage_job_payload or {}),
             "linkage_jobs": list(s.linkage_jobs or []),
+            "operator_shift_logs": list(s.operator_shift_logs or []),
+            "operator_shift_index": int(s.operator_shift_index or 0),
+            "operator_shift_started_at": s.operator_shift_started_at,
+            "operator_shift_baseline_pack_count": int(s.operator_shift_baseline_pack_count or 0),
+            "operator_shift_baseline_good_total": int(s.operator_shift_baseline_good_total or 0),
+            "operator_shift_baseline_butal_total": int(s.operator_shift_baseline_butal_total or 0),
+            "operator_shift_baseline_reject_total": int(s.operator_shift_baseline_reject_total or 0),
+            "operator_shift_baseline_startup_reject_total": int(s.operator_shift_baseline_startup_reject_total or 0),
+            "operator_shift_baseline_raw_sacks_count": int(s.operator_shift_baseline_raw_sacks_count or 0),
+            "operator_shift_baseline_reject_breakdown": dict(s.operator_shift_baseline_reject_breakdown or {}),
+            "operator_shift_baseline_raw_material_logs_len": int(s.operator_shift_baseline_raw_material_logs_len or 0),
+            "operator_shift_baseline_product_pack_history_logs_len": int(s.operator_shift_baseline_product_pack_history_logs_len or 0),
+            "operator_shift_baseline_reject_review_logs_len": int(s.operator_shift_baseline_reject_review_logs_len or 0),
         }
 
     def _save_active_session_snapshot(self):
@@ -3555,6 +3742,21 @@ QWidget#ClientUIRoot {{
         s.linkage_job_name = snap.get("linkage_job_name")
         s.linkage_job_payload = dict(snap.get("linkage_job_payload") or {})
         s.linkage_jobs = list(snap.get("linkage_jobs") or [])
+        s.operator_shift_logs = list(snap.get("operator_shift_logs") or [])
+        s.operator_shift_index = int(snap.get("operator_shift_index") or 0)
+        s.operator_shift_started_at = snap.get("operator_shift_started_at")
+        s.operator_shift_baseline_pack_count = int(snap.get("operator_shift_baseline_pack_count") or 0)
+        s.operator_shift_baseline_good_total = int(snap.get("operator_shift_baseline_good_total") or 0)
+        s.operator_shift_baseline_butal_total = int(snap.get("operator_shift_baseline_butal_total") or 0)
+        s.operator_shift_baseline_reject_total = int(snap.get("operator_shift_baseline_reject_total") or 0)
+        s.operator_shift_baseline_startup_reject_total = int(snap.get("operator_shift_baseline_startup_reject_total") or 0)
+        s.operator_shift_baseline_raw_sacks_count = int(snap.get("operator_shift_baseline_raw_sacks_count") or 0)
+        s.operator_shift_baseline_reject_breakdown = dict(snap.get("operator_shift_baseline_reject_breakdown") or {})
+        s.operator_shift_baseline_raw_material_logs_len = int(snap.get("operator_shift_baseline_raw_material_logs_len") or 0)
+        s.operator_shift_baseline_product_pack_history_logs_len = int(snap.get("operator_shift_baseline_product_pack_history_logs_len") or 0)
+        s.operator_shift_baseline_reject_review_logs_len = int(snap.get("operator_shift_baseline_reject_review_logs_len") or 0)
+        if s.operator_id and not s.operator_shift_started_at:
+            self._start_operator_shift_tracking()
         self._refresh_ui()
         # Re-open pending overlays after reconnect/resume so the user can continue the interrupted step.
         if s.waiting_initial_cycle_time_input:
@@ -3621,6 +3823,7 @@ QWidget#ClientUIRoot {{
             "cycle_time_current": s.cycle_time_current,
             "maintenance_name": s.maintenance_name,
             "supervisor_name": s.supervisor_name,
+            "operator_shift_logs": list(s.operator_shift_logs or []),
             "linkage_enabled": bool(s.linkage_enabled),
             "linkage_job_code": s.linkage_job_code,
             "linkage_job_name": s.linkage_job_name,
@@ -3713,6 +3916,19 @@ QWidget#ClientUIRoot {{
         s.linkage_job_name = None
         s.linkage_job_payload = {}
         s.linkage_jobs = []
+        s.operator_shift_logs = []
+        s.operator_shift_index = 0
+        s.operator_shift_started_at = None
+        s.operator_shift_baseline_pack_count = 0
+        s.operator_shift_baseline_good_total = 0
+        s.operator_shift_baseline_butal_total = 0
+        s.operator_shift_baseline_reject_total = 0
+        s.operator_shift_baseline_startup_reject_total = 0
+        s.operator_shift_baseline_raw_sacks_count = 0
+        s.operator_shift_baseline_reject_breakdown = {}
+        s.operator_shift_baseline_raw_material_logs_len = 0
+        s.operator_shift_baseline_product_pack_history_logs_len = 0
+        s.operator_shift_baseline_reject_review_logs_len = 0
         self._reset_downtime_resolution_state()
         self._hide_resolve_overlay()
         self._hide_production_overlay()
@@ -4237,6 +4453,34 @@ QWidget#ClientUIRoot {{
             print("[JobAPI] FETCH skipped: missing base_url or auth config")
             return None
         url = self._job_api_url(base, f"/jobs/{job_id}")
+
+        def _payload_has_useful_job_details(payload_obj: Any) -> bool:
+            if not isinstance(payload_obj, dict):
+                return False
+            jd = payload_obj.get("job_details") if isinstance(payload_obj.get("job_details"), dict) else {}
+            if not isinstance(jd, dict):
+                jd = {}
+            keys = ("product_id", "mold", "color", "no_of_cavity", "std_cycle_time", "qty_per_shift")
+            if any(str(jd.get(k, "") or "").strip() for k in keys):
+                return True
+            part_ids = jd.get("part_ids")
+            parts = jd.get("parts")
+            if isinstance(part_ids, list) and len(part_ids) > 0:
+                return True
+            if isinstance(part_ids, dict) and len(part_ids.keys()) > 0:
+                return True
+            if isinstance(parts, list) and len(parts) > 0:
+                return True
+            data_parts = payload_obj.get("parts")
+            data_part_ids = payload_obj.get("parts_ids")
+            if isinstance(data_parts, list) and len(data_parts) > 0:
+                return True
+            if isinstance(data_part_ids, list) and len(data_part_ids) > 0:
+                return True
+            return False
+
+        best_partial_wrapped: Optional[Dict[str, Any]] = None
+        max_attempts = 3
         try:
             if not token and user and password:
                 print("[JobAPI] FETCH no cached token; requesting new token via login")
@@ -4244,34 +4488,57 @@ QWidget#ClientUIRoot {{
                 if not token:
                     self.status.setText("Job API login failed; using local job mapping/stub.")
                     return None
-            headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-            resp = requests.get(
-                url,
-                headers=headers,
-                timeout=5,
-            )
-            self._append_job_api_log(f"GET {url} -> HTTP {resp.status_code}")
-            print(f"[JobAPI] GET {url} -> HTTP {resp.status_code}")
-            if resp.status_code != 200:
-                self.status.setText(
-                    f"Job API GET failed HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}"
+            for attempt in range(1, max_attempts + 1):
+                if attempt > 1:
+                    time.sleep(0.18)
+                headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+                resp = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=5,
                 )
-                self._append_job_api_log(f"GET FAIL: {self._http_error_snippet(resp) or 'No response body'}")
-                print(f"[JobAPI] GET FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
-                return None
-            data = resp.json()
-            if not isinstance(data, dict):
-                self.status.setText("Job API fetch returned invalid response; using local job mapping/stub.")
-                return None
-            payload = data.get("data")
-            if not isinstance(payload, dict):
-                self.status.setText("Job API fetch has no job payload; using local job mapping/stub.")
-                return None
-            # Keep a consistent shape with existing JOB_STUB handling.
-            wrapped = {"code": data.get("code"), "message": data.get("message"), "data": payload}
-            self._append_job_api_log(f"GET OK: job {job_id}")
-            print(f"[JobAPI] GET OK: job {job_id}")
-            return wrapped
+                self._append_job_api_log(f"GET {url} -> HTTP {resp.status_code} (try {attempt}/{max_attempts})")
+                print(f"[JobAPI] GET {url} -> HTTP {resp.status_code} (try {attempt}/{max_attempts})")
+                if resp.status_code == 401 and user and password:
+                    self._append_job_api_log("GET unauthorized; refreshing bearer token")
+                    token = self._get_job_api_bearer_token(base=base, user=user, password=password) or token
+                    continue
+                if resp.status_code != 200:
+                    if attempt < max_attempts:
+                        continue
+                    self.status.setText(
+                        f"Job API GET failed HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}"
+                    )
+                    self._append_job_api_log(f"GET FAIL: {self._http_error_snippet(resp) or 'No response body'}")
+                    print(f"[JobAPI] GET FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
+                    return best_partial_wrapped
+                data = resp.json()
+                if not isinstance(data, dict):
+                    if attempt < max_attempts:
+                        continue
+                    self.status.setText("Job API fetch returned invalid response; using local job mapping/stub.")
+                    return best_partial_wrapped
+                payload = data.get("data")
+                if not isinstance(payload, dict):
+                    if attempt < max_attempts:
+                        continue
+                    self.status.setText("Job API fetch has no job payload; using local job mapping/stub.")
+                    return best_partial_wrapped
+
+                wrapped = {"code": data.get("code"), "message": data.get("message"), "data": payload}
+                if _payload_has_useful_job_details(payload):
+                    self._append_job_api_log(f"GET OK: job {job_id}")
+                    print(f"[JobAPI] GET OK: job {job_id}")
+                    return wrapped
+                best_partial_wrapped = wrapped
+                self._append_job_api_log(f"GET partial/blank job_details; retrying ({attempt}/{max_attempts})")
+                print(f"[JobAPI] GET partial/blank job_details; retrying ({attempt}/{max_attempts})")
+
+            if best_partial_wrapped is not None:
+                self.status.setText("Job API returned partial job details after retries.")
+                return best_partial_wrapped
+            self.status.setText("Job API fetch failed after retries; using local job mapping/stub.")
+            return None
         except Exception as e:
             self.status.setText(f"Job API fetch error: {e}; using local job mapping/stub.")
             self._append_job_api_log(f"GET ERROR: {e}")
@@ -4286,6 +4553,23 @@ QWidget#ClientUIRoot {{
             job_details = payload["data"]["job_details"]
         elif isinstance(payload.get("job_details"), dict):
             job_details = payload.get("job_details") or {}
+
+        data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        part_rows: List[Dict[str, Any]] = []
+        # Preferred source from Job API sample: data.parts (or job_details.parts)
+        if isinstance(data_obj.get("parts"), list):
+            part_rows = [r for r in data_obj.get("parts") or [] if isinstance(r, dict)]
+        elif isinstance(job_details.get("parts"), list):
+            part_rows = [r for r in job_details.get("parts") or [] if isinstance(r, dict)]
+        # Fallback legacy sources
+        elif isinstance(job_details.get("part_ids"), list):
+            part_rows = [r for r in job_details.get("part_ids") or [] if isinstance(r, dict)]
+        elif isinstance(job_details.get("part_ids"), dict):
+            part_rows = [job_details.get("part_ids") or {}]
+        elif isinstance(data_obj.get("part_ids"), list):
+            part_rows = [r for r in data_obj.get("part_ids") or [] if isinstance(r, dict)]
+        elif isinstance(payload.get("part_ids"), list):
+            part_rows = [r for r in payload.get("part_ids") or [] if isinstance(r, dict)]
 
         # Keep these in payload/state for downstream use, but do not display them in Job Details cards.
         _stored_machine_num = self._safe_text(job_details.get("machine_num"), "")
@@ -4305,6 +4589,29 @@ QWidget#ClientUIRoot {{
         }
         for key, label in self.job_detail_labels.items():
             label.setText(fields.get(key, "-"))
+
+        if hasattr(self, "jobPartsTable") and self.jobPartsTable is not None:
+            self.jobPartsTable.setRowCount(0)
+            for part in part_rows:
+                r = self.jobPartsTable.rowCount()
+                self.jobPartsTable.insertRow(r)
+                values = [
+                    self._safe_text(part.get("part_product_id"), "-"),
+                    self._safe_text(part.get("sku"), "-"),
+                    self._safe_text(part.get("name"), "-"),
+                    self._safe_text(part.get("part_qty_per_unit"), "-"),
+                    self._safe_text(part.get("request_part_qty"), "-"),
+                    f"{self._safe_text(part.get('approve_part_qty'), '-')} / {self._safe_text(part.get('complete_part_qty'), '-')}",
+                ]
+                for c, val in enumerate(values):
+                    item = QTableWidgetItem(val)
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
+                    self.jobPartsTable.setItem(r, c, item)
+            if self.jobPartsTable.rowCount() == 0:
+                self.jobPartsTable.insertRow(0)
+                for c in range(6):
+                    self.jobPartsTable.setItem(0, c, QTableWidgetItem("-"))
+
         if hasattr(self, "rightCycleStd") and self.rightCycleStd is not None:
             self.rightCycleStd.setText(f"Std Cycle Time: {fields.get('std_cycle_time', 'N/A')}")
 
@@ -4431,6 +4738,8 @@ QWidget#ClientUIRoot {{
             return "Start Up Reject +1"
         if res.kind == "REJECT_SUMMARY":
             return "Reject summary requested"
+        if res.kind == "OPERATOR_SHIFT_TRIGGER":
+            return "Operator shift handoff requested"
         if res.kind == "PRODUCTION_DAILY_REPORT_TRIGGER":
             return "Production daily report mode enabled"
         if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
@@ -4533,6 +4842,9 @@ QWidget#ClientUIRoot {{
         return None
 
     def on_scanned(self, raw: str):
+        if self._operator_shift_flash_active:
+            self.status.setText("Operator shift handoff in progress. Please wait.")
+            return
         if self._finish_anim_running:
             self.status.setText("Finish job in progress. Please wait.")
             return
@@ -4971,6 +5283,39 @@ QWidget#ClientUIRoot {{
             self._show_invalid_overlay("QR code is not recognized.")
             return
 
+        if res.kind == "OPERATOR_SHIFT_TRIGGER":
+            if not self.can_accept_production_scans():
+                msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
+                self.status.setText(msg[:1].upper() + msg[1:])
+                self._show_invalid_overlay(msg)
+                return
+            if (
+                s.waiting_reject_reason
+                or s.waiting_production_report_reason
+                or s.waiting_cycle_time_input
+                or s.waiting_maintenance_qr
+                or s.waiting_supervisor_qr
+                or s.waiting_operator_downtime_confirm
+                or s.waiting_initial_cycle_time_input
+                or s.waiting_cycle_time_confirm_popup
+                or s.downtime_active
+            ):
+                self.status.setText("Cannot shift operator while reject/downtime flow is active.")
+                self._show_invalid_overlay("Finish the active reject/downtime flow first.")
+                return
+            shift_payload = self._finalize_current_operator_shift("QR_SHIFT_HANDOFF", emit_event=True)
+            if shift_payload is None:
+                self.status.setText("Operator shift handoff failed: no active operator data.")
+                self._show_invalid_overlay("No active operator shift to save.")
+                return
+            old_operator = self._safe_text(shift_payload.get("operator_name"), "-")
+            s.operator_id = None
+            s.operator_shift_started_at = None
+            self._show_operator_shift_overlay(shift_payload)
+            self._save_active_session_snapshot()
+            self.status.setText(f"Shift data saved for {old_operator}. Scan next OPERATOR badge.")
+            return
+
         if res.kind == "FINISH_JOB":
             if not self.can_accept_production_scans():
                 self.status.setText("Cannot finish yet: complete MACHINE -> JOB -> OPERATOR first.")
@@ -4986,6 +5331,7 @@ QWidget#ClientUIRoot {{
             ):
                 self.status.setText("Cannot finish while downtime/reject flow is active.")
                 return
+            self._finalize_current_operator_shift("JOB_FINISH", emit_event=False)
             finished_payload = self._build_finished_job_payload()
             if self.state.linkage_enabled and (self.state.linkage_jobs or []):
                 total_jobs_in_group = 1 + len(self.state.linkage_jobs or [])
@@ -5131,6 +5477,19 @@ QWidget#ClientUIRoot {{
             s.linkage_job_name = None
             s.linkage_job_payload = {}
             s.linkage_jobs = []
+            s.operator_shift_logs = []
+            s.operator_shift_index = 0
+            s.operator_shift_started_at = None
+            s.operator_shift_baseline_pack_count = 0
+            s.operator_shift_baseline_good_total = 0
+            s.operator_shift_baseline_butal_total = 0
+            s.operator_shift_baseline_reject_total = 0
+            s.operator_shift_baseline_startup_reject_total = 0
+            s.operator_shift_baseline_raw_sacks_count = 0
+            s.operator_shift_baseline_reject_breakdown = {}
+            s.operator_shift_baseline_raw_material_logs_len = 0
+            s.operator_shift_baseline_product_pack_history_logs_len = 0
+            s.operator_shift_baseline_reject_review_logs_len = 0
             self._reset_downtime_resolution_state()
             self._hide_resolve_overlay()
             self._hide_production_overlay()
@@ -5311,6 +5670,19 @@ QWidget#ClientUIRoot {{
             s.linkage_job_name = None
             s.linkage_job_payload = {}
             s.linkage_jobs = []
+            s.operator_shift_logs = []
+            s.operator_shift_index = 0
+            s.operator_shift_started_at = None
+            s.operator_shift_baseline_pack_count = 0
+            s.operator_shift_baseline_good_total = 0
+            s.operator_shift_baseline_butal_total = 0
+            s.operator_shift_baseline_reject_total = 0
+            s.operator_shift_baseline_startup_reject_total = 0
+            s.operator_shift_baseline_raw_sacks_count = 0
+            s.operator_shift_baseline_reject_breakdown = {}
+            s.operator_shift_baseline_raw_material_logs_len = 0
+            s.operator_shift_baseline_product_pack_history_logs_len = 0
+            s.operator_shift_baseline_reject_review_logs_len = 0
             self._reset_downtime_resolution_state()
             self._hide_resolve_overlay()
             self._hide_production_overlay()
@@ -5368,12 +5740,28 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Scan JOB QR first.")
                     self._show_invalid_overlay("Scan job QR first.")
                 return
+            new_operator_code = self._operator_code_only(res.value)
+            current_operator_code = self._operator_code_only(s.operator_id)
+            if current_operator_code and new_operator_code != current_operator_code:
+                self.status.setText('Operator change blocked. Scan "operatorshift~1" first.')
+                self._show_invalid_overlay('Scan "operatorshift~1" first to save current operator shift data.')
+                return
+            if current_operator_code and new_operator_code == current_operator_code:
+                self.status.setText(f"Operator already active: {self._operator_display_name(s.operator_id)}")
+                return
             s.operator_id = res.value
-            self._begin_initial_cycle_time_setup()
-            self.status.setText(f"Operator set: {s.operator_id}. Enter cycle time now.")
+            self._start_operator_shift_tracking()
+            if not str(s.cycle_time_current or "").strip():
+                self._begin_initial_cycle_time_setup()
+                self.status.setText(f"Operator set: {s.operator_id}. Enter cycle time now.")
+            else:
+                self.status.setText(f"Operator set: {s.operator_id}. Job resumed.")
             self._refresh_ui()
             self._save_active_session_snapshot()
-            self.push_event({"type": "OPERATOR_SET"}, f"OPERATOR {s.operator_id}")
+            self.push_event(
+                {"type": "OPERATOR_SET", "shift_index": int(s.operator_shift_index or 0)},
+                f"OPERATOR {s.operator_id}",
+            )
             return
 
         if res.kind in ("PACK", "BUTAL", "REJECT_TRIGGER", "PRODUCTION_DAILY_REPORT_TRIGGER"):

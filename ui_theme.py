@@ -267,7 +267,7 @@ QFrame#StatReject QLabel#StatValue {
     color: #fb7185;
 }
 QFrame#StatTotalGood QLabel#StatValue {
-    color: #a78bfa;
+    color: #86efac;
 }
 
 /* Pack / Butal / Reject with stronger identity */
@@ -288,8 +288,8 @@ QFrame#StatGood {
     border: 1px solid #22d3ee;
 }
 QFrame#StatTotalGood {
-    background: #4c1d95;
-    border: 1px solid #a78bfa;
+    background: #052e16;
+    border: 1px solid #4ade80;
 }
 
 /* short pulse state toggled from client.py */
@@ -310,8 +310,8 @@ QFrame#StatReject[flash="1"] {
     background: #fee2e2;
 }
 QFrame#StatTotalGood[flash="1"] {
-    border: 2px solid #7c3aed;
-    background: #ddd6fe;
+    border: 2px solid #22c55e;
+    background: #dcfce7;
 }
 
 /* Optional accent bar (if you add a child frame inside each stat) */

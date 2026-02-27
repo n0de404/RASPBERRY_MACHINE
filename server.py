@@ -139,6 +139,7 @@ class MachineSession:
     job_payload: Dict[str, Any] = None
     linkage_enabled: bool = False
     linkage_jobs: List[Dict[str, Any]] = None
+    operator_shift_logs: List[Dict[str, Any]] = None
     last_event: str = ""
     last_seen_utc: str = ""
 
@@ -149,6 +150,7 @@ class MachineSession:
         d["raw_material_logs"] = d["raw_material_logs"] or []
         d["job_payload"] = d["job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
+        d["operator_shift_logs"] = d["operator_shift_logs"] or []
         return d
 
 
@@ -4307,6 +4309,7 @@ async def api_event(req: Request):
             raw_material_scans=[],
             raw_material_logs=[],
             job_payload={},
+            operator_shift_logs=[],
         )
         SESSIONS[machine_code] = sess
 
@@ -4337,6 +4340,12 @@ async def api_event(req: Request):
             rows = list(sess.linkage_jobs or [])
             rows.append({"job_code": linked_code, "job_name": linked_name})
             sess.linkage_jobs = rows
+    elif ev_type == "OPERATOR_SHIFT_SAVE":
+        shift_payload = ev.get("operator_shift")
+        if isinstance(shift_payload, dict):
+            rows = list(sess.operator_shift_logs or [])
+            rows.append(shift_payload)
+            sess.operator_shift_logs = rows[-40:]
     elif ev_type in ("SESSION_SYNC", "HEARTBEAT"):
         snap = ev.get("session_snapshot")
         if isinstance(snap, dict):
@@ -4367,6 +4376,8 @@ async def api_event(req: Request):
             sess.linkage_enabled = bool(snap.get("linkage_enabled", sess.linkage_enabled))
             if isinstance(snap.get("linkage_jobs"), list):
                 sess.linkage_jobs = list(snap.get("linkage_jobs") or [])
+            if isinstance(snap.get("operator_shift_logs"), list):
+                sess.operator_shift_logs = list(snap.get("operator_shift_logs") or [])
     elif ev_type == "PACK":
         qty = int(ev.get("qty", 0) or 0)
         sess.pack_total += qty

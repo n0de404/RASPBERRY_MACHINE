@@ -169,6 +169,10 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
     s = raw.strip()
     s_l = s.lower()
 
+    # Operator handoff trigger
+    if s_l in ("operatorshift~1", "operator_shift~1", "shiftchange~1"):
+        return ScanResult(kind="OPERATOR_SHIFT_TRIGGER", raw=raw, value="Operator shift handoff")
+
     # Production daily report trigger
     if s_l == "productiondailyreport~1":
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_TRIGGER", raw=raw, value="Production daily report mode")
