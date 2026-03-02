@@ -476,6 +476,115 @@ def save_profiles(rows: List[Dict[str, Any]]):
     PROFILES_FILE.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _operator_record_matches_profile(operator_value: Any, profile: Dict[str, Any]) -> bool:
+    raw = str(operator_value or "").strip()
+    if not raw or not isinstance(profile, dict):
+        return False
+    profile_id = str(profile.get("id_number") or "").strip()
+    profile_name = str(profile.get("name") or "").strip().casefold()
+    code_part = raw.split(" - ", 1)[0].strip()
+    name_part = raw.split(" - ", 1)[1].strip().casefold() if " - " in raw else ""
+    if profile_id and (raw == profile_id or code_part == profile_id):
+        return True
+    if profile_name and (raw.casefold() == profile_name or name_part == profile_name):
+        return True
+    return False
+
+
+def _activity_timestamp(row: Dict[str, Any]) -> Optional[datetime]:
+    if not isinstance(row, dict):
+        return None
+    for key in ("finished_at_utc", "last_seen_utc", "saved_at_utc", "created_at_utc", "updated_at_utc"):
+        dt = _parse_iso_utc(row.get(key))
+        if dt is not None:
+            return dt
+    return None
+
+
+def _operator_activity_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
+    active_rows = [s.to_dict() for s in SESSIONS.values() if _operator_record_matches_profile(getattr(s, "operator_id", ""), profile)]
+    active_rows.sort(key=lambda x: _activity_timestamp(x) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    history_rows = [r for r in [*FINISHED_JOBS, *ARCHIVED_JOBS] if _operator_record_matches_profile((r or {}).get("operator_id", ""), profile)]
+    history_rows.sort(key=lambda x: _activity_timestamp(x) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+    latest_active = active_rows[0] if active_rows else None
+    latest_history = history_rows[0] if history_rows else None
+    recent_activity: List[Dict[str, Any]] = []
+
+    if latest_active:
+        recent_activity.append(
+            {
+                "kind": "active_session",
+                "label": "Currently active",
+                "machine_code": latest_active.get("machine_code", ""),
+                "machine_name": latest_active.get("machine_name", ""),
+                "job_code": latest_active.get("job_code", ""),
+                "job_name": latest_active.get("job_name", ""),
+                "at_utc": latest_active.get("last_seen_utc", ""),
+                "detail": f"Monitoring {latest_active.get('machine_name') or latest_active.get('machine_code') or '-'}",
+            }
+        )
+
+    for row in history_rows[:3]:
+        machine_name = row.get("machine_name") or row.get("machine_code") or "-"
+        job_name = row.get("job_name") or row.get("job_code") or "-"
+        recent_activity.append(
+            {
+                "kind": "finished_job",
+                "label": "Finished job",
+                "machine_code": row.get("machine_code", ""),
+                "machine_name": row.get("machine_name", ""),
+                "job_code": row.get("job_code", ""),
+                "job_name": row.get("job_name", ""),
+                "at_utc": row.get("finished_at_utc", ""),
+                "detail": f"{machine_name} | {job_name}",
+            }
+        )
+
+    deduped_activity: List[Dict[str, Any]] = []
+    seen_keys = set()
+    for item in recent_activity:
+        key = (
+            str(item.get("kind") or ""),
+            str(item.get("machine_code") or ""),
+            str(item.get("job_code") or ""),
+            str(item.get("at_utc") or ""),
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped_activity.append(item)
+
+    last_row = latest_active or latest_history or {}
+    last_ts = _activity_timestamp(last_row)
+    return {
+        "name": str(profile.get("name") or "").strip(),
+        "id_number": str(profile.get("id_number") or "").strip(),
+        "role": str(profile.get("role") or "").strip(),
+        "is_active": bool(latest_active),
+        "current_machine_code": str((latest_active or {}).get("machine_code") or "").strip(),
+        "current_machine_name": str((latest_active or {}).get("machine_name") or "").strip(),
+        "current_job_code": str((latest_active or {}).get("job_code") or "").strip(),
+        "current_job_name": str((latest_active or {}).get("job_name") or "").strip(),
+        "last_machine_code": str(last_row.get("machine_code") or "").strip(),
+        "last_machine_name": str(last_row.get("machine_name") or "").strip(),
+        "last_job_code": str(last_row.get("job_code") or "").strip(),
+        "last_job_name": str(last_row.get("job_name") or "").strip(),
+        "last_activity_at_utc": last_ts.isoformat() if last_ts else "",
+        "recent_activity": deduped_activity[:3],
+        "all_activity": deduped_activity[:20],
+    }
+
+
+def build_operator_activity_directory() -> List[Dict[str, Any]]:
+    operators = [p for p in PROFILES if isinstance(p, dict) and str(p.get("role") or "").strip().casefold() == "operator"]
+    items = [_operator_activity_summary(p) for p in operators]
+    items.sort(key=lambda row: str(row.get("name") or "").casefold())
+    items.sort(key=lambda row: _parse_iso_utc(row.get("last_activity_at_utc")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    items.sort(key=lambda row: 0 if row.get("is_active") else 1)
+    return items
+
+
 def _today_key_local() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -1259,7 +1368,7 @@ DASHBOARD_HTML = """
   <style>
     html, body { height: 100%; margin: 0; }
     body { font-family: "Poppins", sans-serif; background: #f8f8f8; color: #333; display: flex; flex-direction: column; }
-    .diagnostics { padding: 8px 14px; background: #e9ecef; border-bottom: 1px solid #d9d9d9; display: grid; grid-template-columns: 48px 48px 48px repeat(4, minmax(180px, 1fr)); gap: 8px; align-items: stretch; }
+    .diagnostics { padding: 8px 14px; background: #e9ecef; border-bottom: 1px solid #d9d9d9; display: grid; grid-template-columns: 48px 48px 48px 48px repeat(4, minmax(180px, 1fr)); gap: 8px; align-items: stretch; }
     .server-menu-btn { width: 48px; min-width: 48px; border: 1px solid #d4dae4; border-radius: 11px; background: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .server-menu-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(15,23,42,0.08); background: #fbfcfe; }
     .server-menu-btn:active { transform: translateY(0) scale(0.985); }
@@ -1462,6 +1571,40 @@ DASHBOARD_HTML = """
     .people-role-row:last-child { border-bottom: none; }
     .people-role-row.head { background: #f8fafc; font-weight: 700; color: #475569; }
     .people-role-pill { display: inline-block; border-radius: 999px; padding: 3px 8px; font-size: 0.76rem; font-weight: 700; background: #e2e8f0; color: #334155; }
+    .operator-directory-card { width: min(1020px, calc(100vw - 36px)); background: #f8fafc; border: 1px solid #d8e0ea; border-radius: 18px; box-shadow: 0 24px 48px rgba(15,23,42,0.20); overflow: hidden; }
+    .operator-directory-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid #dde5ef; }
+    .operator-directory-title { font-weight:800; color:#1f2937; }
+    .operator-directory-sub { font-size:.83rem; color:#64748b; margin-top:4px; }
+    .operator-directory-grid { display:grid; gap:0; padding:0; max-height:min(72vh, 760px); overflow:auto; }
+    .operator-directory-row { display:grid; grid-template-columns: 1.35fr 1fr 1fr .95fr 120px; gap:12px; align-items:center; padding:12px 16px; border-bottom:1px solid #e5edf5; background:rgba(255,255,255,.94); cursor:pointer; transition: background-color .14s ease; }
+    .operator-directory-row:hover:not(.header) { background:#f8fbff; }
+    .operator-directory-row.header { position:sticky; top:0; z-index:2; background:#f8fafc; font-size:.76rem; font-weight:800; text-transform:uppercase; letter-spacing:.04em; color:#64748b; }
+    .operator-directory-row:last-child { border-bottom:none; }
+    .operator-directory-name { display:grid; gap:3px; min-width:0; }
+    .operator-directory-name strong { font-size:.92rem; color:#0f172a; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .operator-directory-meta { font-size:.78rem; color:#64748b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .operator-directory-cell { min-width:0; }
+    .operator-directory-label { display:none; font-size:.68rem; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:#64748b; margin-bottom:2px; }
+    .operator-directory-value { font-size:.83rem; color:#0f172a; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .operator-directory-subvalue { font-size:.74rem; color:#64748b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:2px; }
+    .operator-directory-badge { display:inline-flex; align-items:center; justify-content:center; border-radius:999px; padding:5px 9px; font-size:.72rem; font-weight:800; background:#e2e8f0; color:#334155; white-space:nowrap; }
+    .operator-directory-badge.live { background:#dcfce7; color:#166534; }
+    .operator-directory-empty { padding:24px 18px; color:#64748b; font-size:.9rem; }
+    .operator-detail-card { width:min(860px, calc(100vw - 36px)); background:#f8fafc; border:1px solid #d8e0ea; border-radius:18px; box-shadow:0 24px 48px rgba(15,23,42,0.20); overflow:hidden; }
+    .operator-detail-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid #dde5ef; }
+    .operator-detail-title { font-weight:800; color:#1f2937; }
+    .operator-detail-sub { font-size:.83rem; color:#64748b; margin-top:4px; }
+    .operator-detail-body { padding:16px; display:grid; gap:14px; max-height:min(78vh, 780px); overflow:auto; }
+    .operator-detail-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+    .operator-detail-item { border:1px solid #dbe4f0; border-radius:12px; background:#fff; padding:10px 12px; }
+    .operator-detail-item .k { font-size:.72rem; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:#64748b; margin-bottom:4px; }
+    .operator-detail-item .v { font-size:.86rem; color:#0f172a; overflow-wrap:anywhere; }
+    .operator-detail-section { border:1px solid #dbe4f0; border-radius:14px; background:#fff; padding:12px; }
+    .operator-detail-section h4 { margin:0 0 10px; font-size:.92rem; color:#0f172a; }
+    .operator-detail-list { display:grid; gap:8px; }
+    .operator-detail-list-item { border-left:3px solid #93c5fd; padding-left:10px; }
+    .operator-detail-list-item strong { display:block; font-size:.82rem; color:#0f172a; }
+    .operator-detail-list-item span { display:block; font-size:.77rem; color:#64748b; }
     .linkage-pill { display:inline-block; margin-left:8px; padding:2px 8px; border-radius:999px; font-size:.72rem; font-weight:800; background:#fff7ed; color:#c2410c; border:1px solid #fdba74; }
     .machine-linkage-flag { display:inline-block; margin-bottom:6px; padding:3px 8px; border-radius:999px; font-size:.72rem; font-weight:800; background:#ffedd5; color:#9a3412; border:1px solid #fdba74; box-shadow:0 0 0 0 rgba(251,146,60,.45); animation: linkagePulse 1.1s ease-in-out infinite; }
     @keyframes linkagePulse { 0%,100% { box-shadow:0 0 0 0 rgba(251,146,60,.25);} 50% { box-shadow:0 0 0 8px rgba(251,146,60,0);} }
@@ -1590,6 +1733,18 @@ DASHBOARD_HTML = """
     body[data-theme="Dark"] .people-role-row.head { background: #1f2937; color: #cbd5e1; }
     body[data-theme="Dark"] .settings-table th { background: #1f2937; color: #cbd5e1; }
     body[data-theme="Dark"] .settings-table td { border-bottom-color: #253041; color: #e5e7eb; }
+    body[data-theme="Dark"] .operator-directory-card { background:#0f172a; border-color:#334155; box-shadow:0 24px 48px rgba(0,0,0,0.38); }
+    body[data-theme="Dark"] .operator-directory-head { border-bottom-color:#334155; }
+    body[data-theme="Dark"] .operator-directory-title, body[data-theme="Dark"] .operator-directory-name strong, body[data-theme="Dark"] .operator-directory-value { color:#e5e7eb; }
+    body[data-theme="Dark"] .operator-directory-sub, body[data-theme="Dark"] .operator-directory-meta, body[data-theme="Dark"] .operator-directory-subvalue, body[data-theme="Dark"] .operator-directory-empty, body[data-theme="Dark"] .operator-directory-row.header, body[data-theme="Dark"] .operator-directory-label { color:#94a3b8; }
+    body[data-theme="Dark"] .operator-directory-row { background:#111827; border-bottom-color:#253041; }
+    body[data-theme="Dark"] .operator-directory-row.header { background:#1f2937; }
+    body[data-theme="Dark"] .operator-directory-row:hover:not(.header) { background:#172033; }
+    body[data-theme="Dark"] .operator-detail-card { background:#0f172a; border-color:#334155; box-shadow:0 24px 48px rgba(0,0,0,0.38); }
+    body[data-theme="Dark"] .operator-detail-head { border-bottom-color:#334155; }
+    body[data-theme="Dark"] .operator-detail-title, body[data-theme="Dark"] .operator-detail-item .v, body[data-theme="Dark"] .operator-detail-section h4, body[data-theme="Dark"] .operator-detail-list-item strong { color:#e5e7eb; }
+    body[data-theme="Dark"] .operator-detail-sub, body[data-theme="Dark"] .operator-detail-item .k, body[data-theme="Dark"] .operator-detail-list-item span { color:#94a3b8; }
+    body[data-theme="Dark"] .operator-detail-item, body[data-theme="Dark"] .operator-detail-section { background:#111827; border-color:#334155; }
     body[data-theme="Red"] { background: #fff4f4; color: #3b0a0a; }
     body[data-theme="Red"] .diag-item,
     body[data-theme="Red"] .card,
@@ -1601,6 +1756,9 @@ DASHBOARD_HTML = """
     body[data-theme="Red"] .main-tab-button.active { background: #dc2626; color: #fff; }
     body[data-theme="Red"] .main-tab-content { background: linear-gradient(180deg, rgba(254,242,242,.95), rgba(255,255,255,.88)); border-radius: 16px; }
     body[data-theme="Red"] .finished-item { border-color: #fecaca; background: linear-gradient(160deg, #fff 0%, #fff1f2 66%, #ffe4e6 100%); }
+    body[data-theme="Red"] .operator-directory-row { border-bottom-color:#fee2e2; }
+    body[data-theme="Red"] .operator-directory-row.header { background:#fef2f2; color:#991b1b; }
+    body[data-theme="Red"] .operator-detail-card, body[data-theme="Red"] .operator-detail-item, body[data-theme="Red"] .operator-detail-section { border-color:#fecaca; }
     body[data-theme="Red"] .finished-item h4 { color: #7f1d1d; }
     body[data-theme="Red"] .finished-grid div { border-color: #fecdd3; background: rgba(255,255,255,.95); color: #7f1d1d; }
     body[data-theme="Red"] .raw-list { border-color: #fecdd3; background: #fff; color: #7f1d1d; }
@@ -1635,14 +1793,17 @@ DASHBOARD_HTML = """
     @media (max-width: 900px) { .machine-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     @media (max-width: 1400px) { .grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
     @media (max-width: 1100px) { .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
-    @media (max-width: 1100px) { .diagnostics { grid-template-columns: 48px 48px 48px repeat(2, minmax(180px, 1fr)); } }
-    @media (max-width: 768px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .finished-wrap { grid-template-columns: 1fr; } .finished-grid { grid-template-columns: 1fr; } .overlay-row { grid-template-columns: 1fr; } .main-tab-content { padding: 0 12px 12px; } .main-tabs { padding: 12px; } .diagnostics { padding: 8px 10px; grid-template-columns: 48px 48px 48px 1fr; gap: 6px; } .machine-detail-grid { grid-template-columns: 1fr; } .overlay-card { width: calc(100vw - 18px); border-radius: 16px; } .review-edge-arrow.left { left: 8px; } .review-edge-arrow.right { right: 8px; } #overlayReviewStep, .review-form-card { width: 100%; } .people-role-row { grid-template-columns: 1fr; } }
+    @media (max-width: 1100px) { .diagnostics { grid-template-columns: 48px 48px 48px 48px repeat(2, minmax(180px, 1fr)); } }
+    @media (max-width: 768px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .finished-wrap { grid-template-columns: 1fr; } .finished-grid { grid-template-columns: 1fr; } .overlay-row { grid-template-columns: 1fr; } .main-tab-content { padding: 0 12px 12px; } .main-tabs { padding: 12px; } .diagnostics { padding: 8px 10px; grid-template-columns: 48px 48px 48px 48px 1fr; gap: 6px; } .machine-detail-grid { grid-template-columns: 1fr; } .overlay-card { width: calc(100vw - 18px); border-radius: 16px; } .review-edge-arrow.left { left: 8px; } .review-edge-arrow.right { right: 8px; } #overlayReviewStep, .review-form-card { width: 100%; } .people-role-row { grid-template-columns: 1fr; } .operator-directory-row { grid-template-columns: 1fr; gap:6px; padding:10px 12px; } .operator-directory-row.header { display:none; } .operator-directory-label { display:block; } .operator-detail-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
   <div class="diagnostics">
     <button id="serverSettingsBtn" class="server-menu-btn" type="button" aria-label="Open server settings">
       <div class="server-menu-icon"><span></span><span></span><span></span></div>
+    </button>
+    <button id="operatorsDirectoryBtn" class="server-menu-btn" type="button" aria-label="Open operator directory">
+      <img class="menu-ico-img" src="/Images/worker.png" alt="" />
     </button>
     <button id="dailyRolesBtn" class="server-menu-btn" type="button" aria-label="Open people roles">
       <img class="menu-ico-img" src="/Images/admin.ico" alt="" />
@@ -1889,6 +2050,32 @@ DASHBOARD_HTML = """
     </div>
   </div>
 
+  <div id="operatorDirectoryOverlay" class="settings-overlay">
+    <div class="operator-directory-card">
+      <div class="operator-directory-head">
+        <div>
+          <div class="operator-directory-title">Operator Directory</div>
+          <div class="operator-directory-sub">Shows about 10 operators at a time. Scroll for the rest.</div>
+        </div>
+        <button id="operatorDirectoryCloseBtn" class="overlay-close" type="button">Close</button>
+      </div>
+      <div id="operatorDirectoryGrid" class="operator-directory-grid"></div>
+    </div>
+  </div>
+
+  <div id="operatorDetailOverlay" class="settings-overlay">
+    <div class="operator-detail-card">
+      <div class="operator-detail-head">
+        <div>
+          <div id="operatorDetailTitle" class="operator-detail-title">Operator Details</div>
+          <div id="operatorDetailSub" class="operator-detail-sub">Recent machine activity and handled jobs.</div>
+        </div>
+        <button id="operatorDetailCloseBtn" class="overlay-close" type="button">Close</button>
+      </div>
+      <div id="operatorDetailBody" class="operator-detail-body"></div>
+    </div>
+  </div>
+
   <div id="serverSettingsOverlay" class="settings-overlay">
     <div class="settings-card">
       <div class="settings-head">
@@ -2025,8 +2212,17 @@ DASHBOARD_HTML = """
 <script>
   const clientStatus = document.getElementById("client-status");
   const serverSettingsBtn = document.getElementById("serverSettingsBtn");
+  const operatorsDirectoryBtn = document.getElementById("operatorsDirectoryBtn");
   const dailyRolesBtn = document.getElementById("dailyRolesBtn");
   const profileCreatorBtn = document.getElementById("profileCreatorBtn");
+  const operatorDirectoryOverlay = document.getElementById("operatorDirectoryOverlay");
+  const operatorDirectoryCloseBtn = document.getElementById("operatorDirectoryCloseBtn");
+  const operatorDirectoryGrid = document.getElementById("operatorDirectoryGrid");
+  const operatorDetailOverlay = document.getElementById("operatorDetailOverlay");
+  const operatorDetailCloseBtn = document.getElementById("operatorDetailCloseBtn");
+  const operatorDetailTitle = document.getElementById("operatorDetailTitle");
+  const operatorDetailSub = document.getElementById("operatorDetailSub");
+  const operatorDetailBody = document.getElementById("operatorDetailBody");
   const serverSettingsOverlay = document.getElementById("serverSettingsOverlay");
   const serverSettingsCloseBtn = document.getElementById("serverSettingsCloseBtn");
   const settingsNavGeneral = document.getElementById("settingsNavGeneral");
@@ -2157,6 +2353,7 @@ DASHBOARD_HTML = """
   };
   const DEFAULT_MACHINE_CODES = Object.keys(MACHINE_NAME_MAP);
   let latestState = { sessions: [], active_ttl_seconds: 30 };
+  let operatorDirectoryState = [];
   const machineCardEls = new Map();
   let finishedJobsState = [];
   let archivedJobsState = [];
@@ -2533,6 +2730,114 @@ DASHBOARD_HTML = """
     const daily = (dailyRolesState && typeof dailyRolesState === "object") ? dailyRolesState[code] : null;
     if(daily && String(daily.name || "").trim()) return String(daily.name || "").trim();
     return knownPersonNameFromBadge(code) || code;
+  }
+
+  function fmtLocal(ts){
+    if(!ts) return "-";
+    const dt = new Date(ts);
+    if(Number.isNaN(dt.getTime())) return "-";
+    return dt.toLocaleString();
+  }
+
+  function compactPair(primary, secondary){
+    const p = String(primary || "").trim();
+    const s = String(secondary || "").trim();
+    if(!p && !s) return { primary: "-", secondary: "" };
+    if(!p && s) return { primary: s, secondary: "" };
+    if(p && !s) return { primary: p, secondary: "" };
+    if(p === s) return { primary: p, secondary: "" };
+    return { primary: p, secondary: s };
+  }
+
+  function openOperatorDetail(index){
+    const row = Array.isArray(operatorDirectoryState) ? operatorDirectoryState[index] : null;
+    if(!row || !operatorDetailBody) return;
+    const fullName = row.name || "-";
+    const badge = row.is_active ? "ACTIVE" : "IDLE";
+    const activity = Array.isArray(row.all_activity) ? row.all_activity : [];
+    operatorDetailTitle.textContent = fullName;
+    operatorDetailSub.textContent = `ID ${row.id_number || '-'} | ${row.role || 'Operator'} | ${badge}`;
+    const currentPair = compactPair(row.current_machine_name || row.current_machine_code, row.current_job_name || row.current_job_code);
+    const lastPair = compactPair(row.last_machine_name || row.last_machine_code, row.last_job_name || row.last_job_code);
+    const activityHtml = activity.length
+      ? activity.map(item => `<div class="operator-detail-list-item"><strong>${esc(item.label || 'Activity')}</strong><span>${esc(item.detail || '-')}</span><span>${esc(fmtLocal(item.at_utc))}</span></div>`).join('')
+      : '<div class="operator-directory-empty" style="padding:0;">No machine activity recorded yet.</div>';
+    operatorDetailBody.innerHTML = `
+      <div class="operator-detail-grid">
+        <div class="operator-detail-item"><div class="k">Current Machine</div><div class="v">${esc(currentPair.primary)}${currentPair.secondary ? `<br>${esc(currentPair.secondary)}` : ''}</div></div>
+        <div class="operator-detail-item"><div class="k">Last Handled</div><div class="v">${esc(lastPair.primary)}${lastPair.secondary ? `<br>${esc(lastPair.secondary)}` : ''}</div></div>
+        <div class="operator-detail-item"><div class="k">Last Activity</div><div class="v">${esc(fmtLocal(row.last_activity_at_utc))}</div></div>
+      </div>
+      <div class="operator-detail-section">
+        <h4>Recent Activity</h4>
+        <div class="operator-detail-list">${activityHtml}</div>
+      </div>
+    `;
+    operatorDetailOverlay?.classList.add("active");
+  }
+
+  function renderOperatorDirectory(items){
+    const rows = Array.isArray(items) ? items : [];
+    if(!operatorDirectoryGrid) return;
+    operatorDirectoryState = rows.slice();
+    if(!rows.length){
+      operatorDirectoryGrid.innerHTML = '<div class="operator-directory-empty">No operator profiles found yet.</div>';
+      return;
+    }
+    const header = `<div class="operator-directory-row header">
+      <div>Operator</div>
+      <div>Current Machine</div>
+      <div>Last Handled</div>
+      <div>Last Activity</div>
+      <div>Status</div>
+    </div>`;
+    const body = rows.map((x, index) => {
+      const badge = x.is_active ? '<span class="operator-directory-badge live">ACTIVE</span>' : '<span class="operator-directory-badge">IDLE</span>';
+      const currentPair = compactPair(x.current_machine_name || x.current_machine_code, x.current_job_name || x.current_job_code);
+      const lastPair = compactPair(x.last_machine_name || x.last_machine_code, x.last_job_name || x.last_job_code);
+      const activity = Array.isArray(x.recent_activity) ? x.recent_activity : [];
+      const recentPreview = activity.length
+        ? activity.map(item => `${item.label || 'Activity'}: ${item.detail || '-'}`).slice(0, 2).join(' | ')
+        : 'No machine activity recorded yet.';
+      return `<div class="operator-directory-row" data-operator-index="${index}">
+        <div class="operator-directory-name">
+          <strong>${esc(x.name || '-')}</strong>
+          <div class="operator-directory-meta">ID ${esc(x.id_number || '-')} | ${esc(x.role || 'Operator')}</div>
+        </div>
+        <div class="operator-directory-cell">
+          <div class="operator-directory-label">Current Machine</div>
+          <div class="operator-directory-value">${esc(currentPair.primary)}</div>
+          ${currentPair.secondary ? `<div class="operator-directory-subvalue">${esc(currentPair.secondary)}</div>` : ``}
+        </div>
+        <div class="operator-directory-cell">
+          <div class="operator-directory-label">Last Handled</div>
+          <div class="operator-directory-value">${esc(lastPair.primary)}</div>
+          ${lastPair.secondary ? `<div class="operator-directory-subvalue">${esc(lastPair.secondary)}</div>` : ``}
+        </div>
+        <div class="operator-directory-cell">
+          <div class="operator-directory-label">Last Activity</div>
+          <div class="operator-directory-value">${esc(fmtLocal(x.last_activity_at_utc))}</div>
+          <div class="operator-directory-subvalue">${esc(recentPreview)}</div>
+        </div>
+        <div class="operator-directory-cell">
+          <div class="operator-directory-label">Status</div>
+          ${badge}
+        </div>
+      </div>`;
+    }).join('');
+    operatorDirectoryGrid.innerHTML = header + body;
+  }
+
+  async function loadOperatorDirectory(){
+    if(!operatorDirectoryGrid) return;
+    operatorDirectoryGrid.innerHTML = '<div class="operator-directory-empty">Loading operator activity...</div>';
+    const r = await fetch('/api/profiles/operators');
+    const out = await r.json().catch(() => ({}));
+    if(!r.ok || !out.ok){
+      operatorDirectoryGrid.innerHTML = `<div class="operator-directory-empty">${esc(out.error || 'Failed to load operator activity.')}</div>`;
+      return;
+    }
+    renderOperatorDirectory(out.items || []);
   }
 
   function renderDailyRolesList(items){
@@ -3279,6 +3584,12 @@ DASHBOARD_HTML = """
       setTimeout(() => dailyRoleBadgeInput?.focus(), 0);
     });
   }
+  if(operatorsDirectoryBtn){
+    operatorsDirectoryBtn.addEventListener("click", async () => {
+      operatorDirectoryOverlay?.classList.add("active");
+      await loadOperatorDirectory();
+    });
+  }
   if(profileCreatorBtn){
     profileCreatorBtn.addEventListener("click", async () => {
       const pw = window.prompt("Admin password required to open Profile Creation:", "");
@@ -3298,6 +3609,26 @@ DASHBOARD_HTML = """
       }catch(err){
         alert(`Failed to authorize profile creation: ${err}`);
       }
+    });
+  }
+  if(operatorDirectoryCloseBtn) operatorDirectoryCloseBtn.addEventListener("click", () => operatorDirectoryOverlay?.classList.remove("active"));
+  if(operatorDirectoryOverlay){
+    operatorDirectoryOverlay.addEventListener("click", (ev) => {
+      if(ev.target === operatorDirectoryOverlay) operatorDirectoryOverlay.classList.remove("active");
+    });
+  }
+  if(operatorDirectoryGrid){
+    operatorDirectoryGrid.addEventListener("click", (ev) => {
+      const row = ev.target && ev.target.closest ? ev.target.closest("[data-operator-index]") : null;
+      if(!row) return;
+      const idx = Number(row.getAttribute("data-operator-index") || "-1");
+      if(idx >= 0) openOperatorDetail(idx);
+    });
+  }
+  if(operatorDetailCloseBtn) operatorDetailCloseBtn.addEventListener("click", () => operatorDetailOverlay?.classList.remove("active"));
+  if(operatorDetailOverlay){
+    operatorDetailOverlay.addEventListener("click", (ev) => {
+      if(ev.target === operatorDetailOverlay) operatorDetailOverlay.classList.remove("active");
     });
   }
   if(dailyRolesCloseBtn) dailyRolesCloseBtn.addEventListener("click", () => dailyRolesOverlay?.classList.remove("active"));
@@ -4095,6 +4426,11 @@ def favicon():
 @APP.get("/api/profiles")
 def api_profiles():
     return {"ok": True, "items": PROFILES}
+
+
+@APP.get("/api/profiles/operators")
+def api_profiles_operators():
+    return {"ok": True, "items": build_operator_activity_directory()}
 
 
 @APP.post("/api/profiles")

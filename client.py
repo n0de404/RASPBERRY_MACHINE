@@ -5331,7 +5331,7 @@ QWidget#ClientUIRoot {{
             ):
                 self.status.setText("Cannot finish while downtime/reject flow is active.")
                 return
-            self._finalize_current_operator_shift("JOB_FINISH", emit_event=False)
+            self._finalize_current_operator_shift("JOB_FINISH", emit_event=True)
             finished_payload = self._build_finished_job_payload()
             if self.state.linkage_enabled and (self.state.linkage_jobs or []):
                 total_jobs_in_group = 1 + len(self.state.linkage_jobs or [])
