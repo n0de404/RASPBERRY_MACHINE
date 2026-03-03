@@ -1,6 +1,6 @@
 {
-  "saved_at_utc": "2026-03-02T08:34:15.929898+00:00",
-  "count": 2874,
+  "saved_at_utc": "2026-03-03T06:58:47.712640+00:00",
+  "count": 2872,
   "items": [
     {
       "id": "15",
@@ -6778,34 +6778,24 @@
       "sku": "W-3030-TRAY-SMALL"
     },
     {
+      "id": "10244",
+      "name": "9 Inches Paper Plate Holder - Deluxe",
+      "sku": "W-307-A-ASSTD"
+    },
+    {
       "id": "425",
       "name": "9 Inches Paper Plate Holder Ordinary",
-      "sku": "W-307-ORD-BLUE"
+      "sku": "W-307-ORD-ASSTD"
     },
     {
-      "id": "10264",
-      "name": "9 Inches Paper Plate Holder Ordinary",
-      "sku": "W-307-ORD-GREEN"
-    },
-    {
-      "id": "10265",
-      "name": "9 Inches Paper Plate Holder Ordinary",
-      "sku": "W-307-ORD-RED"
+      "id": "426",
+      "name": "9 Inches Paper Plate Holder",
+      "sku": "W-308-A-ASSTD"
     },
     {
       "id": "427",
       "name": "9 Inches Paper Plate Holder",
-      "sku": "W-308-ORD-BLUE"
-    },
-    {
-      "id": "10254",
-      "name": "9 Inches Paper Plate Holder",
-      "sku": "W-308-ORD-GREEN"
-    },
-    {
-      "id": "10255",
-      "name": "9 Inches Paper Plate Holder",
-      "sku": "W-308-ORD-RED"
+      "sku": "W-308-ORD-ASSTD"
     },
     {
       "id": "10256",

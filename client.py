@@ -14,6 +14,13 @@ from typing import Optional, Dict, Any, List, Set
 
 import requests
 
+try:
+    import pymysql
+    from pymysql.cursors import DictCursor
+except Exception:
+    pymysql = None
+    DictCursor = None
+
 from PyQt6.QtCore import (
     Qt, QObject, QEvent, pyqtSignal, QTimer, QSize, QRectF,
     QPropertyAnimation, QEasingCurve, pyqtProperty,
@@ -60,6 +67,246 @@ REJECT_REVIEW_REQUIRED_ROTATIONS = 4
 USER_QR_PROFILES_FILE = os.path.join(DATABASE_DIR, "user_qr_profiles.json")
 DAILY_ROLE_ASSIGNMENTS_FILE = os.path.join(DATABASE_DIR, "daily_role_assignments.json")
 PRODUCT_CATALOG_CACHE_FILE = os.path.join(DATABASE_DIR, "product_catalog_cache.json")
+FINISHED_JOBS_FILE = os.path.join(DATABASE_DIR, "finished_jobs.json")
+SQL_CONFIG_FILE = os.path.join(DATABASE_DIR, "sql_config.json")
+
+
+def _load_sql_config() -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {
+        "enabled": True,
+        "host": "localhost",
+        "port": 3306,
+        "database": "rpimachineapp_db",
+        "user": "rpimachine_user",
+        "password": "0t1docmtl$tm",
+        "connect_timeout": 5,
+    }
+    try:
+        if os.path.exists(SQL_CONFIG_FILE):
+            with open(SQL_CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                cfg.update(raw)
+    except Exception:
+        pass
+    try:
+        cfg["port"] = int(cfg.get("port", 3306) or 3306)
+    except Exception:
+        cfg["port"] = 3306
+    return cfg
+
+
+def _sql_conn():
+    if pymysql is None:
+        return None
+    cfg = _load_sql_config()
+    if not cfg.get("enabled"):
+        return None
+    try:
+        return pymysql.connect(
+            host=str(cfg.get("host", "localhost")),
+            port=int(cfg.get("port", 3306)),
+            user=str(cfg.get("user", "")),
+            password=str(cfg.get("password", "")),
+            database=str(cfg.get("database", "")),
+            charset="utf8mb4",
+            cursorclass=DictCursor,
+            autocommit=False,
+            connect_timeout=int(cfg.get("connect_timeout", 5) or 5),
+        )
+    except Exception:
+        return None
+
+
+def _ensure_sql_schema() -> bool:
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `user_qr_profiles` (
+                  `id` BIGINT NOT NULL AUTO_INCREMENT,
+                  `id_number` VARCHAR(100) NOT NULL,
+                  `name` VARCHAR(255) NULL,
+                  `role` VARCHAR(100) NULL,
+                  `created_at_utc` VARCHAR(50) NULL,
+                  `print_count` INT NOT NULL DEFAULT 0,
+                  `last_printed_at_utc` VARCHAR(50) NULL,
+                  `raw_json` JSON NOT NULL,
+                  PRIMARY KEY (`id`),
+                  UNIQUE KEY `uq_user_qr_profiles_id_number` (`id_number`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `finished_jobs` (
+                  `id` BIGINT NOT NULL AUTO_INCREMENT,
+                  `finished_at_utc` VARCHAR(50) NULL,
+                  `client_id` VARCHAR(100) NULL,
+                  `machine_code` VARCHAR(50) NULL,
+                  `machine_name` VARCHAR(255) NULL,
+                  `job_code` VARCHAR(100) NULL,
+                  `job_name` VARCHAR(255) NULL,
+                  `operator_id` VARCHAR(255) NULL,
+                  `pack_count` INT NOT NULL DEFAULT 0,
+                  `good_total` INT NOT NULL DEFAULT 0,
+                  `butal_total` INT NOT NULL DEFAULT 0,
+                  `reject_total` INT NOT NULL DEFAULT 0,
+                  `total_good` INT NOT NULL DEFAULT 0,
+                  `startup_reject_total` INT NOT NULL DEFAULT 0,
+                  `raw_sacks_count` INT NOT NULL DEFAULT 0,
+                  `downtime_last_seconds` INT NULL,
+                  `downtime_reason_code` VARCHAR(50) NULL,
+                  `downtime_reason_text` TEXT NULL,
+                  `cycle_time_current` VARCHAR(100) NULL,
+                  `maintenance_name` VARCHAR(255) NULL,
+                  `supervisor_name` VARCHAR(255) NULL,
+                  `approved_by` VARCHAR(255) NULL,
+                  `approved_by_code` VARCHAR(100) NULL,
+                  `approved_by_role` VARCHAR(100) NULL,
+                  `approved_remarks` TEXT NULL,
+                  `approved_at_utc` VARCHAR(50) NULL,
+                  `review_status` VARCHAR(100) NULL,
+                  `linkage_enabled` TINYINT NOT NULL DEFAULT 0,
+                  `linkage_job_code` VARCHAR(100) NULL,
+                  `linkage_job_name` VARCHAR(255) NULL,
+                  `linkage_role` VARCHAR(50) NULL,
+                  `linkage_group_total_jobs` INT NULL,
+                  `linkage_main_job_code` VARCHAR(100) NULL,
+                  `linkage_main_job_name` VARCHAR(255) NULL,
+                  `linkage_note` TEXT NULL,
+                  `reject_breakdown` JSON NOT NULL,
+                  `raw_material_scans` JSON NOT NULL,
+                  `raw_material_logs` JSON NOT NULL,
+                  `job_payload` JSON NOT NULL,
+                  `reject_review_logs` JSON NOT NULL,
+                  `linkage_job_payload` JSON NULL,
+                  `linkage_jobs` JSON NULL,
+                  `linkage_mirror` JSON NULL,
+                  `review_history` JSON NULL,
+                  `raw_json` JSON NOT NULL,
+                  PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _load_profiles_sql() -> List[Dict[str, Any]]:
+    conn = _sql_conn()
+    if conn is None:
+        return []
+    try:
+        items: List[Dict[str, Any]] = []
+        with conn.cursor() as cur:
+            cur.execute("SELECT `raw_json` FROM `user_qr_profiles` ORDER BY `id` ASC")
+            for row in cur.fetchall() or []:
+                raw = row.get("raw_json")
+                if isinstance(raw, dict):
+                    items.append(raw)
+                elif isinstance(raw, str):
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        items.append(parsed)
+        return items
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def _save_profiles_sql(rows: List[Dict[str, Any]]) -> bool:
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM `user_qr_profiles`")
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO `user_qr_profiles`
+                    (`id_number`,`name`,`role`,`created_at_utc`,`print_count`,`last_printed_at_utc`,`raw_json`)
+                    VALUES (%s,%s,%s,%s,%s,%s,CAST(%s AS JSON))
+                    """,
+                    (
+                        row.get("id_number"),
+                        row.get("name"),
+                        row.get("role"),
+                        row.get("created_at_utc"),
+                        int(row.get("print_count", 0) or 0),
+                        row.get("last_printed_at_utc"),
+                        json.dumps(row, ensure_ascii=False),
+                    ),
+                )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _insert_finished_job_sql(row: Dict[str, Any]) -> bool:
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO `finished_jobs`
+                (`finished_at_utc`,`client_id`,`machine_code`,`machine_name`,`job_code`,`job_name`,`operator_id`,
+                 `pack_count`,`good_total`,`butal_total`,`reject_total`,`total_good`,`startup_reject_total`,`raw_sacks_count`,
+                 `downtime_last_seconds`,`downtime_reason_code`,`downtime_reason_text`,`cycle_time_current`,`maintenance_name`,`supervisor_name`,
+                 `approved_by`,`approved_by_code`,`approved_by_role`,`approved_remarks`,`approved_at_utc`,`review_status`,
+                 `linkage_enabled`,`linkage_job_code`,`linkage_job_name`,`linkage_role`,`linkage_group_total_jobs`,
+                 `linkage_main_job_code`,`linkage_main_job_name`,`linkage_note`,
+                 `reject_breakdown`,`raw_material_scans`,`raw_material_logs`,`job_payload`,`reject_review_logs`,
+                 `linkage_job_payload`,`linkage_jobs`,`linkage_mirror`,`review_history`,`raw_json`)
+                VALUES
+                (%s,%s,%s,%s,%s,%s,%s,
+                 %s,%s,%s,%s,%s,%s,%s,
+                 %s,%s,%s,%s,%s,%s,
+                 %s,%s,%s,%s,%s,%s,
+                 %s,%s,%s,%s,%s,
+                 %s,%s,%s,
+                 CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),
+                 CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON))
+                """,
+                (
+                    row.get("finished_at_utc"), row.get("client_id"), row.get("machine_code"), row.get("machine_name"), row.get("job_code"), row.get("job_name"), row.get("operator_id"),
+                    int(row.get("pack_count", 0) or 0), int(row.get("good_total", 0) or 0), int(row.get("butal_total", 0) or 0), int(row.get("reject_total", 0) or 0), int(row.get("total_good", 0) or 0), int(row.get("startup_reject_total", 0) or 0), int(row.get("raw_sacks_count", 0) or 0),
+                    row.get("downtime_last_seconds"), row.get("downtime_reason_code"), row.get("downtime_reason_text"), row.get("cycle_time_current"), row.get("maintenance_name"), row.get("supervisor_name"),
+                    row.get("approved_by"), row.get("approved_by_code"), row.get("approved_by_role"), row.get("approved_remarks"), row.get("approved_at_utc"), row.get("review_status"),
+                    1 if row.get("linkage_enabled") else 0, row.get("linkage_job_code"), row.get("linkage_job_name"), row.get("linkage_role"), row.get("linkage_group_total_jobs"),
+                    row.get("linkage_main_job_code"), row.get("linkage_main_job_name"), row.get("linkage_note"),
+                    json.dumps(row.get("reject_breakdown", {}), ensure_ascii=False), json.dumps(row.get("raw_material_scans", []), ensure_ascii=False), json.dumps(row.get("raw_material_logs", []), ensure_ascii=False), json.dumps(row.get("job_payload", {}), ensure_ascii=False), json.dumps(row.get("reject_review_logs", []), ensure_ascii=False),
+                    json.dumps(row.get("linkage_job_payload"), ensure_ascii=False), json.dumps(row.get("linkage_jobs"), ensure_ascii=False), json.dumps(row.get("linkage_mirror"), ensure_ascii=False), json.dumps(row.get("review_history"), ensure_ascii=False), json.dumps(row, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+_ensure_sql_schema()
 
 
 def _load_client_config() -> Dict[str, Any]:
@@ -2760,8 +3007,7 @@ QWidget#ClientUIRoot {{
                     out_profiles = resp_profiles.json()
                     items = out_profiles.get("items") if isinstance(out_profiles, dict) else None
                     if isinstance(items, list):
-                        self._save_json_file(USER_QR_PROFILES_FILE, items)
-                        ok = True
+                        ok = _save_profiles_sql(items) or ok
 
                 # Daily roles cache (stored locally as {date: items})
                 resp_roles = requests.get(f"{server_url}/api/daily-roles", headers=headers, timeout=2.5)
@@ -2786,13 +3032,6 @@ QWidget#ClientUIRoot {{
                             self._save_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, local_daily)
                             ok = True
 
-                # Consider success if at least profiles synced, even with no daily roles.
-                if not ok:
-                    try:
-                        if os.path.exists(USER_QR_PROFILES_FILE):
-                            ok = True
-                    except Exception:
-                        ok = False
             except Exception:
                 ok = False
             finally:
@@ -2835,17 +3074,16 @@ QWidget#ClientUIRoot {{
             caps.add("qc")
             display_name = display_name or QC_BADGES[code]
 
-        # Profile-based role from server-generated local profile cache.
-        profiles = self._load_json_file(USER_QR_PROFILES_FILE, [])
-        if isinstance(profiles, list):
-            for row in profiles:
-                if not isinstance(row, dict):
-                    continue
-                if str(row.get("id_number") or "").strip() != code:
-                    continue
-                display_name = display_name or str(row.get("name") or "").strip()
-                caps.update(self._role_caps_from_text(row.get("role")))
-                break
+        # Profile-based role from SQL-backed profile cache.
+        profiles = _load_profiles_sql()
+        for row in profiles:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("id_number") or "").strip() != code:
+                continue
+            display_name = display_name or str(row.get("name") or "").strip()
+            caps.update(self._role_caps_from_text(row.get("role")))
+            break
 
         # Daily assignments can grant temporary rights (including both).
         daily_map = self._load_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, {})
@@ -3464,20 +3702,7 @@ QWidget#ClientUIRoot {{
         self.linkageMirrorOuter.setVisible(bool(s.machine_code))
 
     def _save_finished_job_local(self, payload: Dict[str, Any]):
-        os.makedirs(DATABASE_DIR, exist_ok=True)
-        p = os.path.join(DATABASE_DIR, "finished_jobs_client.json")
-        rows: List[Dict[str, Any]] = []
-        try:
-            if os.path.exists(p):
-                with open(p, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                if isinstance(loaded, list):
-                    rows = loaded
-        except Exception:
-            rows = []
-        rows.append(payload)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(rows, f, ensure_ascii=False, indent=2)
+        _insert_finished_job_sql(payload)
 
     def _active_session_file_path(self) -> str:
         os.makedirs(DATABASE_DIR, exist_ok=True)

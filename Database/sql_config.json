@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "host": "localhost",
+  "port": 3306,
+  "database": "rpimachineapp_db",
+  "user": "rpimachine_user",
+  "password": "0t1docmtl$tm",
+  "connect_timeout": 5
+}
