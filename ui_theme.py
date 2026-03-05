@@ -244,74 +244,119 @@ QFrame[role="stat"] {
 QLabel#StatTitle {
     font-size: 16px;
     color: #e2e8f0;
-    font-weight: 800;
+    font-weight: 900;
     text-transform: uppercase;
     letter-spacing: 0.7px;
 }
 QLabel#StatValue {
     font-family: "Segoe UI Variable Display", "Bahnschrift", "Inter";
     font-size: 46px;
-    font-weight: 800;
+    font-weight: 900;
     color: #22d3ee;
 }
 QFrame#StatPack QLabel#StatValue {
-    color: #38bdf8;
+    color: #86efac;
 }
 QFrame#StatGood QLabel#StatValue {
-    color: #22d3ee;
+    color: #86efac;
 }
 QFrame#StatButal QLabel#StatValue {
-    color: #34d399;
+    color: #86efac;
 }
 QFrame#StatReject QLabel#StatValue {
-    color: #fb7185;
+    color: #fecdd3;
 }
 QFrame#StatTotalGood QLabel#StatValue {
-    color: #86efac;
+    color: #bbf7d0;
 }
 
 /* Pack / Butal / Reject with stronger identity */
 QFrame#StatPack {
-    background: #0c4a6e;
-    border: 1px solid #38bdf8;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #1f7a3d,
+                                stop:0.48 #166534,
+                                stop:1 #14532d);
+    border: 1px solid #22c55e;
+    border-top: 2px solid #4ade80;
+    border-left: 2px solid #4ade80;
+    border-right: 2px solid #14532d;
+    border-bottom: 2px solid #14532d;
 }
 QFrame#StatButal {
-    background: #14532d;
-    border: 1px solid #34d399;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #1f7a3d,
+                                stop:0.48 #166534,
+                                stop:1 #14532d);
+    border: 1px solid #22c55e;
+    border-top: 2px solid #4ade80;
+    border-left: 2px solid #4ade80;
+    border-right: 2px solid #14532d;
+    border-bottom: 2px solid #14532d;
 }
 QFrame#StatReject {
-    background: #7f1d1d;
-    border: 1px solid #fb7185;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #b91c1c,
+                                stop:0.48 #991b1b,
+                                stop:1 #7f1d1d);
+    border: 1px solid #ef4444;
+    border-top: 2px solid #f87171;
+    border-left: 2px solid #f87171;
+    border-right: 2px solid #7f1d1d;
+    border-bottom: 2px solid #7f1d1d;
 }
 QFrame#StatGood {
-    background: #164e63;
-    border: 1px solid #22d3ee;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #1f7a3d,
+                                stop:0.48 #166534,
+                                stop:1 #14532d);
+    border: 1px solid #22c55e;
+    border-top: 2px solid #4ade80;
+    border-left: 2px solid #4ade80;
+    border-right: 2px solid #14532d;
+    border-bottom: 2px solid #14532d;
 }
 QFrame#StatTotalGood {
-    background: #052e16;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #2a8a49,
+                                stop:0.5 #1b6d3a,
+                                stop:1 #165c32);
     border: 1px solid #4ade80;
+    border-top: 2px solid #86efac;
+    border-left: 2px solid #86efac;
+    border-right: 2px solid #165c32;
+    border-bottom: 2px solid #165c32;
 }
 
 /* short pulse state toggled from client.py */
 QFrame#StatPack[flash="1"] {
-    border: 2px solid #2563eb;
-    background: #dbeafe;
+    border: 2px solid #22c55e;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #34d399,
+                                stop:1 #15803d);
 }
 QFrame#StatGood[flash="1"] {
-    border: 2px solid #0891b2;
-    background: #cffafe;
+    border: 2px solid #22c55e;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #34d399,
+                                stop:1 #15803d);
 }
 QFrame#StatButal[flash="1"] {
-    border: 2px solid #16a34a;
-    background: #dcfce7;
+    border: 2px solid #22c55e;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #34d399,
+                                stop:1 #15803d);
 }
 QFrame#StatReject[flash="1"] {
-    border: 2px solid #dc2626;
-    background: #fee2e2;
+    border: 2px solid #ef4444;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #f87171,
+                                stop:1 #b91c1c);
 }
 QFrame#StatTotalGood[flash="1"] {
-    border: 2px solid #22c55e;
-    background: #dcfce7;
+    border: 2px solid #4ade80;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #6ee7b7,
+                                stop:1 #16a34a);
 }
 
 /* Optional accent bar (if you add a child frame inside each stat) */

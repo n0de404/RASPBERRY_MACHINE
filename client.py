@@ -51,7 +51,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ANIMATIONS_DIR = os.path.join(BASE_DIR, "Animations")
 IMAGES_DIR = os.path.join(BASE_DIR, "Images")
 DATABASE_DIR = os.path.join(BASE_DIR, "Database")
-CLIENT_SETTINGS_FILE = os.path.join(DATABASE_DIR, "client_settings.json")
 JOB_API_CONFIG_FILE = os.path.join(DATABASE_DIR, "job_api_config.json")
 INVALID_SCAN_GIF = os.environ.get(
     "MACHINE_INVALID_SCAN_GIF",
@@ -65,7 +64,6 @@ SUPERVISOR_BADGES = {"3000001": "Charlie Brown"}
 QC_BADGES = {"4000001": "Lucy Van Pelt"}
 REJECT_REVIEW_REQUIRED_ROTATIONS = 4
 USER_QR_PROFILES_FILE = os.path.join(DATABASE_DIR, "user_qr_profiles.json")
-DAILY_ROLE_ASSIGNMENTS_FILE = os.path.join(DATABASE_DIR, "daily_role_assignments.json")
 PRODUCT_CATALOG_CACHE_FILE = os.path.join(DATABASE_DIR, "product_catalog_cache.json")
 FINISHED_JOBS_FILE = os.path.join(DATABASE_DIR, "finished_jobs.json")
 SQL_CONFIG_FILE = os.path.join(DATABASE_DIR, "sql_config.json")
@@ -192,6 +190,54 @@ def _ensure_sql_schema() -> bool:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `daily_role_assignments` (
+                  `id` BIGINT NOT NULL AUTO_INCREMENT,
+                  `assignment_date` VARCHAR(20) NOT NULL,
+                  `badge_id` VARCHAR(100) NOT NULL,
+                  `name` VARCHAR(255) NULL,
+                  `rights` VARCHAR(50) NULL,
+                  `company_role` VARCHAR(100) NULL,
+                  `extra_privilege` VARCHAR(50) NULL,
+                  `updated_at_utc` VARCHAR(50) NULL,
+                  `raw_json` JSON NOT NULL,
+                  PRIMARY KEY (`id`),
+                  UNIQUE KEY `uq_daily_role_assignments_date_badge` (`assignment_date`, `badge_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `active_machine_sessions` (
+                  `id` BIGINT NOT NULL AUTO_INCREMENT,
+                  `machine_code` VARCHAR(50) NOT NULL,
+                  `saved_at_utc` VARCHAR(50) NULL,
+                  `machine_name` VARCHAR(255) NULL,
+                  `job_code` VARCHAR(100) NULL,
+                  `job_name` VARCHAR(255) NULL,
+                  `operator_id` VARCHAR(255) NULL,
+                  `raw_json` JSON NOT NULL,
+                  PRIMARY KEY (`id`),
+                  UNIQUE KEY `uq_active_machine_sessions_machine_code` (`machine_code`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `client_settings` (
+                  `id` BIGINT NOT NULL AUTO_INCREMENT,
+                  `server_url` VARCHAR(500) NULL,
+                  `client_id` VARCHAR(100) NULL,
+                  `scanner_mode` VARCHAR(50) NULL,
+                  `scanner_com_port` VARCHAR(100) NULL,
+                  `scanner_baudrate` INT NOT NULL DEFAULT 9600,
+                  `scanner_timeout` DOUBLE NOT NULL DEFAULT 1.0,
+                  `raw_json` JSON NOT NULL,
+                  PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
         conn.commit()
         return True
     except Exception:
@@ -260,6 +306,251 @@ def _save_profiles_sql(rows: List[Dict[str, Any]]) -> bool:
         conn.close()
 
 
+def _load_daily_role_assignments_sql() -> Dict[str, Any]:
+    conn = _sql_conn()
+    if conn is None:
+        return {}
+    try:
+        out: Dict[str, Any] = {}
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT `assignment_date`, `badge_id`, `raw_json` FROM `daily_role_assignments` ORDER BY `assignment_date` ASC, `badge_id` ASC"
+            )
+            for row in cur.fetchall() or []:
+                assignment_date = str(row.get("assignment_date") or "").strip()
+                badge_id = str(row.get("badge_id") or "").strip()
+                raw = row.get("raw_json")
+                item = raw if isinstance(raw, dict) else None
+                if item is None and isinstance(raw, str):
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        item = parsed
+                if not assignment_date or not badge_id or not isinstance(item, dict):
+                    continue
+                date_rows = out.get(assignment_date)
+                if not isinstance(date_rows, dict):
+                    date_rows = {}
+                    out[assignment_date] = date_rows
+                date_rows[badge_id] = item
+        return out
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+def _save_daily_role_assignments_sql(rows: Dict[str, Any]) -> bool:
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM `daily_role_assignments`")
+            for assignment_date, items in (rows or {}).items():
+                date_key = str(assignment_date or "").strip()
+                if not date_key or not isinstance(items, dict):
+                    continue
+                for badge_id, raw_row in items.items():
+                    badge_key = str(badge_id or "").strip()
+                    if not badge_key or not isinstance(raw_row, dict):
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO `daily_role_assignments`
+                        (`assignment_date`,`badge_id`,`name`,`rights`,`company_role`,`extra_privilege`,`updated_at_utc`,`raw_json`)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,CAST(%s AS JSON))
+                        """,
+                        (
+                            date_key,
+                            badge_key,
+                            raw_row.get("name"),
+                            raw_row.get("rights"),
+                            raw_row.get("company_role"),
+                            raw_row.get("extra_privilege"),
+                            raw_row.get("updated_at_utc"),
+                            json.dumps(raw_row, ensure_ascii=False),
+                        ),
+                    )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _load_active_sessions_sql() -> Dict[str, Any]:
+    conn = _sql_conn()
+    if conn is None:
+        return {}
+    try:
+        out: Dict[str, Any] = {}
+        with conn.cursor() as cur:
+            cur.execute("SELECT `machine_code`, `raw_json` FROM `active_machine_sessions` ORDER BY `machine_code` ASC")
+            for row in cur.fetchall() or []:
+                machine_code = str(row.get("machine_code") or "").strip()
+                raw = row.get("raw_json")
+                item = raw if isinstance(raw, dict) else None
+                if item is None and isinstance(raw, str):
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        item = parsed
+                if machine_code and isinstance(item, dict):
+                    out[machine_code] = item
+        return out
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
+    machine_code = str((row or {}).get("machine_code") or "").strip()
+    if not machine_code:
+        return False
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO `active_machine_sessions`
+                (`machine_code`,`saved_at_utc`,`machine_name`,`job_code`,`job_name`,`operator_id`,`raw_json`)
+                VALUES (%s,%s,%s,%s,%s,%s,CAST(%s AS JSON))
+                ON DUPLICATE KEY UPDATE
+                  `saved_at_utc`=VALUES(`saved_at_utc`),
+                  `machine_name`=VALUES(`machine_name`),
+                  `job_code`=VALUES(`job_code`),
+                  `job_name`=VALUES(`job_name`),
+                  `operator_id`=VALUES(`operator_id`),
+                  `raw_json`=VALUES(`raw_json`)
+                """,
+                (
+                    machine_code,
+                    row.get("saved_at_utc"),
+                    row.get("machine_name"),
+                    row.get("job_code"),
+                    row.get("job_name"),
+                    row.get("operator_id"),
+                    json.dumps(row, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _delete_active_session_sql(machine_code: Optional[str]) -> bool:
+    code = str(machine_code or "").strip()
+    if not code:
+        return False
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM `active_machine_sessions` WHERE `machine_code`=%s", (code,))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _load_client_settings_sql() -> Dict[str, Any]:
+    conn = _sql_conn()
+    if conn is None:
+        return {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT `raw_json` FROM `client_settings` ORDER BY `id` DESC LIMIT 1")
+            row = cur.fetchone() or {}
+        raw = row.get("raw_json")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+        return {}
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+def _save_client_settings_sql(row: Dict[str, Any]) -> bool:
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM `client_settings`")
+            cur.execute(
+                """
+                INSERT INTO `client_settings`
+                (`server_url`,`client_id`,`scanner_mode`,`scanner_com_port`,`scanner_baudrate`,`scanner_timeout`,`raw_json`)
+                VALUES (%s,%s,%s,%s,%s,%s,CAST(%s AS JSON))
+                """,
+                (
+                    row.get("server_url"),
+                    row.get("client_id"),
+                    row.get("scanner_mode"),
+                    row.get("scanner_com_port"),
+                    int(row.get("scanner_baudrate", SCANNER_BAUDRATE) or SCANNER_BAUDRATE),
+                    float(row.get("scanner_timeout", SCANNER_TIMEOUT) or SCANNER_TIMEOUT),
+                    json.dumps(row, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _migrate_active_sessions_json_to_sql() -> bool:
+    legacy_path = os.path.join(DATABASE_DIR, "active_machine_sessions.json")
+    if not os.path.exists(legacy_path):
+        return True
+    sql_rows = _load_active_sessions_sql()
+    if sql_rows:
+        return True
+    try:
+        with open(legacy_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except Exception:
+        return False
+    if not isinstance(loaded, dict):
+        return False
+    ok = True
+    for machine_code, row in loaded.items():
+        if not isinstance(row, dict):
+            continue
+        payload = dict(row)
+        payload["machine_code"] = str(payload.get("machine_code") or machine_code or "").strip()
+        if not payload["machine_code"]:
+            ok = False
+            continue
+        ok = _upsert_active_session_sql(payload) and ok
+    return ok
+
+
 def _insert_finished_job_sql(row: Dict[str, Any]) -> bool:
     conn = _sql_conn()
     if conn is None:
@@ -307,6 +598,7 @@ def _insert_finished_job_sql(row: Dict[str, Any]) -> bool:
 
 
 _ensure_sql_schema()
+_migrate_active_sessions_json_to_sql()
 
 
 def _load_client_config() -> Dict[str, Any]:
@@ -318,14 +610,9 @@ def _load_client_config() -> Dict[str, Any]:
         "scanner_baudrate": SCANNER_BAUDRATE,
         "scanner_timeout": SCANNER_TIMEOUT,
     }
-    try:
-        if os.path.exists(CLIENT_SETTINGS_FILE):
-            with open(CLIENT_SETTINGS_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                defaults.update(raw)
-    except Exception:
-        pass
+    raw = _load_client_settings_sql()
+    if isinstance(raw, dict):
+        defaults.update(raw)
 
     defaults["server_url"] = str(defaults.get("server_url", SERVER_URL)).strip().rstrip("/")
     defaults["client_id"] = str(defaults.get("client_id", CLIENT_ID)).strip() or CLIENT_ID
@@ -405,12 +692,7 @@ def _save_job_api_config(cfg: Dict[str, Any]):
 
 
 def _save_client_config(cfg: Dict[str, Any]):
-    try:
-        os.makedirs(DATABASE_DIR, exist_ok=True)
-        with open(CLIENT_SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    _save_client_settings_sql(cfg)
 
 
 def _machine_display_name(machine_code: Optional[str], machine_name: Optional[str] = None) -> str:
@@ -608,9 +890,33 @@ class HeartbeatBorderPulseOverlay(QWidget):
         self._pattern_index = 0
         self._active_mode = False
         self._target_rect = QRectF()
+        self._duration = 1.2
+        self._start_out = 2.0
+        self._end_out = 14.0
+        self._glow_scale = 1.0
+        self._core_scale = 1.0
+        self._alpha_scale = 1.0
 
     def set_target_rect(self, rect: QRectF):
         self._target_rect = QRectF(rect)
+        self.update()
+
+    def set_pulse_profile(
+        self,
+        *,
+        duration: float = 1.2,
+        start_out: float = 2.0,
+        end_out: float = 14.0,
+        glow_scale: float = 1.0,
+        core_scale: float = 1.0,
+        alpha_scale: float = 1.0,
+    ):
+        self._duration = max(0.2, float(duration))
+        self._start_out = max(0.0, float(start_out))
+        self._end_out = max(self._start_out, float(end_out))
+        self._glow_scale = max(0.0, float(glow_scale))
+        self._core_scale = max(0.0, float(core_scale))
+        self._alpha_scale = max(0.0, float(alpha_scale))
         self.update()
 
     def set_mode(self, active: bool):
@@ -637,7 +943,7 @@ class HeartbeatBorderPulseOverlay(QWidget):
             self.pulses.append(StatusPulse(age=0.0))
             self._pattern_index += 1
 
-        max_age = 1.2
+        max_age = self._duration
         keep: List[StatusPulse] = []
         for pl in self.pulses:
             pl.age += dt
@@ -656,14 +962,14 @@ class HeartbeatBorderPulseOverlay(QWidget):
         p.end()
 
     def _draw_pulse_ring(self, p: QPainter, card: QRectF, base_radius: float, age: float):
-        duration = 1.2
+        duration = self._duration
         u = max(0.0, min(1.0, age / duration))
-        start_out = 2.0
-        end_out = 14.0
+        start_out = self._start_out
+        end_out = self._end_out
         out = start_out + (end_out - start_out) * (u ** 0.85)
-        alpha = int(255 * (1.0 - u) ** 1.6)
-        glow_w = 7.0 * (1.0 - u) + 1.4
-        core_w = 2.0 * (1.0 - u) + 1.0
+        alpha = int(255 * self._alpha_scale * (1.0 - u) ** 1.6)
+        glow_w = self._glow_scale * (7.0 * (1.0 - u) + 1.4)
+        core_w = self._core_scale * (2.0 * (1.0 - u) + 1.0)
         base = QColor("#22c55e" if self._active_mode else "#f97316")
 
         ring = QRectF(
@@ -882,6 +1188,14 @@ QWidget#ClientUIRoot {{
 
         # Production panel
         self.cardProductionOuter, self.cardProduction = self._make_double_layer_card("Production")
+        # Keep only the stat cards visible for this strip.
+        self.cardProductionOuter.setStyleSheet("QFrame#LeftCardOuter { background: transparent; border: none; }")
+        self.cardProduction.setStyleSheet("QFrame#LeftCardInner { background: transparent; border: none; }")
+        self.cardProduction.layout().setContentsMargins(0, 0, 0, 0)
+        self.cardProduction.layout().setSpacing(0)
+        _production_title = self.cardProduction.findChild(QLabel, "SectionTitle")
+        if _production_title is not None:
+            _production_title.hide()
         statRow = QHBoxLayout()
         statRow.setSpacing(6)
         self.lblPack = QLabel("0")
@@ -894,121 +1208,114 @@ QWidget#ClientUIRoot {{
         self.cardStatButal = self._make_stat_card("Butal", self.lblButal, "StatButal")
         self.cardStatReject = self._make_stat_card("Reject", self.lblReject, "StatReject")
         self.cardStatTotalGood = self._make_stat_card("Total Good", self.lblTotalGood, "StatTotalGood")
-        statRow.addWidget(self.cardStatPack)
-        statRow.addWidget(self.cardStatGood)
-        statRow.addWidget(self.cardStatButal)
-        statRow.addWidget(self.cardStatReject)
-        statRow.addWidget(self.cardStatTotalGood)
+        for card in (
+            self.cardStatPack,
+            self.cardStatGood,
+            self.cardStatButal,
+            self.cardStatReject,
+            self.cardStatTotalGood,
+        ):
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            card.setMinimumHeight(60)
+            statRow.addWidget(card, 1)
         self.cardProduction.layout().addLayout(statRow)
-        self.cardProductionOuter.setMinimumHeight(154)
-        self.cardProductionOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.cardProductionOuter.setMinimumHeight(100)
+        self.cardProductionOuter.setMaximumHeight(120)
+        self.cardProductionOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         grid.addWidget(self.cardProductionOuter, 0, 0, 1, 2)
 
         # Session panel
         self.cardSessionOuter, self.cardSession = self._make_double_layer_card("Session")
+        _session_title = self.cardSession.findChild(QLabel, "SectionTitle")
+        if _session_title is not None:
+            _session_title.hide()
         sessionGrid = QGridLayout()
         sessionGrid.setHorizontalSpacing(12)
-        sessionGrid.setVerticalSpacing(10)
-        sessionGrid.setContentsMargins(0, 0, 10, 0)
+        sessionGrid.setVerticalSpacing(8)
+        sessionGrid.setContentsMargins(0, 0, 0, 0)
         sessionGrid.setColumnStretch(0, 0)
         sessionGrid.setColumnStretch(1, 1)
 
         self.lblMachine = QLabel("-")
         self.lblJob = QLabel("-")
         self.lblOperator = QLabel("-")
+        self.machineAnim.setText("Machine Status: IDLE")
+        self.machineAnim.setFixedHeight(40)
+        self.machineAnim.setMinimumWidth(0)
+        self.machineAnim.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.machineAnim.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        _machine_status_spacer = QWidget()
+        _machine_status_spacer.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        sessionGrid.addWidget(_machine_status_spacer, 0, 0)
+        sessionGrid.addWidget(self.machineAnim, 0, 1)
 
         session_rows = [
             ("Machine", self.lblMachine),
             ("Job", self.lblJob),
             ("Operator", self.lblOperator),
         ]
-        for i, (name, value_lbl) in enumerate(session_rows):
-            n = self._make_meta_label_with_icon(name)
+        for i, (name, value_lbl) in enumerate(session_rows, start=1):
             value_lbl.setObjectName("MetaValue")
             value_lbl.setMinimumWidth(260)
-            value_lbl.setMinimumHeight(40)
+            value_lbl.setFixedHeight(40)
+            value_lbl.setWordWrap(True)
+            value_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
             value_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            sessionGrid.addWidget(n, i, 0)
-            sessionGrid.addWidget(value_lbl, i, 1)
+            session_value_widget = value_lbl
+            sessionGrid.addWidget(session_value_widget, i, 0, 1, 2)
         self.cardSession.layout().addLayout(sessionGrid)
-        self.cardSessionOuter.setMinimumHeight(191)
-        self.cardSessionOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        grid.addWidget(self.cardSessionOuter, 1, 0)
+        self.machinePulseOverlay = HeartbeatBorderPulseOverlay(self.cardSession)
+        self.machinePulseOverlay.setGeometry(self.cardSession.rect())
+        self.machinePulseOverlay.set_pulse_profile(
+            duration=1.0,
+            start_out=1.0,
+            end_out=8.0,
+            glow_scale=0.65,
+            core_scale=0.75,
+            alpha_scale=0.72,
+        )
+        self.machinePulseOverlay.raise_()
+        self.cardSessionOuter.setMinimumHeight(186)
+        self.cardSessionOuter.setMaximumHeight(228)
+        self.cardSessionOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
         # Reject detail panel
         self.cardRejectOuter, self.cardReject = self._make_double_layer_card("Reject Details")
-        self.rejectDetailGrid = QGridLayout()
-        self.rejectDetailGrid.setHorizontalSpacing(8)
-        self.rejectDetailGrid.setVerticalSpacing(6)
-        self.reject_detail_labels: Dict[str, QLabel] = {}
+        self.rejectDetailTable = QTableWidget(1, len(REJECT_DETAIL_ITEMS))
+        self.rejectDetailTable.setHorizontalHeaderLabels([code for code, _ in REJECT_DETAIL_ITEMS])
+        self.rejectDetailTable.setAlternatingRowColors(False)
+        self.rejectDetailTable.setWordWrap(False)
+        self.rejectDetailTable.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.rejectDetailTable.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.rejectDetailTable.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.rejectDetailTable.verticalHeader().setVisible(False)
+        self.rejectDetailTable.verticalHeader().setDefaultSectionSize(32)
+        self.rejectDetailTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.rejectDetailTable.setShowGrid(False)
+        self.rejectDetailTable.setMinimumHeight(72)
+        self.rejectDetailTable.setStyleSheet(
+            "QTableWidget { background: transparent; border: none; gridline-color: transparent; }"
+            "QHeaderView::section { background: rgba(226,232,240,0.9); color: #0f172a; font-weight: 900;"
+            " border: none; border-right: 1px solid rgba(148,163,184,0.45);"
+            " border-bottom: 1px solid rgba(148,163,184,0.5); padding: 6px; }"
+            "QTableWidget::item { padding: 2px; color: #0f172a; font-weight: 900;"
+            " border-right: 1px solid rgba(148,163,184,0.35); background: transparent; }"
+        )
+        self.reject_detail_labels: Dict[str, QTableWidgetItem] = {}
+        for col, (code, label) in enumerate(REJECT_DETAIL_ITEMS):
+            qty_item = QTableWidgetItem("0")
+            qty_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.rejectDetailTable.setItem(0, col, qty_item)
+            self.reject_detail_labels[code] = qty_item
 
-        for idx, (code, label) in enumerate(REJECT_DETAIL_ITEMS):
-            item = QLabel(f"{label} = 0")
-            item.setObjectName("RejectDetailItem")
-            item.setWordWrap(False)
-            item.setMinimumHeight(42)
-            item.setProperty("active", "0")
-            item.setProperty("flash", "0")
-            item.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-            self.reject_detail_labels[code] = item
-            row = idx // 4
-            col = idx % 4
-            self.rejectDetailGrid.addWidget(item, row, col)
-
-        self.cardReject.layout().addLayout(self.rejectDetailGrid)
-        self.cardRejectOuter.setMinimumHeight(316)
-        self.cardRejectOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.cardReject.layout().addWidget(self.rejectDetailTable)
+        self.cardRejectOuter.setMinimumHeight(104)
+        self.cardRejectOuter.setMaximumHeight(122)
+        self.cardRejectOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         grid.addWidget(self.cardRejectOuter, 2, 0, 1, 2)
 
-        # Job details panel
-        self.cardJobDetailsOuter, self.cardJobDetails = self._make_double_layer_card("Job Details")
-        self.jobDetailGrid = QGridLayout()
-        self.jobDetailGrid.setHorizontalSpacing(8)
-        self.jobDetailGrid.setVerticalSpacing(6)
-        self.jobDetailGrid.setContentsMargins(0, 0, 0, 0)
-        self.job_detail_labels: Dict[str, QLabel] = {}
-
-        fields = [
-            ("Job Ref", "job_ref"),
-            ("Product ID", "product_id"),
-            ("Mold", "mold"),
-            ("Color", "color"),
-            ("Cavities", "cavities"),
-            ("Sticker Label", "sticker_label"),
-            ("Std Cycle Time", "std_cycle_time"),
-            ("Qty / Shift", "qty_per_shift"),
-        ]
-        for idx, (title, key) in enumerate(fields):
-            card = QFrame()
-            card.setObjectName("SubPanel")
-            card.setLayout(QVBoxLayout())
-            card.layout().setContentsMargins(10, 8, 10, 8)
-            card.layout().setSpacing(4)
-            if key in ("job_ref", "color"):
-                card.layout().setContentsMargins(10, 4, 10, 8)
-                card.layout().setSpacing(2)
-            t = QLabel(title)
-            t.setObjectName("MetaLabel")
-            v = QLabel("-")
-            v.setObjectName("MetaValue")
-            v.setWordWrap(True)
-            v.setMinimumHeight(38)
-            if key in ("job_ref", "color"):
-                v.setMinimumHeight(34)
-            card.layout().addWidget(t)
-            card.layout().addWidget(v)
-            self.job_detail_labels[key] = v
-            row = idx // 3
-            col = idx % 3
-            self.jobDetailGrid.addWidget(card, row, col)
-
-        part_table_card = QFrame()
-        part_table_card.setObjectName("SubPanel")
-        part_table_card.setLayout(QVBoxLayout())
-        part_table_card.layout().setContentsMargins(10, 8, 10, 8)
-        part_table_card.layout().setSpacing(4)
-        part_table_title = QLabel("Parts")
-        part_table_title.setObjectName("MetaLabel")
+        # Product parts panel
+        self.cardJobDetailsOuter, self.cardJobDetails = self._make_double_layer_card("PRODUCT PARTS")
         self.jobPartsTable = QTableWidget(0, 6)
         self.jobPartsTable.setHorizontalHeaderLabels(
             ["Part Product ID", "SKU", "Name", "Part Qty/Unit", "Request Part Qty", "Approve/Complete"]
@@ -1027,33 +1334,121 @@ QWidget#ClientUIRoot {{
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        self.jobPartsTable.setMinimumHeight(150)
-        part_table_card.layout().addWidget(part_table_title)
-        part_table_card.layout().addWidget(self.jobPartsTable)
-        self.jobDetailGrid.addWidget(part_table_card, 3, 0, 1, 3)
-
-        self.cardJobDetails.layout().addLayout(self.jobDetailGrid)
+        # Size table to show up to 10 visible rows without clipping.
+        parts_row_h = self.jobPartsTable.verticalHeader().defaultSectionSize()
+        parts_header_h = self.jobPartsTable.horizontalHeader().height()
+        parts_frame_h = self.jobPartsTable.frameWidth() * 2
+        parts_target_h = parts_header_h + (parts_row_h * 10) + parts_frame_h
+        self.jobPartsTable.setMinimumHeight(parts_target_h)
+        self.jobPartsTable.setMaximumHeight(parts_target_h)
+        self.cardJobDetails.layout().addWidget(self.jobPartsTable)
         self.cardJobDetails.layout().addStretch(1)
-        self.cardJobDetailsOuter.setMinimumHeight(470)
-        self.cardJobDetailsOuter.setMaximumHeight(520)
+        self.cardJobDetailsOuter.setMinimumHeight(280)
+        self.cardJobDetailsOuter.setMaximumHeight(360)
         self.cardJobDetailsOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
-        # Activity panel
-        self.cardActivityOuter, self.cardActivity = self._make_double_layer_card("Activity")
-        self.machineAnim.setText("Machine Status: Idle")
-        self.machineAnim.setMinimumHeight(40)
-        self.machineAnim.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.cardActivity.layout().addWidget(self.machineAnim)
-        self.lblLast = QLabel("-")
-        self.lblLast.setObjectName("MetaValue")
-        self.lblLast.setWordWrap(True)
-        self.cardActivity.layout().addWidget(self.lblLast)
-        self.machinePulseOverlay = HeartbeatBorderPulseOverlay(self.cardActivity)
-        self.machinePulseOverlay.setGeometry(self.cardActivity.rect())
+        # Job details panel beside Session.
+        self.cardActivityOuter, self.cardActivity = self._make_double_layer_card("Job Details")
+        _job_details_title = self.cardActivity.findChild(QLabel, "SectionTitle")
+        if _job_details_title is not None:
+            _job_details_title.hide()
+        self.cardActivity.layout().setContentsMargins(0, 0, 0, 0)
+        self.cardActivity.layout().setSpacing(4)
+        activityGrid = QGridLayout()
+        activityGrid.setHorizontalSpacing(12)
+        activityGrid.setVerticalSpacing(8)
+        activityGrid.setContentsMargins(0, 0, 0, 0)
+        activityGrid.setColumnStretch(0, 0)
+        activityGrid.setColumnStretch(1, 1)
+        self.lblActivityMold = QLabel("-")
+        self.lblActivityColor = QLabel("-")
+        self.lblActivityCavities = QLabel("-")
+        self.lblActivitySticker = QLabel("-")
+        activity_rows = [
+            ("Mold", self.lblActivityMold),
+            ("Color", self.lblActivityColor),
+            ("Cavities", self.lblActivityCavities),
+            ("Sticker Label", self.lblActivitySticker),
+        ]
+        for i, (name, value_lbl) in enumerate(activity_rows):
+            value_lbl.setObjectName("MetaValue")
+            value_lbl.setWordWrap(True)
+            value_lbl.setMinimumWidth(260)
+            value_lbl.setFixedHeight(40)
+            value_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            value_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            activityGrid.addWidget(value_lbl, i, 0, 1, 2, Qt.AlignmentFlag.AlignVCenter)
+        self.cardActivity.layout().addLayout(activityGrid)
+        self.cardActivityOuter.setMinimumHeight(196)
+        self.cardActivityOuter.setMaximumHeight(238)
+        self.cardActivityOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+
+        # Unified frame: Session + Job Details in one shared outer frame.
+        self.cardSessionActivityOuter, self.cardSessionActivity = self._make_double_layer_card("")
+        _session_activity_title = self.cardSessionActivity.findChild(QLabel, "SectionTitle")
+        if _session_activity_title is not None:
+            # Remove the default placeholder title entirely so it doesn't reserve top space.
+            self.cardSessionActivity.layout().removeWidget(_session_activity_title)
+            _session_activity_title.deleteLater()
+        self.cardSessionActivity.layout().setContentsMargins(0, 0, 0, 0)
+        self.cardSessionActivity.layout().setSpacing(6)
+        self.jobDetailsUnifiedTitle = QLabel("Job Details")
+        self.jobDetailsUnifiedTitle.setObjectName("SectionTitle")
+        self.jobDetailsUnifiedTitle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.cardSessionActivity.layout().setContentsMargins(10, 6, 10, 12)
+        self.cardSessionActivity.layout().addWidget(self.jobDetailsUnifiedTitle, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        # Remove individual outer borders so only one frame is visible.
+        self.cardSessionOuter.setStyleSheet("QFrame#LeftCardOuter { background: transparent; border: none; }")
+        self.cardActivityOuter.setStyleSheet("QFrame#LeftCardOuter { background: transparent; border: none; }")
+        # Remove individual inner frames as well.
+        self.cardSession.setStyleSheet("QFrame#LeftCardInner { background: transparent; border: none; }")
+        self.cardActivity.setStyleSheet("QFrame#LeftCardInner { background: transparent; border: none; }")
+
+        # Top-grid cycle fields (separate widgets from right panel cycle widgets).
+        self.topCycleCount = QLabel("Confirmed by: -")
+        self.topCycleCount.setObjectName("MetaValue")
+        self.topCycleCount.setFixedHeight(40)
+        self.topCycleCurrent = QLabel("Cycle Time: ")
+        self.topCycleCurrent.setObjectName("MetaValue")
+        self.topCycleCurrent.setFixedHeight(40)
+        self.topCycleStd = QLabel("Std Cycle Time: -")
+        self.topCycleStd.setObjectName("MetaValue")
+        self.topCycleStd.setFixedHeight(40)
+        self.topCycleQtyShift = QLabel("Qty / Shift: -")
+        self.topCycleQtyShift.setObjectName("MetaValue")
+        self.topCycleQtyShift.setFixedHeight(40)
+
+        unified_fields_grid = QGridLayout()
+        unified_fields_grid.setContentsMargins(0, 0, 0, 0)
+        unified_fields_grid.setHorizontalSpacing(12)
+        unified_fields_grid.setVerticalSpacing(8)
+        unified_fields_grid.setColumnStretch(0, 1)
+        unified_fields_grid.setColumnStretch(1, 1)
+        unified_fields_grid.setColumnStretch(2, 1)
+
+        unified_fields_grid.addWidget(self.machineAnim, 0, 0)
+        unified_fields_grid.addWidget(self.lblActivityMold, 0, 1)
+        unified_fields_grid.addWidget(self.topCycleQtyShift, 0, 2)
+        unified_fields_grid.addWidget(self.lblMachine, 1, 0)
+        unified_fields_grid.addWidget(self.lblActivityColor, 1, 1)
+        unified_fields_grid.addWidget(self.topCycleCurrent, 1, 2)
+        unified_fields_grid.addWidget(self.lblJob, 2, 0)
+        unified_fields_grid.addWidget(self.lblActivityCavities, 2, 1)
+        unified_fields_grid.addWidget(self.topCycleStd, 2, 2)
+        unified_fields_grid.addWidget(self.lblOperator, 3, 0)
+        unified_fields_grid.addWidget(self.lblActivitySticker, 3, 1)
+        unified_fields_grid.addWidget(self.topCycleCount, 3, 2)
+        self.cardSessionActivity.layout().addLayout(unified_fields_grid)
+
+        self.cardSessionActivityOuter.setMinimumHeight(190)
+        self.cardSessionActivityOuter.setMaximumHeight(230)
+        self.cardSessionActivityOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        grid.addWidget(self.cardSessionActivityOuter, 1, 0, 1, 2)
+        # Machine status now lives in the unified frame, so pulse overlay must follow that parent.
+        self.machinePulseOverlay.setParent(self.cardSessionActivity)
+        self.machinePulseOverlay.setGeometry(self.cardSessionActivity.rect())
         self.machinePulseOverlay.raise_()
-        self.cardActivityOuter.setMinimumHeight(181)
-        self.cardActivityOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        grid.addWidget(self.cardActivityOuter, 1, 1)
 
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
@@ -1061,7 +1456,7 @@ QWidget#ClientUIRoot {{
         # This avoids the top Production row looking over-stretched on taller displays.
         grid.setRowStretch(0, 2)  # Production
         grid.setRowStretch(1, 2)  # Session + Activity
-        grid.setRowStretch(2, 3)  # Reject Details (naturally taller row)
+        grid.setRowStretch(2, 1)
         grid.setRowStretch(3, 2)  # Raw Materials + Cycle row
         left.addLayout(grid, 7)
 
@@ -1092,7 +1487,7 @@ QWidget#ClientUIRoot {{
         self.rightRawSacks.setObjectName("RightMonitorValue")
         self.rightRawScanned = QLabel("Raw Mats Scanned: -")
         self.rightRawScanned.setObjectName("RightMonitorValue")
-        self.rightRawScanned.setWordWrap(False)
+        self.rightRawScanned.setWordWrap(True)
 
         self.rightTitle = QLabel("Downtime Monitor")
         self.rightTitle.setObjectName("RightTitle")
@@ -1115,6 +1510,8 @@ QWidget#ClientUIRoot {{
         self.rightCycleCurrent.setObjectName("RightMonitorValue")
         self.rightCycleStd = QLabel("Std Cycle Time: -")
         self.rightCycleStd.setObjectName("RightMonitorValue")
+        self.rightCycleQtyShift = QLabel("Qty / Shift: -")
+        self.rightCycleQtyShift.setObjectName("RightMonitorValue")
         self.rightMaintenance = QLabel("Maintenance: ")
         self.rightMaintenance.setObjectName("RightMonitorValue")
         self.rightSupervisor = QLabel("Supervisor: ")
@@ -1122,9 +1519,9 @@ QWidget#ClientUIRoot {{
         self.rightSupervisorLeft = QLabel("Supervisor: -")
         self.rightSupervisorLeft.setObjectName("RightMonitorValue")
 
-        topRow = QHBoxLayout()
-        topRow.setContentsMargins(0, 0, 0, 0)
-        topRow.setSpacing(12)
+        rawDowntimeCol = QVBoxLayout()
+        rawDowntimeCol.setContentsMargins(0, 0, 0, 0)
+        rawDowntimeCol.setSpacing(10)
 
         rawOuter = QFrame()
         rawOuter.setObjectName("RightCardOuter")
@@ -1146,37 +1543,10 @@ QWidget#ClientUIRoot {{
         rawCol.addWidget(self.rightRawScanned)
         rawOuterLay.addWidget(rawFrame)
 
-        cycleOuter = QFrame()
-        cycleOuter.setObjectName("RightCardOuter")
-        cycleOuterLay = QVBoxLayout()
-        cycleOuterLay.setContentsMargins(8, 8, 8, 8)
-        cycleOuterLay.setSpacing(0)
-        cycleOuter.setLayout(cycleOuterLay)
-
-        cycleFrame = QFrame()
-        cycleFrame.setObjectName("RightCardInner")
-        cycleFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        cycleCol = QVBoxLayout()
-        cycleCol.setContentsMargins(12, 10, 12, 10)
-        cycleCol.setSpacing(6)
-        cycleFrame.setLayout(cycleCol)
-        cycleCol.addWidget(self._make_right_title_with_icon("Cycle Monitor", "cycle"))
-        cycleCol.addWidget(self.rightCycleHint)
-        cycleCol.addWidget(self.rightCycleCount)
-        cycleCol.addWidget(self.rightCycleCurrent)
-        cycleCol.addWidget(self.rightCycleStd)
-        cycleOuterLay.addWidget(cycleFrame)
-
-        rawOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        cycleOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        rawOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         rawFrame.setMinimumHeight(154)
-        cycleFrame.setMinimumHeight(154)
-        topRow.addWidget(rawOuter, 1)
-        topRow.addWidget(cycleOuter, 1)
+        rawDowntimeCol.addWidget(rawOuter)
 
-        # Swap positions: show Job Details in the right panel top section.
-        rightLayout.addWidget(self.cardJobDetailsOuter)
-        rightLayout.addSpacing(10)
         downtimeOuter = QFrame()
         downtimeOuter.setObjectName("RightCardOuter")
         downtimeOuterLay = QVBoxLayout()
@@ -1206,8 +1576,7 @@ QWidget#ClientUIRoot {{
         downtimeCol.addLayout(downtimeGrid)
         downtimeOuterLay.addWidget(downtimeFrame)
 
-        rightLayout.addWidget(downtimeOuter)
-        rightLayout.addSpacing(8)
+        rawDowntimeCol.addWidget(downtimeOuter)
 
         linkageOuter = QFrame()
         linkageOuter.setObjectName("RightCardOuter")
@@ -1240,14 +1609,18 @@ QWidget#ClientUIRoot {{
         linkageCol.addWidget(self.linkageMirrorRejects)
         linkageOuterLay.addWidget(linkageFrame)
         self.linkageMirrorOuter = linkageOuter
+
+        # Show Linkage above Product Parts in the right panel.
         rightLayout.addWidget(linkageOuter)
+        rightLayout.addSpacing(10)
+        rightLayout.addWidget(self.cardJobDetailsOuter)
         rightLayout.addStretch()
 
         # Swap positions: place Raw Materials + Cycle Monitor where Job Details used to be.
         rawCycleSwapWrap = QWidget()
-        rawCycleSwapWrap.setLayout(topRow)
+        rawCycleSwapWrap.setLayout(rawDowntimeCol)
         rawCycleSwapWrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        rawCycleSwapWrap.setMinimumHeight(190)
+        rawCycleSwapWrap.setMinimumHeight(360)
         self.rawCycleSwapWrap = rawCycleSwapWrap
         grid.addWidget(rawCycleSwapWrap, 3, 0, 1, 2)
 
@@ -1478,14 +1851,32 @@ QWidget#ClientUIRoot {{
         self.rejectSummaryStamp.setObjectName("MetaValue")
         self.rejectSummaryConfirmedBy = QLabel("Confirmed by: -")
         self.rejectSummaryConfirmedBy.setObjectName("MetaValue")
-        self.rejectSummaryDetails = QLabel("No reject data yet.")
-        self.rejectSummaryDetails.setObjectName("ProductionLiveReason")
-        self.rejectSummaryDetails.setWordWrap(True)
-        self.rejectSummaryDetails.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.rejectSummaryTotals = QLabel("Reject Total: 0 | Start Up Reject: 0")
+        self.rejectSummaryTotals.setObjectName("MetaValue")
+        self.rejectSummaryDetails = QTableWidget(1, len(REJECT_DETAIL_ITEMS))
+        self.rejectSummaryDetails.setHorizontalHeaderLabels([code for code, _ in REJECT_DETAIL_ITEMS])
+        self.rejectSummaryDetails.setVerticalHeaderLabels(["Qty"])
+        self.rejectSummaryDetails.setAlternatingRowColors(False)
+        self.rejectSummaryDetails.setWordWrap(False)
+        self.rejectSummaryDetails.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.rejectSummaryDetails.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.rejectSummaryDetails.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.rejectSummaryDetails.verticalHeader().setVisible(True)
+        self.rejectSummaryDetails.verticalHeader().setDefaultSectionSize(34)
+        self.rejectSummaryDetails.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.rejectSummaryDetails.setMinimumHeight(120)
+        self.rejectSummaryDetails.setStyleSheet(
+            "QTableWidget { background: rgba(255,255,255,0.84); border: 1px solid rgba(148,163,184,0.45);"
+            " border-radius: 10px; gridline-color: rgba(148,163,184,0.28); }"
+            "QHeaderView::section { background: rgba(226,232,240,0.92); color: #0f172a; font-weight: 900;"
+            " border: none; border-bottom: 1px solid rgba(148,163,184,0.5); padding: 6px; }"
+            "QTableWidget::item { padding: 6px; color: #0f172a; font-weight: 800; }"
+        )
         self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryTitle)
         self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryHint)
         self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryStamp)
         self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryConfirmedBy)
+        self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryTotals)
         self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryDetails, 1)
         self.rejectSummaryOverlay.hide()
         self.rejectSummaryOverlay.raise_()
@@ -2430,8 +2821,11 @@ QWidget#ClientUIRoot {{
     def _sync_machine_status_pulse_overlay(self):
         if not hasattr(self, "machinePulseOverlay"):
             return
-        self.machinePulseOverlay.setGeometry(self.cardActivity.rect())
-        top_left = self.machineAnim.mapTo(self.cardActivity, self.machineAnim.rect().topLeft())
+        host = self.machinePulseOverlay.parentWidget()
+        if host is None:
+            return
+        self.machinePulseOverlay.setGeometry(host.rect())
+        top_left = self.machineAnim.mapTo(host, self.machineAnim.rect().topLeft())
         target = QRectF(
             float(top_left.x()),
             float(top_left.y()),
@@ -2445,9 +2839,11 @@ QWidget#ClientUIRoot {{
         if not hasattr(self, "rightTopSpacer"):
             return
         try:
-            target_top = self.banner.mapTo(self, self.banner.rect().topLeft()).y()
+            # Align top right frame (Linkage Mirror) with the scan banner frame.
+            target_ref = self.banner
+            target_top = target_ref.mapTo(self, target_ref.rect().topLeft()).y()
             right_top = self.rightPanel.mapTo(self, self.rightPanel.rect().topLeft()).y()
-            # Keep first right frame top aligned with scan banner top.
+            # Keep first right frame top aligned with the selected reference frame.
             offset = max(0, int(target_top - right_top))
             self.rightTopSpacer.setFixedHeight(offset)
         except Exception:
@@ -2703,6 +3099,23 @@ QWidget#ClientUIRoot {{
         if not self._should_keep_background_blur():
             self._set_background_blur(False)
 
+    def _normalized_reject_counts(self, breakdown: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+        counts_by_name: Dict[str, int] = {}
+        source = breakdown if isinstance(breakdown, dict) else (self.state.reject_breakdown or {})
+        for k, v in source.items():
+            key = str(k).strip().upper()
+            try:
+                qty = int(v or 0)
+            except Exception:
+                qty = 0
+            counts_by_name[key] = counts_by_name.get(key, 0) + qty
+        out: Dict[str, int] = {}
+        for code, label in REJECT_DETAIL_ITEMS:
+            by_name = counts_by_name.get(label.upper(), 0)
+            by_code = counts_by_name.get(code.upper(), 0)
+            out[code] = by_name if by_name else by_code
+        return out
+
     def _refresh_reject_summary_overlay(self):
         s = self.state
         stamp_raw = str(s.reject_summary_last_scanned_at or "").strip()
@@ -2719,20 +3132,15 @@ QWidget#ClientUIRoot {{
             pending_name = str(s.cycle_time_confirm_actor_name or "").strip()
         confirmed_name = pending_name or str(s.cycle_time_confirmed_by or "").strip() or "-"
         self.rejectSummaryConfirmedBy.setText(f"Confirmed by: {confirmed_name}")
-
-        rows = self._get_non_zero_rejects()
-        lines = [
-            f"Reject Total: {int(s.reject_total or 0)}",
-            f"Start Up Reject: {int(s.startup_reject_total or 0)}",
-        ]
-        if rows:
-            lines.append("")
-            lines.append("Breakdown:")
-            lines.extend([f"{name}: {qty}" for name, qty in rows])
-        else:
-            lines.append("")
-            lines.append("Breakdown: No rejects recorded.")
-        self.rejectSummaryDetails.setText("\n".join(lines))
+        self.rejectSummaryTotals.setText(
+            f"Reject Total: {int(s.reject_total or 0)} | Start Up Reject: {int(s.startup_reject_total or 0)}"
+        )
+        counts = self._normalized_reject_counts()
+        self.rejectSummaryDetails.setRowCount(1)
+        for col, (code, _label) in enumerate(REJECT_DETAIL_ITEMS):
+            item = QTableWidgetItem(str(int(counts.get(code, 0))))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.rejectSummaryDetails.setItem(0, col, item)
 
     def _show_reject_summary_overlay(self):
         self._refresh_reject_summary_overlay()
@@ -3009,7 +3417,7 @@ QWidget#ClientUIRoot {{
                     if isinstance(items, list):
                         ok = _save_profiles_sql(items) or ok
 
-                # Daily roles cache (stored locally as {date: items})
+                # Daily roles cache is SQL-backed as {date: items}.
                 resp_roles = requests.get(f"{server_url}/api/daily-roles", headers=headers, timeout=2.5)
                 if resp_roles.status_code == 200:
                     out_roles = resp_roles.json()
@@ -3017,20 +3425,13 @@ QWidget#ClientUIRoot {{
                         date_key = str(out_roles.get("date") or "").strip()
                         items = out_roles.get("items")
                         if date_key and isinstance(items, dict):
-                            local_daily = self._load_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, {})
-                            if not isinstance(local_daily, dict):
-                                local_daily = {}
+                            local_daily = _load_daily_role_assignments_sql()
                             local_daily[date_key] = items
-                            self._save_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, local_daily)
-                            ok = True
+                            ok = _save_daily_role_assignments_sql(local_daily) or ok
                         elif isinstance(items, dict):
-                            # Fallback if date key missing.
-                            local_daily = self._load_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, {})
-                            if not isinstance(local_daily, dict):
-                                local_daily = {}
+                            local_daily = _load_daily_role_assignments_sql()
                             local_daily[datetime.now().date().isoformat()] = items
-                            self._save_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, local_daily)
-                            ok = True
+                            ok = _save_daily_role_assignments_sql(local_daily) or ok
 
             except Exception:
                 ok = False
@@ -3086,7 +3487,7 @@ QWidget#ClientUIRoot {{
             break
 
         # Daily assignments can grant temporary rights (including both).
-        daily_map = self._load_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, {})
+        daily_map = _load_daily_role_assignments_sql()
         if isinstance(daily_map, dict):
             today_key = datetime.now().date().isoformat()
             today_rows = daily_map.get(today_key)
@@ -3491,6 +3892,7 @@ QWidget#ClientUIRoot {{
         txt = QLabel(text)
         txt.setObjectName("MetaLabel")
         txt.setStyleSheet("font-size: 14px; font-weight: 800; background: transparent;")
+        txt.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         lay.addWidget(txt, 0, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         lay.addStretch(1)
         return wrap
@@ -3528,6 +3930,7 @@ QWidget#ClientUIRoot {{
         f.layout().setSpacing(2)
         t = QLabel(title)
         t.setObjectName("StatTitle")
+        t.setAlignment(Qt.AlignmentFlag.AlignCenter)
         value_label.setObjectName("StatValue")
         if isinstance(value_label, QLabel):
             value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3559,9 +3962,21 @@ QWidget#ClientUIRoot {{
 
     def _refresh_ui(self):
         s = self.state
-        self.lblMachine.setText(_machine_display_name(s.machine_code, s.machine_name))
-        self.lblJob.setText(s.job_name or "-")
-        self.lblOperator.setText(self._operator_display_name(s.operator_id))
+        self.lblMachine.setText(f"Machine: {_machine_display_name(s.machine_code, s.machine_name)}")
+        self.lblJob.setText(f"Job: {s.job_name or '-'}")
+        self.lblOperator.setText(f"Operator: {self._operator_display_name(s.operator_id)}")
+        payload = s.job_payload or {}
+        data_obj = payload.get("data") if isinstance(payload, dict) else {}
+        job = data_obj.get("job") if isinstance(data_obj, dict) else {}
+        job_details = data_obj.get("job_details") if isinstance(data_obj, dict) else {}
+        if not isinstance(job, dict):
+            job = {}
+        if not isinstance(job_details, dict):
+            job_details = {}
+        self.lblActivityMold.setText(f"Mold: {self._safe_text(job_details.get('mold') or job.get('custom_05'), '-')}")
+        self.lblActivityColor.setText(f"Color: {self._safe_text(job_details.get('color') or job.get('custom_06'), '-')}")
+        self.lblActivityCavities.setText(f"Cavities: {self._safe_text(job_details.get('no_of_cavity') or job.get('custom_11'), '-')}")
+        self.lblActivitySticker.setText(f"Sticker Label: {self._safe_text(job_details.get('sticker_label'), '-')}")
 
         self.lblPack.setText(str(s.pack_count))
         self.lblGood.setText(str(s.good_total))
@@ -3570,6 +3985,10 @@ QWidget#ClientUIRoot {{
         self.lblTotalGood.setText(str(s.good_total + s.butal_total))
         self.rightCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
         self.rightCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
+        if hasattr(self, "topCycleCount") and self.topCycleCount is not None:
+            self.topCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
+        if hasattr(self, "topCycleCurrent") and self.topCycleCurrent is not None:
+            self.topCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
 
         self._refresh_reject_detail_grid()
 
@@ -3620,7 +4039,7 @@ QWidget#ClientUIRoot {{
 
     def _tick_motion(self):
         is_active = self._session_is_running() or bool(self.state.machine_code)
-        status_text = "Active" if is_active else "Idle"
+        status_text = "ACTIVE" if is_active else "IDLE"
         self.machineAnim.setText(f"Machine Status: {status_text}")
         mode = "active" if is_active else "idle"
         if self.machineAnim.property("mode") != mode:
@@ -3702,28 +4121,7 @@ QWidget#ClientUIRoot {{
         self.linkageMirrorOuter.setVisible(bool(s.machine_code))
 
     def _save_finished_job_local(self, payload: Dict[str, Any]):
-        _insert_finished_job_sql(payload)
-
-    def _active_session_file_path(self) -> str:
-        os.makedirs(DATABASE_DIR, exist_ok=True)
-        return os.path.join(DATABASE_DIR, "active_machine_sessions.json")
-
-    def _load_active_sessions_map(self) -> Dict[str, Any]:
-        p = self._active_session_file_path()
-        try:
-            if os.path.exists(p):
-                with open(p, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    return loaded
-        except Exception:
-            pass
-        return {}
-
-    def _save_active_sessions_map(self, rows: Dict[str, Any]):
-        p = self._active_session_file_path()
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(rows, f, ensure_ascii=False, indent=2)
+        return _insert_finished_job_sql(payload)
 
     def _start_operator_shift_tracking(self):
         s = self.state
@@ -3891,12 +4289,10 @@ QWidget#ClientUIRoot {{
         machine_code = str(s.machine_code or "").strip()
         if not machine_code:
             return
-        rows = self._load_active_sessions_map()
-        rows[machine_code] = self._state_to_active_snapshot()
-        self._save_active_sessions_map(rows)
+        _upsert_active_session_sql(self._state_to_active_snapshot())
 
     def _load_active_session_snapshot(self, machine_code: str) -> Optional[Dict[str, Any]]:
-        rows = self._load_active_sessions_map()
+        rows = _load_active_sessions_sql()
         snap = rows.get(str(machine_code or "").strip())
         if isinstance(snap, dict):
             return snap
@@ -3906,10 +4302,7 @@ QWidget#ClientUIRoot {{
         code = str(machine_code or "").strip()
         if not code:
             return
-        rows = self._load_active_sessions_map()
-        if code in rows:
-            del rows[code]
-            self._save_active_sessions_map(rows)
+        _delete_active_session_sql(code)
 
     def _restore_state_from_snapshot(self, snap: Dict[str, Any]):
         s = self.state
@@ -4165,6 +4558,10 @@ QWidget#ClientUIRoot {{
         self._refresh_ui()
         self.rightCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
         self.rightCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
+        if hasattr(self, "topCycleCount") and self.topCycleCount is not None:
+            self.topCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
+        if hasattr(self, "topCycleCurrent") and self.topCycleCurrent is not None:
+            self.topCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
         self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or ''}")
         self.rightSupervisor.setText(f"Supervisor: {s.supervisor_name or ''}")
 
@@ -4272,40 +4669,33 @@ QWidget#ClientUIRoot {{
         self.resolveNewCycle.setText(f"Cycle Time: {self.state.cycle_time_new_input}")
 
     def _refresh_reject_detail_grid(self):
-        counts_by_name: Dict[str, int] = {}
-        breakdown = self.state.reject_breakdown or {}
-
-        for k, v in breakdown.items():
-            key = str(k).strip().upper()
-            try:
-                qty = int(v or 0)
-            except Exception:
-                qty = 0
-            counts_by_name[key] = counts_by_name.get(key, 0) + qty
-
+        counts = self._normalized_reject_counts()
         for code, label in REJECT_DETAIL_ITEMS:
-            by_name = counts_by_name.get(label.upper(), 0)
-            by_code = counts_by_name.get(code.upper(), 0)
-            total = by_name if by_name else by_code
+            total = int(counts.get(code, 0))
             item = self.reject_detail_labels[code]
-            item.setText(f"{label} = {total}")
-            is_active = total == 1
-            item.setProperty("active", "1" if is_active else "0")
-            if not is_active or not self.enable_flashing_lights:
-                item.setProperty("flash", "0")
-            item.style().unpolish(item)
-            item.style().polish(item)
+            item.setText(str(total))
+            is_active = total > 0
+            item.setData(Qt.ItemDataRole.UserRole, 1 if is_active else 0)
+            item.setData(Qt.ItemDataRole.UserRole + 1, 0)
+            if is_active:
+                item.setBackground(QColor(254, 226, 226, 90))
+                item.setForeground(QColor("#991b1b"))
+            else:
+                item.setBackground(QColor(0, 0, 0, 0))
+                item.setForeground(QColor("#0f172a"))
+        self.rejectDetailTable.viewport().update()
 
     def _tick_reject_detail_flash(self):
         if not self.enable_flashing_lights:
             return
         self._reject_detail_flash_on = not self._reject_detail_flash_on
-        flash_value = "1" if self._reject_detail_flash_on else "0"
         for item in self.reject_detail_labels.values():
-            if item.property("active") == "1":
-                item.setProperty("flash", flash_value)
-                item.style().unpolish(item)
-                item.style().polish(item)
+            if int(item.data(Qt.ItemDataRole.UserRole) or 0) == 1:
+                if self._reject_detail_flash_on:
+                    item.setBackground(QColor(252, 165, 165, 130))
+                else:
+                    item.setBackground(QColor(254, 226, 226, 90))
+        self.rejectDetailTable.viewport().update()
 
     def _on_setting_check_animation_toggled(self, checked: bool):
         self.enable_check_animation = bool(checked)
@@ -4316,9 +4706,11 @@ QWidget#ClientUIRoot {{
         self._set_toggle_button_text(self.chkFlashingLights, "Flashing lights", self.enable_flashing_lights)
         if not self.enable_flashing_lights:
             for item in self.reject_detail_labels.values():
-                item.setProperty("flash", "0")
-                item.style().unpolish(item)
-                item.style().polish(item)
+                if int(item.data(Qt.ItemDataRole.UserRole) or 0) == 1:
+                    item.setBackground(QColor(254, 226, 226, 90))
+                else:
+                    item.setBackground(QColor(0, 0, 0, 0))
+            self.rejectDetailTable.viewport().update()
 
     def _on_setting_pulse_effects_toggled(self, checked: bool):
         self.enable_pulse_effects = bool(checked)
@@ -4812,8 +5204,6 @@ QWidget#ClientUIRoot {{
             "std_cycle_time": self._safe_text(job_details.get("std_cycle_time"), "N/A"),
             "qty_per_shift": self._safe_text(job_details.get("qty_per_shift"), "N/A"),
         }
-        for key, label in self.job_detail_labels.items():
-            label.setText(fields.get(key, "-"))
 
         if hasattr(self, "jobPartsTable") and self.jobPartsTable is not None:
             self.jobPartsTable.setRowCount(0)
@@ -4839,6 +5229,12 @@ QWidget#ClientUIRoot {{
 
         if hasattr(self, "rightCycleStd") and self.rightCycleStd is not None:
             self.rightCycleStd.setText(f"Std Cycle Time: {fields.get('std_cycle_time', 'N/A')}")
+        if hasattr(self, "topCycleStd") and self.topCycleStd is not None:
+            self.topCycleStd.setText(f"Std Cycle Time: {fields.get('std_cycle_time', 'N/A')}")
+        if hasattr(self, "rightCycleQtyShift") and self.rightCycleQtyShift is not None:
+            self.rightCycleQtyShift.setText(f"Qty / Shift: {fields.get('qty_per_shift', 'N/A')}")
+        if hasattr(self, "topCycleQtyShift") and self.topCycleQtyShift is not None:
+            self.topCycleQtyShift.setText(f"Qty / Shift: {fields.get('qty_per_shift', 'N/A')}")
 
     def _build_reject_summary_text(self) -> str:
         s = self.state
@@ -4974,7 +5370,7 @@ QWidget#ClientUIRoot {{
         return "Scan received"
 
     def log_last(self, text: str):
-        self.lblLast.setText(text)
+        return
 
     def _set_status_text(self, text: str):
         t = str(text).replace("\n", " ").strip()
@@ -5567,11 +5963,15 @@ QWidget#ClientUIRoot {{
                 )
             linked_finished_payloads = self._build_linked_finished_job_payloads(finished_payload)
             try:
-                self._save_finished_job_local(finished_payload)
+                saved_ok = self._save_finished_job_local(finished_payload)
                 for lp in linked_finished_payloads:
-                    self._save_finished_job_local(lp)
+                    saved_ok = self._save_finished_job_local(lp) and saved_ok
             except Exception as e:
-                self.status.setText(f"Finish saved to server only (local JSON failed: {e})")
+                saved_ok = False
+                self.status.setText(f"Finish save failed: {e}")
+            if not saved_ok:
+                self.status.setText("Finish save failed: active session kept for recovery.")
+                return
             self.push_event(
                 {"type": "FINISH_JOB", "finished_job": finished_payload},
                 f"FINISH JOB {s.job_name or s.job_code or ''}".strip(),
