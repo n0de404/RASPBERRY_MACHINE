@@ -1,7 +1,7 @@
 APP_STYLESHEET = """
 /* ===== Base ===== */
 QWidget {
-    background: #f3f7ff;
+    background: #ffffff;
     color: #0f172a;
     font-family: "Segoe UI Variable Display", "Bahnschrift", "Inter", "Segoe UI";
     font-size: 14px;
@@ -25,38 +25,39 @@ QFrame#RightPanel {
 
 /* Optional: use this objectName for inner sub-panels */
 QFrame#SubPanel {
-    background: #f8fbff;
+    background: #ffffff;
     border: 1px solid #e3eaf5;
     border-radius: 16px;
 }
 
 QFrame#RightCardOuter {
-    background: #ffffff;
-    border: 1px solid #d8dee8;
+    background: transparent;
+    border: none;
     border-radius: 20px;
 }
 QFrame#RightCardInner {
-    background: #f0f4fd;
+    background: #ffffff;
     border: 1px solid #cfd6e1;
     border-radius: 16px;
 }
 QFrame#LeftCardOuter {
-    background: #ffffff;
-    border: 1px solid #d8dee8;
+    background: transparent;
+    border: none;
     border-radius: 20px;
 }
 QFrame#LeftCardInner {
-    background: #f0f4fd;
+    background: #ffffff;
     border: 1px solid #cfd6e1;
     border-radius: 16px;
 }
 
 /* ===== Titles ===== */
 QLabel#PageTitle {
-    font-size: 30px;
+    font-size: 24px;
     font-weight: 800;
     color: #0f172a;
     letter-spacing: 0.4px;
+    padding-top: 2px;
 }
 QLabel#SectionTitle,
 QLabel#RightTitle {

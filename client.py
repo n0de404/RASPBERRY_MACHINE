@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import math
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Set
@@ -22,13 +23,15 @@ except Exception:
     DictCursor = None
 
 from PyQt6.QtCore import (
-    Qt, QObject, QEvent, pyqtSignal, QTimer, QSize, QRectF,
-    QPropertyAnimation, QEasingCurve, pyqtProperty,
+    Qt, QObject, QEvent, pyqtSignal, QTimer, QSize, QRectF, QPointF,
+    QPropertyAnimation, QVariantAnimation, QEasingCurve, pyqtProperty, QRect,
+    QParallelAnimationGroup,
+    QSequentialAnimationGroup,
 )
-from PyQt6.QtGui import QMovie, QPixmap, QColor, QPainter, QPen, QFont
+from PyQt6.QtGui import QMovie, QPixmap, QColor, QPainter, QPen, QFont, QConicalGradient, QBrush
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy,
-    QGraphicsDropShadowEffect, QGraphicsBlurEffect, QProgressBar, QPushButton, QComboBox, QScrollArea,
+    QGraphicsDropShadowEffect, QGraphicsBlurEffect, QGraphicsOpacityEffect, QProgressBar, QPushButton, QComboBox, QScrollArea,
     QLineEdit, QInputDialog, QTableWidget, QTableWidgetItem, QHeaderView
 )
 
@@ -776,12 +779,21 @@ class ClientState:
     downtime_started_at: Optional[float] = None
     downtime_last_seconds: Optional[int] = None
     downtime_active: bool = False
+    downtime_wait_started_at: Optional[float] = None
+    downtime_wait_last_seconds: Optional[int] = None
+    waiting_downtime_start_maintenance: bool = False
+    waiting_downtime_end_maintenance: bool = False
     cycle_time_current: Optional[str] = None
     cycle_time_new_input: str = ""
     cycle_time_confirmed_by: Optional[str] = None
     cycle_time_confirm_actor_code: Optional[str] = None
     cycle_time_confirm_actor_name: Optional[str] = None
     cycle_time_confirm_actor_role: Optional[str] = None
+    live_cycle_last_scan_at: Optional[float] = None
+    live_cycle_total_seconds: float = 0.0
+    live_cycle_intervals: int = 0
+    live_cycle_total_units: int = 0
+    live_cycle_avg_seconds: Optional[float] = None
     maintenance_name: Optional[str] = None
     supervisor_name: Optional[str] = None
     raw_sacks_count: int = 0
@@ -1067,6 +1079,334 @@ class SuccessCheck(QWidget):
                 painter.drawLine(int(b[0]), int(b[1]), int(cx), int(cy))
 
 
+class CircleProgressBadge(QWidget):
+    def __init__(self, accent: QColor, parent=None):
+        super().__init__(parent)
+        self._accent = QColor(accent)
+        self._progress = 0.0
+        self._value_text = "0"
+        self._phase = 0.0
+        self._comet_pos = 0.0
+        self._demo_mode = False
+        self._demo_value = 90
+        self._maximum = 100
+        self._segment_count = 40
+        self._start_angle = -90.0
+        self.setMinimumSize(98, 98)
+        self.setMaximumSize(118, 118)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setStyleSheet("background: transparent;")
+        self._anim = QTimer(self)
+        self._anim.setInterval(15)
+        self._anim.timeout.connect(self._tick)
+        self._anim.start()
+
+    def set_progress(self, value: float):
+        self._progress = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    def set_value_text(self, text: str):
+        self._value_text = str(text or "0")
+        self.update()
+
+    def _tick(self):
+        self._phase = (self._phase + 0.08) % (math.pi * 2.0)
+        active = max(0, min(self._segment_count, round((self._demo_value / self._maximum) * self._segment_count)))
+        if active > 0:
+            self._comet_pos += 0.18
+            if self._comet_pos >= active:
+                self._comet_pos = 0.0
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w = self.width()
+        h = self.height()
+        cx = w / 2.0
+        cy = h / 2.0
+        radius = min(w, h) * 0.32
+        value_pct = float(self._demo_value) if self._demo_mode else max(0.0, min(100.0, self._progress * 100.0))
+        active = max(0, min(self._segment_count, round((value_pct / self._maximum) * self._segment_count)))
+        if (not self._demo_mode) and self._progress > 0 and active == 0:
+            active = 1
+        angle_step = 360.0 / self._segment_count
+
+        # Background aura removed; keep only ring/tick animation.
+
+        for i in range(self._segment_count):
+            ang_deg = self._start_angle + i * angle_step
+            ang = math.radians(ang_deg)
+            inner_r = radius
+            outer_r = radius + 8
+            x1 = cx + math.cos(ang) * inner_r
+            y1 = cy + math.sin(ang) * inner_r
+            x2 = cx + math.cos(ang) * outer_r
+            y2 = cy + math.sin(ang) * outer_r
+
+            if i < active:
+                d = abs(i - self._comet_pos)
+                d = min(d, abs(i - (self._comet_pos - active)), abs(i - (self._comet_pos + active)))
+                trail = max(0.0, 1.0 - d / 8.0)
+                base_brightness = 195
+                extra = int(60 * trail)
+                g = min(255, base_brightness + extra)
+                glow_w1 = 7.0 + 3.0 * trail
+                glow_w2 = 4.8 + 2.0 * trail
+                core_w = 2.2 + 0.9 * trail
+                alpha1 = int(16 + 36 * trail)
+                alpha2 = int(28 + 62 * trail)
+
+                p.setPen(QPen(QColor(0, 255, 70, alpha1), glow_w1, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+                p.setPen(QPen(QColor(0, 255, 70, alpha2), glow_w2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+                if d < 0.8:
+                    p.setPen(QPen(QColor(180, 255, 190, 125), 6.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                    p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+                p.setPen(QPen(QColor(20, g, 60), core_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+            else:
+                p.setPen(QPen(QColor(50, 62, 80, 150), 1.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+        number_font = QFont("DS-Digital", max(12, int(min(w, h) * 0.10)), QFont.Weight.Bold)
+        if "DS-Digital" not in number_font.family():
+            number_font = QFont("Consolas", max(12, int(min(w, h) * 0.10)), QFont.Weight.Bold)
+        draw_rect = self.rect()
+        p.setFont(number_font)
+        text_rect = draw_rect.adjusted(0, -6, 0, 0)
+        if self._demo_mode:
+            val_text = f"{int(round(value_pct))}%"
+        else:
+            val_text = f"{value_pct:.1f}%" if (0.0 < value_pct < 1.0) else f"{int(round(value_pct))}%"
+        # Outline + glow pass for better readability on bright ring colors.
+        for dx, dy, a in [(-1, 0, 140), (1, 0, 140), (0, -1, 140), (0, 1, 140), (-1, -1, 90), (1, 1, 90)]:
+            p.setPen(QColor(10, 18, 30, a))
+            p.drawText(text_rect.adjusted(dx, dy, dx, dy), Qt.AlignmentFlag.AlignCenter, val_text)
+        p.setPen(QColor(245, 250, 245))
+        p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, val_text)
+        p.end()
+
+
+class HistoryAnimatedColumn(QFrame):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("HistoryCol")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._title_text = str(title or "History")
+        self._latest_base_rect = QRect()
+        self._recent_items: deque[QFrame] = deque(maxlen=10)
+        self._anim_groups: List[Any] = []
+        self._latest_anim_groups: List[Any] = []
+        self._recent_insert_queue: deque[str] = deque()
+        self._recent_anim_running = False
+        self._initialized = False
+        self._current_latest_text = ""
+        self._build_ui()
+
+    def _build_ui(self):
+        self.colTitle = QLabel(self._title_text, self)
+        self.colTitle.setObjectName("SectionTitle")
+        self.colTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.latestCard = QFrame(self)
+        self.latestCard.setObjectName("HistoryLatestCard")
+        self.latestCard.setGraphicsEffect(QGraphicsOpacityEffect(self.latestCard))
+        self.latestCard.graphicsEffect().setOpacity(1.0)
+        self.latestCardLabel = QLabel("No scan yet", self.latestCard)
+        self.latestCardLabel.setObjectName("MetaValue")
+        self.latestCardLabel.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.latestCardLabel.setWordWrap(False)
+
+        self.recentPanel = QFrame(self)
+        self.recentPanel.setObjectName("HistoryRecentPanel")
+        self.recentContainer = QWidget(self.recentPanel)
+        self.recentContainer.setStyleSheet("background: transparent; border: none;")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        pad = 4
+        y = 8
+        w = max(0, self.width() - (pad * 2))
+        self.colTitle.setGeometry(pad, y, w, 24)
+        y += 28
+        self.latestCard.setGeometry(pad, y, w, 44)
+        self.latestCardLabel.setGeometry(8, 0, max(0, w - 16), 44)
+        self._latest_base_rect = self.latestCard.geometry()
+        y += 50
+        recent_h = max(60, self.height() - y - 8)
+        self.recentPanel.setGeometry(pad, y, w, recent_h)
+        self.recentContainer.setGeometry(4, 6, max(0, w - 8), max(0, recent_h - 12))
+        self._reposition_recent_items()
+
+    def set_snapshot(self, entries: List[str]):
+        items = [str(x).strip() for x in (entries or []) if str(x).strip()]
+        self._current_latest_text = items[0] if items else ""
+        self.latestCardLabel.setText(self._current_latest_text or "No scan yet")
+        for w in list(self._recent_items):
+            w.deleteLater()
+        self._recent_items.clear()
+        for txt in items[1:11]:
+            row = self._make_recent_row(txt)
+            self._recent_items.append(row)
+        self._reposition_recent_items()
+        self._initialized = True
+
+    def push_scan(self, text: str):
+        new_text = str(text or "").strip()
+        if not new_text:
+            return
+        if not self._initialized:
+            self.set_snapshot([new_text])
+            return
+        old_latest = self._current_latest_text.strip()
+        if old_latest and old_latest != "No scan yet":
+            self._recent_insert_queue.append(old_latest)
+            self._process_recent_queue()
+        self._current_latest_text = new_text
+        self.latestCardLabel.setText(new_text)
+        self._animate_latest_pulse()
+
+    def _make_recent_row(self, text: str) -> QFrame:
+        row = QFrame(self.recentContainer)
+        row.setObjectName("HistoryRecentRow")
+        row.setGraphicsEffect(QGraphicsOpacityEffect(row))
+        row.graphicsEffect().setOpacity(1.0)
+        lbl = QLabel(str(text or ""), row)
+        lbl.setObjectName("HistoryRecentValue")
+        lbl.setStyleSheet("font-size: 11px; font-weight: 700;")
+        lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        lbl.setWordWrap(False)
+        row._inner_label = lbl  # type: ignore[attr-defined]
+        row.show()
+        return row
+
+    def _process_recent_queue(self):
+        if self._recent_anim_running or not self._recent_insert_queue:
+            return
+        self._insert_recent_with_animation(self._recent_insert_queue.popleft())
+
+    def _insert_recent_with_animation(self, text: str):
+        self._recent_anim_running = True
+        row_h = 26
+        gap = 2
+        max_rows = 10
+        incoming = self._make_recent_row(text)
+        incoming.resize(self.recentContainer.width(), row_h)
+        incoming._inner_label.setGeometry(8, 0, max(0, incoming.width() - 16), row_h)  # type: ignore[attr-defined]
+        start_y = -row_h - 6
+        incoming.setGeometry(0, start_y, self.recentContainer.width(), row_h)
+        incoming.raise_()
+
+        current_widgets = list(self._recent_items)
+        group = QParallelAnimationGroup(self)
+        anim_in = QPropertyAnimation(incoming, b"geometry")
+        anim_in.setDuration(300)
+        anim_in.setStartValue(QRect(0, start_y, self.recentContainer.width(), row_h))
+        anim_in.setEndValue(QRect(0, 0, self.recentContainer.width(), row_h))
+        anim_in.setEasingCurve(QEasingCurve.Type.OutCubic)
+        group.addAnimation(anim_in)
+
+        removed_widget = None
+        for i, widget in enumerate(current_widgets):
+            anim = QPropertyAnimation(widget, b"geometry")
+            anim.setDuration(300)
+            anim.setStartValue(widget.geometry())
+            anim.setEndValue(QRect(0, (i + 1) * (row_h + gap), self.recentContainer.width(), row_h))
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            group.addAnimation(anim)
+        if len(current_widgets) >= max_rows:
+            removed_widget = current_widgets[-1]
+            fade = QPropertyAnimation(removed_widget.graphicsEffect(), b"opacity")
+            fade.setDuration(200)
+            fade.setStartValue(1.0)
+            fade.setEndValue(0.0)
+            group.addAnimation(fade)
+
+        def cleanup():
+            self._recent_items.appendleft(incoming)
+            while len(self._recent_items) > max_rows:
+                w = self._recent_items.pop()
+                w.deleteLater()
+            if removed_widget is not None and removed_widget not in self._recent_items:
+                removed_widget.deleteLater()
+            self._reposition_recent_items()
+            self._recent_anim_running = False
+            self._process_recent_queue()
+            if group in self._anim_groups:
+                self._anim_groups.remove(group)
+
+        group.finished.connect(cleanup)
+        self._anim_groups.append(group)
+        group.start()
+
+    def _reposition_recent_items(self):
+        row_h = 26
+        gap = 2
+        w = self.recentContainer.width()
+        for i, widget in enumerate(self._recent_items):
+            widget.resize(w, row_h)
+            widget._inner_label.setGeometry(8, 0, max(0, w - 16), row_h)  # type: ignore[attr-defined]
+            widget.graphicsEffect().setOpacity(1.0)
+            widget.setGeometry(0, i * (row_h + gap), w, row_h)
+
+    def _animate_latest_pulse(self):
+        for grp in list(self._latest_anim_groups):
+            try:
+                grp.stop()
+            except Exception:
+                pass
+            if grp in self._latest_anim_groups:
+                self._latest_anim_groups.remove(grp)
+        base = QRect(self._latest_base_rect)
+        drop_start = QRect(base.x(), base.y() - 10, base.width(), base.height())
+        grow = QRect(base.x() - 2, base.y() - 1, base.width() + 4, base.height() + 2)
+        self.latestCard.setGeometry(drop_start)
+        self.latestCard.graphicsEffect().setOpacity(1.0)
+
+        geom_seq = QSequentialAnimationGroup(self)
+        for dur, start, end in (
+            (120, drop_start, base),
+            (90, base, grow),
+            (120, grow, base),
+        ):
+            a = QPropertyAnimation(self.latestCard, b"geometry")
+            a.setDuration(dur)
+            a.setStartValue(start)
+            a.setEndValue(end)
+            a.setEasingCurve(QEasingCurve.Type.OutCubic)
+            geom_seq.addAnimation(a)
+
+        opacity_seq = QSequentialAnimationGroup(self)
+        a1 = QPropertyAnimation(self.latestCard.graphicsEffect(), b"opacity")
+        a1.setDuration(120)
+        a1.setStartValue(1.0)
+        a1.setEndValue(0.9)
+        a2 = QPropertyAnimation(self.latestCard.graphicsEffect(), b"opacity")
+        a2.setDuration(210)
+        a2.setStartValue(0.9)
+        a2.setEndValue(1.0)
+        opacity_seq.addAnimation(a1)
+        opacity_seq.addAnimation(a2)
+
+        group = QParallelAnimationGroup(self)
+        group.addAnimation(geom_seq)
+        group.addAnimation(opacity_seq)
+
+        def cleanup():
+            if group in self._latest_anim_groups:
+                self._latest_anim_groups.remove(group)
+            self.latestCard.setGeometry(self._latest_base_rect)
+            self.latestCard.graphicsEffect().setOpacity(1.0)
+
+        self._latest_anim_groups.append(group)
+        group.finished.connect(cleanup)
+        group.start()
+
+
 class ClientUI(QWidget):
     UI_BASE_WIDTH = 1920
     UI_BASE_HEIGHT = 1080
@@ -1103,18 +1443,18 @@ class ClientUI(QWidget):
         self._product_history_page = 0
         self._product_history_page_size = 15
         self._product_catalog_name_by_id: Optional[Dict[str, str]] = None
+        self._product_catalog_sku_by_id: Optional[Dict[str, str]] = None
+        self._product_catalog_last_refresh_attempt = 0.0
+        self._action_logs: List[str] = []
 
         self.setWindowTitle("Machine Client Dashboard")
         self.setMinimumSize(0, 0)
         self.setObjectName("ClientUIRoot")
-        bg_image = os.path.join(IMAGES_DIR, "background.png").replace("\\", "/")
         self.setStyleSheet(
             APP_STYLESHEET
             + f"""
 QWidget#ClientUIRoot {{
-    background-image: url("{bg_image}");
-    background-position: center;
-    background-repeat: no-repeat;
+    background: #ffffff;
 }}
 """
         )
@@ -1123,7 +1463,7 @@ QWidget#ClientUIRoot {{
         self.enable_pulse_effects = True
 
         root = QVBoxLayout()
-        root.setContentsMargins(10, 8, 10, 8)
+        root.setContentsMargins(10, 10, 10, 8)
         root.setSpacing(6)
 
         leftWrap = QWidget()
@@ -1135,6 +1475,9 @@ QWidget#ClientUIRoot {{
 
         self.pageTitle = QLabel("Machine Dashboard")
         self.pageTitle.setObjectName("PageTitle")
+        self.pageTitle.setWordWrap(False)
+        self.pageTitle.setMinimumHeight(40)
+        self.pageTitle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.headerDateTime = QLabel("")
         self.headerDateTime.setObjectName("MetaValue")
         self.headerDateTime.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1146,7 +1489,7 @@ QWidget#ClientUIRoot {{
 
         headerRow = QHBoxLayout()
         headerRow.setContentsMargins(0, 0, 0, 0)
-        headerRow.setSpacing(8)
+        headerRow.setSpacing(4)
         headerRow.addWidget(self.btnSettings, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.pageTitle, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.headerDateTime, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1154,7 +1497,7 @@ QWidget#ClientUIRoot {{
         self.headerDivider = QFrame()
         self.headerDivider.setFrameShape(QFrame.Shape.HLine)
         self.headerDivider.setFrameShadow(QFrame.Shadow.Plain)
-        self.headerDivider.setStyleSheet("background: rgba(148, 163, 184, 0.45); min-height: 1px; max-height: 1px; border: none;")
+        self.headerDivider.setStyleSheet("background: transparent; min-height: 0px; max-height: 0px; border: none;")
 
         self._banner_base_text = "Scan MACHINE QR to start"
         self.banner = QLabel(self._banner_base_text)
@@ -1184,7 +1527,7 @@ QWidget#ClientUIRoot {{
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(6)
+        grid.setVerticalSpacing(4)
 
         # Production panel
         self.cardProductionOuter, self.cardProduction = self._make_double_layer_card("Production")
@@ -1240,7 +1583,7 @@ QWidget#ClientUIRoot {{
         self.lblJob = QLabel("-")
         self.lblOperator = QLabel("-")
         self.machineAnim.setText("Machine Status: IDLE")
-        self.machineAnim.setFixedHeight(40)
+        self.machineAnim.setFixedHeight(36)
         self.machineAnim.setMinimumWidth(0)
         self.machineAnim.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.machineAnim.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -1256,8 +1599,8 @@ QWidget#ClientUIRoot {{
         ]
         for i, (name, value_lbl) in enumerate(session_rows, start=1):
             value_lbl.setObjectName("MetaValue")
-            value_lbl.setMinimumWidth(260)
-            value_lbl.setFixedHeight(40)
+            value_lbl.setMinimumWidth(0)
+            value_lbl.setFixedHeight(36)
             value_lbl.setWordWrap(True)
             value_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
             value_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -1289,10 +1632,15 @@ QWidget#ClientUIRoot {{
         self.rejectDetailTable.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.rejectDetailTable.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.rejectDetailTable.verticalHeader().setVisible(False)
-        self.rejectDetailTable.verticalHeader().setDefaultSectionSize(32)
+        self.rejectDetailTable.verticalHeader().setDefaultSectionSize(30)
         self.rejectDetailTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.rejectDetailTable.setShowGrid(False)
-        self.rejectDetailTable.setMinimumHeight(72)
+        self.rejectDetailTable.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.rejectDetailTable.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.rejectDetailTable.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.rejectDetailTable.horizontalHeader().setFixedHeight(34)
+        self.rejectDetailTable.setMinimumHeight(68)
+        self.rejectDetailTable.setMaximumHeight(68)
         self.rejectDetailTable.setStyleSheet(
             "QTableWidget { background: transparent; border: none; gridline-color: transparent; }"
             "QHeaderView::section { background: rgba(226,232,240,0.9); color: #0f172a; font-weight: 900;"
@@ -1312,13 +1660,12 @@ QWidget#ClientUIRoot {{
         self.cardRejectOuter.setMinimumHeight(104)
         self.cardRejectOuter.setMaximumHeight(122)
         self.cardRejectOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        grid.addWidget(self.cardRejectOuter, 2, 0, 1, 2)
 
         # Product parts panel
         self.cardJobDetailsOuter, self.cardJobDetails = self._make_double_layer_card("PRODUCT PARTS")
-        self.jobPartsTable = QTableWidget(0, 6)
+        self.jobPartsTable = QTableWidget(0, 4)
         self.jobPartsTable.setHorizontalHeaderLabels(
-            ["Part Product ID", "SKU", "Name", "Part Qty/Unit", "Request Part Qty", "Approve/Complete"]
+            ["SKU", "Name", "Part Qty/Unit", "Request Part Qty"]
         )
         self.jobPartsTable.setAlternatingRowColors(True)
         self.jobPartsTable.setWordWrap(True)
@@ -1328,12 +1675,11 @@ QWidget#ClientUIRoot {{
         self.jobPartsTable.verticalHeader().setVisible(False)
         self.jobPartsTable.verticalHeader().setDefaultSectionSize(30)
         self.jobPartsTable.horizontalHeader().setStretchLastSection(False)
-        self.jobPartsTable.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.jobPartsTable.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.jobPartsTable.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.jobPartsTable.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.jobPartsTable.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.jobPartsTable.setColumnWidth(0, 260)
         # Size table to show up to 10 visible rows without clipping.
         parts_row_h = self.jobPartsTable.verticalHeader().defaultSectionSize()
         parts_header_h = self.jobPartsTable.horizontalHeader().height()
@@ -1343,6 +1689,13 @@ QWidget#ClientUIRoot {{
         self.jobPartsTable.setMaximumHeight(parts_target_h)
         self.cardJobDetails.layout().addWidget(self.jobPartsTable)
         self.cardJobDetails.layout().addStretch(1)
+        self.cardJobDetailsOuter.setStyleSheet("QFrame#LeftCardOuter { background: transparent; border: none; }")
+        self.cardJobDetails.setStyleSheet(
+            "QFrame#LeftCardInner { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
+            "QLabel#SectionTitle { background: #d9e0ec; color: #0f172a; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; padding: 8px 12px; }"
+        )
+        self.cardJobDetails.layout().setContentsMargins(0, 0, 0, 0)
+        self.cardJobDetails.layout().setSpacing(10)
         self.cardJobDetailsOuter.setMinimumHeight(280)
         self.cardJobDetailsOuter.setMaximumHeight(360)
         self.cardJobDetailsOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
@@ -1373,8 +1726,8 @@ QWidget#ClientUIRoot {{
         for i, (name, value_lbl) in enumerate(activity_rows):
             value_lbl.setObjectName("MetaValue")
             value_lbl.setWordWrap(True)
-            value_lbl.setMinimumWidth(260)
-            value_lbl.setFixedHeight(40)
+            value_lbl.setMinimumWidth(0)
+            value_lbl.setFixedHeight(36)
             value_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
             value_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             activityGrid.addWidget(value_lbl, i, 0, 1, 2, Qt.AlignmentFlag.AlignVCenter)
@@ -1394,9 +1747,16 @@ QWidget#ClientUIRoot {{
         self.cardSessionActivity.layout().setSpacing(6)
         self.jobDetailsUnifiedTitle = QLabel("Job Details")
         self.jobDetailsUnifiedTitle.setObjectName("SectionTitle")
-        self.jobDetailsUnifiedTitle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        self.cardSessionActivity.layout().setContentsMargins(10, 6, 10, 12)
-        self.cardSessionActivity.layout().addWidget(self.jobDetailsUnifiedTitle, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.jobDetailsUnifiedTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.jobDetailsUnifiedTitle.setStyleSheet(
+            "background: #c7cfdd; color: #0f172a; border: none; "
+            "border-top-left-radius: 16px; border-top-right-radius: 16px; "
+            "border-bottom-left-radius: 0px; border-bottom-right-radius: 0px; "
+            "padding: 8px 12px; font-weight: 900;"
+        )
+        self.jobDetailsUnifiedTitle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.jobDetailsUnifiedTitle.setMinimumHeight(38)
+        self.cardSessionActivity.layout().addWidget(self.jobDetailsUnifiedTitle)
 
         # Remove individual outer borders so only one frame is visible.
         self.cardSessionOuter.setStyleSheet("QFrame#LeftCardOuter { background: transparent; border: none; }")
@@ -1408,20 +1768,20 @@ QWidget#ClientUIRoot {{
         # Top-grid cycle fields (separate widgets from right panel cycle widgets).
         self.topCycleCount = QLabel("Confirmed by: -")
         self.topCycleCount.setObjectName("MetaValue")
-        self.topCycleCount.setFixedHeight(40)
-        self.topCycleCurrent = QLabel("Cycle Time: ")
+        self.topCycleCount.setFixedHeight(36)
+        self.topCycleCurrent = QLabel("Act Cycle Time: ")
         self.topCycleCurrent.setObjectName("MetaValue")
-        self.topCycleCurrent.setFixedHeight(40)
+        self.topCycleCurrent.setFixedHeight(36)
         self.topCycleStd = QLabel("Std Cycle Time: -")
         self.topCycleStd.setObjectName("MetaValue")
-        self.topCycleStd.setFixedHeight(40)
-        self.topCycleQtyShift = QLabel("Qty / Shift: -")
+        self.topCycleStd.setFixedHeight(36)
+        self.topCycleQtyShift = QLabel("Pack Cycle Time: -")
         self.topCycleQtyShift.setObjectName("MetaValue")
-        self.topCycleQtyShift.setFixedHeight(40)
+        self.topCycleQtyShift.setFixedHeight(36)
 
         unified_fields_grid = QGridLayout()
-        unified_fields_grid.setContentsMargins(0, 0, 0, 0)
-        unified_fields_grid.setHorizontalSpacing(12)
+        unified_fields_grid.setContentsMargins(18, 0, 18, 0)
+        unified_fields_grid.setHorizontalSpacing(10)
         unified_fields_grid.setVerticalSpacing(8)
         unified_fields_grid.setColumnStretch(0, 1)
         unified_fields_grid.setColumnStretch(1, 1)
@@ -1440,10 +1800,17 @@ QWidget#ClientUIRoot {{
         unified_fields_grid.addWidget(self.lblActivitySticker, 3, 1)
         unified_fields_grid.addWidget(self.topCycleCount, 3, 2)
         self.cardSessionActivity.layout().addLayout(unified_fields_grid)
+        self.cardSessionActivity.layout().addSpacing(8)
+        self.rejectDetailsUnifiedTitle = QLabel("Reject Details")
+        self.rejectDetailsUnifiedTitle.setObjectName("SectionTitle")
+        self.rejectDetailsUnifiedTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cardSessionActivity.layout().addWidget(self.rejectDetailsUnifiedTitle)
+        self.cardSessionActivity.layout().addSpacing(4)
+        self.cardSessionActivity.layout().addWidget(self.rejectDetailTable)
 
-        self.cardSessionActivityOuter.setMinimumHeight(190)
-        self.cardSessionActivityOuter.setMaximumHeight(230)
-        self.cardSessionActivityOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.cardSessionActivityOuter.setMinimumHeight(300)
+        self.cardSessionActivityOuter.setMaximumHeight(380)
+        self.cardSessionActivityOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         grid.addWidget(self.cardSessionActivityOuter, 1, 0, 1, 2)
         # Machine status now lives in the unified frame, so pulse overlay must follow that parent.
         self.machinePulseOverlay.setParent(self.cardSessionActivity)
@@ -1456,9 +1823,10 @@ QWidget#ClientUIRoot {{
         # This avoids the top Production row looking over-stretched on taller displays.
         grid.setRowStretch(0, 2)  # Production
         grid.setRowStretch(1, 2)  # Session + Activity
-        grid.setRowStretch(2, 1)
-        grid.setRowStretch(3, 2)  # Raw Materials + Cycle row
-        left.addLayout(grid, 7)
+        grid.setRowStretch(2, 0)
+        grid.setRowStretch(3, 0)  # Raw Materials + Cycle row
+        left.addLayout(grid, 0)
+        left.addStretch(1)
 
         # Keep in-memory logging, but remove the temporary visible Job API logs panel.
         self.cardJobApiLogsOuter = None
@@ -1479,20 +1847,48 @@ QWidget#ClientUIRoot {{
         self.rightTopSpacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         rightLayout.addWidget(self.rightTopSpacer)
 
-        self.rightRawTitle = QLabel("Raw Materials Consumption")
-        self.rightRawTitle.setObjectName("RightTitle")
-        self.rightRawHint = QLabel("Track sacks count and scanned raw materials.")
-        self.rightRawHint.setObjectName("RightHint")
-        self.rightRawSacks = QLabel("Sacks Count: 0")
+        self.rightRawSacks = QLabel("Raw Mat 1: -    Sacks: 0")
         self.rightRawSacks.setObjectName("RightMonitorValue")
-        self.rightRawScanned = QLabel("Raw Mats Scanned: -")
-        self.rightRawScanned.setObjectName("RightMonitorValue")
-        self.rightRawScanned.setWordWrap(True)
+        self.rightRawField = QLabel("Raw Mat 2: -    Sacks: 0")
+        self.rightRawField.setObjectName("RightMonitorValue")
+        self.rightRawTotalScans = QLabel("Raw Mat 3: -    Sacks: 0")
+        self.rightRawTotalScans.setObjectName("RightMonitorValue")
+        self.rawPreviewWrap = QFrame()
+        self.rawPreviewWrap.setObjectName("RawPreviewWrap")
+        self.rawPreviewWrap.setLayout(QHBoxLayout())
+        self.rawPreviewWrap.layout().setContentsMargins(0, 0, 0, 0)
+        self.rawPreviewWrap.layout().setSpacing(8)
+        self.rawPreviewCols: List[QFrame] = []
+        self.rawPreviewNames: List[QLabel] = []
+        self.rawPreviewRings: List[CircleProgressBadge] = []
+        accents = [QColor("#22c55e"), QColor("#0ea5e9"), QColor("#f59e0b")]
+        for i in range(3):
+            col = QFrame()
+            col.setObjectName("RawPreviewCol")
+            col.setLayout(QVBoxLayout())
+            col.layout().setContentsMargins(8, 8, 8, 8)
+            col.layout().setSpacing(6)
+            name = QLabel("-")
+            name.setObjectName("RawPreviewName")
+            name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name.setWordWrap(True)
+            name.setFixedHeight(34)
+            ring = CircleProgressBadge(accents[i])
+            col.layout().addWidget(name)
+            col.layout().addWidget(ring, 1, Qt.AlignmentFlag.AlignCenter)
+            self.rawPreviewWrap.layout().addWidget(col, 1)
+            self.rawPreviewCols.append(col)
+            self.rawPreviewNames.append(name)
+            self.rawPreviewRings.append(ring)
+        self.rawPreviewWrap.setStyleSheet(
+            "QFrame#RawPreviewCol { background: #e7ecf5; border: 1px solid #d6deeb; border-radius: 12px; }"
+            "QLabel#RawPreviewName { color: #334a6a; font-size: 11px; font-weight: 900; }"
+        )
+        self.rightRawSacks.setMinimumHeight(44)
+        self.rightRawField.setMinimumHeight(44)
+        self.rightRawTotalScans.setMinimumHeight(44)
+        self.rawPreviewWrap.setMinimumHeight(148)
 
-        self.rightTitle = QLabel("Downtime Monitor")
-        self.rightTitle.setObjectName("RightTitle")
-        self.rightHint = QLabel("Scan ProductionDailyReport~1, then scan reason QR (01-15).")
-        self.rightHint.setObjectName("RightHint")
         self.rightDowntimeTimer = QLabel("Downtime: 00:00:00")
         self.rightDowntimeTimer.setObjectName("RightMonitorValueAccent")
         self.rightDowntimeReason = QLabel("Reason: -")
@@ -1506,11 +1902,11 @@ QWidget#ClientUIRoot {{
         self.rightCycleHint.setObjectName("RightHint")
         self.rightCycleCount = QLabel("Confirmed by: -")
         self.rightCycleCount.setObjectName("RightMonitorValue")
-        self.rightCycleCurrent = QLabel("Cycle Time: ")
+        self.rightCycleCurrent = QLabel("Act Cycle Time: ")
         self.rightCycleCurrent.setObjectName("RightMonitorValue")
         self.rightCycleStd = QLabel("Std Cycle Time: -")
         self.rightCycleStd.setObjectName("RightMonitorValue")
-        self.rightCycleQtyShift = QLabel("Qty / Shift: -")
+        self.rightCycleQtyShift = QLabel("Pack Cycle Time: -")
         self.rightCycleQtyShift.setObjectName("RightMonitorValue")
         self.rightMaintenance = QLabel("Maintenance: ")
         self.rightMaintenance.setObjectName("RightMonitorValue")
@@ -1521,7 +1917,7 @@ QWidget#ClientUIRoot {{
 
         rawDowntimeCol = QVBoxLayout()
         rawDowntimeCol.setContentsMargins(0, 0, 0, 0)
-        rawDowntimeCol.setSpacing(10)
+        rawDowntimeCol.setSpacing(5)
 
         rawOuter = QFrame()
         rawOuter.setObjectName("RightCardOuter")
@@ -1531,16 +1927,57 @@ QWidget#ClientUIRoot {{
         rawOuter.setLayout(rawOuterLay)
 
         rawFrame = QFrame()
-        rawFrame.setObjectName("RightCardInner")
+        rawFrame.setObjectName("RawMirrorHost")
         rawFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         rawCol = QVBoxLayout()
-        rawCol.setContentsMargins(12, 10, 12, 10)
+        rawCol.setContentsMargins(0, 0, 0, 0)
         rawCol.setSpacing(6)
         rawFrame.setLayout(rawCol)
-        rawCol.addWidget(self._make_right_title_with_icon("Raw Materials Consumption", "raw-material"))
-        rawCol.addWidget(self.rightRawHint)
-        rawCol.addWidget(self.rightRawSacks)
-        rawCol.addWidget(self.rightRawScanned)
+
+        rawBody = QFrame()
+        rawBody.setObjectName("RawMirrorBody")
+        rawBody.setLayout(QVBoxLayout())
+        rawBody.layout().setContentsMargins(0, 0, 0, 0)
+        rawBody.layout().setSpacing(10)
+
+        rawHeader = QFrame()
+        rawHeader.setObjectName("RawMirrorHeader")
+        rawHeader.setLayout(QVBoxLayout())
+        rawHeader.layout().setContentsMargins(12, 10, 12, 10)
+        rawHeader.layout().setSpacing(0)
+        rawTitle = QLabel("Raw Materials Consumption")
+        rawTitle.setObjectName("RightTitle")
+        rawTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rawHeader.layout().addWidget(rawTitle)
+        rawBody.layout().addWidget(rawHeader)
+
+        rawContent = QHBoxLayout()
+        rawContent.setContentsMargins(10, 0, 10, 10)
+        rawContent.setSpacing(8)
+
+        rawLeftCol = QVBoxLayout()
+        rawLeftCol.setContentsMargins(0, 0, 0, 0)
+        rawLeftCol.setSpacing(8)
+        rawLeftCol.addWidget(self.rightRawSacks)
+        rawLeftCol.addWidget(self.rightRawField)
+        rawLeftCol.addWidget(self.rightRawTotalScans)
+
+        rawRightCol = QVBoxLayout()
+        rawRightCol.setContentsMargins(0, 0, 0, 0)
+        rawRightCol.setSpacing(8)
+        rawRightCol.addWidget(self.rawPreviewWrap)
+
+        rawContent.addLayout(rawLeftCol, 1)
+        rawContent.addLayout(rawRightCol, 1)
+        rawBody.layout().addLayout(rawContent)
+        rawCol.addWidget(rawBody)
+        rawFrame.setStyleSheet(
+            "QFrame#RawMirrorHost { background: transparent; border: none; }"
+            "QFrame#RawMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
+            "QFrame#RawMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
+            "QFrame#RawMirrorHeader QLabel#RightTitle { color: #0f172a; }"
+            "QFrame#RawMirrorHeader QLabel { color: #0f172a; }"
+        )
         rawOuterLay.addWidget(rawFrame)
 
         rawOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -1555,16 +1992,33 @@ QWidget#ClientUIRoot {{
         downtimeOuter.setLayout(downtimeOuterLay)
 
         downtimeFrame = QFrame()
-        downtimeFrame.setObjectName("RightCardInner")
+        downtimeFrame.setObjectName("DowntimeMirrorHost")
+        downtimeFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         downtimeCol = QVBoxLayout()
-        downtimeCol.setContentsMargins(12, 10, 12, 10)
-        downtimeCol.setSpacing(8)
+        downtimeCol.setContentsMargins(0, 0, 0, 0)
+        downtimeCol.setSpacing(6)
         downtimeFrame.setLayout(downtimeCol)
-        downtimeCol.addWidget(self._make_right_title_with_icon("Downtime Monitor", "downtime"))
-        downtimeCol.addWidget(self.rightHint)
+
+        downtimeBody = QFrame()
+        downtimeBody.setObjectName("DowntimeMirrorBody")
+        downtimeBody.setLayout(QVBoxLayout())
+        downtimeBody.layout().setContentsMargins(0, 0, 0, 0)
+        downtimeBody.layout().setSpacing(10)
+
+        downtimeHeader = QFrame()
+        downtimeHeader.setObjectName("DowntimeMirrorHeader")
+        downtimeHeader.setLayout(QVBoxLayout())
+        downtimeHeader.layout().setContentsMargins(12, 10, 12, 10)
+        downtimeHeader.layout().setSpacing(0)
+        downtimeTitle = QLabel("Downtime Monitor")
+        downtimeTitle.setObjectName("RightTitle")
+        downtimeTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        downtimeHeader.layout().addWidget(downtimeTitle)
+        rawHeader.setFixedHeight(downtimeHeader.sizeHint().height())
+        downtimeBody.layout().addWidget(downtimeHeader)
 
         downtimeGrid = QGridLayout()
-        downtimeGrid.setContentsMargins(0, 0, 0, 0)
+        downtimeGrid.setContentsMargins(10, 0, 10, 10)
         downtimeGrid.setHorizontalSpacing(8)
         downtimeGrid.setVerticalSpacing(8)
         downtimeGrid.addWidget(self.rightDowntimeTimer, 0, 0)
@@ -1573,7 +2027,15 @@ QWidget#ClientUIRoot {{
         downtimeGrid.addWidget(self.rightMaintenance, 1, 1)
         downtimeGrid.addWidget(self.rightSupervisorLeft, 2, 0)
         downtimeGrid.addWidget(self.rightSupervisor, 2, 1)
-        downtimeCol.addLayout(downtimeGrid)
+        downtimeBody.layout().addLayout(downtimeGrid)
+        downtimeCol.addWidget(downtimeBody)
+        downtimeFrame.setStyleSheet(
+            "QFrame#DowntimeMirrorHost { background: transparent; border: none; }"
+            "QFrame#DowntimeMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
+            "QFrame#DowntimeMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
+            "QFrame#DowntimeMirrorHeader QLabel#RightTitle { color: #0f172a; }"
+            "QFrame#DowntimeMirrorHeader QLabel { color: #0f172a; }"
+        )
         downtimeOuterLay.addWidget(downtimeFrame)
 
         rawDowntimeCol.addWidget(downtimeOuter)
@@ -1586,35 +2048,196 @@ QWidget#ClientUIRoot {{
         linkageOuter.setLayout(linkageOuterLay)
 
         linkageFrame = QFrame()
-        linkageFrame.setObjectName("RightCardInner")
+        linkageFrame.setObjectName("LinkageMirrorHost")
         linkageFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         linkageCol = QVBoxLayout()
-        linkageCol.setContentsMargins(12, 10, 12, 10)
+        linkageCol.setContentsMargins(0, 0, 0, 0)
         linkageCol.setSpacing(6)
         linkageFrame.setLayout(linkageCol)
-        linkageCol.addWidget(self._make_right_title_with_icon("Linkage Mirror", "job"))
-        self.linkageMirrorHint = QLabel('Scan "joblinkage~1" then scan another JOB QR.')
-        self.linkageMirrorHint.setObjectName("RightHint")
-        self.linkageMirrorJob = QLabel("Linked Job: -")
-        self.linkageMirrorJob.setObjectName("RightMonitorValue")
-        self.linkageMirrorCounts = QLabel("Pack: 0 | Good: 0 | Butal: 0 | Reject: 0 | Total Good: 0")
-        self.linkageMirrorCounts.setObjectName("RightMonitorValue")
-        self.linkageMirrorCounts.setWordWrap(True)
-        self.linkageMirrorRejects = QLabel("Reject Details: -")
-        self.linkageMirrorRejects.setObjectName("RightMonitorValue")
-        self.linkageMirrorRejects.setWordWrap(True)
-        linkageCol.addWidget(self.linkageMirrorHint)
-        linkageCol.addWidget(self.linkageMirrorJob)
-        linkageCol.addWidget(self.linkageMirrorCounts)
-        linkageCol.addWidget(self.linkageMirrorRejects)
+        linkageBody = QFrame()
+        linkageBody.setObjectName("LinkageMirrorBody")
+        linkageBody.setLayout(QVBoxLayout())
+        linkageBody.layout().setContentsMargins(0, 0, 0, 0)
+        linkageBody.layout().setSpacing(10)
+
+        linkageHeader = QFrame()
+        linkageHeader.setObjectName("LinkageMirrorHeader")
+        linkageHeader.setLayout(QVBoxLayout())
+        linkageHeader.layout().setContentsMargins(12, 10, 12, 10)
+        linkageHeader.layout().setSpacing(0)
+        linkageMirrorTitle = QLabel("Linkage Mirror")
+        linkageMirrorTitle.setObjectName("RightTitle")
+        linkageMirrorTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        linkageHeader.layout().addWidget(linkageMirrorTitle)
+        linkageHeader.setFixedHeight(downtimeHeader.sizeHint().height())
+        linkageBody.layout().addWidget(linkageHeader)
+
+        linkageContent = QWidget()
+        linkageContent.setLayout(QHBoxLayout())
+        linkageContent.layout().setContentsMargins(10, 0, 10, 10)
+        linkageContent.layout().setSpacing(14)
+        linkageContent.layout().setStretch(0, 1)
+        linkageContent.layout().setStretch(1, 1)
+        linkageContent.layout().setStretch(2, 1)
+
+        linkageLeft = QFrame()
+        linkageLeft.setObjectName("LinkageMirrorLeft")
+        linkageLeft.setLayout(QVBoxLayout())
+        linkageLeft.layout().setContentsMargins(0, 0, 0, 0)
+        linkageLeft.layout().setSpacing(10)
+        linkageLeft.setMinimumWidth(0)
+
+        def _make_linked_job_row(title: str):
+            row = QFrame()
+            row.setObjectName("LinkageMirrorJobRow")
+            row.setLayout(QHBoxLayout())
+            row.layout().setContentsMargins(12, 8, 12, 8)
+            row.layout().setSpacing(10)
+            key = QLabel(title)
+            key.setObjectName("LinkageMirrorJobKey")
+            value = QLabel("-")
+            value.setObjectName("LinkageMirrorJobVal")
+            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            row.layout().addWidget(key, 1)
+            row.layout().addWidget(value, 0)
+            return row, value
+
+        row1, self.linkageMirrorJob1 = _make_linked_job_row("Linked Job 1:")
+        row2, self.linkageMirrorJob2 = _make_linked_job_row("Linked Job 2:")
+        row3, self.linkageMirrorJob3 = _make_linked_job_row("Linked Job 3:")
+        linkageLeft.layout().addWidget(row1)
+        linkageLeft.layout().addWidget(row2)
+        linkageLeft.layout().addWidget(row3)
+        linkageLeft.layout().addStretch(1)
+
+        linkageRight = QFrame()
+        linkageRight.setObjectName("LinkageMirrorRight")
+        linkageRight.setLayout(QGridLayout())
+        linkageRight.layout().setContentsMargins(0, 0, 0, 0)
+        linkageRight.layout().setHorizontalSpacing(10)
+        linkageRight.layout().setVerticalSpacing(10)
+
+        def _make_counter_card(title: str):
+            card = QFrame()
+            card.setObjectName("LinkageMirrorCounterCard")
+            card.setLayout(QHBoxLayout())
+            card.layout().setContentsMargins(12, 8, 12, 8)
+            card.layout().setSpacing(10)
+            t = QLabel(title)
+            t.setObjectName("LinkageMirrorCounterTitle")
+            t.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            v = QLabel("0")
+            v.setObjectName("LinkageMirrorCounterValue")
+            v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            card.layout().addWidget(t, 1)
+            card.layout().addWidget(v, 0)
+            return card, v
+
+        card_pack, self.linkageMirrorPack = _make_counter_card("Pack")
+        card_good, self.linkageMirrorGood = _make_counter_card("Good")
+        card_butal, self.linkageMirrorButal = _make_counter_card("Butal")
+        card_total, self.linkageMirrorTotalGood = _make_counter_card("Total Good")
+        linkageRight.layout().setColumnStretch(0, 1)
+        linkageRight.layout().setColumnStretch(1, 1)
+        linkageRight.layout().setColumnStretch(2, 1)
+        linkageRight.layout().addWidget(card_pack, 0, 0)
+        linkageRight.layout().addWidget(card_good, 0, 1)
+        linkageRight.layout().addWidget(card_butal, 1, 0)
+        linkageRight.layout().addWidget(card_total, 1, 1)
+
+        linkageContent.layout().addWidget(linkageLeft, 1)
+        linkageContent.layout().addWidget(linkageRight, 1)
+        linkageThirdCol = QWidget()
+        linkageThirdCol.setObjectName("LinkageMirrorThirdCol")
+        linkageContent.layout().addWidget(linkageThirdCol, 1)
+        linkageBody.layout().addWidget(linkageContent)
+        linkageCol.addWidget(linkageBody)
+        linkageFrame.setStyleSheet(
+            "QFrame#LinkageMirrorHost { background: transparent; border: none; }"
+            "QFrame#LinkageMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
+            "QFrame#LinkageMirrorLeft { background: #f4f7fc; border: 1px solid #d8e0eb; border-radius: 14px; }"
+            "QFrame#LinkageMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
+            "QFrame#LinkageMirrorHeader QLabel#RightTitle { color: #0f172a; }"
+            "QFrame#LinkageMirrorHeader QLabel { color: #0f172a; }"
+            "QFrame#LinkageMirrorJobRow { background: #e7ecf5; border: none; border-radius: 10px; }"
+            "QLabel#LinkageMirrorJobKey { color: #334a6a; font-size: 13px; font-weight: 900; }"
+            "QLabel#LinkageMirrorJobVal { color: #7a93b7; font-size: 18px; font-weight: 900; }"
+            "QFrame#LinkageMirrorRight { background: transparent; border: none; }"
+            "QWidget#LinkageMirrorThirdCol { background: transparent; border: none; }"
+            "QFrame#LinkageMirrorCounterCard { background: #e7ecf5; border: 1px solid #dde3ee; border-radius: 10px; min-height: 40px; max-height: 40px; }"
+            "QLabel#LinkageMirrorCounterTitle { color: #334a6a; font-size: 13px; font-weight: 900; }"
+            "QLabel#LinkageMirrorCounterValue { color: #7a93b7; font-size: 18px; font-weight: 900; }"
+        )
         linkageOuterLay.addWidget(linkageFrame)
         self.linkageMirrorOuter = linkageOuter
+
+        historyOuter = QFrame()
+        historyOuter.setObjectName("RightCardOuter")
+        historyOuterLay = QVBoxLayout()
+        historyOuterLay.setContentsMargins(8, 8, 8, 8)
+        historyOuterLay.setSpacing(0)
+        historyOuter.setLayout(historyOuterLay)
+        historyOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        historyFrame = QFrame()
+        historyFrame.setObjectName("HistoryMirrorHost")
+        historyFrame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        historyCol = QVBoxLayout()
+        historyCol.setContentsMargins(0, 0, 0, 0)
+        historyCol.setSpacing(6)
+        historyFrame.setLayout(historyCol)
+
+        historyBody = QFrame()
+        historyBody.setObjectName("HistoryMirrorBody")
+        historyBody.setLayout(QVBoxLayout())
+        historyBody.layout().setContentsMargins(0, 0, 0, 0)
+        historyBody.layout().setSpacing(10)
+
+        historyHeader = QFrame()
+        historyHeader.setObjectName("HistoryMirrorHeader")
+        historyHeader.setLayout(QVBoxLayout())
+        historyHeader.layout().setContentsMargins(12, 10, 12, 10)
+        historyHeader.layout().setSpacing(0)
+        historyTitle = QLabel("History")
+        historyTitle.setObjectName("RightTitle")
+        historyTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        historyHeader.layout().addWidget(historyTitle)
+        historyBody.layout().addWidget(historyHeader)
+
+        historyContent = QWidget()
+        historyContent.setLayout(QHBoxLayout())
+        historyContent.layout().setContentsMargins(10, 0, 10, 10)
+        historyContent.layout().setSpacing(8)
+
+        self.historyPackCol = HistoryAnimatedColumn("Pack/Good/Butal/Reject", historyContent)
+        self.historyRawCol = HistoryAnimatedColumn("Raw Materials (Recent)", historyContent)
+        self.historyActionCol = HistoryAnimatedColumn("Last Actions", historyContent)
+        historyContent.layout().addWidget(self.historyPackCol, 1)
+        historyContent.layout().addWidget(self.historyRawCol, 1)
+        historyContent.layout().addWidget(self.historyActionCol, 1)
+        historyBody.layout().addWidget(historyContent, 1)
+
+        historyCol.addWidget(historyBody, 1)
+        historyFrame.setStyleSheet(
+            "QFrame#HistoryMirrorHost { background: transparent; border: none; }"
+            "QFrame#HistoryMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
+            "QFrame#HistoryMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
+            "QFrame#HistoryMirrorHeader QLabel#RightTitle { color: #0f172a; }"
+            "QFrame#HistoryMirrorHeader QLabel { color: #0f172a; }"
+            "QFrame#HistoryCol { background: #e7ecf5; border: 1px solid #d8e0eb; border-radius: 12px; }"
+            "QFrame#HistoryLatestCard { background: #f4f7fc; border: 1px solid #d8e0eb; border-radius: 10px; }"
+            "QFrame#HistoryRecentPanel { background: transparent; border: none; }"
+            "QFrame#HistoryRecentRow { background: #f4f7fc; border: 1px solid #d8e0eb; border-radius: 10px; }"
+        )
+        historyOuterLay.addWidget(historyFrame, 1)
+        self.historyOuter = historyOuter
 
         # Show Linkage above Product Parts in the right panel.
         rightLayout.addWidget(linkageOuter)
         rightLayout.addSpacing(10)
         rightLayout.addWidget(self.cardJobDetailsOuter)
-        rightLayout.addStretch()
+        rightLayout.addSpacing(10)
+        rightLayout.addWidget(historyOuter, 1)
 
         # Swap positions: place Raw Materials + Cycle Monitor where Job Details used to be.
         rawCycleSwapWrap = QWidget()
@@ -1626,10 +2249,14 @@ QWidget#ClientUIRoot {{
 
         contentRow = QHBoxLayout()
         contentRow.setContentsMargins(0, 0, 0, 0)
-        contentRow.setSpacing(10)
+        contentRow.setSpacing(8)
         contentRow.addWidget(leftWrap, 1)
         contentRow.addWidget(self.rightPanel, 1)
 
+        self.topSafeSpacer = QWidget()
+        self.topSafeSpacer.setFixedHeight(6)
+        self.topSafeSpacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        root.addWidget(self.topSafeSpacer)
         root.addLayout(headerRow)
         root.addWidget(self.headerDivider)
         root.addLayout(contentRow, 1)
@@ -3345,9 +3972,10 @@ QWidget#ClientUIRoot {{
             self._set_background_blur(False)
 
     def _ensure_product_catalog_index(self):
-        if isinstance(self._product_catalog_name_by_id, dict):
+        if isinstance(self._product_catalog_name_by_id, dict) and isinstance(self._product_catalog_sku_by_id, dict):
             return
         self._product_catalog_name_by_id = {}
+        self._product_catalog_sku_by_id = {}
         raw = self._load_json_file(PRODUCT_CATALOG_CACHE_FILE, {})
         items = []
         if isinstance(raw, dict):
@@ -3365,6 +3993,7 @@ QWidget#ClientUIRoot {{
                 continue
             key = pid.lstrip("0") or "0"
             self._product_catalog_name_by_id[key] = name
+            self._product_catalog_sku_by_id[key] = str(row.get("sku") or "").strip()
 
     def _lookup_product_name(self, product_id: str) -> str:
         pid = str(product_id or "").strip()
@@ -3374,6 +4003,99 @@ QWidget#ClientUIRoot {{
         key = pid.lstrip("0") if pid.isdigit() else pid
         key = key or "0"
         return str((self._product_catalog_name_by_id or {}).get(key) or "")
+
+    def _lookup_product_sku(self, product_id: str) -> str:
+        pid = str(product_id or "").strip()
+        if not pid:
+            return ""
+        self._ensure_product_catalog_index()
+        key = pid.lstrip("0") if pid.isdigit() else pid
+        key = key or "0"
+        return str((self._product_catalog_sku_by_id or {}).get(key) or "")
+
+    def _refresh_product_catalog_cache_from_api(self) -> bool:
+        now_ts = time.time()
+        if (now_ts - float(getattr(self, "_product_catalog_last_refresh_attempt", 0.0) or 0.0)) < 30.0:
+            return False
+        self._product_catalog_last_refresh_attempt = now_ts
+        try:
+            jcfg = getattr(self, "job_api_config", {}) or _load_job_api_config()
+            self.job_api_config = jcfg
+            bms = jcfg.get("bms") if isinstance(jcfg.get("bms"), dict) else {}
+            base = str(jcfg.get("base_url") or bms.get("base_url") or "").strip().rstrip("/")
+            token = str(jcfg.get("bearer_token", "") or "").strip()
+            user = str(jcfg.get("user") or bms.get("username") or bms.get("user") or "").strip()
+            password = str(jcfg.get("password") or bms.get("password") or "").strip()
+            if not base:
+                return False
+            if not token and user and password:
+                token = self._get_job_api_bearer_token(base=base, user=user, password=password) or ""
+            if not token:
+                return False
+            url = self._job_api_url(base, "/products")
+            resp = requests.get(
+                url,
+                headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                return False
+            payload = resp.json()
+            items = []
+            if isinstance(payload, dict):
+                data = payload.get("data")
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    if isinstance(data.get("items"), list):
+                        items = data.get("items") or []
+                    elif isinstance(data.get("products"), list):
+                        items = data.get("products") or []
+            if not isinstance(items, list) or not items:
+                return False
+            out = []
+            idx: Dict[str, str] = {}
+            sku_idx: Dict[str, str] = {}
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                pid = str(row.get("id") or row.get("product_id") or "").strip()
+                name = str(row.get("name") or row.get("product_name") or "").strip()
+                sku = str(row.get("sku") or "").strip()
+                category_id = str(
+                    row.get("categoryId")
+                    or row.get("category_id")
+                    or row.get("category")
+                    or ""
+                ).strip()
+                category_name = str(
+                    row.get("categoryName")
+                    or row.get("category_name")
+                    or row.get("category_text")
+                    or ""
+                ).strip()
+                if not pid or not name:
+                    continue
+                out.append(
+                    {
+                        "id": pid,
+                        "name": name,
+                        "sku": sku,
+                        "categoryId": category_id,
+                        "categoryName": category_name,
+                    }
+                )
+                key = pid.lstrip("0") if pid.isdigit() else pid
+                idx[key or "0"] = name
+                sku_idx[key or "0"] = sku
+            if not out:
+                return False
+            self._save_json_file(PRODUCT_CATALOG_CACHE_FILE, {"items": out})
+            self._product_catalog_name_by_id = idx
+            self._product_catalog_sku_by_id = sku_idx
+            return True
+        except Exception:
+            return False
 
     def _load_json_file(self, path: str, fallback: Any) -> Any:
         try:
@@ -3948,9 +4670,51 @@ QWidget#ClientUIRoot {{
             return
         if not self.enable_pulse_effects:
             return
+        glow_map = {
+            "StatPack": QColor(34, 197, 94),
+            "StatGood": QColor(34, 197, 94),
+            "StatButal": QColor(14, 165, 233),
+            "StatReject": QColor(239, 68, 68),
+            "StatTotalGood": QColor(34, 211, 238),
+        }
+        base = glow_map.get(str(card.objectName() or ""), QColor(59, 130, 246))
+        fx = getattr(card, "_pulse_glow_fx", None)
+        if fx is None:
+            fx = QGraphicsDropShadowEffect(card)
+            fx.setOffset(0, 0)
+            fx.setBlurRadius(0)
+            fx.setColor(QColor(base.red(), base.green(), base.blue(), 0))
+            card.setGraphicsEffect(fx)
+            card._pulse_glow_fx = fx
+
+        blur_anim = getattr(card, "_pulse_blur_anim", None)
+        if blur_anim is not None:
+            blur_anim.stop()
+        blur_anim = QPropertyAnimation(fx, b"blurRadius", card)
+        blur_anim.setDuration(420)
+        blur_anim.setStartValue(28.0)
+        blur_anim.setEndValue(2.0)
+        blur_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        card._pulse_blur_anim = blur_anim
+
+        alpha_anim = getattr(card, "_pulse_alpha_anim", None)
+        if alpha_anim is not None:
+            alpha_anim.stop()
+        alpha_anim = QVariantAnimation(card)
+        alpha_anim.setDuration(420)
+        alpha_anim.setStartValue(190)
+        alpha_anim.setEndValue(0)
+        alpha_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        alpha_anim.valueChanged.connect(
+            lambda v, e=fx, c=base: e.setColor(QColor(c.red(), c.green(), c.blue(), int(v)))
+        )
+        card._pulse_alpha_anim = alpha_anim
+
         card.setProperty("flash", "1")
         card.style().unpolish(card)
         card.style().polish(card)
+        blur_anim.start()
+        alpha_anim.start()
         QTimer.singleShot(220, lambda c=card: self._clear_pulse(c))
 
     def _clear_pulse(self, card: QFrame):
@@ -3984,11 +4748,29 @@ QWidget#ClientUIRoot {{
         self.lblReject.setText(str(s.reject_total))
         self.lblTotalGood.setText(str(s.good_total + s.butal_total))
         self.rightCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
-        self.rightCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
+        act_cycle = self._parse_cycle_seconds(s.cycle_time_current)
+        act_cycle_text = f"{act_cycle:g} sec" if act_cycle is not None else "-"
+        act_qty_shift = self._qty_per_shift_from_cycle(act_cycle)
+        act_qty_shift_text = str(act_qty_shift) if act_qty_shift is not None else "-"
+        std_cycle_raw = self._safe_text(job_details.get("std_cycle_time"), "-")
+        api_qty_raw = self._safe_text(job_details.get("qty_per_shift"), "")
+        api_qty_num = self._parse_cycle_seconds(api_qty_raw)
+        qty_shift_std_text = str(int(api_qty_num)) if api_qty_num is not None else act_qty_shift_text
+        live_avg = s.live_cycle_avg_seconds if s.live_cycle_avg_seconds and s.live_cycle_avg_seconds > 0 else None
+        live_cycle_text = f"{live_avg:.2f} sec" if live_avg is not None else "-"
+        live_qty_shift = self._qty_per_shift_from_cycle(live_avg)
+        live_qty_shift_text = str(live_qty_shift) if live_qty_shift is not None else "-"
+        self.rightCycleCurrent.setText(f"Act Cycle Time: {act_cycle_text}    Qty / Shift: {act_qty_shift_text}")
+        self.rightCycleStd.setText(f"Std Cycle Time: {std_cycle_raw}    Qty / Shift: {qty_shift_std_text}")
+        self.rightCycleQtyShift.setText(f"Pack Cycle Time: {live_cycle_text}    Qty / Shift: {live_qty_shift_text}")
         if hasattr(self, "topCycleCount") and self.topCycleCount is not None:
             self.topCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
         if hasattr(self, "topCycleCurrent") and self.topCycleCurrent is not None:
-            self.topCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
+            self.topCycleCurrent.setText(f"Act Cycle Time: {act_cycle_text}    Qty / Shift: {act_qty_shift_text}")
+        if hasattr(self, "topCycleStd") and self.topCycleStd is not None:
+            self.topCycleStd.setText(f"Std Cycle Time: {std_cycle_raw}    Qty / Shift: {qty_shift_std_text}")
+        if hasattr(self, "topCycleQtyShift") and self.topCycleQtyShift is not None:
+            self.topCycleQtyShift.setText(f"Pack Cycle Time: {live_cycle_text}    Qty / Shift: {live_qty_shift_text}")
 
         self._refresh_reject_detail_grid()
 
@@ -4013,6 +4795,10 @@ QWidget#ClientUIRoot {{
             self._set_banner_text("Initial setup: Scan QC badge to confirm cycle time")
         elif s.waiting_cycle_time_input:
             self._set_banner_text("Downtime resolve: Scan cycle time digits, then confirm")
+        elif s.waiting_downtime_start_maintenance:
+            self._set_banner_text("PDR waiting: scan Maintenance QR to start downtime")
+        elif s.waiting_downtime_end_maintenance:
+            self._set_banner_text("Downtime active: scan Maintenance QR when repair is done")
         elif s.waiting_maintenance_qr:
             self._set_banner_text("Downtime resolve: Scan Maintenance QR")
         elif s.waiting_supervisor_qr:
@@ -4054,13 +4840,97 @@ QWidget#ClientUIRoot {{
 
     def _refresh_downtime_panel(self):
         s = self.state
-        self.rightRawSacks.setText(f"Sacks Count: {s.raw_sacks_count}")
         raw_logs = [x for x in (s.raw_material_logs or []) if isinstance(x, dict)]
-        if raw_logs:
-            recent_names = [str(x.get("material_name") or x.get("material") or "-").strip() or "-" for x in raw_logs[-4:]]
-            self.rightRawScanned.setText(f"Raw Mats Scanned: {', '.join(recent_names)}")
-        else:
-            self.rightRawScanned.setText("Raw Mats Scanned: -")
+        qty_by_name: Dict[str, float] = {}
+        scans_by_name: Dict[str, int] = {}
+        recent_unique: List[str] = []
+        seen_names: Set[str] = set()
+        for row in raw_logs:
+            name = str(row.get("material_name") or row.get("material") or "-").strip() or "-"
+            scans_by_name[name] = int(scans_by_name.get(name, 0) or 0) + 1
+            try:
+                qty = float(row.get("qty") or 0)
+            except Exception:
+                qty = 0.0
+            qty_by_name[name] = float(qty_by_name.get(name, 0.0) or 0.0) + max(0.0, qty)
+        for row in reversed(raw_logs):
+            name = str(row.get("material_name") or row.get("material") or "-").strip() or "-"
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            recent_unique.append(name)
+            if len(recent_unique) >= 3:
+                break
+        while len(recent_unique) < 3:
+            recent_unique.append("-")
+
+        def _to_float(value: Any) -> Optional[float]:
+            raw = str(value or "").strip()
+            if not raw:
+                return None
+            try:
+                return float(raw.replace(",", ""))
+            except Exception:
+                m = re.search(r"(\d+(?:\.\d+)?)", raw.replace(",", ""))
+                if not m:
+                    return None
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    return None
+
+        requested_part_qty = 0.0
+        payload = s.job_payload if isinstance(s.job_payload, dict) else {}
+        job = self._extract_job_record()
+        data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        job_details = {}
+        if isinstance(job.get("job_details"), dict):
+            job_details = job.get("job_details") or {}
+        elif isinstance(payload.get("job_details"), dict):
+            job_details = payload.get("job_details") or {}
+        elif isinstance(data_obj.get("job_details"), dict):
+            job_details = data_obj.get("job_details") or {}
+        part_rows: List[Dict[str, Any]] = []
+        # Keep source priority aligned with the job details table logic.
+        if isinstance(data_obj.get("parts"), list):
+            part_rows = [r for r in data_obj.get("parts") or [] if isinstance(r, dict)]
+        elif isinstance(job_details.get("parts"), list):
+            part_rows = [r for r in job_details.get("parts") or [] if isinstance(r, dict)]
+        elif isinstance(job_details.get("part_ids"), list):
+            part_rows = [r for r in job_details.get("part_ids") or [] if isinstance(r, dict)]
+        elif isinstance(job_details.get("part_ids"), dict):
+            part_rows = [job_details.get("part_ids") or {}]
+        elif isinstance(data_obj.get("part_ids"), list):
+            part_rows = [r for r in data_obj.get("part_ids") or [] if isinstance(r, dict)]
+        elif isinstance(payload.get("part_ids"), list):
+            part_rows = [r for r in payload.get("part_ids") or [] if isinstance(r, dict)]
+        for part in part_rows:
+            v = _to_float((part or {}).get("request_part_qty"))
+            if v is not None and v > 0:
+                requested_part_qty = v
+                break
+
+        n1, n2, n3 = recent_unique[0], recent_unique[1], recent_unique[2]
+        self.rightRawSacks.setText(f"Raw Mat 1: {n1}    Sacks: {int(scans_by_name.get(n1, 0) or 0)}")
+        self.rightRawField.setText(f"Raw Mat 2: {n2}    Sacks: {int(scans_by_name.get(n2, 0) or 0)}")
+        self.rightRawTotalScans.setText(f"Raw Mat 3: {n3}    Sacks: {int(scans_by_name.get(n3, 0) or 0)}")
+        preview_names = [n1, n2, n3]
+        for idx, mat_name in enumerate(preview_names):
+            display_name = str(mat_name or "-")
+            if len(display_name) > 14:
+                display_name = f"{display_name[:14]}\n{display_name[14:28]}"
+            else:
+                display_name = f"{display_name}\n "
+            qty_val = float(qty_by_name.get(mat_name, 0.0) or 0.0)
+            if requested_part_qty > 0:
+                progress = (qty_val / requested_part_qty)
+            else:
+                progress = 0.0
+            if idx < len(self.rawPreviewNames):
+                self.rawPreviewNames[idx].setText(display_name)
+            if idx < len(self.rawPreviewRings):
+                self.rawPreviewRings[idx].set_value_text(str(int(round(qty_val))))
+                self.rawPreviewRings[idx].set_progress(progress)
 
         if s.downtime_reason_code and s.downtime_reason_text:
             self.rightDowntimeReason.setText(f"Reason {s.downtime_reason_code}: {s.downtime_reason_text}")
@@ -4071,7 +4941,18 @@ QWidget#ClientUIRoot {{
         self.rightSupervisor.setText(f"Supervisor: {s.supervisor_name or '-'}")
         self.rightSupervisorLeft.setText(f"Supervisor: {s.supervisor_name or '-'}")
 
-        if s.downtime_started_at:
+        if s.waiting_downtime_start_maintenance and s.downtime_wait_started_at:
+            elapsed_wait = max(0, int(time.time() - s.downtime_wait_started_at))
+            hh = elapsed_wait // 3600
+            mm = (elapsed_wait % 3600) // 60
+            ss = elapsed_wait % 60
+            self.rightDowntimeTimer.setText(f"Waiting: {hh:02d}:{mm:02d}:{ss:02d}")
+            if self._overlay_mode == "active":
+                self.productionLiveReason.setText(self.rightDowntimeReason.text())
+                self.productionCounter.setText(f"{hh:02d}:{mm:02d}:{ss:02d}")
+                if self._repair_movie is None:
+                    self.productionFixAnim.setText("Waiting for maintenance...")
+        elif s.downtime_started_at:
             elapsed = max(0, int(time.time() - s.downtime_started_at))
             hh = elapsed // 3600
             mm = (elapsed % 3600) // 60
@@ -4097,28 +4978,112 @@ QWidget#ClientUIRoot {{
         s = self.state
         if getattr(self, "linkageMirrorOuter", None) is None:
             return
-        if s.waiting_linkage_job_scan:
-            self.linkageMirrorHint.setText("Linkage mode active: scan another JOB QR to mirror current session.")
-        elif s.linkage_enabled:
-            self.linkageMirrorHint.setText("Mirroring current session counters/reject details to linked job.")
-        else:
-            self.linkageMirrorHint.setText('Scan "joblinkage~1" then scan another JOB QR.')
-
         linked_rows = list(s.linkage_jobs or [])
-        if linked_rows:
-            linked_name = ", ".join(
-                [str(r.get("job_name") or r.get("job_code") or "-") for r in linked_rows[:2]]
-            )
-            if len(linked_rows) > 2:
-                linked_name += f" (+{len(linked_rows) - 2})"
-        else:
-            linked_name = s.linkage_job_name or s.linkage_job_code or "-"
-        self.linkageMirrorJob.setText(f"Linked Job(s): {linked_name}")
-        self.linkageMirrorCounts.setText(
-            f"Pack: {s.pack_count} | Good: {s.good_total} | Total Good (Pack Only): {s.good_total}"
-        )
-        self.linkageMirrorRejects.setText("Reject/Butal: main job only (linked job mirrors Pack/Good only)")
-        self.linkageMirrorOuter.setVisible(bool(s.machine_code))
+        linked_names = [
+            str(r.get("job_name") or r.get("job_code") or "-")
+            for r in linked_rows[:3]
+        ]
+        while len(linked_names) < 3:
+            linked_names.append("-")
+        self.linkageMirrorJob1.setText(linked_names[0])
+        self.linkageMirrorJob2.setText(linked_names[1])
+        self.linkageMirrorJob3.setText(linked_names[2])
+        self.linkageMirrorPack.setText(str(s.pack_count))
+        self.linkageMirrorGood.setText(str(s.good_total))
+        self.linkageMirrorButal.setText(str(s.butal_total))
+        self.linkageMirrorTotalGood.setText(str(s.good_total + s.butal_total))
+        self.linkageMirrorOuter.setVisible(True)
+        self._refresh_history_panel()
+
+    def _refresh_history_panel(self):
+        if not all(
+            hasattr(self, name)
+            for name in ("historyPackCol", "historyRawCol", "historyActionCol")
+        ):
+            return
+        s = self.state
+
+        def _fmt_ts(raw_val: Any) -> str:
+            txt = str(raw_val or "").strip()
+            if not txt:
+                return "-"
+            try:
+                dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+                return dt.astimezone().strftime("%H:%M:%S")
+            except Exception:
+                return txt[-8:] if len(txt) >= 8 else txt
+
+        pack_rows = []
+        for row in reversed(list(s.product_pack_history_logs or [])[-20:]):
+            if not isinstance(row, dict):
+                continue
+            idx = str(row.get("index") or "-")
+            qty = str(row.get("qty_q") or row.get("qty") or "-")
+            pid_raw = str(row.get("product_p") or row.get("product_id") or "").strip()
+            pid = pid_raw.lstrip("0") if pid_raw.isdigit() else pid_raw
+            pid = pid or ""
+            pname = self._lookup_product_name(pid) if pid else ""
+            if pid and not pname:
+                if self._refresh_product_catalog_cache_from_api():
+                    pname = self._lookup_product_name(pid)
+            product_name = pname or (f"Product {pid}" if pid else "-")
+            ts = _fmt_ts(row.get("scanned_at"))
+            pack_rows.append(f"{idx} | {product_name} | {qty} | {ts}")
+
+        raw_rows = []
+        for row in reversed(list(s.raw_material_logs or [])[-20:]):
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("material_name") or row.get("material") or "-").strip() or "-"
+            qty = int(row.get("qty") or 1)
+            raw_rows.append(f"{_fmt_ts(row.get('scanned_at'))}  {name}  +{qty}")
+
+        action_rows = []
+        raw_actions = list(reversed(list(getattr(self, "_action_logs", []) or [])[-20:]))
+        for idx, row in enumerate(raw_actions, start=1):
+            txt = str(row or "").strip()
+            if not txt:
+                continue
+            ts = "-"
+            action_text = txt
+            m = re.match(r"^(\d{2}:\d{2}:\d{2})\s+(.*)$", txt)
+            if m:
+                ts = m.group(1)
+                action_text = m.group(2).strip()
+            has_pack_fields = ("Q:" in action_text) and ("I:" in action_text)
+            if has_pack_fields:
+                m_idx = re.search(r"\bI\s*:\s*([0-9]+)\b", action_text)
+                m_qty = re.search(r"\bQ\s*:\s*([0-9]+)\b", action_text)
+                item_idx = m_idx.group(1) if m_idx else str(idx)
+                qty_val = m_qty.group(1) if m_qty else "-"
+                name_text = re.sub(r"\bQ\s*:\s*[0-9]+\b", "", action_text)
+                name_text = re.sub(r"\bI\s*:\s*[0-9]+\b", "", name_text)
+                name_text = re.sub(r"\s{2,}", " ", name_text).strip(" |")
+                action_rows.append(f"{item_idx} | {name_text} | {qty_val} | {ts}")
+            else:
+                action_rows.append(action_text)
+
+        self._sync_history_column(self.historyPackCol, "pack", pack_rows)
+        self._sync_history_column(self.historyRawCol, "raw", raw_rows)
+        self._sync_history_column(self.historyActionCol, "action", action_rows)
+
+    def _sync_history_column(self, col_widget: Any, key: str, entries: List[str]):
+        vals = [str(x).strip() for x in (entries or []) if str(x).strip()]
+        last_attr = f"_history_last_{key}"
+        inited_attr = f"_history_init_{key}"
+        if not bool(getattr(self, inited_attr, False)):
+            col_widget.set_snapshot(vals)
+            setattr(self, last_attr, vals[0] if vals else "")
+            setattr(self, inited_attr, True)
+            return
+        latest = vals[0] if vals else ""
+        prev = str(getattr(self, last_attr, "") or "")
+        if latest and latest != prev:
+            col_widget.push_scan(latest)
+            setattr(self, last_attr, latest)
+        elif not latest and prev:
+            col_widget.set_snapshot([])
+            setattr(self, last_attr, "")
 
     def _save_finished_job_local(self, payload: Dict[str, Any]):
         return _insert_finished_job_sql(payload)
@@ -4235,6 +5200,10 @@ QWidget#ClientUIRoot {{
             "downtime_started_at": s.downtime_started_at,
             "downtime_last_seconds": s.downtime_last_seconds,
             "downtime_active": bool(s.downtime_active),
+            "downtime_wait_started_at": s.downtime_wait_started_at,
+            "downtime_wait_last_seconds": s.downtime_wait_last_seconds,
+            "waiting_downtime_start_maintenance": bool(s.waiting_downtime_start_maintenance),
+            "waiting_downtime_end_maintenance": bool(s.waiting_downtime_end_maintenance),
             "cycle_time_current": s.cycle_time_current,
             "cycle_time_new_input": s.cycle_time_new_input,
             "waiting_cycle_time_input": bool(s.waiting_cycle_time_input),
@@ -4246,6 +5215,11 @@ QWidget#ClientUIRoot {{
             "cycle_time_confirm_actor_code": s.cycle_time_confirm_actor_code,
             "cycle_time_confirm_actor_name": s.cycle_time_confirm_actor_name,
             "cycle_time_confirm_actor_role": s.cycle_time_confirm_actor_role,
+            "live_cycle_last_scan_at": s.live_cycle_last_scan_at,
+            "live_cycle_total_seconds": float(s.live_cycle_total_seconds or 0.0),
+            "live_cycle_intervals": int(s.live_cycle_intervals or 0),
+            "live_cycle_total_units": int(s.live_cycle_total_units or 0),
+            "live_cycle_avg_seconds": s.live_cycle_avg_seconds,
             "waiting_maintenance_qr": bool(s.waiting_maintenance_qr),
             "waiting_supervisor_qr": bool(s.waiting_supervisor_qr),
             "waiting_operator_downtime_confirm": bool(s.waiting_operator_downtime_confirm),
@@ -4326,6 +5300,10 @@ QWidget#ClientUIRoot {{
         s.downtime_started_at = snap.get("downtime_started_at")
         s.downtime_last_seconds = snap.get("downtime_last_seconds")
         s.downtime_active = bool(snap.get("downtime_active"))
+        s.downtime_wait_started_at = snap.get("downtime_wait_started_at")
+        s.downtime_wait_last_seconds = snap.get("downtime_wait_last_seconds")
+        s.waiting_downtime_start_maintenance = bool(snap.get("waiting_downtime_start_maintenance"))
+        s.waiting_downtime_end_maintenance = bool(snap.get("waiting_downtime_end_maintenance"))
         s.cycle_time_current = snap.get("cycle_time_current")
         s.cycle_time_new_input = str(snap.get("cycle_time_new_input") or "")
         s.waiting_cycle_time_input = bool(snap.get("waiting_cycle_time_input"))
@@ -4337,6 +5315,14 @@ QWidget#ClientUIRoot {{
         s.cycle_time_confirm_actor_code = snap.get("cycle_time_confirm_actor_code")
         s.cycle_time_confirm_actor_name = snap.get("cycle_time_confirm_actor_name")
         s.cycle_time_confirm_actor_role = snap.get("cycle_time_confirm_actor_role")
+        s.live_cycle_last_scan_at = snap.get("live_cycle_last_scan_at")
+        s.live_cycle_total_seconds = float(snap.get("live_cycle_total_seconds") or 0.0)
+        s.live_cycle_intervals = int(snap.get("live_cycle_intervals") or 0)
+        s.live_cycle_total_units = int(snap.get("live_cycle_total_units") or 0)
+        live_avg = snap.get("live_cycle_avg_seconds")
+        s.live_cycle_avg_seconds = float(live_avg) if live_avg is not None else None
+        if s.live_cycle_last_scan_at is None and s.machine_code:
+            s.live_cycle_last_scan_at = time.time()
         s.waiting_maintenance_qr = bool(snap.get("waiting_maintenance_qr"))
         s.waiting_supervisor_qr = bool(snap.get("waiting_supervisor_qr"))
         s.waiting_operator_downtime_confirm = bool(snap.get("waiting_operator_downtime_confirm"))
@@ -4436,6 +5422,7 @@ QWidget#ClientUIRoot {{
             "job_payload": s.job_payload or {},
             "reject_review_logs": list(s.reject_review_logs or []),
             "downtime_last_seconds": s.downtime_last_seconds,
+            "downtime_wait_last_seconds": s.downtime_wait_last_seconds,
             "downtime_reason_code": s.downtime_reason_code,
             "downtime_reason_text": s.downtime_reason_text,
             "cycle_time_current": s.cycle_time_current,
@@ -4510,6 +5497,10 @@ QWidget#ClientUIRoot {{
         s.downtime_started_at = None
         s.downtime_last_seconds = None
         s.downtime_active = False
+        s.downtime_wait_started_at = None
+        s.downtime_wait_last_seconds = None
+        s.waiting_downtime_start_maintenance = False
+        s.waiting_downtime_end_maintenance = False
         s.cycle_time_current = None
         s.cycle_time_confirmed_by = None
         s.waiting_initial_cycle_time_input = False
@@ -4547,6 +5538,7 @@ QWidget#ClientUIRoot {{
         s.operator_shift_baseline_raw_material_logs_len = 0
         s.operator_shift_baseline_product_pack_history_logs_len = 0
         s.operator_shift_baseline_reject_review_logs_len = 0
+        self._reset_live_cycle_tracking()
         self._reset_downtime_resolution_state()
         self._hide_resolve_overlay()
         self._hide_production_overlay()
@@ -4557,11 +5549,11 @@ QWidget#ClientUIRoot {{
         self._clear_active_session_snapshot(active_machine_code)
         self._refresh_ui()
         self.rightCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
-        self.rightCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
+        self.rightCycleCurrent.setText(f"Act Cycle Time: {s.cycle_time_current or ''}")
         if hasattr(self, "topCycleCount") and self.topCycleCount is not None:
             self.topCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
         if hasattr(self, "topCycleCurrent") and self.topCycleCurrent is not None:
-            self.topCycleCurrent.setText(f"Cycle Time: {s.cycle_time_current or ''}")
+            self.topCycleCurrent.setText(f"Act Cycle Time: {s.cycle_time_current or ''}")
         self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or ''}")
         self.rightSupervisor.setText(f"Supervisor: {s.supervisor_name or ''}")
 
@@ -4924,6 +5916,49 @@ QWidget#ClientUIRoot {{
         s = str(v).strip()
         return s if s else fallback
 
+    def _parse_cycle_seconds(self, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        raw = str(v).strip()
+        if not raw:
+            return None
+        m = re.search(r"(\d+(?:\.\d+)?)", raw)
+        if not m:
+            return None
+        try:
+            out = float(m.group(1))
+            return out if out > 0 else None
+        except Exception:
+            return None
+
+    def _qty_per_shift_from_cycle(self, cycle_seconds: Optional[float]) -> Optional[int]:
+        if cycle_seconds is None or cycle_seconds <= 0:
+            return None
+        return int((12 * 60 * 60) / cycle_seconds)
+
+    def _reset_live_cycle_tracking(self, *, start_now: bool = False):
+        s = self.state
+        s.live_cycle_last_scan_at = time.time() if start_now else None
+        s.live_cycle_total_seconds = 0.0
+        s.live_cycle_intervals = 0
+        s.live_cycle_total_units = 0
+        s.live_cycle_avg_seconds = None
+
+    def _mark_live_cycle_scan_event(self, units: int = 1):
+        s = self.state
+        now_ts = time.time()
+        prev_ts = s.live_cycle_last_scan_at
+        qty_units = max(1, int(units or 1))
+        if prev_ts is not None and now_ts > prev_ts:
+            delta = now_ts - prev_ts
+            s.live_cycle_total_seconds = float(s.live_cycle_total_seconds or 0.0) + float(delta)
+            s.live_cycle_intervals = int(s.live_cycle_intervals or 0) + 1
+            s.live_cycle_total_units = int(s.live_cycle_total_units or 0) + qty_units
+            if s.live_cycle_total_units > 0:
+                # Live cycle time is per unit (sec/unit), weighted by scanned quantity.
+                s.live_cycle_avg_seconds = s.live_cycle_total_seconds / s.live_cycle_total_units
+        s.live_cycle_last_scan_at = now_ts
+
     def _http_error_snippet(self, resp: Any, max_len: int = 180) -> str:
         try:
             txt = str(getattr(resp, "text", "") or "").strip()
@@ -4942,6 +5977,7 @@ QWidget#ClientUIRoot {{
         self._job_api_logs = rows
         if hasattr(self, "jobApiLogLabel") and self.jobApiLogLabel is not None:
             self.jobApiLogLabel.setText("\n".join(rows) if rows else "No Job API logs yet.")
+        self.log_last(f"JobAPI: {str(msg or '').strip()}")
 
     def _extract_job_record(self) -> Dict[str, Any]:
         payload = self.state.job_payload or {}
@@ -5165,6 +6201,7 @@ QWidget#ClientUIRoot {{
     def _refresh_job_details(self):
         job = self._extract_job_record()
         payload = self.state.job_payload or {}
+        s = self.state
         job_details = {}
         if isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("job_details"), dict):
             job_details = payload["data"]["job_details"]
@@ -5205,18 +6242,32 @@ QWidget#ClientUIRoot {{
             "qty_per_shift": self._safe_text(job_details.get("qty_per_shift"), "N/A"),
         }
 
+        consumed_raw_qty = 0.0
+        for row in (s.raw_material_logs or []):
+            if not isinstance(row, dict):
+                continue
+            try:
+                consumed_raw_qty += float(row.get("qty") or 0)
+            except Exception:
+                pass
+
+        def _fmt_number(v: float) -> str:
+            if abs(v - int(v)) < 1e-9:
+                return str(int(v))
+            return f"{v:.2f}".rstrip("0").rstrip(".")
+
         if hasattr(self, "jobPartsTable") and self.jobPartsTable is not None:
             self.jobPartsTable.setRowCount(0)
             for part in part_rows:
                 r = self.jobPartsTable.rowCount()
                 self.jobPartsTable.insertRow(r)
                 values = [
-                    self._safe_text(part.get("part_product_id"), "-"),
                     self._safe_text(part.get("sku"), "-"),
                     self._safe_text(part.get("name"), "-"),
                     self._safe_text(part.get("part_qty_per_unit"), "-"),
-                    self._safe_text(part.get("request_part_qty"), "-"),
-                    f"{self._safe_text(part.get('approve_part_qty'), '-')} / {self._safe_text(part.get('complete_part_qty'), '-')}",
+                    (
+                        f"{_fmt_number(consumed_raw_qty)} / {self._safe_text(part.get('request_part_qty'), '-')}"
+                    ),
                 ]
                 for c, val in enumerate(values):
                     item = QTableWidgetItem(val)
@@ -5224,17 +6275,12 @@ QWidget#ClientUIRoot {{
                     self.jobPartsTable.setItem(r, c, item)
             if self.jobPartsTable.rowCount() == 0:
                 self.jobPartsTable.insertRow(0)
-                for c in range(6):
+                for c in range(4):
                     self.jobPartsTable.setItem(0, c, QTableWidgetItem("-"))
 
-        if hasattr(self, "rightCycleStd") and self.rightCycleStd is not None:
-            self.rightCycleStd.setText(f"Std Cycle Time: {fields.get('std_cycle_time', 'N/A')}")
-        if hasattr(self, "topCycleStd") and self.topCycleStd is not None:
-            self.topCycleStd.setText(f"Std Cycle Time: {fields.get('std_cycle_time', 'N/A')}")
-        if hasattr(self, "rightCycleQtyShift") and self.rightCycleQtyShift is not None:
-            self.rightCycleQtyShift.setText(f"Qty / Shift: {fields.get('qty_per_shift', 'N/A')}")
-        if hasattr(self, "topCycleQtyShift") and self.topCycleQtyShift is not None:
-            self.topCycleQtyShift.setText(f"Qty / Shift: {fields.get('qty_per_shift', 'N/A')}")
+        # Cycle monitor values are computed live in _refresh_ui from:
+        # - Act cycle time entered/confirmed by operator
+        # - Live cycle average based on production scan cadence
 
     def _build_reject_summary_text(self) -> str:
         s = self.state
@@ -5348,7 +6394,22 @@ QWidget#ClientUIRoot {{
                 return f"Raw Material: {res.value} (+{int(res.qty or 1)}) [{res.meta.get('unique_key')}]"
             return f"Raw Material: {res.value} (+{int(res.qty or 1)})"
         if res.kind == "PACK":
-            return f"Pack +{int(res.qty or 0)}"
+            pack_meta = self._extract_pack_history_fields(raw)
+            qty_text = str(int(res.qty or 0))
+            idx_text = "-"
+            product_id = ""
+            if isinstance(pack_meta, dict):
+                qty_text = str(pack_meta.get("qty_q") or qty_text)
+                idx_text = str(pack_meta.get("index") or "-")
+                product_id = str(pack_meta.get("product_p") or "").strip()
+            norm_pid = product_id.lstrip("0") if product_id.isdigit() else product_id
+            norm_pid = norm_pid or ""
+            product_name = self._lookup_product_name(norm_pid) if norm_pid else ""
+            if norm_pid and not product_name:
+                if self._refresh_product_catalog_cache_from_api():
+                    product_name = self._lookup_product_name(norm_pid)
+            display_name = product_name or (f"Product {norm_pid}" if norm_pid else "Pack")
+            return f"{display_name}  Q:{qty_text}  I:{idx_text}"
         if res.kind == "BUTAL":
             return f"Butal +{int(res.qty or 0)}"
         if res.kind == "REJECT_TRIGGER":
@@ -5370,7 +6431,14 @@ QWidget#ClientUIRoot {{
         return "Scan received"
 
     def log_last(self, text: str):
-        return
+        t = str(text or "").strip()
+        if not t:
+            return
+        stamp = time.strftime("%H:%M:%S")
+        rows = list(getattr(self, "_action_logs", []) or [])
+        rows.append(f"{stamp}  {t}")
+        self._action_logs = rows[-20:]
+        self._refresh_history_panel()
 
     def _set_status_text(self, text: str):
         t = str(text).replace("\n", " ").strip()
@@ -5385,9 +6453,11 @@ QWidget#ClientUIRoot {{
             short = t[:117] + "..."
             self.status.setText(short)
             self.status.setToolTip(t)
+            self.log_last(short)
         else:
             self.status.setText(t)
             self.status.setToolTip("")
+            self.log_last(t)
 
     def _setup_scanner_input(self):
         mode = str(self.client_config.get("scanner_mode", SCANNER_MODE)).strip().lower()
@@ -5450,6 +6520,14 @@ QWidget#ClientUIRoot {{
         return bool(
             s.machine_code and s.job_code and s.operator_id
             and not s.waiting_initial_cycle_time_input
+            and not s.waiting_production_report_reason
+            and not s.waiting_downtime_start_maintenance
+            and not s.waiting_downtime_end_maintenance
+            and not s.waiting_cycle_time_input
+            and not s.waiting_maintenance_qr
+            and not s.waiting_supervisor_qr
+            and not s.waiting_operator_downtime_confirm
+            and not s.downtime_active
         )
 
     def _missing_session_prereq_message(self) -> Optional[str]:
@@ -5552,6 +6630,8 @@ QWidget#ClientUIRoot {{
             reviewer_can_qc = str(reviewer.get("can_qc", "0")) == "1"
             in_downtime_flow = (
                 s.waiting_production_report_reason
+                or s.waiting_downtime_start_maintenance
+                or s.waiting_downtime_end_maintenance
                 or s.waiting_cycle_time_input
                 or s.waiting_maintenance_qr
                 or s.waiting_supervisor_qr
@@ -5722,7 +6802,7 @@ QWidget#ClientUIRoot {{
                 return
 
             qty = int(res_pre.qty or 1)
-            s.raw_sacks_count += qty
+            s.raw_sacks_count += 1
             material_name = str((meta.get("material_name") if isinstance(meta, dict) else None) or res_pre.value or "Raw Material").strip()
             s.raw_material_scans.append(material_name)
             s.raw_material_logs.append(
@@ -5754,6 +6834,39 @@ QWidget#ClientUIRoot {{
                 },
                 f"RAW MATERIAL {material_name} +{qty}",
             )
+            return
+
+        # PDR waiting step: scan maintenance to actually start downtime timer.
+        if s.waiting_downtime_start_maintenance:
+            auth = self._authorized_person_from_scan(raw_s)
+            if auth and str(auth.get("can_maintenance", "0")) == "1":
+                s.maintenance_name = str(auth.get("name") or raw_s)
+                if s.downtime_wait_started_at:
+                    s.downtime_wait_last_seconds = max(0, int(time.time() - s.downtime_wait_started_at))
+                s.downtime_wait_started_at = None
+                s.waiting_downtime_start_maintenance = False
+                s.downtime_started_at = time.time()
+                s.downtime_active = True
+                s.waiting_downtime_end_maintenance = True
+                self.status.setText("Maintenance acknowledged. Downtime timer started.")
+                self._refresh_ui()
+                self._save_active_session_snapshot()
+                return
+            self.status.setText("Waiting mode: scan valid Maintenance QR to start downtime.")
+            return
+
+        # Downtime running step: maintenance scans again when repair is done.
+        if s.waiting_downtime_end_maintenance and s.downtime_active:
+            auth = self._authorized_person_from_scan(raw_s)
+            if auth and str(auth.get("can_maintenance", "0")) == "1":
+                s.maintenance_name = str(auth.get("name") or raw_s)
+                s.waiting_downtime_end_maintenance = False
+                self._begin_downtime_resolution()
+                self.status.setText("Maintenance done. Enter cycle time, then continue confirmation flow.")
+                self._refresh_ui()
+                self._save_active_session_snapshot()
+                return
+            self.status.setText("Downtime active: scan Maintenance QR when repair is completed.")
             return
 
         # Resolution step 1: Cycle time input via num_0..num_9, backspace, confirm
@@ -5825,6 +6938,7 @@ QWidget#ClientUIRoot {{
                     s.downtime_last_seconds = max(0, int(time.time() - s.downtime_started_at))
                 s.downtime_started_at = None
                 s.downtime_active = False
+                s.waiting_downtime_end_maintenance = False
                 self._reset_downtime_resolution_state()
                 self._hide_resolve_overlay()
                 self._hide_production_overlay()
@@ -5835,6 +6949,8 @@ QWidget#ClientUIRoot {{
                         "reason_code": s.downtime_reason_code,
                         "reason": s.downtime_reason_text,
                         "cycle_time": s.cycle_time_current,
+                        "waiting_seconds": int(s.downtime_wait_last_seconds or 0),
+                        "downtime_seconds": int(s.downtime_last_seconds or 0),
                         "maintenance": s.maintenance_name,
                         "supervisor": s.supervisor_name,
                     },
@@ -5850,9 +6966,9 @@ QWidget#ClientUIRoot {{
             self.status.setText("Scan operator QR to confirm.")
             return
 
-        # Downtime lock: allow resolve trigger and SUR while active
+        # Downtime lock: keep scans constrained while downtime flow is active.
         if s.downtime_active and raw_l not in ("productiondailyreport~2", "sur"):
-            self.status.setText('Downtime active: only "productiondailyreport~2" or "SUR" is allowed.')
+            self.status.setText("Downtime flow active: complete maintenance/cycle/supervisor/operator steps.")
             return
 
         res = parse_scan(raw_s)
@@ -5885,16 +7001,20 @@ QWidget#ClientUIRoot {{
             s.waiting_production_report_reason = False
             s.downtime_reason_code = code
             s.downtime_reason_text = reason
-            s.downtime_started_at = time.time()
-            s.downtime_active = True
+            s.downtime_wait_started_at = time.time()
+            s.downtime_wait_last_seconds = None
+            s.waiting_downtime_start_maintenance = True
+            s.waiting_downtime_end_maintenance = False
+            s.downtime_started_at = None
+            s.downtime_active = False
             s.maintenance_name = None
             s.supervisor_name = None
             self._set_production_overlay_mode("active")
             self._show_production_overlay()
-            self.status.setText(f"Production Daily Report reason set: {code} - {reason}")
+            self.status.setText(f"Production Daily Report reason set: {code} - {reason}. Waiting for maintenance scan.")
             self._refresh_ui()
             self.push_event(
-                {"type": "PRODUCTION_DAILY_REPORT", "reason_code": code, "reason": reason},
+                {"type": "PRODUCTION_DAILY_REPORT", "reason_code": code, "reason": reason, "mode": "WAITING_FOR_MAINTENANCE"},
                 f"PRODUCTION DAILY REPORT {code} {reason}",
             )
             return
@@ -5913,6 +7033,8 @@ QWidget#ClientUIRoot {{
             if (
                 s.waiting_reject_reason
                 or s.waiting_production_report_reason
+                or s.waiting_downtime_start_maintenance
+                or s.waiting_downtime_end_maintenance
                 or s.waiting_cycle_time_input
                 or s.waiting_maintenance_qr
                 or s.waiting_supervisor_qr
@@ -5944,6 +7066,8 @@ QWidget#ClientUIRoot {{
             if (
                 s.waiting_reject_reason
                 or s.waiting_production_report_reason
+                or s.waiting_downtime_start_maintenance
+                or s.waiting_downtime_end_maintenance
                 or s.waiting_cycle_time_input
                 or s.waiting_maintenance_qr
                 or s.waiting_supervisor_qr
@@ -5993,7 +7117,13 @@ QWidget#ClientUIRoot {{
                 self.status.setText(msg[:1].upper() + msg[1:])
                 self._show_invalid_overlay(msg)
                 return
-            if s.waiting_reject_reason or s.waiting_production_report_reason or s.downtime_active:
+            if (
+                s.waiting_reject_reason
+                or s.waiting_production_report_reason
+                or s.waiting_downtime_start_maintenance
+                or s.waiting_downtime_end_maintenance
+                or s.downtime_active
+            ):
                 self.status.setText("Cannot start linkage while reject/downtime flow is active.")
                 return
             s.waiting_linkage_job_scan = True
@@ -6018,6 +7148,7 @@ QWidget#ClientUIRoot {{
             if res.kind == "REJECT_REASON":
                 reason = res.value
                 s.reject_total += 1
+                self._mark_live_cycle_scan_event()
                 s.reject_breakdown[reason] = s.reject_breakdown.get(reason, 0) + 1
                 s.waiting_reject_reason = False
                 self.status.setText(f"Reject recorded: {reason}")
@@ -6027,6 +7158,7 @@ QWidget#ClientUIRoot {{
                 return
             if res.kind == "STARTUP_REJECT":
                 s.startup_reject_total += 1
+                self._mark_live_cycle_scan_event()
                 s.waiting_reject_reason = False
                 self.status.setText("Start Up Reject recorded.")
                 self._refresh_ui()
@@ -6042,6 +7174,7 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay(msg)
                 return
             s.startup_reject_total += 1
+            self._mark_live_cycle_scan_event()
             self.status.setText("Start Up Reject recorded.")
             self._refresh_ui()
             self.push_event({"type": "STARTUP_REJECT", "qty": 1}, "STARTUP REJECT +1")
@@ -6078,6 +7211,10 @@ QWidget#ClientUIRoot {{
             s.downtime_started_at = None
             s.downtime_last_seconds = None
             s.downtime_active = False
+            s.downtime_wait_started_at = None
+            s.downtime_wait_last_seconds = None
+            s.waiting_downtime_start_maintenance = False
+            s.waiting_downtime_end_maintenance = False
             s.cycle_time_current = None
             s.cycle_time_confirmed_by = None
             s.waiting_initial_cycle_time_input = False
@@ -6087,6 +7224,7 @@ QWidget#ClientUIRoot {{
             s.cycle_time_confirm_actor_code = None
             s.cycle_time_confirm_actor_name = None
             s.cycle_time_confirm_actor_role = None
+            self._reset_live_cycle_tracking(start_now=True)
             s.maintenance_name = None
             s.supervisor_name = None
             s.raw_sacks_count = 0
@@ -6271,6 +7409,10 @@ QWidget#ClientUIRoot {{
             s.downtime_started_at = None
             s.downtime_last_seconds = None
             s.downtime_active = False
+            s.downtime_wait_started_at = None
+            s.downtime_wait_last_seconds = None
+            s.waiting_downtime_start_maintenance = False
+            s.waiting_downtime_end_maintenance = False
             s.cycle_time_current = None
             s.cycle_time_confirmed_by = None
             s.waiting_initial_cycle_time_input = False
@@ -6280,6 +7422,7 @@ QWidget#ClientUIRoot {{
             s.cycle_time_confirm_actor_code = None
             s.cycle_time_confirm_actor_name = None
             s.cycle_time_confirm_actor_role = None
+            self._reset_live_cycle_tracking(start_now=True)
             s.maintenance_name = None
             s.supervisor_name = None
             s.raw_sacks_count = 0
@@ -6448,6 +7591,60 @@ QWidget#ClientUIRoot {{
 
                 qty = int(res.qty or 0)
                 pack_hist = self._extract_pack_history_fields(raw_s)
+                product_name_for_pack = ""
+                product_sku_for_pack = ""
+                if isinstance(pack_hist, dict):
+                    pid_raw = str(pack_hist.get("product_p") or pack_hist.get("product_id") or "").strip()
+                    pid = pid_raw.lstrip("0") if pid_raw.isdigit() else pid_raw
+                    pid = pid or ""
+                    if pid:
+                        product_name_for_pack = self._lookup_product_name(pid)
+                        product_sku_for_pack = self._lookup_product_sku(pid)
+                        if (not product_name_for_pack or not product_sku_for_pack) and self._refresh_product_catalog_cache_from_api():
+                            product_name_for_pack = self._lookup_product_name(pid)
+                            product_sku_for_pack = self._lookup_product_sku(pid)
+                is_rm_from_pack = bool(str(product_sku_for_pack).strip().upper().startswith("Z-RM"))
+                if is_rm_from_pack:
+                    material_name = str(product_name_for_pack or "Raw Material").strip() or "Raw Material"
+                    unique_key = ""
+                    if isinstance(pack_hist, dict):
+                        scan_idx = str(pack_hist.get("index") or "").strip()
+                        scan_lot = str(pack_hist.get("lot_number") or "").strip()
+                        pid_raw = str(pack_hist.get("product_p") or "").strip()
+                        if scan_idx and scan_lot:
+                            unique_key = f"PACKRM:{pid_raw}:{scan_idx}:{scan_lot}"
+                    if unique_key and unique_key in (s.raw_material_unique_keys or set()):
+                        self.status.setText("Invalid RAW MATERIAL QR: duplicate serial already scanned.")
+                        self._show_invalid_overlay("RAW MATERIAL QR serial already scanned.")
+                        return
+                    s.raw_sacks_count += 1
+                    s.raw_material_scans.append(material_name)
+                    log_row = {
+                        "material_name": material_name,
+                        "qty": qty,
+                        "scanned_at": datetime.now(timezone.utc).isoformat(),
+                        "source": "PACK_QR_ZRM",
+                    }
+                    if isinstance(pack_hist, dict):
+                        log_row.update(
+                            {
+                                "index": str(pack_hist.get("index") or "-"),
+                                "total_labels": str(pack_hist.get("total_labels") or "-"),
+                                "lot_number": str(pack_hist.get("lot_number") or "-"),
+                                "po_number": str(pack_hist.get("po_number") or "-"),
+                            }
+                        )
+                    s.raw_material_logs.append(log_row)
+                    if unique_key:
+                        s.raw_material_unique_keys.add(unique_key)
+                    self.status.setText(f"Raw material scanned: {material_name} (+{qty})")
+                    self._refresh_ui()
+                    self.push_event(
+                        {"type": "RAW_MATERIAL", "qty": qty, "material": material_name, "source": "PACK_QR_ZRM"},
+                        f"RAW MATERIAL {material_name} +{qty}",
+                    )
+                    return
+
                 if pack_hist is not None:
                     pack_hist["operator"] = str(s.operator_id or "").strip() or "-"
                     pack_hist["operator_name"] = self._operator_display_name(s.operator_id)
@@ -6469,6 +7666,7 @@ QWidget#ClientUIRoot {{
                     s.product_pack_history_logs.append(pack_hist)
                 s.pack_count += 1
                 s.good_total += qty
+                self._mark_live_cycle_scan_event(units=qty if qty > 0 else 1)
                 self.status.setText(f"Pack +1 (Good +{qty})")
                 self._refresh_ui()
                 self._pulse_card(self.cardStatPack)
@@ -6480,6 +7678,7 @@ QWidget#ClientUIRoot {{
             if res.kind == "BUTAL":
                 qty = int(res.qty or 0)
                 s.butal_total += qty
+                self._mark_live_cycle_scan_event(units=qty if qty > 0 else 1)
                 self.status.setText(f"Butal +{qty}")
                 self._refresh_ui()
                 self._pulse_card(self.cardStatButal)
