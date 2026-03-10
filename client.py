@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import random
 import socket
 import sys
 import threading
@@ -28,7 +29,10 @@ from PyQt6.QtCore import (
     QParallelAnimationGroup,
     QSequentialAnimationGroup,
 )
-from PyQt6.QtGui import QMovie, QPixmap, QColor, QPainter, QPen, QFont, QConicalGradient, QBrush
+from PyQt6.QtGui import (
+    QMovie, QPixmap, QColor, QPainter, QPen, QFont, QConicalGradient, QBrush,
+    QLinearGradient, QRadialGradient, QPainterPath,
+)
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy,
     QGraphicsDropShadowEffect, QGraphicsBlurEffect, QGraphicsOpacityEffect, QProgressBar, QPushButton, QComboBox, QScrollArea,
@@ -99,9 +103,11 @@ def _load_sql_config() -> Dict[str, Any]:
 
 def _sql_conn():
     if pymysql is None:
+        print("[SQL] PyMySQL is not installed. MySQL features are unavailable.")
         return None
     cfg = _load_sql_config()
     if not cfg.get("enabled"):
+        print("[SQL] SQL is disabled in configuration.")
         return None
     try:
         return pymysql.connect(
@@ -115,7 +121,8 @@ def _sql_conn():
             autocommit=False,
             connect_timeout=int(cfg.get("connect_timeout", 5) or 5),
         )
-    except Exception:
+    except Exception as e:
+        print(f"[SQL] Connection failed: {e}")
         return None
 
 
@@ -416,23 +423,119 @@ def _load_active_sessions_sql() -> Dict[str, Any]:
 def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
     machine_code = str((row or {}).get("machine_code") or "").strip()
     if not machine_code:
+        print("[SQL] Active session save skipped: empty machine_code.")
         return False
     conn = _sql_conn()
     if conn is None:
+        print(f"[SQL] Active session save failed for {machine_code}: no SQL connection.")
         return False
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO `active_machine_sessions`
-                (`machine_code`,`saved_at_utc`,`machine_name`,`job_code`,`job_name`,`operator_id`,`raw_json`)
-                VALUES (%s,%s,%s,%s,%s,%s,CAST(%s AS JSON))
+                (`machine_code`,`saved_at_utc`,`machine_name`,`job_code`,`job_name`,`operator_id`,
+                 `pack_count`,`good_total`,`butal_total`,`reject_total`,`reject_breakdown`,
+                 `waiting_reject_reason`,`waiting_production_report_reason`,`showing_reject_summary`,`reject_summary_last_scanned_at`,
+                 `job_payload`,`downtime_reason_code`,`downtime_reason_text`,`downtime_started_at`,`downtime_last_seconds`,`downtime_active`,
+                 `cycle_time_current`,`cycle_time_new_input`,`waiting_cycle_time_input`,`waiting_initial_cycle_time_input`,
+                 `waiting_initial_cycle_qc_confirm`,`waiting_cycle_time_confirm_popup`,`cycle_time_confirm_phase`,
+                 `cycle_time_confirmed_by`,`cycle_time_confirm_actor_code`,`cycle_time_confirm_actor_name`,`cycle_time_confirm_actor_role`,
+                 `waiting_maintenance_qr`,`waiting_supervisor_qr`,`waiting_operator_downtime_confirm`,`maintenance_name`,`supervisor_name`,
+                 `raw_sacks_count`,`raw_material_scans`,`raw_material_logs`,`raw_material_unique_keys`,`product_pack_history_logs`,
+                 `startup_reject_total`,`reject_review_open`,`reject_review_phase`,`reject_review_actor_code`,`reject_review_actor_name`,
+                 `reject_review_actor_role`,`reject_review_logs`,`waiting_linkage_job_scan`,`linkage_enabled`,`linkage_job_code`,
+                 `linkage_job_name`,`linkage_job_payload`,`linkage_jobs`,`operator_shift_logs`,`operator_shift_index`,
+                 `operator_shift_started_at`,`operator_shift_baseline_pack_count`,`operator_shift_baseline_good_total`,
+                 `operator_shift_baseline_butal_total`,`operator_shift_baseline_reject_total`,`operator_shift_baseline_startup_reject_total`,
+                 `operator_shift_baseline_raw_sacks_count`,`operator_shift_baseline_reject_breakdown`,
+                 `operator_shift_baseline_raw_material_logs_len`,`operator_shift_baseline_product_pack_history_logs_len`,
+                 `operator_shift_baseline_reject_review_logs_len`,`raw_json`)
+                VALUES (%s,%s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,CAST(%s AS JSON),
+                        %s,%s,%s,%s,
+                        CAST(%s AS JSON),%s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,
+                        %s,%s,%s,
+                        %s,%s,%s,%s,
+                        %s,%s,%s,%s,%s,
+                        %s,CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),
+                        %s,%s,%s,%s,%s,
+                        %s,CAST(%s AS JSON),%s,%s,%s,
+                        %s,CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),%s,
+                        %s,%s,%s,
+                        %s,%s,%s,
+                        %s,CAST(%s AS JSON),
+                        %s,%s,
+                        %s,CAST(%s AS JSON))
                 ON DUPLICATE KEY UPDATE
                   `saved_at_utc`=VALUES(`saved_at_utc`),
                   `machine_name`=VALUES(`machine_name`),
                   `job_code`=VALUES(`job_code`),
                   `job_name`=VALUES(`job_name`),
                   `operator_id`=VALUES(`operator_id`),
+                  `pack_count`=VALUES(`pack_count`),
+                  `good_total`=VALUES(`good_total`),
+                  `butal_total`=VALUES(`butal_total`),
+                  `reject_total`=VALUES(`reject_total`),
+                  `reject_breakdown`=VALUES(`reject_breakdown`),
+                  `waiting_reject_reason`=VALUES(`waiting_reject_reason`),
+                  `waiting_production_report_reason`=VALUES(`waiting_production_report_reason`),
+                  `showing_reject_summary`=VALUES(`showing_reject_summary`),
+                  `reject_summary_last_scanned_at`=VALUES(`reject_summary_last_scanned_at`),
+                  `job_payload`=VALUES(`job_payload`),
+                  `downtime_reason_code`=VALUES(`downtime_reason_code`),
+                  `downtime_reason_text`=VALUES(`downtime_reason_text`),
+                  `downtime_started_at`=VALUES(`downtime_started_at`),
+                  `downtime_last_seconds`=VALUES(`downtime_last_seconds`),
+                  `downtime_active`=VALUES(`downtime_active`),
+                  `cycle_time_current`=VALUES(`cycle_time_current`),
+                  `cycle_time_new_input`=VALUES(`cycle_time_new_input`),
+                  `waiting_cycle_time_input`=VALUES(`waiting_cycle_time_input`),
+                  `waiting_initial_cycle_time_input`=VALUES(`waiting_initial_cycle_time_input`),
+                  `waiting_initial_cycle_qc_confirm`=VALUES(`waiting_initial_cycle_qc_confirm`),
+                  `waiting_cycle_time_confirm_popup`=VALUES(`waiting_cycle_time_confirm_popup`),
+                  `cycle_time_confirm_phase`=VALUES(`cycle_time_confirm_phase`),
+                  `cycle_time_confirmed_by`=VALUES(`cycle_time_confirmed_by`),
+                  `cycle_time_confirm_actor_code`=VALUES(`cycle_time_confirm_actor_code`),
+                  `cycle_time_confirm_actor_name`=VALUES(`cycle_time_confirm_actor_name`),
+                  `cycle_time_confirm_actor_role`=VALUES(`cycle_time_confirm_actor_role`),
+                  `waiting_maintenance_qr`=VALUES(`waiting_maintenance_qr`),
+                  `waiting_supervisor_qr`=VALUES(`waiting_supervisor_qr`),
+                  `waiting_operator_downtime_confirm`=VALUES(`waiting_operator_downtime_confirm`),
+                  `maintenance_name`=VALUES(`maintenance_name`),
+                  `supervisor_name`=VALUES(`supervisor_name`),
+                  `raw_sacks_count`=VALUES(`raw_sacks_count`),
+                  `raw_material_scans`=VALUES(`raw_material_scans`),
+                  `raw_material_logs`=VALUES(`raw_material_logs`),
+                  `raw_material_unique_keys`=VALUES(`raw_material_unique_keys`),
+                  `product_pack_history_logs`=VALUES(`product_pack_history_logs`),
+                  `startup_reject_total`=VALUES(`startup_reject_total`),
+                  `reject_review_open`=VALUES(`reject_review_open`),
+                  `reject_review_phase`=VALUES(`reject_review_phase`),
+                  `reject_review_actor_code`=VALUES(`reject_review_actor_code`),
+                  `reject_review_actor_name`=VALUES(`reject_review_actor_name`),
+                  `reject_review_actor_role`=VALUES(`reject_review_actor_role`),
+                  `reject_review_logs`=VALUES(`reject_review_logs`),
+                  `waiting_linkage_job_scan`=VALUES(`waiting_linkage_job_scan`),
+                  `linkage_enabled`=VALUES(`linkage_enabled`),
+                  `linkage_job_code`=VALUES(`linkage_job_code`),
+                  `linkage_job_name`=VALUES(`linkage_job_name`),
+                  `linkage_job_payload`=VALUES(`linkage_job_payload`),
+                  `linkage_jobs`=VALUES(`linkage_jobs`),
+                  `operator_shift_logs`=VALUES(`operator_shift_logs`),
+                  `operator_shift_index`=VALUES(`operator_shift_index`),
+                  `operator_shift_started_at`=VALUES(`operator_shift_started_at`),
+                  `operator_shift_baseline_pack_count`=VALUES(`operator_shift_baseline_pack_count`),
+                  `operator_shift_baseline_good_total`=VALUES(`operator_shift_baseline_good_total`),
+                  `operator_shift_baseline_butal_total`=VALUES(`operator_shift_baseline_butal_total`),
+                  `operator_shift_baseline_reject_total`=VALUES(`operator_shift_baseline_reject_total`),
+                  `operator_shift_baseline_startup_reject_total`=VALUES(`operator_shift_baseline_startup_reject_total`),
+                  `operator_shift_baseline_raw_sacks_count`=VALUES(`operator_shift_baseline_raw_sacks_count`),
+                  `operator_shift_baseline_reject_breakdown`=VALUES(`operator_shift_baseline_reject_breakdown`),
+                  `operator_shift_baseline_raw_material_logs_len`=VALUES(`operator_shift_baseline_raw_material_logs_len`),
+                  `operator_shift_baseline_product_pack_history_logs_len`=VALUES(`operator_shift_baseline_product_pack_history_logs_len`),
+                  `operator_shift_baseline_reject_review_logs_len`=VALUES(`operator_shift_baseline_reject_review_logs_len`),
                   `raw_json`=VALUES(`raw_json`)
                 """,
                 (
@@ -442,12 +545,75 @@ def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
                     row.get("job_code"),
                     row.get("job_name"),
                     row.get("operator_id"),
+                    int(row.get("pack_count", 0) or 0),
+                    int(row.get("good_total", 0) or 0),
+                    int(row.get("butal_total", 0) or 0),
+                    int(row.get("reject_total", 0) or 0),
+                    json.dumps(row.get("reject_breakdown", {}), ensure_ascii=False),
+                    1 if row.get("waiting_reject_reason") else 0,
+                    1 if row.get("waiting_production_report_reason") else 0,
+                    1 if row.get("showing_reject_summary") else 0,
+                    row.get("reject_summary_last_scanned_at"),
+                    json.dumps(row.get("job_payload", {}), ensure_ascii=False),
+                    row.get("downtime_reason_code"),
+                    row.get("downtime_reason_text"),
+                    row.get("downtime_started_at"),
+                    row.get("downtime_last_seconds"),
+                    1 if row.get("downtime_active") else 0,
+                    row.get("cycle_time_current"),
+                    row.get("cycle_time_new_input"),
+                    1 if row.get("waiting_cycle_time_input") else 0,
+                    1 if row.get("waiting_initial_cycle_time_input") else 0,
+                    1 if row.get("waiting_initial_cycle_qc_confirm") else 0,
+                    1 if row.get("waiting_cycle_time_confirm_popup") else 0,
+                    int(row.get("cycle_time_confirm_phase", 0) or 0),
+                    row.get("cycle_time_confirmed_by"),
+                    row.get("cycle_time_confirm_actor_code"),
+                    row.get("cycle_time_confirm_actor_name"),
+                    row.get("cycle_time_confirm_actor_role"),
+                    1 if row.get("waiting_maintenance_qr") else 0,
+                    1 if row.get("waiting_supervisor_qr") else 0,
+                    1 if row.get("waiting_operator_downtime_confirm") else 0,
+                    row.get("maintenance_name"),
+                    row.get("supervisor_name"),
+                    int(row.get("raw_sacks_count", 0) or 0),
+                    json.dumps(row.get("raw_material_scans", []), ensure_ascii=False),
+                    json.dumps(row.get("raw_material_logs", []), ensure_ascii=False),
+                    json.dumps(row.get("raw_material_unique_keys", []), ensure_ascii=False),
+                    json.dumps(row.get("product_pack_history_logs", []), ensure_ascii=False),
+                    int(row.get("startup_reject_total", 0) or 0),
+                    1 if row.get("reject_review_open") else 0,
+                    int(row.get("reject_review_phase", 0) or 0),
+                    row.get("reject_review_actor_code"),
+                    row.get("reject_review_actor_name"),
+                    row.get("reject_review_actor_role"),
+                    json.dumps(row.get("reject_review_logs", []), ensure_ascii=False),
+                    1 if row.get("waiting_linkage_job_scan") else 0,
+                    1 if row.get("linkage_enabled") else 0,
+                    row.get("linkage_job_code"),
+                    row.get("linkage_job_name"),
+                    json.dumps(row.get("linkage_job_payload", {}), ensure_ascii=False),
+                    json.dumps(row.get("linkage_jobs", []), ensure_ascii=False),
+                    json.dumps(row.get("operator_shift_logs", []), ensure_ascii=False),
+                    int(row.get("operator_shift_index", 0) or 0),
+                    row.get("operator_shift_started_at"),
+                    int(row.get("operator_shift_baseline_pack_count", 0) or 0),
+                    int(row.get("operator_shift_baseline_good_total", 0) or 0),
+                    int(row.get("operator_shift_baseline_butal_total", 0) or 0),
+                    int(row.get("operator_shift_baseline_reject_total", 0) or 0),
+                    int(row.get("operator_shift_baseline_startup_reject_total", 0) or 0),
+                    int(row.get("operator_shift_baseline_raw_sacks_count", 0) or 0),
+                    json.dumps(row.get("operator_shift_baseline_reject_breakdown", {}), ensure_ascii=False),
+                    int(row.get("operator_shift_baseline_raw_material_logs_len", 0) or 0),
+                    int(row.get("operator_shift_baseline_product_pack_history_logs_len", 0) or 0),
+                    int(row.get("operator_shift_baseline_reject_review_logs_len", 0) or 0),
                     json.dumps(row, ensure_ascii=False),
                 ),
             )
         conn.commit()
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[SQL] Active session save failed for {machine_code}: {e}")
         return False
     finally:
         conn.close()
@@ -1090,7 +1256,7 @@ class CircleProgressBadge(QWidget):
         self._demo_mode = False
         self._demo_value = 90
         self._maximum = 100
-        self._segment_count = 40
+        self._segment_count = 35
         self._start_angle = -90.0
         self.setMinimumSize(98, 98)
         self.setMaximumSize(118, 118)
@@ -1114,9 +1280,7 @@ class CircleProgressBadge(QWidget):
         self._phase = (self._phase + 0.08) % (math.pi * 2.0)
         active = max(0, min(self._segment_count, round((self._demo_value / self._maximum) * self._segment_count)))
         if active > 0:
-            self._comet_pos += 0.18
-            if self._comet_pos >= active:
-                self._comet_pos = 0.0
+            self._comet_pos = (self._comet_pos + 0.18) % float(self._segment_count)
         self.update()
 
     def paintEvent(self, _):
@@ -1148,7 +1312,7 @@ class CircleProgressBadge(QWidget):
 
             if i < active:
                 d = abs(i - self._comet_pos)
-                d = min(d, abs(i - (self._comet_pos - active)), abs(i - (self._comet_pos + active)))
+                d = min(d, float(self._segment_count) - d)
                 trail = max(0.0, 1.0 - d / 8.0)
                 base_brightness = 195
                 extra = int(60 * trail)
@@ -1182,13 +1346,253 @@ class CircleProgressBadge(QWidget):
             val_text = f"{int(round(value_pct))}%"
         else:
             val_text = f"{value_pct:.1f}%" if (0.0 < value_pct < 1.0) else f"{int(round(value_pct))}%"
-        # Outline + glow pass for better readability on bright ring colors.
-        for dx, dy, a in [(-1, 0, 140), (1, 0, 140), (0, -1, 140), (0, 1, 140), (-1, -1, 90), (1, 1, 90)]:
-            p.setPen(QColor(10, 18, 30, a))
-            p.drawText(text_rect.adjusted(dx, dy, dx, dy), Qt.AlignmentFlag.AlignCenter, val_text)
-        p.setPen(QColor(245, 250, 245))
+        p.setPen(QColor("#5f6978"))
         p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, val_text)
         p.end()
+
+
+@dataclass
+class Spark:
+    x: float
+    y: float
+    dx: float
+    dy: float
+    life: float
+
+
+@dataclass
+class Dust:
+    x: float
+    y: float
+    dx: float
+    dy: float
+    r: float
+    alpha: int
+
+
+class MachineFixingAnimation(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(320, 180)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setStyleSheet("background: transparent; border: none;")
+
+        self.t = 0.0
+        self.gear1 = 0.0
+        self.gear2 = 0.0
+        self.gear3 = 0.0
+        self.scan_y_phase = 0.0
+        self.bar_phase = 0.0
+        self.status_words = [
+            "MACHINE FIXING",
+            "CALIBRATING",
+            "REALIGNING",
+            "TORQUE MATCHING",
+            "REPAIRING CORE",
+        ]
+        self.status_index = 0
+        self.status_counter = 0
+        self.sparks: List[Spark] = []
+        self.dusts: List[Dust] = [self._make_dust() for _ in range(18)]
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(16)
+
+    def _make_dust(self) -> Dust:
+        return Dust(
+            x=random.uniform(0, max(1, self.width() or 640)),
+            y=random.uniform(0, max(1, self.height() or 220)),
+            dx=random.uniform(-0.18, 0.18),
+            dy=random.uniform(-0.12, 0.12),
+            r=random.uniform(1.5, 4.0),
+            alpha=random.randint(20, 70),
+        )
+
+    def _tick(self):
+        self.t += 0.016
+        self.gear1 += 1.2
+        self.gear2 -= 1.8
+        self.gear3 += 0.7
+        self.scan_y_phase += 0.03
+        self.bar_phase += 0.07
+        self.status_counter += 1
+        if self.status_counter > 100:
+            self.status_counter = 0
+            self.status_index = (self.status_index + 1) % len(self.status_words)
+        if random.random() < 0.32:
+            self._spawn_sparks()
+
+        next_sparks: List[Spark] = []
+        for spark in self.sparks:
+            spark.x += spark.dx
+            spark.y += spark.dy
+            spark.life -= 0.05
+            if spark.life > 0:
+                next_sparks.append(spark)
+        self.sparks = next_sparks
+
+        w = max(1, self.width())
+        h = max(1, self.height())
+        for dust in self.dusts:
+            dust.x += dust.dx
+            dust.y += dust.dy
+            if dust.x < 0:
+                dust.x = w
+            elif dust.x > w:
+                dust.x = 0
+            if dust.y < 0:
+                dust.y = h
+            elif dust.y > h:
+                dust.y = 0
+        self.update()
+
+    def _spawn_sparks(self):
+        cx = self.width() / 2
+        cy = self.height() / 2 - 8
+        for _ in range(random.randint(2, 4)):
+            ang = random.uniform(0, math.tau)
+            speed = random.uniform(1.5, 4.0)
+            self.sparks.append(
+                Spark(
+                    x=cx + random.uniform(-52, 52),
+                    y=cy + random.uniform(-34, 34),
+                    dx=math.cos(ang) * speed,
+                    dy=math.sin(ang) * speed,
+                    life=1.0,
+                )
+            )
+
+    def _draw_background(self, p: QPainter, rect):
+        return
+
+    def _draw_dust(self, p: QPainter):
+        p.save()
+        p.setPen(Qt.PenStyle.NoPen)
+        for dust in self.dusts:
+            p.setBrush(QColor(180, 210, 230, dust.alpha))
+            p.drawEllipse(QPointF(dust.x, dust.y), dust.r, dust.r)
+        p.restore()
+
+    def _draw_machine_frame(self, p: QPainter, rect) -> QRectF:
+        panel = QRectF(rect.center().x() - 150, rect.center().y() - 72, 300, 144)
+        grad = QLinearGradient(panel.topLeft(), panel.bottomLeft())
+        grad.setColorAt(0.0, QColor(35, 42, 52, 245))
+        grad.setColorAt(0.5, QColor(25, 31, 40, 245))
+        grad.setColorAt(1.0, QColor(18, 24, 32, 245))
+        p.setPen(QPen(QColor(85, 110, 130), 2))
+        p.setBrush(grad)
+        p.drawRoundedRect(panel, 18, 18)
+
+        inner = panel.adjusted(14, 14, -14, -14)
+        p.setPen(QPen(QColor(55, 75, 95), 1))
+        p.setBrush(QColor(14, 18, 24, 220))
+        p.drawRoundedRect(inner, 14, 14)
+        return inner
+
+    def _draw_gear(self, p: QPainter, cx: float, cy: float, radius: float, teeth: int, rotation: float, color: QColor):
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(rotation)
+        path = QPainterPath()
+        first = True
+        for i in range(teeth * 2):
+            ang = (i / (teeth * 2)) * math.tau
+            rr = radius if i % 2 == 0 else radius * 0.84
+            x = math.cos(ang) * rr
+            y = math.sin(ang) * rr
+            if first:
+                path.moveTo(x, y)
+                first = False
+            else:
+                path.lineTo(x, y)
+        path.closeSubpath()
+        hole = QPainterPath()
+        hole.addEllipse(QPointF(0, 0), radius * 0.42, radius * 0.42)
+        gear = path.subtracted(hole)
+        p.setPen(QPen(QColor(180, 220, 255, 70), 2))
+        p.setBrush(color)
+        p.drawPath(gear)
+        p.restore()
+
+    def _draw_machine_center(self, p: QPainter, rect):
+        cx = rect.center().x()
+        cy = rect.center().y() - 8
+        glow = QRadialGradient(QPointF(cx, cy), 54)
+        glow.setColorAt(0.0, QColor(120, 240, 255, 140))
+        glow.setColorAt(0.35, QColor(50, 160, 255, 70))
+        glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(glow)
+        p.drawEllipse(QPointF(cx, cy), 54, 54)
+        self._draw_gear(p, cx - 58, cy + 2, 24, 12, self.gear1, QColor(78, 92, 110, 220))
+        self._draw_gear(p, cx, cy, 38, 15, self.gear2, QColor(95, 110, 128, 230))
+        self._draw_gear(p, cx + 62, cy - 3, 20, 10, self.gear3, QColor(70, 84, 100, 220))
+
+    def _draw_scan_line(self, p: QPainter, inner_rect: QRectF):
+        top = inner_rect.top() + 16
+        bottom = inner_rect.bottom() - 16
+        scan_y = top + ((math.sin(self.scan_y_phase) + 1) / 2) * (bottom - top)
+        grad = QLinearGradient(inner_rect.left(), scan_y, inner_rect.right(), scan_y)
+        grad.setColorAt(0.0, QColor(0, 0, 0, 0))
+        grad.setColorAt(0.18, QColor(80, 220, 255, 50))
+        grad.setColorAt(0.5, QColor(200, 255, 255, 240))
+        grad.setColorAt(0.82, QColor(80, 220, 255, 50))
+        grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.save()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(grad)
+        p.drawRoundedRect(QRectF(inner_rect.left() + 8, scan_y - 2, inner_rect.width() - 16, 5), 2, 2)
+        p.restore()
+
+    def _draw_sparks(self, p: QPainter):
+        p.save()
+        p.setPen(Qt.PenStyle.NoPen)
+        for spark in self.sparks:
+            alpha = int(255 * spark.life)
+            rg = QRadialGradient(QPointF(spark.x, spark.y), 10)
+            rg.setColorAt(0.0, QColor(255, 255, 255, alpha))
+            rg.setColorAt(0.25, QColor(255, 220, 120, alpha))
+            rg.setColorAt(0.7, QColor(255, 150, 40, int(alpha * 0.7)))
+            rg.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.setBrush(rg)
+            p.drawEllipse(QPointF(spark.x, spark.y), 6, 6)
+        p.restore()
+
+    def _draw_bottom_progress(self, p: QPainter, rect):
+        bar_rect = QRectF(rect.center().x() - 110, rect.bottom() - 22, 220, 8)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(25, 35, 45, 220))
+        p.drawRoundedRect(bar_rect, 4, 4)
+        fill = 0.12 + ((math.sin(self.bar_phase * 0.8) + 1) / 2) * 0.82
+        fill_rect = QRectF(bar_rect.left(), bar_rect.top(), bar_rect.width() * fill, bar_rect.height())
+        fg = QLinearGradient(fill_rect.left(), fill_rect.top(), fill_rect.right(), fill_rect.top())
+        fg.setColorAt(0.0, QColor(60, 190, 255, 200))
+        fg.setColorAt(0.5, QColor(200, 255, 255, 245))
+        fg.setColorAt(1.0, QColor(50, 150, 255, 180))
+        p.setBrush(fg)
+        p.drawRoundedRect(fill_rect, 4, 4)
+
+    def _draw_texts(self, p: QPainter, rect):
+        title_font = QFont("Segoe UI", 13, QFont.Weight.Bold)
+        p.setFont(title_font)
+        p.setPen(QColor(220, 248, 255))
+        dots = "." * (int(self.t * 3) % 4)
+        p.drawText(QRectF(0, rect.bottom() - 46, rect.width(), 24), Qt.AlignmentFlag.AlignHCenter, f"{self.status_words[self.status_index]}{dots}")
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect()
+        self._draw_background(p, rect)
+        self._draw_dust(p)
+        inner = self._draw_machine_frame(p, rect)
+        self._draw_machine_center(p, rect)
+        self._draw_scan_line(p, inner)
+        self._draw_sparks(p)
+        self._draw_bottom_progress(p, rect)
+        self._draw_texts(p, rect)
 
 
 class HistoryAnimatedColumn(QFrame):
@@ -1231,8 +1635,11 @@ class HistoryAnimatedColumn(QFrame):
         pad = 4
         y = 8
         w = max(0, self.width() - (pad * 2))
-        self.colTitle.setGeometry(pad, y, w, 24)
-        y += 28
+        if self.colTitle.isVisible():
+            self.colTitle.setGeometry(pad, y, w, 24)
+            y += 28
+        else:
+            self.colTitle.setGeometry(0, 0, 0, 0)
         self.latestCard.setGeometry(pad, y, w, 44)
         self.latestCardLabel.setGeometry(8, 0, max(0, w - 16), 44)
         self._latest_base_rect = self.latestCard.geometry()
@@ -1646,8 +2053,10 @@ QWidget#ClientUIRoot {{
             "QHeaderView::section { background: rgba(226,232,240,0.9); color: #0f172a; font-weight: 900;"
             " border: none; border-right: 1px solid rgba(148,163,184,0.45);"
             " border-bottom: 1px solid rgba(148,163,184,0.5); padding: 6px; }"
+            "QHeaderView::section:last { border-right: none; }"
             "QTableWidget::item { padding: 2px; color: #0f172a; font-weight: 900;"
             " border-right: 1px solid rgba(148,163,184,0.35); background: transparent; }"
+            "QTableWidget::item:last { border-right: none; }"
         )
         self.reject_detail_labels: Dict[str, QTableWidgetItem] = {}
         for col, (code, label) in enumerate(REJECT_DETAIL_ITEMS):
@@ -1684,7 +2093,7 @@ QWidget#ClientUIRoot {{
         parts_row_h = self.jobPartsTable.verticalHeader().defaultSectionSize()
         parts_header_h = self.jobPartsTable.horizontalHeader().height()
         parts_frame_h = self.jobPartsTable.frameWidth() * 2
-        parts_target_h = parts_header_h + (parts_row_h * 10) + parts_frame_h
+        parts_target_h = parts_header_h + (parts_row_h * 9) + parts_frame_h
         self.jobPartsTable.setMinimumHeight(parts_target_h)
         self.jobPartsTable.setMaximumHeight(parts_target_h)
         self.cardJobDetails.layout().addWidget(self.jobPartsTable)
@@ -1694,10 +2103,33 @@ QWidget#ClientUIRoot {{
             "QFrame#LeftCardInner { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
             "QLabel#SectionTitle { background: #d9e0ec; color: #0f172a; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; padding: 8px 12px; }"
         )
-        self.cardJobDetails.layout().setContentsMargins(0, 0, 0, 0)
-        self.cardJobDetails.layout().setSpacing(10)
-        self.cardJobDetailsOuter.setMinimumHeight(280)
-        self.cardJobDetailsOuter.setMaximumHeight(360)
+        self.cardJobDetails.layout().setContentsMargins(0, 0, 0, 14)
+        self.cardJobDetails.layout().setSpacing(8)
+        self.jobPartsTable.setStyleSheet(
+            "QTableWidget {"
+            " background: rgba(255,255,255,0.86);"
+            " border: 1px solid #d5dde9;"
+            " border-radius: 12px;"
+            " gridline-color: rgba(148,163,184,0.30);"
+            "}"
+            "QHeaderView::section {"
+            " background: rgba(226,232,240,0.92);"
+            " color: #0f172a;"
+            " font-weight: 900;"
+            " border: none;"
+            " border-bottom: 1px solid rgba(148,163,184,0.45);"
+            " border-right: 1px solid rgba(148,163,184,0.28);"
+            " padding: 6px 8px;"
+            "}"
+            "QHeaderView::section:last { border-right: none; }"
+            "QTableWidget::item {"
+            " border-right: 1px solid rgba(148,163,184,0.20);"
+            " border-bottom: 1px solid rgba(148,163,184,0.20);"
+            " padding: 6px;"
+            "}"
+        )
+        self.cardJobDetailsOuter.setMinimumHeight(292)
+        self.cardJobDetailsOuter.setMaximumHeight(372)
         self.cardJobDetailsOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
         # Job details panel beside Session.
@@ -2043,7 +2475,7 @@ QWidget#ClientUIRoot {{
         linkageOuter = QFrame()
         linkageOuter.setObjectName("RightCardOuter")
         linkageOuterLay = QVBoxLayout()
-        linkageOuterLay.setContentsMargins(8, 8, 8, 8)
+        linkageOuterLay.setContentsMargins(8, 0, 8, 8)
         linkageOuterLay.setSpacing(0)
         linkageOuter.setLayout(linkageOuterLay)
 
@@ -2057,8 +2489,8 @@ QWidget#ClientUIRoot {{
         linkageBody = QFrame()
         linkageBody.setObjectName("LinkageMirrorBody")
         linkageBody.setLayout(QVBoxLayout())
-        linkageBody.layout().setContentsMargins(0, 0, 0, 0)
-        linkageBody.layout().setSpacing(10)
+        linkageBody.layout().setContentsMargins(0, 0, 0, 10)
+        linkageBody.layout().setSpacing(0)
 
         linkageHeader = QFrame()
         linkageHeader.setObjectName("LinkageMirrorHeader")
@@ -2073,8 +2505,9 @@ QWidget#ClientUIRoot {{
         linkageBody.layout().addWidget(linkageHeader)
 
         linkageContent = QWidget()
+        linkageContent.setObjectName("LinkageMirrorContent")
         linkageContent.setLayout(QHBoxLayout())
-        linkageContent.layout().setContentsMargins(10, 0, 10, 10)
+        linkageContent.layout().setContentsMargins(10, 10, 10, 12)
         linkageContent.layout().setSpacing(14)
         linkageContent.layout().setStretch(0, 1)
         linkageContent.layout().setStretch(1, 1)
@@ -2091,13 +2524,14 @@ QWidget#ClientUIRoot {{
             row = QFrame()
             row.setObjectName("LinkageMirrorJobRow")
             row.setLayout(QHBoxLayout())
-            row.layout().setContentsMargins(12, 8, 12, 8)
+            row.layout().setContentsMargins(18, 10, 18, 10)
             row.layout().setSpacing(10)
+            row.setMinimumHeight(20)
             key = QLabel(title)
             key.setObjectName("LinkageMirrorJobKey")
             value = QLabel("-")
             value.setObjectName("LinkageMirrorJobVal")
-            value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             row.layout().addWidget(key, 1)
             row.layout().addWidget(value, 0)
             return row, value
@@ -2114,7 +2548,7 @@ QWidget#ClientUIRoot {{
         linkageRight.setObjectName("LinkageMirrorRight")
         linkageRight.setLayout(QGridLayout())
         linkageRight.layout().setContentsMargins(0, 0, 0, 0)
-        linkageRight.layout().setHorizontalSpacing(10)
+        linkageRight.layout().setHorizontalSpacing(5)
         linkageRight.layout().setVerticalSpacing(10)
 
         def _make_counter_card(title: str):
@@ -2152,16 +2586,18 @@ QWidget#ClientUIRoot {{
         linkageContent.layout().addWidget(linkageThirdCol, 1)
         linkageBody.layout().addWidget(linkageContent)
         linkageCol.addWidget(linkageBody)
+        linkageFrame.setMinimumHeight(170)
         linkageFrame.setStyleSheet(
             "QFrame#LinkageMirrorHost { background: transparent; border: none; }"
             "QFrame#LinkageMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
-            "QFrame#LinkageMirrorLeft { background: #f4f7fc; border: 1px solid #d8e0eb; border-radius: 14px; }"
+            "QFrame#LinkageMirrorLeft { background: transparent; border: none; }"
             "QFrame#LinkageMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
             "QFrame#LinkageMirrorHeader QLabel#RightTitle { color: #0f172a; }"
             "QFrame#LinkageMirrorHeader QLabel { color: #0f172a; }"
-            "QFrame#LinkageMirrorJobRow { background: #e7ecf5; border: none; border-radius: 10px; }"
-            "QLabel#LinkageMirrorJobKey { color: #334a6a; font-size: 13px; font-weight: 900; }"
-            "QLabel#LinkageMirrorJobVal { color: #7a93b7; font-size: 18px; font-weight: 900; }"
+            "QWidget#LinkageMirrorContent { background: transparent; border: none; }"
+            "QFrame#LinkageMirrorJobRow { background: #f7f7f8; border: 1px solid #cfd8e3; border-radius: 16px; }"
+            "QLabel#LinkageMirrorJobKey { color: #0f172a; font-size: 13px; font-weight: 900; }"
+            "QLabel#LinkageMirrorJobVal { color: #0f172a; font-size: 16px; font-weight: 900; }"
             "QFrame#LinkageMirrorRight { background: transparent; border: none; }"
             "QWidget#LinkageMirrorThirdCol { background: transparent; border: none; }"
             "QFrame#LinkageMirrorCounterCard { background: #e7ecf5; border: 1px solid #dde3ee; border-radius: 10px; min-height: 40px; max-height: 40px; }"
@@ -2171,73 +2607,89 @@ QWidget#ClientUIRoot {{
         linkageOuterLay.addWidget(linkageFrame)
         self.linkageMirrorOuter = linkageOuter
 
-        historyOuter = QFrame()
-        historyOuter.setObjectName("RightCardOuter")
-        historyOuterLay = QVBoxLayout()
-        historyOuterLay.setContentsMargins(8, 8, 8, 8)
-        historyOuterLay.setSpacing(0)
-        historyOuter.setLayout(historyOuterLay)
-        historyOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        def _make_history_card(header_text: str, column_title: str):
+            outer = QFrame()
+            outer.setObjectName("RightCardOuter")
+            outer_lay = QVBoxLayout()
+            outer_lay.setContentsMargins(8, 8, 8, 8)
+            outer_lay.setSpacing(0)
+            outer.setLayout(outer_lay)
+            outer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        historyFrame = QFrame()
-        historyFrame.setObjectName("HistoryMirrorHost")
-        historyFrame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        historyCol = QVBoxLayout()
-        historyCol.setContentsMargins(0, 0, 0, 0)
-        historyCol.setSpacing(6)
-        historyFrame.setLayout(historyCol)
+            frame = QFrame()
+            frame.setObjectName("HistoryMirrorHost")
+            frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            frame_lay = QVBoxLayout()
+            frame_lay.setContentsMargins(0, 0, 0, 0)
+            frame_lay.setSpacing(6)
+            frame.setLayout(frame_lay)
 
-        historyBody = QFrame()
-        historyBody.setObjectName("HistoryMirrorBody")
-        historyBody.setLayout(QVBoxLayout())
-        historyBody.layout().setContentsMargins(0, 0, 0, 0)
-        historyBody.layout().setSpacing(10)
+            body = QFrame()
+            body.setObjectName("HistoryMirrorBody")
+            body.setLayout(QVBoxLayout())
+            body.layout().setContentsMargins(0, 0, 0, 10)
+            body.layout().setSpacing(10)
 
-        historyHeader = QFrame()
-        historyHeader.setObjectName("HistoryMirrorHeader")
-        historyHeader.setLayout(QVBoxLayout())
-        historyHeader.layout().setContentsMargins(12, 10, 12, 10)
-        historyHeader.layout().setSpacing(0)
-        historyTitle = QLabel("History")
-        historyTitle.setObjectName("RightTitle")
-        historyTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        historyHeader.layout().addWidget(historyTitle)
-        historyBody.layout().addWidget(historyHeader)
+            header = QFrame()
+            header.setObjectName("HistoryMirrorHeader")
+            header.setLayout(QVBoxLayout())
+            header.layout().setContentsMargins(12, 10, 12, 10)
+            header.layout().setSpacing(0)
+            title = QLabel(header_text)
+            title.setObjectName("RightTitle")
+            title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            header.layout().addWidget(title)
+            body.layout().addWidget(header)
 
-        historyContent = QWidget()
-        historyContent.setLayout(QHBoxLayout())
-        historyContent.layout().setContentsMargins(10, 0, 10, 10)
-        historyContent.layout().setSpacing(8)
+            content = QWidget()
+            content.setObjectName("HistoryMirrorContent")
+            content.setLayout(QVBoxLayout())
+            content.layout().setContentsMargins(10, 0, 10, 10)
+            content.layout().setSpacing(0)
 
-        self.historyPackCol = HistoryAnimatedColumn("Pack/Good/Butal/Reject", historyContent)
-        self.historyRawCol = HistoryAnimatedColumn("Raw Materials (Recent)", historyContent)
-        self.historyActionCol = HistoryAnimatedColumn("Last Actions", historyContent)
-        historyContent.layout().addWidget(self.historyPackCol, 1)
-        historyContent.layout().addWidget(self.historyRawCol, 1)
-        historyContent.layout().addWidget(self.historyActionCol, 1)
-        historyBody.layout().addWidget(historyContent, 1)
+            col = HistoryAnimatedColumn(column_title, content)
+            col.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            if hasattr(col, "colTitle") and col.colTitle is not None:
+                col.colTitle.hide()
+            content.layout().addWidget(col, 1)
+            body.layout().addWidget(content, 1)
 
-        historyCol.addWidget(historyBody, 1)
-        historyFrame.setStyleSheet(
-            "QFrame#HistoryMirrorHost { background: transparent; border: none; }"
-            "QFrame#HistoryMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
-            "QFrame#HistoryMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
-            "QFrame#HistoryMirrorHeader QLabel#RightTitle { color: #0f172a; }"
-            "QFrame#HistoryMirrorHeader QLabel { color: #0f172a; }"
-            "QFrame#HistoryCol { background: #e7ecf5; border: 1px solid #d8e0eb; border-radius: 12px; }"
-            "QFrame#HistoryLatestCard { background: #f4f7fc; border: 1px solid #d8e0eb; border-radius: 10px; }"
-            "QFrame#HistoryRecentPanel { background: transparent; border: none; }"
-            "QFrame#HistoryRecentRow { background: #f4f7fc; border: 1px solid #d8e0eb; border-radius: 10px; }"
-        )
-        historyOuterLay.addWidget(historyFrame, 1)
-        self.historyOuter = historyOuter
+            frame_lay.addWidget(body, 1)
+            frame.setStyleSheet(
+                "QFrame#HistoryMirrorHost { background: transparent; border: none; }"
+                "QFrame#HistoryMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
+                "QFrame#HistoryMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
+                "QFrame#HistoryMirrorHeader QLabel#RightTitle { color: #0f172a; }"
+                "QFrame#HistoryMirrorHeader QLabel { color: #0f172a; }"
+                "QWidget#HistoryMirrorContent { background: transparent; border: none; }"
+                "QFrame#HistoryCol { background: #e7ecf5; border: none; border-radius: 12px; }"
+                "QFrame#HistoryLatestCard { background: #f4f7fc; border: none; border-radius: 10px; }"
+                "QFrame#HistoryRecentPanel { background: transparent; border: none; }"
+                "QFrame#HistoryRecentRow { background: #f4f7fc; border: none; border-radius: 10px; }"
+            )
+            outer_lay.addWidget(frame, 1)
+            return outer, col
+
+        self.historyRowOuter = QFrame()
+        self.historyRowOuter.setObjectName("HistoryRowOuter")
+        self.historyRowOuter.setLayout(QHBoxLayout())
+        self.historyRowOuter.layout().setContentsMargins(0, 0, 0, 0)
+        self.historyRowOuter.layout().setSpacing(6)
+        self.historyRowOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        self.productionHistoryOuter, self.historyPackCol = _make_history_card("Production", "Pack/Good/Butal/Reject")
+        self.partsHistoryOuter, self.historyRawCol = _make_history_card("Parts History", "Raw Materials (Recent)")
+        self.actionsHistoryOuter, self.historyActionCol = _make_history_card("Last Action", "Last Actions")
+        self.historyRowOuter.layout().addWidget(self.productionHistoryOuter, 1)
+        self.historyRowOuter.layout().addWidget(self.partsHistoryOuter, 1)
+        self.historyRowOuter.layout().addWidget(self.actionsHistoryOuter, 1)
 
         # Show Linkage above Product Parts in the right panel.
         rightLayout.addWidget(linkageOuter)
-        rightLayout.addSpacing(10)
+        rightLayout.addSpacing(6)
         rightLayout.addWidget(self.cardJobDetailsOuter)
-        rightLayout.addSpacing(10)
-        rightLayout.addWidget(historyOuter, 1)
+        rightLayout.addSpacing(6)
+        rightLayout.addWidget(self.historyRowOuter, 1)
 
         # Swap positions: place Raw Materials + Cycle Monitor where Job Details used to be.
         rawCycleSwapWrap = QWidget()
@@ -2348,13 +2800,10 @@ QWidget#ClientUIRoot {{
         self.productionCounter.setObjectName("ProductionCounter7")
         self.productionCounter.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.productionOverlay.layout().addWidget(self.productionCounter)
-        self.pdrPulseOverlay = HeartbeatBorderPulseOverlay(self.productionOverlay)
-        self.pdrPulseOverlay.setGeometry(self.productionOverlay.rect())
-        self.pdrPulseOverlay.raise_()
 
-        self.productionFixAnim = QLabel("Repair in progress...")
+        self.productionFixAnim = MachineFixingAnimation(self.productionOverlay)
         self.productionFixAnim.setObjectName("ProductionFixAnim")
-        self.productionFixAnim.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productionFixAnim.setFixedHeight(210)
         self.productionOverlay.layout().addWidget(self.productionFixAnim)
 
         self.productionMarqueeWrap = QWidget()
@@ -3188,12 +3637,6 @@ QWidget#ClientUIRoot {{
         self.settingsOverlay.hide()
         self.settingsOverlay.raise_()
 
-        self._repair_movie: Optional[QMovie] = None
-        if REPAIR_GIF and os.path.exists(REPAIR_GIF):
-            repair_movie = QMovie(REPAIR_GIF)
-            if repair_movie.isValid():
-                self.productionFixAnim.setMovie(repair_movie)
-                self._repair_movie = repair_movie
         self._overlay_mode = "select"
         self._overlay_pulse_on = False
         self._pulse_phase = 0.0
@@ -3214,6 +3657,9 @@ QWidget#ClientUIRoot {{
         self.scan_received.connect(self.on_scanned)
         self.scanner_status.connect(self._set_status_text)
         self._setup_scanner_input()
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._save_active_session_snapshot)
 
         # heartbeat timer
         self.hb = QTimer(self)
@@ -3473,6 +3919,12 @@ QWidget#ClientUIRoot {{
             # Keep first right frame top aligned with the selected reference frame.
             offset = max(0, int(target_top - right_top))
             self.rightTopSpacer.setFixedHeight(offset)
+            if hasattr(self, "linkageMirrorOuter") and self.linkageMirrorOuter is not None:
+                prod_bottom = self.cardProductionOuter.mapTo(self, self.cardProductionOuter.rect().bottomLeft()).y()
+                linkage_top = self.linkageMirrorOuter.mapTo(self, self.linkageMirrorOuter.rect().topLeft()).y()
+                target_h = max(150, int(prod_bottom - linkage_top + 1))
+                self.linkageMirrorOuter.setMinimumHeight(target_h)
+                self.linkageMirrorOuter.setMaximumHeight(target_h)
         except Exception:
             self.rightTopSpacer.setFixedHeight(0)
 
@@ -3571,23 +4023,7 @@ QWidget#ClientUIRoot {{
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.productionOverlay.setGeometry(x, y, w, h)
-        self._sync_pdr_pulse_overlay()
         self._position_marquee()
-        self._update_repair_movie_size()
-
-    def _sync_pdr_pulse_overlay(self):
-        if not hasattr(self, "pdrPulseOverlay"):
-            return
-        self.pdrPulseOverlay.setGeometry(self.productionOverlay.rect())
-        top_left = self.productionCounter.mapTo(self.productionOverlay, self.productionCounter.rect().topLeft())
-        target = QRectF(
-            float(top_left.x()),
-            float(top_left.y()),
-            float(self.productionCounter.width()),
-            float(self.productionCounter.height()),
-        )
-        self.pdrPulseOverlay.set_target_rect(target)
-        self.pdrPulseOverlay.raise_()
 
     def _position_resolve_overlay(self):
         self.resolveOverlay.adjustSize()
@@ -4405,19 +4841,6 @@ QWidget#ClientUIRoot {{
             self._reject_review_anim_timer.stop()
             self._set_reject_review_blur(False)
 
-    def _update_repair_movie_size(self):
-        if self._repair_movie is None:
-            return
-        base = self._repair_movie.currentPixmap().size()
-        if not base.isValid() or base.width() <= 0 or base.height() <= 0:
-            base = self._repair_movie.frameRect().size()
-        if not base.isValid() or base.width() <= 0 or base.height() <= 0:
-            return
-        max_w = max(120, int(self.productionOverlay.width() * 0.46))
-        max_h = 120
-        ratio = min(max_w / base.width(), max_h / base.height())
-        self._repair_movie.setScaledSize(QSize(max(1, int(base.width() * ratio)), max(1, int(base.height() * ratio))))
-
     def _position_marquee(self):
         if self.productionMarqueeText.parent() is not self.productionMarqueeWrap:
             self.productionMarqueeText.setParent(self.productionMarqueeWrap)
@@ -4433,17 +4856,8 @@ QWidget#ClientUIRoot {{
         self.productionOverlay.show()
         self.productionOverlay.raise_()
         self._position_marquee()
-        self._update_repair_movie_size()
-        if self._repair_movie is not None and self._overlay_mode == "active":
-            self._repair_movie.start()
-        if self._overlay_mode == "active" and hasattr(self, "pdrPulseOverlay"):
-            self._sync_pdr_pulse_overlay()
-            self.pdrPulseOverlay.set_mode(True)
-            self.pdrPulseOverlay.trigger_now()
 
     def _hide_production_overlay(self):
-        if self._repair_movie is not None:
-            self._repair_movie.stop()
         self.productionOverlay.hide()
         self.productionOverlay.setProperty("pulse", "0")
         self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
@@ -4486,7 +4900,6 @@ QWidget#ClientUIRoot {{
             self.productionCounter.hide()
             self.productionFixAnim.hide()
             self.productionMarqueeWrap.hide()
-            self.pdrPulseOverlay.advance(False)
             return
         self.productionTitle.setText("DOWNTIME ACTIVE")
         self.productionHint.setText("Machine under repair / adjustment")
@@ -4495,13 +4908,8 @@ QWidget#ClientUIRoot {{
         self.productionCounter.show()
         self.productionFixAnim.show()
         self.productionMarqueeWrap.show()
-        self._sync_pdr_pulse_overlay()
-        self.pdrPulseOverlay.set_mode(True)
-        self.pdrPulseOverlay.trigger_now()
         self._marquee_x = self.productionMarqueeWrap.width()
         self._position_marquee()
-        if self._repair_movie is not None and self.productionOverlay.isVisible():
-            self._repair_movie.start()
 
     def _apply_overlay_base_style(self):
         self.productionOverlay.setStyleSheet(
@@ -4512,34 +4920,11 @@ QWidget#ClientUIRoot {{
         )
 
     def _tick_overlay_pulse(self):
-        if not self.enable_pulse_effects:
-            if self.productionOverlay.isVisible():
-                self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
-                self._apply_overlay_base_style()
-        if not self.productionOverlay.isVisible() or self._overlay_mode != "active":
-            if hasattr(self, "pdrPulseOverlay"):
-                self.pdrPulseOverlay.advance(False)
-            return
-        if self.enable_pulse_effects:
-            self._pulse_phase += 0.16
-            level = (math.sin(self._pulse_phase) + 1.0) * 0.5
-            border_alpha = int(130 + 110 * level)
-            glow_alpha = int(45 + 155 * level)
-            blur = 18 + 16 * level
-            self.productionOverlay.setStyleSheet(
-                "QFrame#ProductionOverlay {"
-                "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
-                "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(248,250,252,0.98), stop:1 rgba(226,232,240,0.98));"
-                f"border: 3px solid rgba(249,115,22,{border_alpha}); border-radius: 14px; }}"
-            )
-            self._overlay_shadow.setBlurRadius(blur)
-            self._overlay_shadow.setColor(QColor(249, 115, 22, glow_alpha))
-        else:
+        if self.productionOverlay.isVisible():
             self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
             self._apply_overlay_base_style()
-        self._sync_pdr_pulse_overlay()
-        self.pdrPulseOverlay.set_mode(True)
-        self.pdrPulseOverlay.advance(True, dt=0.07)
+        if not self.productionOverlay.isVisible() or self._overlay_mode != "active":
+            return
         self._tick_marquee()
 
     def _tick_marquee(self):
@@ -4739,7 +5124,8 @@ QWidget#ClientUIRoot {{
             job_details = {}
         self.lblActivityMold.setText(f"Mold: {self._safe_text(job_details.get('mold') or job.get('custom_05'), '-')}")
         self.lblActivityColor.setText(f"Color: {self._safe_text(job_details.get('color') or job.get('custom_06'), '-')}")
-        self.lblActivityCavities.setText(f"Cavities: {self._safe_text(job_details.get('no_of_cavity') or job.get('custom_11'), '-')}")
+        cavity_count = job_details.get("no_of_cavity") or job.get("custom_11") or 1
+        self.lblActivityCavities.setText(f"Cavities: {self._safe_text(cavity_count, '-')}")
         self.lblActivitySticker.setText(f"Sticker Label: {self._safe_text(job_details.get('sticker_label'), '-')}")
 
         self.lblPack.setText(str(s.pack_count))
@@ -4750,7 +5136,7 @@ QWidget#ClientUIRoot {{
         self.rightCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
         act_cycle = self._parse_cycle_seconds(s.cycle_time_current)
         act_cycle_text = f"{act_cycle:g} sec" if act_cycle is not None else "-"
-        act_qty_shift = self._qty_per_shift_from_cycle(act_cycle)
+        act_qty_shift = self._qty_per_shift_from_cycle(act_cycle, cavity_count)
         act_qty_shift_text = str(act_qty_shift) if act_qty_shift is not None else "-"
         std_cycle_raw = self._safe_text(job_details.get("std_cycle_time"), "-")
         api_qty_raw = self._safe_text(job_details.get("qty_per_shift"), "")
@@ -4809,6 +5195,23 @@ QWidget#ClientUIRoot {{
             self._set_banner_text('Downtime active: scan "productiondailyreport~2" or SUR')
         else:
             self._set_banner_text("Ready: Scan PACK / BUTAL / Reject~1")
+
+        show_pdr_select = bool(s.waiting_production_report_reason)
+        show_pdr_active = bool(
+            s.waiting_downtime_start_maintenance
+            or s.waiting_downtime_end_maintenance
+            or s.downtime_active
+            or s.downtime_started_at
+        )
+        if show_pdr_select:
+            self._set_production_overlay_mode("select")
+            self._show_production_overlay()
+        elif show_pdr_active:
+            self._set_production_overlay_mode("active")
+            self._show_production_overlay()
+        else:
+            self._hide_production_overlay()
+
         self._refresh_job_details()
         self._refresh_downtime_panel()
         self._refresh_linkage_panel()
@@ -4950,8 +5353,6 @@ QWidget#ClientUIRoot {{
             if self._overlay_mode == "active":
                 self.productionLiveReason.setText(self.rightDowntimeReason.text())
                 self.productionCounter.setText(f"{hh:02d}:{mm:02d}:{ss:02d}")
-                if self._repair_movie is None:
-                    self.productionFixAnim.setText("Waiting for maintenance...")
         elif s.downtime_started_at:
             elapsed = max(0, int(time.time() - s.downtime_started_at))
             hh = elapsed // 3600
@@ -4971,8 +5372,6 @@ QWidget#ClientUIRoot {{
                 self.rightDowntimeTimer.setText("Downtime: 00:00:00")
             if self._overlay_mode == "active":
                 self.productionCounter.setText("00:00:00")
-                if self._repair_movie is None:
-                    self.productionFixAnim.setText("Repair in progress...")
 
     def _refresh_linkage_panel(self):
         s = self.state
@@ -5230,6 +5629,7 @@ QWidget#ClientUIRoot {{
             "raw_material_logs": list(s.raw_material_logs or []),
             "raw_material_unique_keys": sorted(list(s.raw_material_unique_keys or set())),
             "product_pack_history_logs": list(s.product_pack_history_logs or []),
+            "action_logs": list(getattr(self, "_action_logs", []) or []),
             "startup_reject_total": int(s.startup_reject_total or 0),
             "reject_review_open": bool(s.reject_review_open),
             "reject_review_phase": int(s.reject_review_phase or 0),
@@ -5333,6 +5733,7 @@ QWidget#ClientUIRoot {{
         s.raw_material_logs = list(snap.get("raw_material_logs") or [])
         s.raw_material_unique_keys = set(snap.get("raw_material_unique_keys") or [])
         s.product_pack_history_logs = list(snap.get("product_pack_history_logs") or [])
+        self._action_logs = list(snap.get("action_logs") or [])
         s.startup_reject_total = int(snap.get("startup_reject_total") or 0)
         s.reject_review_open = bool(snap.get("reject_review_open"))
         s.reject_review_phase = int(snap.get("reject_review_phase") or 0)
@@ -5359,6 +5760,9 @@ QWidget#ClientUIRoot {{
         s.operator_shift_baseline_raw_material_logs_len = int(snap.get("operator_shift_baseline_raw_material_logs_len") or 0)
         s.operator_shift_baseline_product_pack_history_logs_len = int(snap.get("operator_shift_baseline_product_pack_history_logs_len") or 0)
         s.operator_shift_baseline_reject_review_logs_len = int(snap.get("operator_shift_baseline_reject_review_logs_len") or 0)
+        for key in ("pack", "raw", "action"):
+            setattr(self, f"_history_init_{key}", False)
+            setattr(self, f"_history_last_{key}", "")
         if s.operator_id and not s.operator_shift_started_at:
             self._start_operator_shift_tracking()
         self._refresh_ui()
@@ -5931,10 +6335,15 @@ QWidget#ClientUIRoot {{
         except Exception:
             return None
 
-    def _qty_per_shift_from_cycle(self, cycle_seconds: Optional[float]) -> Optional[int]:
+    def _qty_per_shift_from_cycle(self, cycle_seconds: Optional[float], cavities: Any = 1) -> Optional[int]:
         if cycle_seconds is None or cycle_seconds <= 0:
             return None
-        return int((12 * 60 * 60) / cycle_seconds)
+        try:
+            cavity_count = int(float(cavities or 1))
+        except Exception:
+            cavity_count = 1
+        cavity_count = max(1, cavity_count)
+        return int(((12 * 60 * 60) / cycle_seconds) * cavity_count)
 
     def _reset_live_cycle_tracking(self, *, start_now: bool = False):
         s = self.state
