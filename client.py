@@ -919,6 +919,7 @@ class ClientState:
     machine_name: Optional[str] = None
     job_code: Optional[str] = None
     job_name: Optional[str] = None
+    job_started_at: Optional[str] = None
     operator_id: Optional[str] = None
 
     pack_count: int = 0
@@ -1885,6 +1886,16 @@ QWidget#ClientUIRoot {{
         self.pageTitle.setWordWrap(False)
         self.pageTitle.setMinimumHeight(40)
         self.pageTitle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.headerJobStart = QLabel("")
+        self.headerJobStart.setObjectName("MetaValue")
+        self.headerJobStart.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.headerJobStart.setMinimumWidth(0)
+        self.headerJobStart.hide()
+        self.headerJobDuration = QLabel("")
+        self.headerJobDuration.setObjectName("MetaValue")
+        self.headerJobDuration.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.headerJobDuration.setMinimumWidth(0)
+        self.headerJobDuration.hide()
         self.headerDateTime = QLabel("")
         self.headerDateTime.setObjectName("MetaValue")
         self.headerDateTime.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1899,6 +1910,8 @@ QWidget#ClientUIRoot {{
         headerRow.setSpacing(4)
         headerRow.addWidget(self.btnSettings, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.pageTitle, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        headerRow.addWidget(self.headerJobStart, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        headerRow.addWidget(self.headerJobDuration, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.headerDateTime, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.headerDivider = QFrame()
@@ -2511,7 +2524,6 @@ QWidget#ClientUIRoot {{
         linkageContent.layout().setSpacing(14)
         linkageContent.layout().setStretch(0, 1)
         linkageContent.layout().setStretch(1, 1)
-        linkageContent.layout().setStretch(2, 1)
 
         linkageLeft = QFrame()
         linkageLeft.setObjectName("LinkageMirrorLeft")
@@ -2573,7 +2585,6 @@ QWidget#ClientUIRoot {{
         card_total, self.linkageMirrorTotalGood = _make_counter_card("Total Good")
         linkageRight.layout().setColumnStretch(0, 1)
         linkageRight.layout().setColumnStretch(1, 1)
-        linkageRight.layout().setColumnStretch(2, 1)
         linkageRight.layout().addWidget(card_pack, 0, 0)
         linkageRight.layout().addWidget(card_good, 0, 1)
         linkageRight.layout().addWidget(card_butal, 1, 0)
@@ -2581,9 +2592,6 @@ QWidget#ClientUIRoot {{
 
         linkageContent.layout().addWidget(linkageLeft, 1)
         linkageContent.layout().addWidget(linkageRight, 1)
-        linkageThirdCol = QWidget()
-        linkageThirdCol.setObjectName("LinkageMirrorThirdCol")
-        linkageContent.layout().addWidget(linkageThirdCol, 1)
         linkageBody.layout().addWidget(linkageContent)
         linkageCol.addWidget(linkageBody)
         linkageFrame.setMinimumHeight(170)
@@ -2599,13 +2607,65 @@ QWidget#ClientUIRoot {{
             "QLabel#LinkageMirrorJobKey { color: #0f172a; font-size: 13px; font-weight: 900; }"
             "QLabel#LinkageMirrorJobVal { color: #0f172a; font-size: 16px; font-weight: 900; }"
             "QFrame#LinkageMirrorRight { background: transparent; border: none; }"
-            "QWidget#LinkageMirrorThirdCol { background: transparent; border: none; }"
             "QFrame#LinkageMirrorCounterCard { background: #e7ecf5; border: 1px solid #dde3ee; border-radius: 10px; min-height: 40px; max-height: 40px; }"
             "QLabel#LinkageMirrorCounterTitle { color: #334a6a; font-size: 13px; font-weight: 900; }"
             "QLabel#LinkageMirrorCounterValue { color: #7a93b7; font-size: 18px; font-weight: 900; }"
         )
         linkageOuterLay.addWidget(linkageFrame)
         self.linkageMirrorOuter = linkageOuter
+        self.linkageMirrorFrame = linkageFrame
+
+        qtyOuter = QFrame()
+        qtyOuter.setObjectName("RightCardOuter")
+        qtyOuterLay = QVBoxLayout()
+        qtyOuterLay.setContentsMargins(8, 0, 8, 8)
+        qtyOuterLay.setSpacing(0)
+        qtyOuter.setLayout(qtyOuterLay)
+
+        qtyFrame = QFrame()
+        qtyFrame.setObjectName("LinkageMirrorHost")
+        qtyFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        qtyCol = QVBoxLayout()
+        qtyCol.setContentsMargins(0, 0, 0, 0)
+        qtyCol.setSpacing(6)
+        qtyFrame.setLayout(qtyCol)
+        qtyBody = QFrame()
+        qtyBody.setObjectName("LinkageMirrorBody")
+        qtyBody.setLayout(QVBoxLayout())
+        qtyBody.layout().setContentsMargins(0, 0, 0, 10)
+        qtyBody.layout().setSpacing(0)
+        qtyHeader = QFrame()
+        qtyHeader.setObjectName("LinkageMirrorHeader")
+        qtyHeader.setLayout(QVBoxLayout())
+        qtyHeader.layout().setContentsMargins(12, 10, 12, 10)
+        qtyHeader.layout().setSpacing(0)
+        qtyTitle = QLabel("Job Quantity Request")
+        qtyTitle.setObjectName("RightTitle")
+        qtyTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        qtyHeader.layout().addWidget(qtyTitle)
+        qtyHeader.setFixedHeight(downtimeHeader.sizeHint().height())
+        qtyBody.layout().addWidget(qtyHeader)
+
+        qtyContent = QWidget()
+        qtyContent.setObjectName("LinkageMirrorContent")
+        qtyContent.setLayout(QVBoxLayout())
+        qtyContent.layout().setContentsMargins(10, 10, 10, 12)
+        qtyContent.layout().setSpacing(10)
+
+        progress_card, self.linkageMirrorProduced = _make_counter_card("Produced")
+        remaining_card, self.linkageMirrorRemaining = _make_counter_card("Remaining")
+        overrun_card, self.linkageMirrorOverrun = _make_counter_card("Overrun")
+        qtyContent.layout().addWidget(progress_card)
+        qtyContent.layout().addWidget(remaining_card)
+        qtyContent.layout().addWidget(overrun_card)
+        qtyContent.layout().addStretch(1)
+        qtyBody.layout().addWidget(qtyContent)
+        qtyCol.addWidget(qtyBody)
+        qtyFrame.setMinimumHeight(170)
+        qtyFrame.setStyleSheet(linkageFrame.styleSheet())
+        qtyOuterLay.addWidget(qtyFrame)
+        self.jobQtyRequestOuter = qtyOuter
+        self.jobQtyRequestFrame = qtyFrame
 
         def _make_history_card(header_text: str, column_title: str):
             outer = QFrame()
@@ -2684,8 +2744,15 @@ QWidget#ClientUIRoot {{
         self.historyRowOuter.layout().addWidget(self.partsHistoryOuter, 1)
         self.historyRowOuter.layout().addWidget(self.actionsHistoryOuter, 1)
 
+        self.rightTopRow = QWidget()
+        self.rightTopRow.setLayout(QHBoxLayout())
+        self.rightTopRow.layout().setContentsMargins(0, 0, 0, 0)
+        self.rightTopRow.layout().setSpacing(6)
+        self.rightTopRow.layout().addWidget(linkageOuter, 2)
+        self.rightTopRow.layout().addWidget(qtyOuter, 1)
+
         # Show Linkage above Product Parts in the right panel.
-        rightLayout.addWidget(linkageOuter)
+        rightLayout.addWidget(self.rightTopRow)
         rightLayout.addSpacing(6)
         rightLayout.addWidget(self.cardJobDetailsOuter)
         rightLayout.addSpacing(6)
@@ -3912,19 +3979,42 @@ QWidget#ClientUIRoot {{
         if not hasattr(self, "rightTopSpacer"):
             return
         try:
-            # Align top right frame (Linkage Mirror) with the scan banner frame.
-            target_ref = self.banner
-            target_top = target_ref.mapTo(self, target_ref.rect().topLeft()).y()
+            # Lock the Linkage Mirror top to the scan banner top and its bottom
+            # to the production strip bottom so the right panel mirrors the left.
+            target_top = self.banner.mapTo(self, self.banner.rect().topLeft()).y()
+            target_bottom = self.cardProductionOuter.mapTo(
+                self, self.cardProductionOuter.rect().bottomLeft()
+            ).y()
             right_top = self.rightPanel.mapTo(self, self.rightPanel.rect().topLeft()).y()
-            # Keep first right frame top aligned with the selected reference frame.
+            desired_outer_height = max(150, int(target_bottom - target_top + 1))
+
             offset = max(0, int(target_top - right_top))
             self.rightTopSpacer.setFixedHeight(offset)
+
             if hasattr(self, "linkageMirrorOuter") and self.linkageMirrorOuter is not None:
-                prod_bottom = self.cardProductionOuter.mapTo(self, self.cardProductionOuter.rect().bottomLeft()).y()
-                linkage_top = self.linkageMirrorOuter.mapTo(self, self.linkageMirrorOuter.rect().topLeft()).y()
-                target_h = max(150, int(prod_bottom - linkage_top + 1))
-                self.linkageMirrorOuter.setMinimumHeight(target_h)
-                self.linkageMirrorOuter.setMaximumHeight(target_h)
+                self.linkageMirrorOuter.setMinimumHeight(desired_outer_height)
+                self.linkageMirrorOuter.setMaximumHeight(desired_outer_height)
+
+            if hasattr(self, "linkageMirrorFrame") and self.linkageMirrorFrame is not None:
+                linkage_margins = self.linkageMirrorOuter.layout().contentsMargins() if hasattr(self, "linkageMirrorOuter") and self.linkageMirrorOuter.layout() is not None else None
+                outer_vertical_margins = (
+                    int(linkage_margins.top() + linkage_margins.bottom()) if linkage_margins is not None else 0
+                )
+                linkage_height = max(150, desired_outer_height - outer_vertical_margins)
+                self.linkageMirrorFrame.setMinimumHeight(linkage_height)
+                self.linkageMirrorFrame.setMaximumHeight(linkage_height)
+
+                if hasattr(self, "jobQtyRequestOuter") and self.jobQtyRequestOuter is not None:
+                    self.jobQtyRequestOuter.setMinimumHeight(desired_outer_height)
+                    self.jobQtyRequestOuter.setMaximumHeight(desired_outer_height)
+                if hasattr(self, "jobQtyRequestFrame") and self.jobQtyRequestFrame is not None:
+                    qty_margins = self.jobQtyRequestOuter.layout().contentsMargins() if self.jobQtyRequestOuter.layout() is not None else None
+                    qty_outer_vertical_margins = (
+                        int(qty_margins.top() + qty_margins.bottom()) if qty_margins is not None else 0
+                    )
+                    qty_height = max(150, desired_outer_height - qty_outer_vertical_margins)
+                    self.jobQtyRequestFrame.setMinimumHeight(qty_height)
+                    self.jobQtyRequestFrame.setMaximumHeight(qty_height)
         except Exception:
             self.rightTopSpacer.setFixedHeight(0)
 
@@ -5391,6 +5481,10 @@ QWidget#ClientUIRoot {{
         self.linkageMirrorGood.setText(str(s.good_total))
         self.linkageMirrorButal.setText(str(s.butal_total))
         self.linkageMirrorTotalGood.setText(str(s.good_total + s.butal_total))
+        progress = self._compute_job_progress_metrics()
+        self.linkageMirrorProduced.setText(f"{progress['produced_now']} / {progress['target_qty']}")
+        self.linkageMirrorRemaining.setText(str(progress["remaining_qty"]))
+        self.linkageMirrorOverrun.setText(str(progress["overrun_qty"]))
         self.linkageMirrorOuter.setVisible(True)
         self._refresh_history_panel()
 
@@ -5583,6 +5677,7 @@ QWidget#ClientUIRoot {{
             "machine_name": s.machine_name,
             "job_code": s.job_code,
             "job_name": s.job_name,
+            "job_started_at": s.job_started_at,
             "operator_id": s.operator_id,
             "pack_count": int(s.pack_count or 0),
             "good_total": int(s.good_total or 0),
@@ -5684,6 +5779,7 @@ QWidget#ClientUIRoot {{
         s.machine_name = _machine_display_name(snap.get("machine_code"), snap.get("machine_name"))
         s.job_code = snap.get("job_code")
         s.job_name = snap.get("job_name")
+        s.job_started_at = snap.get("job_started_at")
         s.operator_id = snap.get("operator_id")
         s.pack_count = int(snap.get("pack_count") or 0)
         s.good_total = int(snap.get("good_total") or 0)
@@ -5885,6 +5981,7 @@ QWidget#ClientUIRoot {{
         s.machine_name = None
         s.job_code = None
         s.job_name = None
+        s.job_started_at = None
         s.operator_id = None
         s.pack_count = 0
         s.good_total = 0
@@ -6320,6 +6417,50 @@ QWidget#ClientUIRoot {{
         s = str(v).strip()
         return s if s else fallback
 
+    def _parse_number(self, value: Any) -> float:
+        if value is None:
+            return 0.0
+        raw = str(value).strip().replace(",", "")
+        if not raw:
+            return 0.0
+        try:
+            return float(raw)
+        except Exception:
+            m = re.search(r"-?\d+(?:\.\d+)?", raw)
+            if not m:
+                return 0.0
+            try:
+                return float(m.group(0))
+            except Exception:
+                return 0.0
+
+    def _compute_job_progress_metrics(self) -> Dict[str, int]:
+        payload = self.state.job_payload or {}
+        data_obj = payload.get("data") if isinstance(payload, dict) else {}
+        job = data_obj.get("job") if isinstance(data_obj, dict) and isinstance(data_obj.get("job"), dict) else {}
+        partials = data_obj.get("partials") if isinstance(data_obj, dict) and isinstance(data_obj.get("partials"), list) else []
+        target_qty_raw = job.get("approve_qty")
+        if self._parse_number(target_qty_raw) <= 0:
+            target_qty_raw = job.get("request_qty")
+        target_qty = max(0, int(round(self._parse_number(target_qty_raw))))
+        api_partial_total = 0
+        for row in partials:
+            if not isinstance(row, dict):
+                continue
+            api_partial_total += int(round(self._parse_number(row.get("partial_qty"))))
+        live_shift_good = int((self.state.good_total or 0) + (self.state.butal_total or 0))
+        produced_now = max(0, api_partial_total + live_shift_good)
+        remaining_qty = max(target_qty - produced_now, 0)
+        overrun_qty = max(produced_now - target_qty, 0)
+        return {
+            "target_qty": target_qty,
+            "api_partial_total": api_partial_total,
+            "live_shift_good": live_shift_good,
+            "produced_now": produced_now,
+            "remaining_qty": remaining_qty,
+            "overrun_qty": overrun_qty,
+        }
+
     def _parse_cycle_seconds(self, v: Any) -> Optional[float]:
         if v is None:
             return None
@@ -6743,8 +6884,55 @@ QWidget#ClientUIRoot {{
         self._banner_base_text = text
         self.banner.setText((self._banner_base_text or "").strip())
 
+    def _compute_total_job_duration_seconds(self) -> int:
+        s = self.state
+        total_seconds = 0.0
+        for row in (s.operator_shift_logs or []):
+            if not isinstance(row, dict):
+                continue
+            started_raw = str(row.get("started_at_utc") or "").strip()
+            ended_raw = str(row.get("ended_at_utc") or "").strip()
+            if not started_raw or not ended_raw:
+                continue
+            try:
+                started_dt = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+                ended_dt = datetime.fromisoformat(ended_raw.replace("Z", "+00:00"))
+                total_seconds += max(0.0, (ended_dt - started_dt).total_seconds())
+            except Exception:
+                continue
+        current_started_raw = str(s.operator_shift_started_at or "").strip()
+        if current_started_raw:
+            try:
+                current_started_dt = datetime.fromisoformat(current_started_raw.replace("Z", "+00:00"))
+                total_seconds += max(0.0, (datetime.now(timezone.utc) - current_started_dt).total_seconds())
+            except Exception:
+                pass
+        return max(0, int(total_seconds))
+
     def _update_header_datetime(self):
         now_local = datetime.now()
+        job_started_text = ""
+        job_started_raw = str(self.state.job_started_at or "").strip()
+        if job_started_raw:
+            try:
+                started_dt = datetime.fromisoformat(job_started_raw.replace("Z", "+00:00"))
+                if started_dt.tzinfo is not None:
+                    started_dt = started_dt.astimezone()
+                job_started_text = f"Job Start: {started_dt.strftime('%b %d, %Y | %I:%M:%S %p')}"
+            except Exception:
+                job_started_text = f"Job Start: {job_started_raw}"
+        self.headerJobStart.setText(job_started_text)
+        self.headerJobStart.setVisible(bool(job_started_text))
+
+        total_job_seconds = self._compute_total_job_duration_seconds()
+        duration_text = ""
+        if total_job_seconds > 0:
+            hh = total_job_seconds // 3600
+            mm = (total_job_seconds % 3600) // 60
+            ss = total_job_seconds % 60
+            duration_text = f"Job Duration: {hh:02d}:{mm:02d}:{ss:02d}"
+        self.headerJobDuration.setText(duration_text)
+        self.headerJobDuration.setVisible(bool(duration_text))
         self.headerDateTime.setText(now_local.strftime("%A | %b %d, %Y | %I:%M:%S %p"))
 
     def _operator_display_name(self, text: Optional[str]) -> str:
@@ -7609,6 +7797,7 @@ QWidget#ClientUIRoot {{
             s.machine_name = _machine_display_name(s.machine_code, res.value)
             s.job_code = None
             s.job_name = None
+            s.job_started_at = None
             s.operator_id = None
             s.waiting_reject_reason = False
             s.waiting_production_report_reason = False
@@ -7783,32 +7972,35 @@ QWidget#ClientUIRoot {{
                         or self._safe_text(api_job.get("ref_no"), "")
                         or requested_job_id
                     )
-                    s.job_name = (
-                        self._safe_text(api_job.get("ref_no"), "")
-                        or res.value
-                    )
-                    self.status.setText(f"Job set (API): {s.job_name}")
-                else:
-                    s.job_code = requested_job_id
-                    s.job_name = res.value
-                    s.job_payload = {}
+                s.job_name = (
+                    self._safe_text(api_job.get("ref_no"), "")
+                    or res.value
+                )
+                s.job_started_at = datetime.now(timezone.utc).isoformat()
+                self.status.setText(f"Job set (API): {s.job_name}")
             else:
-                payload = res.meta or {}
-                s.job_payload = payload
-                job = self._extract_job_record()
-                s.job_code = (
+                s.job_code = requested_job_id
+                s.job_name = res.value
+                s.job_payload = {}
+                s.job_started_at = datetime.now(timezone.utc).isoformat()
+        else:
+            payload = res.meta or {}
+            s.job_payload = payload
+            job = self._extract_job_record()
+            s.job_code = (
                     self._safe_text(job.get("id"), "")
                     or self._safe_text(job.get("ref_no"), "")
                     or self._safe_text(payload.get("job_code"), "")
                     or s.job_code
                     or "QR-STUB"
                 )
-                s.job_name = (
-                    self._safe_text(job.get("ref_no"), "")
-                    or self._safe_text(payload.get("job_name"), "")
-                    or s.job_name
-                    or "Job Stub"
-                )
+            s.job_name = (
+                self._safe_text(job.get("ref_no"), "")
+                or self._safe_text(payload.get("job_name"), "")
+                or s.job_name
+                or "Job Stub"
+            )
+            s.job_started_at = datetime.now(timezone.utc).isoformat()
             s.operator_id = None
             s.showing_reject_summary = False
             s.waiting_production_report_reason = False
