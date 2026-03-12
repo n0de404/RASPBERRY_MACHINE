@@ -155,6 +155,18 @@ def _sql_decode_json(value: Any, fallback: Any) -> Any:
         return fallback
 
 
+def _load_json_object(path: Path) -> Dict[str, Any]:
+    try:
+        if not path.exists():
+            return {}
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(raw, dict):
+            return raw
+    except Exception:
+        pass
+    return {}
+
+
 def _ensure_sql_schema() -> bool:
     conn = _sql_conn()
     if conn is None:

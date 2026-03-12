@@ -59,6 +59,7 @@ ANIMATIONS_DIR = os.path.join(BASE_DIR, "Animations")
 IMAGES_DIR = os.path.join(BASE_DIR, "Images")
 DATABASE_DIR = os.path.join(BASE_DIR, "Database")
 JOB_API_CONFIG_FILE = os.path.join(DATABASE_DIR, "job_api_config.json")
+ACTIVE_MACHINE_SESSIONS_FILE = os.path.join(DATABASE_DIR, "active_machine_sessions.json")
 INVALID_SCAN_GIF = os.environ.get(
     "MACHINE_INVALID_SCAN_GIF",
     os.path.join(ANIMATIONS_DIR, "slap-virtual-slap.gif"),
@@ -420,6 +421,81 @@ def _load_active_sessions_sql() -> Dict[str, Any]:
         conn.close()
 
 
+def _load_active_sessions_json() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(ACTIVE_MACHINE_SESSIONS_FILE):
+            return {}
+        with open(ACTIVE_MACHINE_SESSIONS_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        for machine_code, row in loaded.items():
+            code = str(machine_code or "").strip()
+            if code and isinstance(row, dict):
+                item = dict(row)
+                item["machine_code"] = str(item.get("machine_code") or code).strip()
+                out[code] = item
+        return out
+    except Exception:
+        return {}
+
+
+def _save_active_sessions_json(rows: Dict[str, Any]) -> bool:
+    try:
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        payload: Dict[str, Any] = {}
+        for machine_code, row in (rows or {}).items():
+            code = str(machine_code or "").strip()
+            if code and isinstance(row, dict):
+                item = dict(row)
+                item["machine_code"] = str(item.get("machine_code") or code).strip()
+                payload[code] = item
+        with open(ACTIVE_MACHINE_SESSIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"[JSON] Active session save failed: {e}")
+        return False
+
+
+def _upsert_active_session_json(row: Dict[str, Any]) -> bool:
+    machine_code = str((row or {}).get("machine_code") or "").strip()
+    if not machine_code:
+        return False
+    rows = _load_active_sessions_json()
+    payload = dict(row or {})
+    payload["machine_code"] = machine_code
+    rows[machine_code] = payload
+    return _save_active_sessions_json(rows)
+
+
+def _delete_active_session_json(machine_code: Optional[str]) -> bool:
+    code = str(machine_code or "").strip()
+    if not code:
+        return False
+    rows = _load_active_sessions_json()
+    if code in rows:
+        rows.pop(code, None)
+        return _save_active_sessions_json(rows)
+    return True
+
+
+def _sync_active_sessions_json_to_sql() -> bool:
+    rows = _load_active_sessions_json()
+    ok = True
+    for machine_code, row in rows.items():
+        if not isinstance(row, dict):
+            continue
+        payload = dict(row)
+        payload["machine_code"] = str(payload.get("machine_code") or machine_code or "").strip()
+        if not payload["machine_code"]:
+            ok = False
+            continue
+        ok = _upsert_active_session_sql(payload) and ok
+    return ok
+
+
 def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
     machine_code = str((row or {}).get("machine_code") or "").strip()
     if not machine_code:
@@ -694,7 +770,7 @@ def _save_client_settings_sql(row: Dict[str, Any]) -> bool:
 
 
 def _migrate_active_sessions_json_to_sql() -> bool:
-    legacy_path = os.path.join(DATABASE_DIR, "active_machine_sessions.json")
+    legacy_path = ACTIVE_MACHINE_SESSIONS_FILE
     if not os.path.exists(legacy_path):
         return True
     sql_rows = _load_active_sessions_sql()
@@ -950,7 +1026,14 @@ class ClientState:
     downtime_wait_last_seconds: Optional[int] = None
     waiting_downtime_start_maintenance: bool = False
     waiting_downtime_end_maintenance: bool = False
+    downtime_resolution_started_at: Optional[float] = None
+    maintenance_downtime_seconds: Optional[int] = None
+    supervisor_downtime_confirmation_started_at: Optional[float] = None
+    supervisor_downtime_confirmation_seconds: Optional[int] = None
+    operator_downtime_confirmation_started_at: Optional[float] = None
+    operator_downtime_confirmation_seconds: Optional[int] = None
     cycle_time_current: Optional[str] = None
+    cycle_time_change_logs: List[Dict[str, Any]] = None
     cycle_time_new_input: str = ""
     cycle_time_confirmed_by: Optional[str] = None
     cycle_time_confirm_actor_code: Optional[str] = None
@@ -984,6 +1067,7 @@ class ClientState:
     operator_shift_logs: List[Dict[str, Any]] = None
     operator_shift_index: int = 0
     operator_shift_started_at: Optional[str] = None
+    operator_shift_baseline_cycle_time: Optional[str] = None
     operator_shift_baseline_pack_count: int = 0
     operator_shift_baseline_good_total: int = 0
     operator_shift_baseline_butal_total: int = 0
@@ -1016,6 +1100,8 @@ class ClientState:
             self.linkage_jobs = []
         if self.operator_shift_logs is None:
             self.operator_shift_logs = []
+        if self.cycle_time_change_logs is None:
+            self.cycle_time_change_logs = []
         if self.operator_shift_baseline_reject_breakdown is None:
             self.operator_shift_baseline_reject_breakdown = {}
 
@@ -1833,6 +1919,10 @@ class ClientUI(QWidget):
         self._identity_sync_inflight = False
         self._identity_sync_last_attempt = 0.0
         self._identity_sync_last_ok = 0.0
+        self._active_session_sql_sync_lock = threading.Lock()
+        self._active_session_sql_sync_inflight = False
+        self._active_session_sql_sync_last_attempt = 0.0
+        self._active_session_sql_sync_last_ok = 0.0
         self._serial_stop = threading.Event()
         self._serial_thread: Optional[threading.Thread] = None
         self._motion_index = 0
@@ -3733,6 +3823,11 @@ QWidget#ClientUIRoot {{
         self.hb.timeout.connect(self.send_heartbeat)
         self.hb.start(1500)
 
+        self.activeSessionSqlSyncTimer = QTimer(self)
+        self.activeSessionSqlSyncTimer.timeout.connect(self._sync_active_session_snapshots_to_sql)
+        self.activeSessionSqlSyncTimer.start(180000)
+        QTimer.singleShot(2000, self._sync_active_session_snapshots_to_sql)
+
         # Keep profile/role cache synced from server so remote profile creation is recognized by scans.
         self.identitySyncTimer = QTimer(self)
         self.identitySyncTimer.timeout.connect(lambda: self._trigger_identity_cache_sync(force=False))
@@ -4992,7 +5087,7 @@ QWidget#ClientUIRoot {{
             self.productionMarqueeWrap.hide()
             return
         self.productionTitle.setText("DOWNTIME ACTIVE")
-        self.productionHint.setText("Machine under repair / adjustment")
+        self.productionHint.setText("Follow the instruction shown in status and banner")
         self.productionReasonList.hide()
         self.productionLiveReason.show()
         self.productionCounter.show()
@@ -5201,6 +5296,7 @@ QWidget#ClientUIRoot {{
 
     def _refresh_ui(self):
         s = self.state
+        self._restore_job_payload_from_active_snapshot()
         self.lblMachine.setText(f"Machine: {_machine_display_name(s.machine_code, s.machine_name)}")
         self.lblJob.setText(f"Job: {s.job_name or '-'}")
         self.lblOperator.setText(f"Operator: {self._operator_display_name(s.operator_id)}")
@@ -5224,9 +5320,16 @@ QWidget#ClientUIRoot {{
         self.lblReject.setText(str(s.reject_total))
         self.lblTotalGood.setText(str(s.good_total + s.butal_total))
         self.rightCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
-        act_cycle = self._parse_cycle_seconds(s.cycle_time_current)
-        act_cycle_text = f"{act_cycle:g} sec" if act_cycle is not None else "-"
-        act_qty_shift = self._qty_per_shift_from_cycle(act_cycle, cavity_count)
+        act_cycle_current = self._parse_cycle_seconds(s.cycle_time_current)
+        act_cycle_shift_avg = self._compute_current_shift_avg_cycle_seconds()
+        act_cycle_for_qty = act_cycle_shift_avg if act_cycle_shift_avg is not None else act_cycle_current
+        if act_cycle_shift_avg is not None and act_cycle_current is not None and abs(act_cycle_shift_avg - act_cycle_current) > 0.01:
+            act_cycle_text = f"{act_cycle_shift_avg:.2f} sec avg"
+        elif act_cycle_for_qty is not None:
+            act_cycle_text = f"{act_cycle_for_qty:g} sec"
+        else:
+            act_cycle_text = "-"
+        act_qty_shift = self._qty_per_shift_from_cycle(act_cycle_for_qty, cavity_count)
         act_qty_shift_text = str(act_qty_shift) if act_qty_shift is not None else "-"
         std_cycle_raw = self._safe_text(job_details.get("std_cycle_time"), "-")
         api_qty_raw = self._safe_text(job_details.get("qty_per_shift"), "")
@@ -5262,7 +5365,7 @@ QWidget#ClientUIRoot {{
         elif s.waiting_reject_reason:
             self._set_banner_text("Reject mode: Scan reason (BM01/CS02/CO03/CR04/DI05) or SUR")
         elif s.waiting_production_report_reason:
-            self._set_banner_text("Production Daily Report mode: Scan reason QR (01-15)")
+            self._set_banner_text("Production Daily Report mode: scan reason QR (01-15)")
         elif s.waiting_initial_cycle_time_input:
             self._set_banner_text("Initial setup: Scan cycle time digits, then confirm")
         elif s.waiting_cycle_time_confirm_popup:
@@ -5270,11 +5373,11 @@ QWidget#ClientUIRoot {{
         elif s.waiting_initial_cycle_qc_confirm:
             self._set_banner_text("Initial setup: Scan QC badge to confirm cycle time")
         elif s.waiting_cycle_time_input:
-            self._set_banner_text("Downtime resolve: Scan cycle time digits, then confirm")
+            self._set_banner_text("Downtime resolve: enter cycle time, then confirm")
         elif s.waiting_downtime_start_maintenance:
             self._set_banner_text("PDR waiting: scan Maintenance QR to start downtime")
         elif s.waiting_downtime_end_maintenance:
-            self._set_banner_text("Downtime active: scan Maintenance QR when repair is done")
+            self._set_banner_text('Downtime active: scan "pdr_done" when repair is done')
         elif s.waiting_maintenance_qr:
             self._set_banner_text("Downtime resolve: Scan Maintenance QR")
         elif s.waiting_supervisor_qr:
@@ -5429,6 +5532,20 @@ QWidget#ClientUIRoot {{
             self.rightDowntimeReason.setText(f"Reason {s.downtime_reason_code}: {s.downtime_reason_text}")
         else:
             self.rightDowntimeReason.setText("Reason: -")
+        if s.waiting_downtime_start_maintenance:
+            self.productionHint.setText("Scan Maintenance QR to start downtime")
+        elif s.waiting_downtime_end_maintenance:
+            self.productionHint.setText('Downtime running. Scan "pdr_done" when repair is done')
+        elif s.waiting_cycle_time_input:
+            self.productionHint.setText("Enter cycle time now. Downtime is still running")
+        elif s.waiting_maintenance_qr:
+            self.productionHint.setText("Scan Maintenance QR to stop maintenance downtime")
+        elif s.waiting_supervisor_qr:
+            self.productionHint.setText("Scan Supervisor QR to continue")
+        elif s.waiting_operator_downtime_confirm:
+            self.productionHint.setText("Scan Operator QR to finish downtime confirmation")
+        elif self._overlay_mode == "active":
+            self.productionHint.setText("Machine under repair / adjustment")
         self.rightStartupReject.setText(f"Start Up Reject: {s.startup_reject_total}")
         self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or '-'}")
         self.rightSupervisor.setText(f"Supervisor: {s.supervisor_name or '-'}")
@@ -5442,7 +5559,15 @@ QWidget#ClientUIRoot {{
             self.rightDowntimeTimer.setText(f"Waiting: {hh:02d}:{mm:02d}:{ss:02d}")
             if self._overlay_mode == "active":
                 self.productionLiveReason.setText(self.rightDowntimeReason.text())
-                self.productionCounter.setText(f"{hh:02d}:{mm:02d}:{ss:02d}")
+                self.productionCounter.setText(f"WAITING TIME\n{hh:02d}:{mm:02d}:{ss:02d}")
+        elif s.maintenance_downtime_seconds is not None:
+            hh = s.maintenance_downtime_seconds // 3600
+            mm = (s.maintenance_downtime_seconds % 3600) // 60
+            ss = s.maintenance_downtime_seconds % 60
+            self.rightDowntimeTimer.setText(f"Downtime: {hh:02d}:{mm:02d}:{ss:02d}")
+            if self._overlay_mode == "active":
+                self.productionLiveReason.setText(self.rightDowntimeReason.text())
+                self.productionCounter.setText(f"DOWNTIME\n{hh:02d}:{mm:02d}:{ss:02d}")
         elif s.downtime_started_at:
             elapsed = max(0, int(time.time() - s.downtime_started_at))
             hh = elapsed // 3600
@@ -5451,7 +5576,7 @@ QWidget#ClientUIRoot {{
             self.rightDowntimeTimer.setText(f"Downtime: {hh:02d}:{mm:02d}:{ss:02d}")
             if self._overlay_mode == "active":
                 self.productionLiveReason.setText(self.rightDowntimeReason.text())
-                self.productionCounter.setText(f"{hh:02d}:{mm:02d}:{ss:02d}")
+                self.productionCounter.setText(f"DOWNTIME\n{hh:02d}:{mm:02d}:{ss:02d}")
         else:
             if s.downtime_last_seconds is not None:
                 hh = s.downtime_last_seconds // 3600
@@ -5461,7 +5586,7 @@ QWidget#ClientUIRoot {{
             else:
                 self.rightDowntimeTimer.setText("Downtime: 00:00:00")
             if self._overlay_mode == "active":
-                self.productionCounter.setText("00:00:00")
+                self.productionCounter.setText("DOWNTIME\n00:00:00")
 
     def _refresh_linkage_panel(self):
         s = self.state
@@ -5587,6 +5712,7 @@ QWidget#ClientUIRoot {{
             return
         s.operator_shift_index = int(s.operator_shift_index or 0) + 1
         s.operator_shift_started_at = datetime.now(timezone.utc).isoformat()
+        s.operator_shift_baseline_cycle_time = s.cycle_time_current
         s.operator_shift_baseline_pack_count = int(s.pack_count or 0)
         s.operator_shift_baseline_good_total = int(s.good_total or 0)
         s.operator_shift_baseline_butal_total = int(s.butal_total or 0)
@@ -5623,6 +5749,19 @@ QWidget#ClientUIRoot {{
         reject_total = max(0, int(s.reject_total or 0) - int(s.operator_shift_baseline_reject_total or 0))
         startup_reject_total = max(0, int(s.startup_reject_total or 0) - int(s.operator_shift_baseline_startup_reject_total or 0))
         raw_sacks_count = max(0, int(s.raw_sacks_count or 0) - int(s.operator_shift_baseline_raw_sacks_count or 0))
+        shift_avg_cycle_seconds = self._compute_current_shift_avg_cycle_seconds()
+        payload = s.job_payload or {}
+        data_obj = payload.get("data") if isinstance(payload, dict) else {}
+        job = data_obj.get("job") if isinstance(data_obj, dict) else {}
+        job_details = data_obj.get("job_details") if isinstance(data_obj, dict) else {}
+        cavity_count = 1
+        if isinstance(job_details, dict) or isinstance(job, dict):
+            cavity_count = (
+                (job_details.get("no_of_cavity") if isinstance(job_details, dict) else None)
+                or (job.get("custom_11") if isinstance(job, dict) else None)
+                or 1
+            )
+        shift_qty_per_shift = self._qty_per_shift_from_cycle(shift_avg_cycle_seconds, cavity_count)
         return {
             "shift_index": int(s.operator_shift_index or (len(s.operator_shift_logs or []) + 1)),
             "reason": str(reason or "SHIFT_CHANGE"),
@@ -5650,6 +5789,8 @@ QWidget#ClientUIRoot {{
             "downtime_reason_text": s.downtime_reason_text,
             "downtime_last_seconds": s.downtime_last_seconds,
             "cycle_time_current": s.cycle_time_current,
+            "cycle_time_shift_avg_seconds": shift_avg_cycle_seconds,
+            "qty_per_shift_avg_cycle": shift_qty_per_shift,
             "maintenance_name": s.maintenance_name,
             "supervisor_name": s.supervisor_name,
         }
@@ -5698,7 +5839,14 @@ QWidget#ClientUIRoot {{
             "downtime_wait_last_seconds": s.downtime_wait_last_seconds,
             "waiting_downtime_start_maintenance": bool(s.waiting_downtime_start_maintenance),
             "waiting_downtime_end_maintenance": bool(s.waiting_downtime_end_maintenance),
+            "downtime_resolution_started_at": s.downtime_resolution_started_at,
+            "maintenance_downtime_seconds": s.maintenance_downtime_seconds,
+            "supervisor_downtime_confirmation_started_at": s.supervisor_downtime_confirmation_started_at,
+            "supervisor_downtime_confirmation_seconds": s.supervisor_downtime_confirmation_seconds,
+            "operator_downtime_confirmation_started_at": s.operator_downtime_confirmation_started_at,
+            "operator_downtime_confirmation_seconds": s.operator_downtime_confirmation_seconds,
             "cycle_time_current": s.cycle_time_current,
+            "cycle_time_change_logs": list(s.cycle_time_change_logs or []),
             "cycle_time_new_input": s.cycle_time_new_input,
             "waiting_cycle_time_input": bool(s.waiting_cycle_time_input),
             "waiting_initial_cycle_time_input": bool(s.waiting_initial_cycle_time_input),
@@ -5741,6 +5889,7 @@ QWidget#ClientUIRoot {{
             "operator_shift_logs": list(s.operator_shift_logs or []),
             "operator_shift_index": int(s.operator_shift_index or 0),
             "operator_shift_started_at": s.operator_shift_started_at,
+            "operator_shift_baseline_cycle_time": s.operator_shift_baseline_cycle_time,
             "operator_shift_baseline_pack_count": int(s.operator_shift_baseline_pack_count or 0),
             "operator_shift_baseline_good_total": int(s.operator_shift_baseline_good_total or 0),
             "operator_shift_baseline_butal_total": int(s.operator_shift_baseline_butal_total or 0),
@@ -5758,11 +5907,20 @@ QWidget#ClientUIRoot {{
         machine_code = str(s.machine_code or "").strip()
         if not machine_code:
             return
-        _upsert_active_session_sql(self._state_to_active_snapshot())
+        snapshot = self._state_to_active_snapshot()
+        _upsert_active_session_json(snapshot)
+        self._trigger_active_session_sql_sync(force=False)
 
     def _load_active_session_snapshot(self, machine_code: str) -> Optional[Dict[str, Any]]:
+        code = str(machine_code or "").strip()
+        if not code:
+            return None
+        rows = _load_active_sessions_json()
+        snap = rows.get(code)
+        if isinstance(snap, dict):
+            return snap
         rows = _load_active_sessions_sql()
-        snap = rows.get(str(machine_code or "").strip())
+        snap = rows.get(code)
         if isinstance(snap, dict):
             return snap
         return None
@@ -5771,7 +5929,39 @@ QWidget#ClientUIRoot {{
         code = str(machine_code or "").strip()
         if not code:
             return
+        _delete_active_session_json(code)
         _delete_active_session_sql(code)
+
+    def _sync_active_session_snapshots_to_sql(self):
+        self._trigger_active_session_sql_sync(force=True)
+
+    def _trigger_active_session_sql_sync(self, force: bool = False):
+        now_ts = time.time()
+        if not force and (now_ts - float(self._active_session_sql_sync_last_attempt or 0.0)) < 10.0:
+            return
+        with self._active_session_sql_sync_lock:
+            if self._active_session_sql_sync_inflight:
+                return
+            self._active_session_sql_sync_inflight = True
+            self._active_session_sql_sync_last_attempt = now_ts
+
+        def _run():
+            ok = False
+            try:
+                ok = _sync_active_sessions_json_to_sql()
+            except Exception as e:
+                print(f"[SQL] Active session sync error: {e}")
+            finally:
+                with self._active_session_sql_sync_lock:
+                    self._active_session_sql_sync_inflight = False
+                    if ok:
+                        self._active_session_sql_sync_last_ok = time.time()
+            if ok:
+                print("[SQL] Active session snapshot sync: SQL OK")
+            else:
+                print("[SQL] Active session snapshot sync: SQL pending, local JSON retained")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _restore_state_from_snapshot(self, snap: Dict[str, Any]):
         s = self.state
@@ -5800,7 +5990,14 @@ QWidget#ClientUIRoot {{
         s.downtime_wait_last_seconds = snap.get("downtime_wait_last_seconds")
         s.waiting_downtime_start_maintenance = bool(snap.get("waiting_downtime_start_maintenance"))
         s.waiting_downtime_end_maintenance = bool(snap.get("waiting_downtime_end_maintenance"))
+        s.downtime_resolution_started_at = snap.get("downtime_resolution_started_at")
+        s.maintenance_downtime_seconds = snap.get("maintenance_downtime_seconds")
+        s.supervisor_downtime_confirmation_started_at = snap.get("supervisor_downtime_confirmation_started_at")
+        s.supervisor_downtime_confirmation_seconds = snap.get("supervisor_downtime_confirmation_seconds")
+        s.operator_downtime_confirmation_started_at = snap.get("operator_downtime_confirmation_started_at")
+        s.operator_downtime_confirmation_seconds = snap.get("operator_downtime_confirmation_seconds")
         s.cycle_time_current = snap.get("cycle_time_current")
+        s.cycle_time_change_logs = list(snap.get("cycle_time_change_logs") or [])
         s.cycle_time_new_input = str(snap.get("cycle_time_new_input") or "")
         s.waiting_cycle_time_input = bool(snap.get("waiting_cycle_time_input"))
         s.waiting_initial_cycle_time_input = bool(snap.get("waiting_initial_cycle_time_input"))
@@ -5846,6 +6043,7 @@ QWidget#ClientUIRoot {{
         s.operator_shift_logs = list(snap.get("operator_shift_logs") or [])
         s.operator_shift_index = int(snap.get("operator_shift_index") or 0)
         s.operator_shift_started_at = snap.get("operator_shift_started_at")
+        s.operator_shift_baseline_cycle_time = snap.get("operator_shift_baseline_cycle_time")
         s.operator_shift_baseline_pack_count = int(snap.get("operator_shift_baseline_pack_count") or 0)
         s.operator_shift_baseline_good_total = int(snap.get("operator_shift_baseline_good_total") or 0)
         s.operator_shift_baseline_butal_total = int(snap.get("operator_shift_baseline_butal_total") or 0)
@@ -6002,7 +6200,14 @@ QWidget#ClientUIRoot {{
         s.downtime_wait_last_seconds = None
         s.waiting_downtime_start_maintenance = False
         s.waiting_downtime_end_maintenance = False
+        s.downtime_resolution_started_at = None
+        s.maintenance_downtime_seconds = None
+        s.supervisor_downtime_confirmation_started_at = None
+        s.supervisor_downtime_confirmation_seconds = None
+        s.operator_downtime_confirmation_started_at = None
+        s.operator_downtime_confirmation_seconds = None
         s.cycle_time_current = None
+        s.cycle_time_change_logs = []
         s.cycle_time_confirmed_by = None
         s.waiting_initial_cycle_time_input = False
         s.waiting_initial_cycle_qc_confirm = False
@@ -6029,6 +6234,7 @@ QWidget#ClientUIRoot {{
         s.operator_shift_logs = []
         s.operator_shift_index = 0
         s.operator_shift_started_at = None
+        s.operator_shift_baseline_cycle_time = None
         s.operator_shift_baseline_pack_count = 0
         s.operator_shift_baseline_good_total = 0
         s.operator_shift_baseline_butal_total = 0
@@ -6081,6 +6287,9 @@ QWidget#ClientUIRoot {{
         s.waiting_maintenance_qr = False
         s.waiting_supervisor_qr = False
         s.waiting_operator_downtime_confirm = False
+        s.downtime_resolution_started_at = None
+        s.supervisor_downtime_confirmation_started_at = None
+        s.operator_downtime_confirmation_started_at = None
         s.cycle_time_new_input = ""
 
     def _begin_initial_cycle_time_setup(self):
@@ -6148,10 +6357,12 @@ QWidget#ClientUIRoot {{
         s = self.state
         self._reset_downtime_resolution_state()
         s.waiting_cycle_time_input = True
+        s.downtime_resolution_started_at = time.time()
         s.cycle_time_new_input = ""
-        self._hide_production_overlay()
+        self._set_production_overlay_mode("active")
+        self._show_production_overlay()
         self.resolveTitle.setText("DOWNTIME RESOLUTION")
-        self.resolveHint.setText("Scan cycle time digits (num_0..num_9), backspace, then confirm")
+        self.resolveHint.setText("Scan cycle time digits (num_0..num_9), backspace, then confirm. Downtime is still running.")
         self.resolveOldCycleTitle.setText("OLD CYCLE TIME")
         self.resolveNewCycleTitle.setText("CYCLE TIME INPUT")
         self.resolveOldCycle.setText(f"Old Cycle Time: {s.cycle_time_current or '-'}")
@@ -6350,6 +6561,11 @@ QWidget#ClientUIRoot {{
                 print(f"[JobAPI] TEST FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
                 return
             data = resp.json()
+            if self._job_api_body_is_unauthorized(data):
+                self.status.setText("Job API test failed: bearer token unauthorized. Clear the token or save settings to force a fresh login.")
+                self._append_job_api_log("TEST FAIL: response body reported unauthorized bearer token")
+                print("[JobAPI] TEST FAIL: response body reported unauthorized bearer token")
+                return
             job = {}
             if isinstance(data, dict) and isinstance(data.get("data"), dict):
                 job = data["data"].get("job") or {}
@@ -6475,6 +6691,68 @@ QWidget#ClientUIRoot {{
             return out if out > 0 else None
         except Exception:
             return None
+
+    def _record_cycle_time_change(self, value: Any, source: str = "manual"):
+        cycle_seconds = self._parse_cycle_seconds(value)
+        if cycle_seconds is None:
+            return
+        s = self.state
+        rows = list(s.cycle_time_change_logs or [])
+        prev = rows[-1] if rows else {}
+        prev_seconds = self._parse_cycle_seconds(prev.get("cycle_seconds") if isinstance(prev, dict) else None)
+        if prev_seconds is not None and abs(prev_seconds - cycle_seconds) < 1e-9:
+            return
+        rows.append(
+            {
+                "set_at_utc": datetime.now(timezone.utc).isoformat(),
+                "cycle_time": str(value).strip(),
+                "cycle_seconds": cycle_seconds,
+                "source": str(source or "manual").strip() or "manual",
+            }
+        )
+        s.cycle_time_change_logs = rows[-200:]
+
+    def _set_cycle_time_current(self, value: Any, source: str = "manual"):
+        txt = str(value).strip() if value is not None else ""
+        self.state.cycle_time_current = txt or None
+        if txt:
+            self._record_cycle_time_change(txt, source=source)
+
+    def _parse_utc_iso_datetime(self, raw: Any) -> Optional[datetime]:
+        txt = str(raw or "").strip()
+        if not txt:
+            return None
+        try:
+            return datetime.fromisoformat(txt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _compute_current_shift_avg_cycle_seconds(self) -> Optional[float]:
+        s = self.state
+        shift_start_dt = self._parse_utc_iso_datetime(s.operator_shift_started_at)
+        if shift_start_dt is None:
+            return self._parse_cycle_seconds(s.cycle_time_current)
+
+        cycle_values: List[float] = []
+        baseline_cycle = self._parse_cycle_seconds(s.operator_shift_baseline_cycle_time)
+        if baseline_cycle is not None:
+            cycle_values.append(baseline_cycle)
+        rows = [row for row in (s.cycle_time_change_logs or []) if isinstance(row, dict)]
+        rows.sort(key=lambda row: str(row.get("set_at_utc") or ""))
+
+        for row in rows:
+            changed_at = self._parse_utc_iso_datetime(row.get("set_at_utc"))
+            if changed_at is None or changed_at < shift_start_dt:
+                continue
+            row_cycle = self._parse_cycle_seconds(row.get("cycle_seconds"))
+            if row_cycle is None:
+                row_cycle = self._parse_cycle_seconds(row.get("cycle_time"))
+            if row_cycle is not None:
+                cycle_values.append(row_cycle)
+
+        if cycle_values:
+            return sum(cycle_values) / len(cycle_values)
+        return self._parse_cycle_seconds(s.cycle_time_current)
 
     def _qty_per_shift_from_cycle(self, cycle_seconds: Optional[float], cavities: Any = 1) -> Optional[int]:
         if cycle_seconds is None or cycle_seconds <= 0:
@@ -6622,6 +6900,34 @@ QWidget#ClientUIRoot {{
             return f"{base_url}{p}"
         return f"{base_url}/v1{p}"
 
+    def _job_api_body_is_unauthorized(self, data: Any) -> bool:
+        if not isinstance(data, dict):
+            return False
+        code = str(data.get("code", "") or "").strip()
+        message = str(data.get("message", "") or "").strip().lower()
+        return code == "401" or message == "unauthorized"
+
+    def _restore_job_payload_from_active_snapshot(self):
+        s = self.state
+        if not (s.machine_code and s.job_code):
+            return
+        payload = s.job_payload if isinstance(s.job_payload, dict) else {}
+        data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        if isinstance(data_obj.get("job"), dict) or isinstance(payload.get("job"), dict):
+            return
+        snap = self._load_active_session_snapshot(str(s.machine_code))
+        if not isinstance(snap, dict):
+            return
+        snap_job_code = self._normalize_job_code(snap.get("job_code"))
+        if snap_job_code != self._normalize_job_code(s.job_code):
+            return
+        snap_payload = snap.get("job_payload")
+        if not isinstance(snap_payload, dict):
+            return
+        snap_data = snap_payload.get("data") if isinstance(snap_payload.get("data"), dict) else {}
+        if isinstance(snap_data.get("job"), dict) or isinstance(snap_payload.get("job"), dict):
+            s.job_payload = snap_payload
+
     def _fetch_job_payload_from_api(self, job_identifier: str) -> Optional[Dict[str, Any]]:
         # Reload from disk so config edits apply without restarting the client.
         try:
@@ -6716,6 +7022,16 @@ QWidget#ClientUIRoot {{
                     print(f"[JobAPI] GET FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
                     return best_partial_wrapped
                 data = resp.json()
+                if self._job_api_body_is_unauthorized(data):
+                    if user and password:
+                        self._append_job_api_log("GET body unauthorized; refreshing bearer token")
+                        print("[JobAPI] GET body unauthorized; refreshing bearer token")
+                        token = self._get_job_api_bearer_token(base=base, user=user, password=password) or token
+                        if attempt < max_attempts:
+                            continue
+                    self.status.setText("Job API bearer token unauthorized; using local job mapping/stub.")
+                    self._append_job_api_log("GET FAIL: response body reported unauthorized bearer token")
+                    return best_partial_wrapped
                 if not isinstance(data, dict):
                     if attempt < max_attempts:
                         continue
@@ -6952,8 +7268,21 @@ QWidget#ClientUIRoot {{
         return digits.lstrip("0") or "0"
 
     def _extract_job_code_from_pack_qr(self, raw: str) -> Optional[str]:
-        # Expected tail format like "...-000000102378" where 102378 is the job code.
-        m = re.search(r"-0*(\d+)\s*$", str(raw).strip())
+        s = str(raw).strip()
+        pack_hist = self._extract_pack_history_fields(s)
+        if isinstance(pack_hist, dict):
+            po_digits = str(pack_hist.get("po_number") or "").strip()
+            if po_digits:
+                return po_digits.lstrip("0") or "0"
+
+        # Fallback for labels that still carry the standard tail but include
+        # extra text before or after the structured payload.
+        m = re.search(r"I\d{11}T\d{11}L\d{14}-0*(\d+)", s)
+        if m:
+            return m.group(1).lstrip("0") or "0"
+
+        # Last fallback for older labels ending directly with "-<job_code>".
+        m = re.search(r"-0*(\d+)\s*$", s)
         if not m:
             return None
         return m.group(1).lstrip("0") or "0"
@@ -6962,7 +7291,7 @@ QWidget#ClientUIRoot {{
         s = str(raw).strip()
         if "V2" not in s or "QB" in s:
             return None
-        m = re.search(r"P(\d{11})Q(\d{11})I(\d{11})T(\d{11})L(\d{14})-(\d+)\s*$", s)
+        m = re.search(r"P(\d{11})Q(\d{11})I(\d{11})T(\d{11})L(\d{14})-(\d+)", s)
         if not m:
             return None
         p_digits, q_digits, i_digits, t_digits, lot_digits, po_digits = m.groups()
@@ -7163,7 +7492,7 @@ QWidget#ClientUIRoot {{
                     if not s.cycle_time_new_input:
                         self.status.setText("Cycle Time is empty. Scan digits first.")
                         return
-                    s.cycle_time_current = s.cycle_time_new_input
+                    self._set_cycle_time_current(s.cycle_time_new_input, source="supervisor_review")
                     s.cycle_time_confirm_phase = 2
                     s.reject_summary_last_scanned_at = datetime.now(timezone.utc).isoformat()
                     self._hide_resolve_overlay()
@@ -7364,7 +7693,7 @@ QWidget#ClientUIRoot {{
                 if not s.cycle_time_new_input:
                     self.status.setText("Cycle Time is empty. Scan digits first.")
                     return
-                s.cycle_time_current = s.cycle_time_new_input
+                self._set_cycle_time_current(s.cycle_time_new_input, source="initial_setup")
                 s.waiting_initial_cycle_time_input = False
                 s.waiting_initial_cycle_qc_confirm = False
                 self._hide_resolve_overlay()
@@ -7445,25 +7774,16 @@ QWidget#ClientUIRoot {{
                 s.downtime_started_at = time.time()
                 s.downtime_active = True
                 s.waiting_downtime_end_maintenance = True
-                self.status.setText("Maintenance acknowledged. Downtime timer started.")
+                self.status.setText('Maintenance acknowledged. Downtime timer started. Scan "pdr_done" when downtime is done.')
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 return
             self.status.setText("Waiting mode: scan valid Maintenance QR to start downtime.")
             return
 
-        # Downtime running step: maintenance scans again when repair is done.
-        if s.waiting_downtime_end_maintenance and s.downtime_active:
-            auth = self._authorized_person_from_scan(raw_s)
-            if auth and str(auth.get("can_maintenance", "0")) == "1":
-                s.maintenance_name = str(auth.get("name") or raw_s)
-                s.waiting_downtime_end_maintenance = False
-                self._begin_downtime_resolution()
-                self.status.setText("Maintenance done. Enter cycle time, then continue confirmation flow.")
-                self._refresh_ui()
-                self._save_active_session_snapshot()
-                return
-            self.status.setText("Downtime active: scan Maintenance QR when repair is completed.")
+        # Downtime running step: wait for pdr_done to begin resolution flow.
+        if s.waiting_downtime_end_maintenance and s.downtime_active and raw_l not in ("productiondailyreport~2", "pdr_done", "pdrdone"):
+            self.status.setText('Downtime active: scan "pdr_done" when repair is completed.')
             return
 
         # Resolution step 1: Cycle time input via num_0..num_9, backspace, confirm
@@ -7480,12 +7800,12 @@ QWidget#ClientUIRoot {{
                 if not s.cycle_time_new_input:
                     self.status.setText("Cycle Time is empty. Scan digits first.")
                     return
-                s.cycle_time_current = s.cycle_time_new_input
+                self._set_cycle_time_current(s.cycle_time_new_input, source="downtime_resolution")
                 s.waiting_cycle_time_input = False
                 s.waiting_maintenance_qr = True
                 self.resolveOldCycleTitle.setText("RESOLVED CYCLE TIME")
                 self.resolveNewCycleTitle.setText("NEXT STEP")
-                self.resolveHint.setText("Scan Maintenance QR")
+                self.resolveHint.setText("Scan Maintenance QR to confirm maintenance completed.")
                 self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_current}")
                 return
             self.status.setText("Cycle Time input mode: scan num_0..num_9, backspace, confirm.")
@@ -7496,11 +7816,15 @@ QWidget#ClientUIRoot {{
             auth = self._authorized_person_from_scan(raw_s)
             if auth and str(auth.get("can_maintenance", "0")) == "1":
                 s.maintenance_name = str(auth.get("name") or raw_s)
+                if s.downtime_started_at:
+                    s.maintenance_downtime_seconds = max(0, int(time.time() - s.downtime_started_at))
+                    s.downtime_last_seconds = s.maintenance_downtime_seconds
+                s.supervisor_downtime_confirmation_started_at = time.time()
                 s.waiting_maintenance_qr = False
                 s.waiting_supervisor_qr = True
                 self.resolveOldCycleTitle.setText("MAINTENANCE")
                 self.resolveNewCycleTitle.setText("NEXT STEP")
-                self.resolveHint.setText("Scan Supervisor QR")
+                self.resolveHint.setText("Scan Supervisor QR to continue downtime confirmation.")
                 self._refresh_downtime_panel()
                 return
             self.status.setText("Scan valid Maintenance QR.")
@@ -7511,6 +7835,11 @@ QWidget#ClientUIRoot {{
             auth = self._authorized_person_from_scan(raw_s)
             if auth and str(auth.get("can_supervisor", "0")) == "1":
                 s.supervisor_name = str(auth.get("name") or raw_s)
+                if s.supervisor_downtime_confirmation_started_at:
+                    s.supervisor_downtime_confirmation_seconds = max(
+                        0, int(time.time() - s.supervisor_downtime_confirmation_started_at)
+                    )
+                s.operator_downtime_confirmation_started_at = time.time()
                 s.waiting_supervisor_qr = False
                 s.waiting_operator_downtime_confirm = True
                 self.resolveOldCycleTitle.setText("SUPERVISOR")
@@ -7531,8 +7860,12 @@ QWidget#ClientUIRoot {{
                 if scanned_operator_code != current_operator_code:
                     self.status.setText("Operator confirmation failed: must be current operator.")
                     return
-                if s.downtime_started_at:
-                    s.downtime_last_seconds = max(0, int(time.time() - s.downtime_started_at))
+                if s.operator_downtime_confirmation_started_at:
+                    s.operator_downtime_confirmation_seconds = max(
+                        0, int(time.time() - s.operator_downtime_confirmation_started_at)
+                    )
+                if s.maintenance_downtime_seconds is not None:
+                    s.downtime_last_seconds = int(s.maintenance_downtime_seconds)
                 s.downtime_started_at = None
                 s.downtime_active = False
                 s.waiting_downtime_end_maintenance = False
@@ -7548,6 +7881,9 @@ QWidget#ClientUIRoot {{
                         "cycle_time": s.cycle_time_current,
                         "waiting_seconds": int(s.downtime_wait_last_seconds or 0),
                         "downtime_seconds": int(s.downtime_last_seconds or 0),
+                        "maintenance_downtime_seconds": int(s.maintenance_downtime_seconds or 0),
+                        "supervisor_downtime_confirmation_seconds": int(s.supervisor_downtime_confirmation_seconds or 0),
+                        "operator_downtime_confirmation_seconds": int(s.operator_downtime_confirmation_seconds or 0),
                         "maintenance": s.maintenance_name,
                         "supervisor": s.supervisor_name,
                     },
@@ -7564,7 +7900,7 @@ QWidget#ClientUIRoot {{
             return
 
         # Downtime lock: keep scans constrained while downtime flow is active.
-        if s.downtime_active and raw_l not in ("productiondailyreport~2", "sur"):
+        if s.downtime_active and raw_l not in ("productiondailyreport~2", "pdr_done", "pdrdone", "sur"):
             self.status.setText("Downtime flow active: complete maintenance/cycle/supervisor/operator steps.")
             return
 
@@ -7603,7 +7939,13 @@ QWidget#ClientUIRoot {{
             s.waiting_downtime_start_maintenance = True
             s.waiting_downtime_end_maintenance = False
             s.downtime_started_at = None
+            s.downtime_resolution_started_at = None
             s.downtime_active = False
+            s.maintenance_downtime_seconds = None
+            s.supervisor_downtime_confirmation_started_at = None
+            s.supervisor_downtime_confirmation_seconds = None
+            s.operator_downtime_confirmation_started_at = None
+            s.operator_downtime_confirmation_seconds = None
             s.maintenance_name = None
             s.supervisor_name = None
             self._set_production_overlay_mode("active")
@@ -7737,8 +8079,12 @@ QWidget#ClientUIRoot {{
             if not s.downtime_active:
                 self.status.setText("No active downtime to resolve.")
                 return
+            if not s.waiting_downtime_end_maintenance:
+                self.status.setText("Downtime resolution is already in progress.")
+                return
+            s.waiting_downtime_end_maintenance = False
             self._begin_downtime_resolution()
-            self.status.setText("Downtime resolve mode: enter cycle time.")
+            self.status.setText("Downtime done. Enter cycle time, then scan Maintenance, Supervisor, and Operator QR.")
             return
 
         if s.waiting_reject_reason:
@@ -7813,7 +8159,14 @@ QWidget#ClientUIRoot {{
             s.downtime_wait_last_seconds = None
             s.waiting_downtime_start_maintenance = False
             s.waiting_downtime_end_maintenance = False
+            s.downtime_resolution_started_at = None
+            s.maintenance_downtime_seconds = None
+            s.supervisor_downtime_confirmation_started_at = None
+            s.supervisor_downtime_confirmation_seconds = None
+            s.operator_downtime_confirmation_started_at = None
+            s.operator_downtime_confirmation_seconds = None
             s.cycle_time_current = None
+            s.cycle_time_change_logs = []
             s.cycle_time_confirmed_by = None
             s.waiting_initial_cycle_time_input = False
             s.waiting_initial_cycle_qc_confirm = False
@@ -7841,6 +8194,7 @@ QWidget#ClientUIRoot {{
             s.operator_shift_logs = []
             s.operator_shift_index = 0
             s.operator_shift_started_at = None
+            s.operator_shift_baseline_cycle_time = None
             s.operator_shift_baseline_pack_count = 0
             s.operator_shift_baseline_good_total = 0
             s.operator_shift_baseline_butal_total = 0
@@ -7958,6 +8312,7 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay("Scan machine QR first.")
                 return
             if res.kind == "JOB":
+                api_job: Dict[str, Any] = {}
                 po_from_meta = ""
                 if isinstance(res.meta, dict):
                     po_from_meta = self._safe_text(res.meta.get("po_number"), "")
@@ -7972,34 +8327,31 @@ QWidget#ClientUIRoot {{
                         or self._safe_text(api_job.get("ref_no"), "")
                         or requested_job_id
                     )
+                else:
+                    s.job_payload = {}
+                    s.job_code = requested_job_id
                 s.job_name = (
                     self._safe_text(api_job.get("ref_no"), "")
                     or res.value
                 )
-                s.job_started_at = datetime.now(timezone.utc).isoformat()
                 self.status.setText(f"Job set (API): {s.job_name}")
             else:
-                s.job_code = requested_job_id
-                s.job_name = res.value
-                s.job_payload = {}
-                s.job_started_at = datetime.now(timezone.utc).isoformat()
-        else:
-            payload = res.meta or {}
-            s.job_payload = payload
-            job = self._extract_job_record()
-            s.job_code = (
+                payload = res.meta or {}
+                s.job_payload = payload if isinstance(payload, dict) else {}
+                job = self._extract_job_record()
+                s.job_code = (
                     self._safe_text(job.get("id"), "")
                     or self._safe_text(job.get("ref_no"), "")
-                    or self._safe_text(payload.get("job_code"), "")
-                    or s.job_code
+                    or self._safe_text(s.job_payload.get("job_code"), "")
+                    or res.value
                     or "QR-STUB"
                 )
-            s.job_name = (
-                self._safe_text(job.get("ref_no"), "")
-                or self._safe_text(payload.get("job_name"), "")
-                or s.job_name
-                or "Job Stub"
-            )
+                s.job_name = (
+                    self._safe_text(job.get("ref_no"), "")
+                    or self._safe_text(s.job_payload.get("job_name"), "")
+                    or res.value
+                    or "Job Stub"
+                )
             s.job_started_at = datetime.now(timezone.utc).isoformat()
             s.operator_id = None
             s.showing_reject_summary = False
@@ -8014,7 +8366,14 @@ QWidget#ClientUIRoot {{
             s.downtime_wait_last_seconds = None
             s.waiting_downtime_start_maintenance = False
             s.waiting_downtime_end_maintenance = False
+            s.downtime_resolution_started_at = None
+            s.maintenance_downtime_seconds = None
+            s.supervisor_downtime_confirmation_started_at = None
+            s.supervisor_downtime_confirmation_seconds = None
+            s.operator_downtime_confirmation_started_at = None
+            s.operator_downtime_confirmation_seconds = None
             s.cycle_time_current = None
+            s.cycle_time_change_logs = []
             s.cycle_time_confirmed_by = None
             s.waiting_initial_cycle_time_input = False
             s.waiting_initial_cycle_qc_confirm = False
@@ -8042,6 +8401,7 @@ QWidget#ClientUIRoot {{
             s.operator_shift_logs = []
             s.operator_shift_index = 0
             s.operator_shift_started_at = None
+            s.operator_shift_baseline_cycle_time = None
             s.operator_shift_baseline_pack_count = 0
             s.operator_shift_baseline_good_total = 0
             s.operator_shift_baseline_butal_total = 0
@@ -8063,6 +8423,8 @@ QWidget#ClientUIRoot {{
                 self.status.setText(f"Job set: {s.job_name}")
             self._refresh_ui()
             self._save_active_session_snapshot()
+            if res.kind == "JOB" and s.job_payload:
+                self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (JOB API)")
             if res.kind == "JOB":
                 ev = {"type": "JOB_SET"}
                 if s.job_payload:
