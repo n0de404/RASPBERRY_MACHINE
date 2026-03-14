@@ -57,6 +57,7 @@ SCANNER_TIMEOUT = float(os.environ.get("MACHINE_SCANNER_TIMEOUT", "1.0"))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ANIMATIONS_DIR = os.path.join(BASE_DIR, "Animations")
 IMAGES_DIR = os.path.join(BASE_DIR, "Images")
+PDR_ICON_DIR = os.path.join(BASE_DIR, "PDR_Icon")
 DATABASE_DIR = os.path.join(BASE_DIR, "Database")
 JOB_API_CONFIG_FILE = os.path.join(DATABASE_DIR, "job_api_config.json")
 ACTIVE_MACHINE_SESSIONS_FILE = os.path.join(DATABASE_DIR, "active_machine_sessions.json")
@@ -988,6 +989,24 @@ PRODUCTION_DAILY_REPORT_ITEMS = [
     ("15", "Others"),
 ]
 
+PDR_REASON_ICON_FILES = {
+    "01": "breakdown.png",
+    "02": "machineadjustment.png",
+    "03": "Materialissue.png",
+    "04": "moldissue.png",
+    "05": "nomanpower.png",
+    "06": "materialcolorchange.png",
+    "07": "item.png",
+    "08": "preventivemaintenance.png",
+    "09": "noschedule.png",
+    "10": "startup.png",
+    "11": "turnover.png",
+    "12": "colortesting.png",
+    "13": "powerinterruption.png",
+    "14": "robotsetup.png",
+    "15": "others.png",
+}
+
 
 @dataclass
 class ClientState:
@@ -1460,226 +1479,153 @@ class Dust:
 class MachineFixingAnimation(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(320, 180)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedSize(200, 150)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet("background: transparent; border: none;")
 
-        self.t = 0.0
-        self.gear1 = 0.0
-        self.gear2 = 0.0
-        self.gear3 = 0.0
-        self.scan_y_phase = 0.0
-        self.bar_phase = 0.0
-        self.status_words = [
-            "MACHINE FIXING",
-            "CALIBRATING",
-            "REALIGNING",
-            "TORQUE MATCHING",
-            "REPAIRING CORE",
+        self._gears = [
+            {"x": 10.0, "y": 12.0, "size": 60.0, "bars": 3, "speed": 4.0, "clockwise": False, "angle": 0.0},
+            {"x": 60.0, "y": 61.0, "size": 60.0, "bars": 3, "speed": 4.0, "clockwise": True, "angle": 0.0},
+            {"x": 10.0, "y": 110.0, "size": 60.0, "bars": 3, "speed": 4.0, "clockwise": False, "angle": 0.0},
+            {"x": 128.0, "y": 13.0, "size": 120.0, "bars": 6, "speed": 2.0, "clockwise": False, "angle": 0.0},
         ]
-        self.status_index = 0
-        self.status_counter = 0
-        self.sparks: List[Spark] = []
-        self.dusts: List[Dust] = [self._make_dust() for _ in range(18)]
-
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
-        self.timer.start(16)
-
-    def _make_dust(self) -> Dust:
-        return Dust(
-            x=random.uniform(0, max(1, self.width() or 640)),
-            y=random.uniform(0, max(1, self.height() or 220)),
-            dx=random.uniform(-0.18, 0.18),
-            dy=random.uniform(-0.12, 0.12),
-            r=random.uniform(1.5, 4.0),
-            alpha=random.randint(20, 70),
-        )
+        self.timer.start(33)
 
     def _tick(self):
-        self.t += 0.016
-        self.gear1 += 1.2
-        self.gear2 -= 1.8
-        self.gear3 += 0.7
-        self.scan_y_phase += 0.03
-        self.bar_phase += 0.07
-        self.status_counter += 1
-        if self.status_counter > 100:
-            self.status_counter = 0
-            self.status_index = (self.status_index + 1) % len(self.status_words)
-        if random.random() < 0.32:
-            self._spawn_sparks()
-
-        next_sparks: List[Spark] = []
-        for spark in self.sparks:
-            spark.x += spark.dx
-            spark.y += spark.dy
-            spark.life -= 0.05
-            if spark.life > 0:
-                next_sparks.append(spark)
-        self.sparks = next_sparks
-
-        w = max(1, self.width())
-        h = max(1, self.height())
-        for dust in self.dusts:
-            dust.x += dust.dx
-            dust.y += dust.dy
-            if dust.x < 0:
-                dust.x = w
-            elif dust.x > w:
-                dust.x = 0
-            if dust.y < 0:
-                dust.y = h
-            elif dust.y > h:
-                dust.y = 0
+        for gear in self._gears:
+            delta = gear["speed"]
+            gear["angle"] = gear["angle"] + delta if gear["clockwise"] else gear["angle"] - delta
         self.update()
 
-    def _spawn_sparks(self):
-        cx = self.width() / 2
-        cy = self.height() / 2 - 8
-        for _ in range(random.randint(2, 4)):
-            ang = random.uniform(0, math.tau)
-            speed = random.uniform(1.5, 4.0)
-            self.sparks.append(
-                Spark(
-                    x=cx + random.uniform(-52, 52),
-                    y=cy + random.uniform(-34, 34),
-                    dx=math.cos(ang) * speed,
-                    dy=math.sin(ang) * speed,
-                    life=1.0,
-                )
-            )
-
-    def _draw_background(self, p: QPainter, rect):
-        return
-
-    def _draw_dust(self, p: QPainter):
-        p.save()
+    def _draw_background(self, p: QPainter, rect: QRectF):
         p.setPen(Qt.PenStyle.NoPen)
-        for dust in self.dusts:
-            p.setBrush(QColor(180, 210, 230, dust.alpha))
-            p.drawEllipse(QPointF(dust.x, dust.y), dust.r, dust.r)
-        p.restore()
+        p.setBrush(QColor("#111111"))
+        p.drawRoundedRect(rect, 6, 6)
 
-    def _draw_machine_frame(self, p: QPainter, rect) -> QRectF:
-        panel = QRectF(rect.center().x() - 150, rect.center().y() - 72, 300, 144)
-        grad = QLinearGradient(panel.topLeft(), panel.bottomLeft())
-        grad.setColorAt(0.0, QColor(35, 42, 52, 245))
-        grad.setColorAt(0.5, QColor(25, 31, 40, 245))
-        grad.setColorAt(1.0, QColor(18, 24, 32, 245))
-        p.setPen(QPen(QColor(85, 110, 130), 2))
-        p.setBrush(grad)
-        p.drawRoundedRect(panel, 18, 18)
+        p.setPen(QPen(QColor(255, 255, 255, 25), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 6, 6)
 
-        inner = panel.adjusted(14, 14, -14, -14)
-        p.setPen(QPen(QColor(55, 75, 95), 1))
-        p.setBrush(QColor(14, 18, 24, 220))
-        p.drawRoundedRect(inner, 14, 14)
-        return inner
+    def _draw_overlay(self, p: QPainter, rect: QRectF):
+        p.setPen(Qt.PenStyle.NoPen)
 
-    def _draw_gear(self, p: QPainter, cx: float, cy: float, radius: float, teeth: int, rotation: float, color: QColor):
+        grad_top = QLinearGradient(0, rect.top(), 0, rect.top() + 28)
+        grad_top.setColorAt(0.0, QColor(0, 0, 0, 120))
+        grad_top.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setBrush(grad_top)
+        p.drawRoundedRect(rect, 6, 6)
+
+        grad_bottom = QLinearGradient(0, rect.bottom(), 0, rect.bottom() - 28)
+        grad_bottom.setColorAt(0.0, QColor(0, 0, 0, 120))
+        grad_bottom.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setBrush(grad_bottom)
+        p.drawRoundedRect(rect, 6, 6)
+
+        grad_left = QLinearGradient(rect.left(), 0, rect.left() + 28, 0)
+        grad_left.setColorAt(0.0, QColor(0, 0, 0, 90))
+        grad_left.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setBrush(grad_left)
+        p.drawRoundedRect(rect, 6, 6)
+
+        grad_right = QLinearGradient(rect.right(), 0, rect.right() - 28, 0)
+        grad_right.setColorAt(0.0, QColor(0, 0, 0, 90))
+        grad_right.setColorAt(1.0, QColor(0, 0, 0, 0))
+        p.setBrush(grad_right)
+        p.drawRoundedRect(rect, 6, 6)
+
+    def _draw_gear(self, p: QPainter, gear: Dict[str, float | int | bool]):
+        x = float(gear["x"])
+        y = float(gear["y"])
+        size = float(gear["size"])
+        radius = size / 2.0
+        cx = x + radius
+        cy = y + radius
+
         p.save()
+
+        outer_rect = QRectF(x, y, size, size)
+        shell_grad = QRadialGradient(QPointF(cx, cy), radius)
+        shell_grad.setColorAt(0.0, QColor("#6a6a6a"))
+        shell_grad.setColorAt(0.65, QColor("#5b5b5b"))
+        shell_grad.setColorAt(1.0, QColor("#444444"))
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(shell_grad)
+        p.drawEllipse(outer_rect)
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor("#888888"), 1))
+        p.drawArc(outer_rect.adjusted(0.5, 0.5, -0.5, -0.5), 45 * 16, 180 * 16)
+
+        p.setPen(QPen(QColor(0, 0, 0, 170), 1))
+        p.drawArc(outer_rect.adjusted(0.5, 0.5, -0.5, -0.5), 225 * 16, 180 * 16)
+
         p.translate(cx, cy)
-        p.rotate(rotation)
-        path = QPainterPath()
-        first = True
-        for i in range(teeth * 2):
-            ang = (i / (teeth * 2)) * math.tau
-            rr = radius if i % 2 == 0 else radius * 0.84
-            x = math.cos(ang) * rr
-            y = math.sin(ang) * rr
-            if first:
-                path.moveTo(x, y)
-                first = False
-            else:
-                path.lineTo(x, y)
-        path.closeSubpath()
-        hole = QPainterPath()
-        hole.addEllipse(QPointF(0, 0), radius * 0.42, radius * 0.42)
-        gear = path.subtracted(hole)
-        p.setPen(QPen(QColor(180, 220, 255, 70), 2))
-        p.setBrush(color)
-        p.drawPath(gear)
+        p.rotate(float(gear["angle"]))
+
+        inner_radius = radius - 1
+        inner_rect = QRectF(-inner_radius, -inner_radius, inner_radius * 2, inner_radius * 2)
+        p.setPen(QPen(QColor(255, 255, 255, 25), 1))
+        p.setBrush(QColor("#555555"))
+        p.drawEllipse(inner_rect)
+
+        angles = [0, 60, 120] if int(gear["bars"]) == 3 else [0, 60, 120, 90, 30, 150]
+        bar_h = 16
+        bar_w = 76 if int(size) == 60 else 136
+        bar_rect = QRectF(-bar_w / 2, -bar_h / 2, bar_w, bar_h)
+        for angle in angles:
+            p.save()
+            p.rotate(angle)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor("#555555"))
+            p.drawRoundedRect(bar_rect, 2, 2)
+            p.setPen(QPen(QColor(255, 255, 255, 25), 1))
+            p.drawLine(
+                QPointF(bar_rect.left() + 0.5, bar_rect.top() + 1),
+                QPointF(bar_rect.left() + 0.5, bar_rect.bottom() - 1),
+            )
+            p.drawLine(
+                QPointF(bar_rect.right() - 0.5, bar_rect.top() + 1),
+                QPointF(bar_rect.right() - 0.5, bar_rect.bottom() - 1),
+            )
+            p.restore()
+
+        hole_size = 36 if int(size) == 60 else 96
+        hole_r = hole_size / 2
+        hole_rect = QRectF(-hole_r, -hole_r, hole_size, hole_size)
+        hole_grad = QRadialGradient(QPointF(0, 0), hole_r)
+        hole_grad.setColorAt(0.0, QColor("#1b1b1b"))
+        hole_grad.setColorAt(0.6, QColor("#131313"))
+        hole_grad.setColorAt(1.0, QColor("#0d0d0d"))
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(hole_grad)
+        p.drawEllipse(hole_rect)
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 18), 1))
+        p.drawArc(hole_rect.adjusted(1, 1, -1, -1), 35 * 16, 180 * 16)
+        p.setPen(QPen(QColor(0, 0, 0, 180), 1))
+        p.drawArc(hole_rect.adjusted(1, 1, -1, -1), 215 * 16, 180 * 16)
         p.restore()
-
-    def _draw_machine_center(self, p: QPainter, rect):
-        cx = rect.center().x()
-        cy = rect.center().y() - 8
-        glow = QRadialGradient(QPointF(cx, cy), 54)
-        glow.setColorAt(0.0, QColor(120, 240, 255, 140))
-        glow.setColorAt(0.35, QColor(50, 160, 255, 70))
-        glow.setColorAt(1.0, QColor(0, 0, 0, 0))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(glow)
-        p.drawEllipse(QPointF(cx, cy), 54, 54)
-        self._draw_gear(p, cx - 58, cy + 2, 24, 12, self.gear1, QColor(78, 92, 110, 220))
-        self._draw_gear(p, cx, cy, 38, 15, self.gear2, QColor(95, 110, 128, 230))
-        self._draw_gear(p, cx + 62, cy - 3, 20, 10, self.gear3, QColor(70, 84, 100, 220))
-
-    def _draw_scan_line(self, p: QPainter, inner_rect: QRectF):
-        top = inner_rect.top() + 16
-        bottom = inner_rect.bottom() - 16
-        scan_y = top + ((math.sin(self.scan_y_phase) + 1) / 2) * (bottom - top)
-        grad = QLinearGradient(inner_rect.left(), scan_y, inner_rect.right(), scan_y)
-        grad.setColorAt(0.0, QColor(0, 0, 0, 0))
-        grad.setColorAt(0.18, QColor(80, 220, 255, 50))
-        grad.setColorAt(0.5, QColor(200, 255, 255, 240))
-        grad.setColorAt(0.82, QColor(80, 220, 255, 50))
-        grad.setColorAt(1.0, QColor(0, 0, 0, 0))
-        p.save()
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(grad)
-        p.drawRoundedRect(QRectF(inner_rect.left() + 8, scan_y - 2, inner_rect.width() - 16, 5), 2, 2)
-        p.restore()
-
-    def _draw_sparks(self, p: QPainter):
-        p.save()
-        p.setPen(Qt.PenStyle.NoPen)
-        for spark in self.sparks:
-            alpha = int(255 * spark.life)
-            rg = QRadialGradient(QPointF(spark.x, spark.y), 10)
-            rg.setColorAt(0.0, QColor(255, 255, 255, alpha))
-            rg.setColorAt(0.25, QColor(255, 220, 120, alpha))
-            rg.setColorAt(0.7, QColor(255, 150, 40, int(alpha * 0.7)))
-            rg.setColorAt(1.0, QColor(0, 0, 0, 0))
-            p.setBrush(rg)
-            p.drawEllipse(QPointF(spark.x, spark.y), 6, 6)
-        p.restore()
-
-    def _draw_bottom_progress(self, p: QPainter, rect):
-        bar_rect = QRectF(rect.center().x() - 110, rect.bottom() - 22, 220, 8)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(25, 35, 45, 220))
-        p.drawRoundedRect(bar_rect, 4, 4)
-        fill = 0.12 + ((math.sin(self.bar_phase * 0.8) + 1) / 2) * 0.82
-        fill_rect = QRectF(bar_rect.left(), bar_rect.top(), bar_rect.width() * fill, bar_rect.height())
-        fg = QLinearGradient(fill_rect.left(), fill_rect.top(), fill_rect.right(), fill_rect.top())
-        fg.setColorAt(0.0, QColor(60, 190, 255, 200))
-        fg.setColorAt(0.5, QColor(200, 255, 255, 245))
-        fg.setColorAt(1.0, QColor(50, 150, 255, 180))
-        p.setBrush(fg)
-        p.drawRoundedRect(fill_rect, 4, 4)
-
-    def _draw_texts(self, p: QPainter, rect):
-        title_font = QFont("Segoe UI", 13, QFont.Weight.Bold)
-        p.setFont(title_font)
-        p.setPen(QColor(220, 248, 255))
-        dots = "." * (int(self.t * 3) % 4)
-        p.drawText(QRectF(0, rect.bottom() - 46, rect.width(), 24), Qt.AlignmentFlag.AlignHCenter, f"{self.status_words[self.status_index]}{dots}")
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        rect = self.rect()
-        self._draw_background(p, rect)
-        self._draw_dust(p)
-        inner = self._draw_machine_frame(p, rect)
-        self._draw_machine_center(p, rect)
-        self._draw_scan_line(p, inner)
-        self._draw_sparks(p)
-        self._draw_bottom_progress(p, rect)
-        self._draw_texts(p, rect)
+        panel_rect = QRectF(0, 0, 200, 150)
+        panel_x = (self.width() - panel_rect.width()) / 2.0
+        panel_y = (self.height() - panel_rect.height()) / 2.0
+        p.save()
+        p.translate(panel_x, panel_y)
+        self._draw_background(p, panel_rect)
+        for gear in self._gears:
+            self._draw_gear(p, gear)
+        self._draw_overlay(p, panel_rect)
+        p.restore()
+        p.end()
 
 
 class HistoryAnimatedColumn(QFrame):
@@ -2942,10 +2888,70 @@ QWidget#ClientUIRoot {{
         self.productionHint = QLabel("Scan reason QR code (01-15)")
         self.productionHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
         self.productionOverlay.layout().addWidget(self.productionHint)
-        self.productionReasonList = QLabel("\n".join(f"{code} - {label}" for code, label in PRODUCTION_DAILY_REPORT_ITEMS))
-        self.productionReasonList.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: 700;")
-        self.productionReasonList.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.productionReasonList.setWordWrap(True)
+        self.productionReasonList = QWidget()
+        self.productionReasonList.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.productionReasonList.setLayout(QGridLayout())
+        self.productionReasonList.layout().setContentsMargins(0, 2, 0, 2)
+        self.productionReasonList.layout().setSpacing(8)
+        self.productionReasonCards: List[QFrame] = []
+        self.productionReasonCodes: List[str] = []
+        self.productionReasonCodeLabels: List[QLabel] = []
+        self.productionReasonIconLabels: List[QLabel] = []
+        self.productionReasonTextLabels: List[QLabel] = []
+        for idx, (code, label) in enumerate(PRODUCTION_DAILY_REPORT_ITEMS):
+            card = QFrame()
+            card.setObjectName("ProductionReasonCard")
+            card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            card.setStyleSheet(
+                "QFrame#ProductionReasonCard {"
+                "background: rgba(255,255,255,0.92);"
+                "border: 1px solid rgba(148,163,184,0.55);"
+                "border-radius: 12px;"
+                "}"
+            )
+            card_shadow = QGraphicsDropShadowEffect(card)
+            card_shadow.setBlurRadius(16)
+            card_shadow.setOffset(0, 3)
+            card_shadow.setColor(QColor(15, 23, 42, 45))
+            card.setGraphicsEffect(card_shadow)
+            card.setLayout(QVBoxLayout())
+            card.layout().setContentsMargins(6, 6, 6, 5)
+            card.layout().setSpacing(7)
+            iconLabel = QLabel()
+            iconLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            iconLabel.setFixedHeight(60)
+            icon_path = self._find_pdr_reason_icon_path(code)
+            if icon_path:
+                pm = QPixmap(icon_path)
+                if not pm.isNull():
+                    pm = pm.scaled(
+                        55,
+                        55,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    iconLabel.setPixmap(pm)
+            codeLabel = QLabel(code, card)
+            codeLabel.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            codeLabel.setContentsMargins(0, 0, 0, 0)
+            codeLabel.setStyleSheet("color: #ea580c; font-size: 32px; font-weight: 900;")
+            codeLabel.adjustSize()
+            codeLabel.raise_()
+            textLabel = QLabel(label)
+            textLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            textLabel.setWordWrap(True)
+            textLabel.setContentsMargins(0, 8, 0, 0)
+            textLabel.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: 800;")
+            card.layout().addWidget(iconLabel, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            card.layout().addWidget(textLabel, 1)
+            self.productionReasonList.layout().addWidget(card, idx // 5, idx % 5)
+            self.productionReasonCards.append(card)
+            self.productionReasonCodes.append(code)
+            self.productionReasonCodeLabels.append(codeLabel)
+            self.productionReasonIconLabels.append(iconLabel)
+            self.productionReasonTextLabels.append(textLabel)
+        for col in range(5):
+            self.productionReasonList.layout().setColumnStretch(col, 1)
         self.productionOverlay.layout().addWidget(self.productionReasonList)
 
         self.productionLiveReason = QLabel("Reason: -")
@@ -2960,11 +2966,11 @@ QWidget#ClientUIRoot {{
 
         self.productionFixAnim = MachineFixingAnimation(self.productionOverlay)
         self.productionFixAnim.setObjectName("ProductionFixAnim")
-        self.productionFixAnim.setFixedHeight(210)
-        self.productionOverlay.layout().addWidget(self.productionFixAnim)
+        self.productionOverlay.layout().addWidget(self.productionFixAnim, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.productionMarqueeWrap = QWidget()
         self.productionMarqueeWrap.setObjectName("ProductionMarqueeWrap")
+        self.productionMarqueeWrap.setFixedWidth(420)
         self.productionMarqueeWrap.setFixedHeight(28)
         self.productionMarqueeWrap.setStyleSheet("background: transparent;")
         self.productionMarqueeText = QLabel(
@@ -2975,7 +2981,7 @@ QWidget#ClientUIRoot {{
         self.productionMarqueeText.adjustSize()
         self._marquee_x = 0
         self._marquee_speed = 5
-        self.productionOverlay.layout().addWidget(self.productionMarqueeWrap)
+        self.productionOverlay.layout().addWidget(self.productionMarqueeWrap, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.resolveOverlay = QFrame(self)
         self.resolveOverlay.setObjectName("ProductionOverlay")
@@ -4203,12 +4209,71 @@ QWidget#ClientUIRoot {{
         self.invalidOverlay.hide()
 
     def _position_production_overlay(self):
-        w = min(760, max(500, int(self.width() * 0.58)))
-        h = min(620, max(420, int(self.height() * 0.72)))
+        if getattr(self, "_overlay_mode", "select") == "select":
+            w = min(1140, max(820, int(self.width() * 0.8)))
+            h = min(610, max(380, int(self.height() * 0.5)))
+        else:
+            w = min(760, max(500, int(self.width() * 0.58)))
+            h = min(620, max(420, int(self.height() * 0.72)))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.productionOverlay.setGeometry(x, y, w, h)
+        self._sync_production_reason_card_sizes()
         self._position_marquee()
+
+    def _sync_production_reason_card_sizes(self):
+        if not hasattr(self, "productionReasonCards") or not self.productionReasonCards:
+            return
+        grid = self.productionReasonList.layout()
+        if grid is None:
+            return
+        available_w = max(0, int(self.productionReasonList.width()))
+        if available_w <= 0:
+            return
+        columns = 5
+        spacing = max(0, int(grid.spacing()))
+        margins = grid.contentsMargins()
+        inner_w = max(1, available_w - margins.left() - margins.right())
+        cell_w = max(96, int((inner_w - ((columns - 1) * spacing)) / columns))
+        reference_height = 0
+        for code, card, codeLabel, iconLabel, textLabel in zip(
+            self.productionReasonCodes,
+            self.productionReasonCards,
+            self.productionReasonCodeLabels,
+            self.productionReasonIconLabels,
+            self.productionReasonTextLabels,
+        ):
+            layout = card.layout()
+            if layout is None:
+                continue
+            card_margins = layout.contentsMargins()
+            text_w = max(72, cell_w - card_margins.left() - card_margins.right() - 4)
+            text_rect = textLabel.fontMetrics().boundingRect(
+                0,
+                0,
+                text_w,
+                200,
+                int(Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextExpandTabs),
+                str(textLabel.text() or ""),
+            )
+            icon_h = max(0, int(iconLabel.maximumHeight() if iconLabel.maximumHeight() < 16777215 else iconLabel.height()))
+            card_h = (
+                card_margins.top()
+                + card_margins.bottom()
+                + icon_h
+                + int(layout.spacing())
+                + max(24, int(text_rect.height()))
+            )
+            reference_height = max(reference_height, card_h, 64)
+        if reference_height <= 0:
+            reference_height = 64
+        for card, codeLabel in zip(self.productionReasonCards, self.productionReasonCodeLabels):
+            target_h = reference_height
+            card.setMinimumHeight(target_h)
+            card.setMaximumHeight(target_h)
+            codeLabel.adjustSize()
+            codeLabel.move(12, 6)
+            codeLabel.raise_()
 
     def _position_resolve_overlay(self):
         self.resolveOverlay.adjustSize()
@@ -5158,6 +5223,15 @@ QWidget#ClientUIRoot {{
                 return p2
             if os.path.exists(candidate):
                 return os.path.abspath(candidate)
+        return None
+
+    def _find_pdr_reason_icon_path(self, code: str) -> Optional[str]:
+        filename = PDR_REASON_ICON_FILES.get(str(code or "").strip())
+        if not filename:
+            return None
+        path = os.path.join(PDR_ICON_DIR, filename)
+        if os.path.exists(path):
+            return path
         return None
 
     def _make_meta_label_with_icon(self, text: str) -> QWidget:
