@@ -30,7 +30,7 @@ from PyQt6.QtCore import (
     QSequentialAnimationGroup,
 )
 from PyQt6.QtGui import (
-    QMovie, QPixmap, QColor, QPainter, QPen, QFont, QConicalGradient, QBrush,
+    QMovie, QPixmap, QColor, QPainter, QPen, QFont, QFontDatabase, QFontMetrics, QConicalGradient, QBrush,
     QLinearGradient, QRadialGradient, QPainterPath,
 )
 from PyQt6.QtWidgets import (
@@ -1351,6 +1351,82 @@ class SuccessCheck(QWidget):
                 painter.drawLine(int(b[0]), int(b[1]), int(cx), int(cy))
 
 
+class FailureCross(QWidget):
+    def __init__(self, size=140, parent=None):
+        super().__init__(parent)
+
+        self._progress = 0.0
+        self.setFixedSize(size, size)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("background: transparent; border: none;")
+
+        self.animation = QPropertyAnimation(self, b"progress")
+        self.animation.setDuration(650)
+        self.animation.setStartValue(0.0)
+        self.animation.setEndValue(1.0)
+        self.animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+    def start(self):
+        self.animation.stop()
+        self.setProgress(0.0)
+        self.animation.start()
+
+    def getProgress(self):
+        return self._progress
+
+    def setProgress(self, value):
+        self._progress = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    progress = pyqtProperty(float, fget=getProgress, fset=setProgress)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+        padding = int(min(w, h) * 0.12)
+        rect = QRectF(padding, padding, w - padding * 2, h - padding * 2)
+
+        pen = QPen(QColor(220, 38, 38))
+        pen.setWidth(int(min(w, h) * 0.07))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+
+        circle_phase = min(self._progress / 0.65, 1.0)
+        cross_phase = 0.0 if self._progress < 0.65 else min((self._progress - 0.65) / 0.35, 1.0)
+
+        start_angle = int(270 * 16)
+        span_angle = int(-360 * 16 * circle_phase)
+        painter.drawArc(rect, start_angle, span_angle)
+
+        if cross_phase > 0:
+            x0 = rect.left()
+            y0 = rect.top()
+            rw = rect.width()
+            rh = rect.height()
+
+            a = (x0 + 0.34 * rw, y0 + 0.34 * rh)
+            b = (x0 + 0.66 * rw, y0 + 0.66 * rh)
+            c = (x0 + 0.66 * rw, y0 + 0.34 * rh)
+            d = (x0 + 0.34 * rw, y0 + 0.66 * rh)
+
+            if cross_phase <= 0.5:
+                t = cross_phase / 0.5
+                bx = a[0] + (b[0] - a[0]) * t
+                by = a[1] + (b[1] - a[1]) * t
+                painter.drawLine(int(a[0]), int(a[1]), int(bx), int(by))
+            else:
+                painter.drawLine(int(a[0]), int(a[1]), int(b[0]), int(b[1]))
+                t = (cross_phase - 0.5) / 0.5
+                dx = c[0] + (d[0] - c[0]) * t
+                dy = c[1] + (d[1] - c[1]) * t
+                painter.drawLine(int(c[0]), int(c[1]), int(dx), int(dy))
+
+
 class CircleProgressBadge(QWidget):
     def __init__(self, accent: QColor, parent=None):
         super().__init__(parent)
@@ -1494,6 +1570,11 @@ class MachineFixingAnimation(QWidget):
         self.timer.timeout.connect(self._tick)
         self.timer.start(33)
 
+    def ensure_running(self):
+        if not self.timer.isActive():
+            self.timer.start(33)
+        self.update()
+
     def _tick(self):
         for gear in self._gears:
             delta = gear["speed"]
@@ -1625,6 +1706,32 @@ class MachineFixingAnimation(QWidget):
             self._draw_gear(p, gear)
         self._draw_overlay(p, panel_rect)
         p.restore()
+        p.end()
+
+
+class HazardStripeWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(16)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.fillRect(self.rect(), QColor("#facc15"))
+        stripe_w = 18
+        stripe_span = stripe_w * 2
+        rect_h = self.height()
+        for x in range(-stripe_span * 2, self.width() + stripe_span * 2, stripe_span):
+            path = QPainterPath()
+            path.moveTo(x, rect_h)
+            path.lineTo(x + stripe_w, rect_h)
+            path.lineTo(x + stripe_span, 0)
+            path.lineTo(x + stripe_w, 0)
+            path.closeSubpath()
+            p.fillPath(path, QColor("#111111"))
         p.end()
 
 
@@ -1856,11 +1963,24 @@ class ClientUI(QWidget):
     scan_received = pyqtSignal(str)
     scanner_status = pyqtSignal(str)
 
+    @staticmethod
+    def _load_digital_font_family() -> str:
+        font_path = os.path.join(BASE_DIR, "digital-7.ttf")
+        fallback_family = "DS-Digital"
+        if not os.path.exists(font_path):
+            return fallback_family
+        font_id = QFontDatabase.addApplicationFont(font_path)
+        if font_id < 0:
+            return fallback_family
+        families = QFontDatabase.applicationFontFamilies(font_id)
+        return str(families[0]).strip() if families else fallback_family
+
     def __init__(self):
         super().__init__()
         self.state = ClientState()
         self.client_config = _load_client_config()
         self.job_api_config = _load_job_api_config()
+        self._digital_font_family = self._load_digital_font_family()
         self._identity_sync_lock = threading.Lock()
         self._identity_sync_inflight = False
         self._identity_sync_last_attempt = 0.0
@@ -2879,12 +2999,14 @@ QWidget#ClientUIRoot {{
         self.productionOverlay.setObjectName("ProductionOverlay")
         self.productionOverlay.setStyleSheet("")
         self.productionOverlay.setLayout(QVBoxLayout())
-        self.productionOverlay.layout().setContentsMargins(14, 12, 14, 12)
-        self.productionOverlay.layout().setSpacing(6)
+        self.productionOverlay.layout().setContentsMargins(0, 16, 0, 16)
+        self.productionOverlay.layout().setSpacing(12)
         self.productionOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.productionTitle = QLabel("PRODUCTION DAILY REPORT")
-        self.productionTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
-        self.productionOverlay.layout().addWidget(self.productionTitle)
+        self.productionTitle.setStyleSheet("color: #111111; font-size: 24px; font-weight: 900;")
+        self.productionTitle.setFixedWidth(552)
+        self.productionTitle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.productionOverlay.layout().addWidget(self.productionTitle, 0, Qt.AlignmentFlag.AlignHCenter)
         self.productionHint = QLabel("Scan reason QR code (01-15)")
         self.productionHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
         self.productionOverlay.layout().addWidget(self.productionHint)
@@ -2956,17 +3078,103 @@ QWidget#ClientUIRoot {{
 
         self.productionLiveReason = QLabel("Reason: -")
         self.productionLiveReason.setObjectName("ProductionLiveReason")
+        self.productionLiveReason.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.productionLiveReason.setWordWrap(True)
+        self.productionLiveReason.setFixedSize(538, 42)
         self.productionOverlay.layout().addWidget(self.productionLiveReason)
 
-        self.productionCounter = QLabel("00:00:00")
-        self.productionCounter.setObjectName("ProductionCounter7")
-        self.productionCounter.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.productionOverlay.layout().addWidget(self.productionCounter)
+        self.productionMaintenanceLine = QLabel("Maintenance: -")
+        self.productionMaintenanceLine.setObjectName("ProductionLiveReason")
+        self.productionMaintenanceLine.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.productionMaintenanceLine.setWordWrap(True)
+        self.productionMaintenanceLine.setFixedSize(538, 42)
+        self.productionOverlay.layout().addWidget(self.productionMaintenanceLine)
 
-        self.productionFixAnim = MachineFixingAnimation(self.productionOverlay)
+        self.productionTimerPanelWrap = QWidget()
+        self.productionTimerPanelWrap.setStyleSheet("background: transparent;")
+        self.productionTimerPanelWrap.setLayout(QHBoxLayout())
+        self.productionTimerPanelWrap.layout().setContentsMargins(8, 4, 8, 4)
+        self.productionTimerPanelWrap.layout().setSpacing(22)
+
+        self.productionWaitingPanel = QFrame()
+        self.productionWaitingPanel.setStyleSheet(
+            "background: #2f343f; border: none; border-radius: 16px; padding: 6px 10px;"
+        )
+        self.productionWaitingPanel.setFixedSize(257, 120)
+        self.productionWaitingPanel.setLayout(QVBoxLayout())
+        self.productionWaitingPanel.layout().setContentsMargins(10, 8, 10, 8)
+        self.productionWaitingPanel.layout().setSpacing(0)
+        self.productionWaitingIndicatorRow = QWidget()
+        self.productionWaitingIndicatorRow.setStyleSheet("background: transparent;")
+        self.productionWaitingIndicatorRow.setLayout(QHBoxLayout())
+        self.productionWaitingIndicatorRow.layout().setContentsMargins(0, 0, 0, 0)
+        self.productionWaitingIndicatorRow.layout().setSpacing(0)
+        self.productionWaitingLabel = QLabel("WAITING TIME")
+        self.productionWaitingLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productionWaitingValue = QLabel("00:00:00")
+        self.productionWaitingValue.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productionWaitingPanel.layout().addWidget(self.productionWaitingLabel)
+        self.productionWaitingPanel.layout().addWidget(self.productionWaitingValue)
+
+        self.productionDowntimePanel = QFrame()
+        self.productionDowntimePanel.setStyleSheet(
+            "background: #2f343f; border: none; border-radius: 16px; padding: 6px 10px;"
+        )
+        self.productionDowntimePanel.setFixedSize(257, 120)
+        self.productionDowntimePanel.setLayout(QVBoxLayout())
+        self.productionDowntimePanel.layout().setContentsMargins(10, 8, 10, 8)
+        self.productionDowntimePanel.layout().setSpacing(0)
+        self.productionDowntimeIndicatorRow = QWidget()
+        self.productionDowntimeIndicatorRow.setStyleSheet("background: transparent;")
+        self.productionDowntimeIndicatorRow.setLayout(QHBoxLayout())
+        self.productionDowntimeIndicatorRow.layout().setContentsMargins(0, 0, 0, 0)
+        self.productionDowntimeIndicatorRow.layout().setSpacing(0)
+        self.productionDowntimeLabel = QLabel("DOWNTIME")
+        self.productionDowntimeLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productionDowntimeValue = QLabel("00:00:00")
+        self.productionDowntimeValue.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productionDowntimePanel.layout().addWidget(self.productionDowntimeLabel)
+        self.productionDowntimePanel.layout().addWidget(self.productionDowntimeValue)
+
+        self.productionTimerPanelWrap.layout().addWidget(self.productionWaitingPanel, 1)
+        self.productionTimerPanelWrap.layout().addWidget(self.productionDowntimePanel, 1)
+        self.productionOverlay.layout().addWidget(self.productionTimerPanelWrap)
+        self._apply_production_timer_fonts()
+
+        self.productionOverlay.layout().removeWidget(self.productionLiveReason)
+        self.productionOverlay.layout().removeWidget(self.productionMaintenanceLine)
+        self.productionOverlay.layout().addWidget(self.productionLiveReason, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.productionOverlay.layout().addWidget(self.productionMaintenanceLine, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self.productionActionBanner = QLabel('SCAN PDR DONE QR WHEN\nREPAIR IS DONE')
+        self.productionActionBanner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productionActionBanner.setWordWrap(True)
+        self.productionActionBanner.setFixedSize(292, 66)
+        self.productionOverlay.layout().addWidget(self.productionActionBanner, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.productionOverlay.layout().addSpacing(14)
+
+        self.productionRepairZone = QFrame()
+        self.productionRepairZone.setObjectName("ProductionRepairZone")
+        self.productionRepairZone.setFixedHeight(206)
+        self.productionRepairZone.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.productionRepairZone.setLayout(QVBoxLayout())
+        self.productionRepairZone.layout().setContentsMargins(0, 0, 0, 0)
+        self.productionRepairZone.layout().setSpacing(0)
+        self.productionRepairZoneTopStripe = HazardStripeWidget(self.productionRepairZone)
+        self.productionRepairZoneBody = QFrame(self.productionRepairZone)
+        self.productionRepairZoneBody.setObjectName("ProductionRepairZoneBody")
+        self.productionRepairZoneBody.setLayout(QVBoxLayout())
+        self.productionRepairZoneBody.layout().setContentsMargins(0, 12, 0, 12)
+        self.productionRepairZoneBody.layout().setSpacing(0)
+        self.productionRepairZoneBottomStripe = HazardStripeWidget(self.productionRepairZone)
+        self.productionRepairZone.layout().addWidget(self.productionRepairZoneTopStripe)
+        self.productionRepairZone.layout().addWidget(self.productionRepairZoneBody)
+        self.productionRepairZone.layout().addWidget(self.productionRepairZoneBottomStripe)
+        self.productionOverlay.layout().addWidget(self.productionRepairZone)
+
+        self.productionFixAnim = MachineFixingAnimation(self.productionRepairZoneBody)
         self.productionFixAnim.setObjectName("ProductionFixAnim")
-        self.productionOverlay.layout().addWidget(self.productionFixAnim, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.productionRepairZoneBody.layout().addWidget(self.productionFixAnim, 0, Qt.AlignmentFlag.AlignCenter)
 
         self.productionMarqueeWrap = QWidget()
         self.productionMarqueeWrap.setObjectName("ProductionMarqueeWrap")
@@ -2982,32 +3190,42 @@ QWidget#ClientUIRoot {{
         self._marquee_x = 0
         self._marquee_speed = 5
         self.productionOverlay.layout().addWidget(self.productionMarqueeWrap, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.productionMarqueeWrap.hide()
 
         self.resolveOverlay = QFrame(self)
         self.resolveOverlay.setObjectName("ProductionOverlay")
         self.resolveOverlay.setStyleSheet(
             "QFrame#ProductionOverlay {"
-            "background: qradialgradient(cx:0.42, cy:0.26, radius:1.0, fx:0.42, fy:0.26,"
-            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(239,246,255,0.98), stop:1 rgba(219,234,254,0.97));"
-            "border: 2px solid #f97316; border-radius: 16px; }"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "stop:0 rgba(251,251,251,0.99), stop:1 rgba(238,241,245,0.99));"
+            "border: 5px solid #ff8a00; border-radius: 28px; }"
             "QFrame#ResolveInfoCard {"
-            "background: rgba(255,255,255,0.88); border: 1px solid rgba(148,163,184,0.45); border-radius: 12px; }"
-            "QLabel#ResolveInfoTitle { color: #64748b; font-size: 11px; font-weight: 800; }"
-            "QLabel#ResolveInfoValue { color: #0f172a; font-size: 19px; font-weight: 900; }"
+            "background: rgba(255,255,255,0.98); border: none; border-radius: 20px; }"
+            "QLabel#ResolveInfoTitle { color: transparent; font-size: 1px; }"
+            "QLabel#ResolveInfoValue { color: #111111; font-size: 24px; font-weight: 500; border: none; background: transparent; }"
         )
         self.resolveOverlay.setLayout(QVBoxLayout())
-        self.resolveOverlay.layout().setContentsMargins(16, 14, 16, 14)
-        self.resolveOverlay.layout().setSpacing(10)
+        self.resolveOverlay.layout().setContentsMargins(22, 18, 22, 20)
+        self.resolveOverlay.layout().setSpacing(14)
         self.resolveOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.resolveTitle = QLabel("DOWNTIME RESOLUTION")
-        self.resolveTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
+        self.resolveTitle.setStyleSheet("color: #111111; font-size: 24px; font-weight: 500; background: transparent; border: none;")
+        self.resolveTitle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.resolveHint = QLabel("Scan cycle time digits (num_0..num_9), backspace, then confirm")
-        self.resolveHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.resolveHint.setStyleSheet(
+            "color: #ffffff; font-size: 21px; font-weight: 900;"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #4b9aeb, stop:1 #3187df);"
+            "border: none; border-radius: 22px; padding: 14px 22px;"
+        )
         self.resolveHint.setWordWrap(True)
+        self.resolveHint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.resolveHint.setFixedSize(364, 78)
         self.resolveOldCycle = QLabel("Old Cycle Time: -")
         self.resolveOldCycle.setObjectName("ResolveInfoValue")
+        self.resolveOldCycle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.resolveNewCycle = QLabel("Cycle Time: ")
         self.resolveNewCycle.setObjectName("ResolveInfoValue")
+        self.resolveNewCycle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.resolveOldCycleTitle = QLabel("REFERENCE")
         self.resolveOldCycleTitle.setObjectName("ResolveInfoTitle")
         self.resolveNewCycleTitle = QLabel("CURRENT INPUT")
@@ -3015,21 +3233,26 @@ QWidget#ClientUIRoot {{
         self.resolveOldCard = QFrame()
         self.resolveOldCard.setObjectName("ResolveInfoCard")
         self.resolveOldCard.setLayout(QVBoxLayout())
-        self.resolveOldCard.layout().setContentsMargins(12, 10, 12, 10)
-        self.resolveOldCard.layout().setSpacing(4)
+        self.resolveOldCard.setFixedHeight(52)
+        self.resolveOldCard.layout().setContentsMargins(20, 10, 20, 10)
+        self.resolveOldCard.layout().setSpacing(0)
         self.resolveOldCard.layout().addWidget(self.resolveOldCycleTitle)
         self.resolveOldCard.layout().addWidget(self.resolveOldCycle)
         self.resolveNewCard = QFrame()
         self.resolveNewCard.setObjectName("ResolveInfoCard")
         self.resolveNewCard.setLayout(QVBoxLayout())
-        self.resolveNewCard.layout().setContentsMargins(12, 10, 12, 10)
-        self.resolveNewCard.layout().setSpacing(4)
+        self.resolveNewCard.setFixedHeight(52)
+        self.resolveNewCard.layout().setContentsMargins(20, 10, 20, 10)
+        self.resolveNewCard.layout().setSpacing(0)
         self.resolveNewCard.layout().addWidget(self.resolveNewCycleTitle)
         self.resolveNewCard.layout().addWidget(self.resolveNewCycle)
         self.resolveOverlay.layout().addWidget(self.resolveTitle)
-        self.resolveOverlay.layout().addWidget(self.resolveHint)
         self.resolveOverlay.layout().addWidget(self.resolveOldCard)
         self.resolveOverlay.layout().addWidget(self.resolveNewCard)
+        self.resolveOverlay.layout().addSpacing(4)
+        self.resolveOverlay.layout().addWidget(self.resolveHint, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._apply_widget_shadow(self.resolveOldCard, 26, 8, QColor(15, 23, 42, 55))
+        self._apply_widget_shadow(self.resolveNewCard, 26, 8, QColor(15, 23, 42, 55))
         self.resolveOverlay.hide()
         self.resolveOverlay.raise_()
 
@@ -3430,10 +3653,13 @@ QWidget#ClientUIRoot {{
         self.finishSuccessRow.layout().setSpacing(10)
         self.finishSuccessRow.layout().setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishCheck = SuccessCheck(size=64, parent=self.finishSuccessRow)
+        self.finishCross = FailureCross(size=64, parent=self.finishSuccessRow)
+        self.finishCross.hide()
         self.finishDoneText = QLabel("Success")
         self.finishDoneText.setObjectName("FinishDoneText")
         self.finishDoneText.setStyleSheet("background: transparent; color: #166534; font-size: 20px; font-weight: 900;")
         self.finishSuccessRow.layout().addWidget(self.finishCheck, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.finishSuccessRow.layout().addWidget(self.finishCross, 0, Qt.AlignmentFlag.AlignVCenter)
         self.finishSuccessRow.layout().addWidget(self.finishDoneText, 0, Qt.AlignmentFlag.AlignVCenter)
         self.finishSuccessRow.hide()
         self.finishOverlay.layout().addWidget(self.finishTitle)
@@ -3461,6 +3687,9 @@ QWidget#ClientUIRoot {{
         self._finish_anim_value = 0
         self._finish_anim_running = False
         self._finish_pending_clear = False
+        self._finish_post_action = ""
+        self._supervisor_validation_pending = False
+        self._supervisor_validation_failed_value = ""
         self._operator_shift_flash_active = False
         self._operator_shift_flash_timer = QTimer(self)
         self._operator_shift_flash_timer.setSingleShot(True)
@@ -3802,6 +4031,9 @@ QWidget#ClientUIRoot {{
 
         self._overlay_mode = "select"
         self._overlay_pulse_on = False
+        self._indicator_pulse_strength = 0.0
+        self._production_timer_label_px: Optional[int] = None
+        self._production_timer_value_px: Optional[int] = None
         self._pulse_phase = 0.0
         self._machine_idle_flash_phase = 0.0
         self._overlay_shadow = QGraphicsDropShadowEffect(self)
@@ -3809,6 +4041,7 @@ QWidget#ClientUIRoot {{
         self._overlay_shadow.setOffset(0, 0)
         self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
         self.productionOverlay.setGraphicsEffect(self._overlay_shadow)
+        self._apply_downtime_active_widget_styles()
         self._blur_left = None
         self._blur_right = None
         self.leftWrap.setGraphicsEffect(None)
@@ -3878,6 +4111,7 @@ QWidget#ClientUIRoot {{
         self._position_reject_review_overlay()
         self._position_finish_overlay()
         self._sync_machine_status_pulse_overlay()
+        self._apply_production_timer_fonts()
 
     def _screen_ui_scale(self) -> float:
         screen = None
@@ -4213,10 +4447,13 @@ QWidget#ClientUIRoot {{
             w = min(1140, max(820, int(self.width() * 0.8)))
             h = min(610, max(380, int(self.height() * 0.5)))
         else:
-            w = min(760, max(500, int(self.width() * 0.58)))
-            h = min(620, max(420, int(self.height() * 0.72)))
+            w = min(620, max(620, int(self.width() * 0.50)))
+            h = min(640, max(640, int(self.height() * 0.80)))
         x = max(0, (self.width() - w) // 2)
-        y = max(0, (self.height() - h) // 2)
+        if getattr(self, "_overlay_mode", "select") == "select":
+            y = max(0, (self.height() - h) // 2)
+        else:
+            y = max(12, (self.height() - h) // 2 - 8)
         self.productionOverlay.setGeometry(x, y, w, h)
         self._sync_production_reason_card_sizes()
         self._position_marquee()
@@ -4279,10 +4516,15 @@ QWidget#ClientUIRoot {{
         self.resolveOverlay.adjustSize()
         hint_h = self.resolveOverlay.sizeHint().height()
         hint_w = self.resolveOverlay.sizeHint().width()
-        w = min(max(560, int(self.width() * 0.95)), max(520, hint_w + 24, int(self.width() * 0.58)))
-        h = min(max(320, int(self.height() * 0.90)), max(260, hint_h + 16))
+        w = min(max(420, int(self.width() * 0.40)), max(400, hint_w + 20))
+        h = min(max(250, int(self.height() * 0.34)), max(238, hint_h + 18))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
+        if hasattr(self, "productionMaintenanceLine") and self.productionMaintenanceLine is not None and self.productionMaintenanceLine.isVisible():
+            maintenance_top_left = self.productionMaintenanceLine.mapTo(self, self.productionMaintenanceLine.rect().topLeft())
+            maintenance_bottom = maintenance_top_left.y() + self.productionMaintenanceLine.height()
+            x = max(0, int((self.width() - w) / 2))
+            y = max(12, int(maintenance_bottom + 10))
         self.resolveOverlay.setGeometry(x, y, w, h)
 
     def _position_raw_mats_overlay(self):
@@ -5003,6 +5245,8 @@ QWidget#ClientUIRoot {{
         self.finishProgressBar.setValue(0)
         self.finishSuccessRow.hide()
         self.finishCheck.setProgress(0.0)
+        self.finishCheck.show()
+        self.finishCross.hide()
         self._finish_anim_value = 0
         self._finish_anim_running = True
         self.finishOverlay.show()
@@ -5022,12 +5266,35 @@ QWidget#ClientUIRoot {{
         if self._finish_anim_value < 100:
             return
         self._finish_anim_timer.stop()
-        self.finishStatus.setText("Completed")
+        if self._finish_post_action and self._finish_post_action != "downtime_supervisor_saved":
+            self.finishOverlay.setStyleSheet(
+                "QFrame#ProductionOverlay {"
+                "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
+                "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(254,242,242,0.98), stop:1 rgba(254,226,226,0.98));"
+                "border: 3px solid #dc2626; border-radius: 14px; }"
+                "QWidget#FinishSuccessRow { background: transparent; border: none; }"
+                "QLabel#FinishDoneText { background: transparent; border: none; }"
+                "QProgressBar {"
+                "border: 1px solid #dc2626; border-radius: 8px; background: rgba(255,255,255,0.88); min-height: 14px; }"
+                "QProgressBar::chunk {"
+                "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ef4444, stop:1 #dc2626);"
+                "border-radius: 7px; }"
+            )
+            self.finishStatus.setText(self._finish_post_action)
+        else:
+            self.finishStatus.setText("Completed")
         self.finishSuccessRow.show()
-        if self.enable_check_animation:
+        if self._finish_post_action and self._finish_post_action != "downtime_supervisor_saved":
+            self.finishCheck.hide()
+            self.finishCross.show()
+            self.finishCross.start()
+            QTimer.singleShot(2000, self._complete_finish_sequence)
+        elif self.enable_check_animation:
+            self.finishCross.hide()
             self.finishCheck.start()
             QTimer.singleShot(900, self._complete_finish_sequence)
         else:
+            self.finishCross.hide()
             self.finishCheck.setProgress(1.0)
             QTimer.singleShot(280, self._complete_finish_sequence)
 
@@ -5036,6 +5303,88 @@ QWidget#ClientUIRoot {{
         if self._finish_pending_clear:
             self._finish_pending_clear = False
             self._clear_full_session()
+            return
+        if self._finish_post_action == "downtime_supervisor_saved":
+            self._finish_post_action = ""
+            self._supervisor_validation_pending = False
+            self._hide_resolve_overlay()
+            self._refresh_ui()
+            return
+        if self._finish_post_action and self._finish_post_action != "downtime_supervisor_saved":
+            self._finish_post_action = ""
+            self._supervisor_validation_pending = False
+            self.resolveNewCycle.setText("Confirmed by: ")
+            self.resolveHint.setText("SCAN SUPERVISOR QR")
+            self._refresh_ui()
+            self._show_resolve_overlay()
+
+    def _show_downtime_supervisor_saved_overlay(self, supervisor_name: str):
+        self.finishOverlay.setStyleSheet(
+            "QFrame#ProductionOverlay {"
+            "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
+            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(240,253,244,0.98), stop:1 rgba(220,252,231,0.98));"
+            "border: 3px solid #16a34a; border-radius: 14px; }"
+            "QWidget#FinishSuccessRow { background: transparent; border: none; }"
+            "QLabel#FinishDoneText { background: transparent; border: none; }"
+            "QProgressBar {"
+            "border: 1px solid #16a34a; border-radius: 8px; background: rgba(255,255,255,0.88); min-height: 14px; }"
+            "QProgressBar::chunk {"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16a34a, stop:1 #22c55e);"
+            "border-radius: 7px; }"
+        )
+        self._position_finish_overlay()
+        self._set_background_blur(True)
+        self.finishTitle.setText("SUPERVISOR CONFIRMED")
+        self.finishStatus.setText(str(supervisor_name or "Saving..."))
+        self.finishDoneText.setText("Success")
+        self.finishDoneText.setStyleSheet("background: transparent; color: #166534; font-size: 20px; font-weight: 900;")
+        self.finishCheck.show()
+        self.finishCross.hide()
+        self.finishProgressBar.show()
+        self.finishProgressBar.setValue(0)
+        self.finishSuccessRow.hide()
+        self.finishCheck.setProgress(0.0)
+        self._finish_anim_value = 0
+        self._finish_anim_running = True
+        self._finish_pending_clear = False
+        self._finish_post_action = "downtime_supervisor_saved"
+        self.finishOverlay.show()
+        self.finishOverlay.raise_()
+        self._finish_anim_timer.start()
+
+    def _show_downtime_supervisor_failed_overlay(self, message: str):
+        self.finishOverlay.setStyleSheet(
+            "QFrame#ProductionOverlay {"
+            "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
+            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(240,253,244,0.98), stop:1 rgba(220,252,231,0.98));"
+            "border: 3px solid #16a34a; border-radius: 14px; }"
+            "QWidget#FinishSuccessRow { background: transparent; border: none; }"
+            "QLabel#FinishDoneText { background: transparent; border: none; }"
+            "QProgressBar {"
+            "border: 1px solid #16a34a; border-radius: 8px; background: rgba(255,255,255,0.88); min-height: 14px; }"
+            "QProgressBar::chunk {"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16a34a, stop:1 #22c55e);"
+            "border-radius: 7px; }"
+        )
+        self._position_finish_overlay()
+        self._set_background_blur(True)
+        self.finishTitle.setText("SUPERVISOR VALIDATION")
+        self.finishStatus.setText("Validating...")
+        self.finishDoneText.setText("Failed")
+        self.finishDoneText.setStyleSheet("background: transparent; color: #b91c1c; font-size: 20px; font-weight: 900;")
+        self.finishCheck.hide()
+        self.finishCross.show()
+        self.finishCross.setProgress(0.0)
+        self.finishProgressBar.show()
+        self.finishProgressBar.setValue(0)
+        self.finishSuccessRow.hide()
+        self._finish_anim_value = 0
+        self._finish_anim_running = True
+        self._finish_pending_clear = False
+        self._finish_post_action = str(message or "This is not supervisor QR")
+        self.finishOverlay.show()
+        self.finishOverlay.raise_()
+        self._finish_anim_timer.start()
 
     def _show_operator_shift_overlay(self, shift_payload: Dict[str, Any]):
         name = self._safe_text(shift_payload.get("operator_name"), "-")
@@ -5103,6 +5452,8 @@ QWidget#ClientUIRoot {{
         self.productionOverlay.setProperty("pulse", "0")
         self._overlay_shadow.setBlurRadius(18)
         self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
+        if hasattr(self, "productionFixAnim") and self.productionFixAnim is not None:
+            self.productionFixAnim.ensure_running()
         self.productionOverlay.show()
         self.productionOverlay.raise_()
         self._position_marquee()
@@ -5145,34 +5496,111 @@ QWidget#ClientUIRoot {{
         if mode == "select":
             self.productionTitle.setText("PRODUCTION DAILY REPORT")
             self.productionHint.setText("Scan reason QR code (01-15)")
+            self.productionHint.show()
             self.productionReasonList.show()
             self.productionLiveReason.hide()
-            self.productionCounter.hide()
-            self.productionFixAnim.hide()
+            self.productionMaintenanceLine.hide()
+            self.productionActionBanner.hide()
+            self.productionTimerPanelWrap.hide()
+            self.productionRepairZone.hide()
             self.productionMarqueeWrap.hide()
+            self._apply_timer_indicator_state(False, False)
             return
         self.productionTitle.setText("DOWNTIME ACTIVE")
-        self.productionHint.setText("Follow the instruction shown in status and banner")
+        self.productionHint.hide()
         self.productionReasonList.hide()
         self.productionLiveReason.show()
-        self.productionCounter.show()
+        self.productionMaintenanceLine.show()
+        self.productionActionBanner.show()
+        self.productionTimerPanelWrap.show()
+        self.productionRepairZone.show()
         self.productionFixAnim.show()
-        self.productionMarqueeWrap.show()
+        self.productionFixAnim.ensure_running()
+        self.productionMarqueeWrap.hide()
         self._marquee_x = self.productionMarqueeWrap.width()
         self._position_marquee()
+        self._apply_production_timer_fonts()
 
     def _apply_overlay_base_style(self):
         self.productionOverlay.setStyleSheet(
             "QFrame#ProductionOverlay {"
-            "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
-            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(248,250,252,0.98), stop:1 rgba(226,232,240,0.98));"
-            "border: 3px solid #fb923c; border-radius: 14px; }"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "stop:0 rgba(244,244,244,0.99), stop:1 rgba(233,233,233,0.99));"
+            "border: 4px solid #fb8c00; border-radius: 20px; }"
         )
+
+    def _apply_downtime_active_widget_styles(self):
+        self.productionTitle.setStyleSheet(
+            "color: #111111; font-size: 26px; font-weight: 900; letter-spacing: 0.2px; background: transparent; border: none;"
+        )
+        self.productionLiveReason.setStyleSheet(
+            "color: #111111; font-size: 15px; font-weight: 900;"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #fbfbfb);"
+            "border: 2px solid #2196f3; border-radius: 11px;"
+            "padding: 8px 12px;"
+        )
+        self.productionMaintenanceLine.setStyleSheet(
+            "color: #111111; font-size: 15px; font-weight: 900;"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #fafafa);"
+            "border: 1px solid rgba(0,0,0,0.10); border-radius: 11px;"
+            "padding: 8px 12px;"
+        )
+        self.productionActionBanner.setStyleSheet(
+            "color: #ffffff; font-size: 17px; font-weight: 900;"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #5aa4ee, stop:0.52 #4795e3, stop:1 #3b84d2);"
+            "border-top: 1px solid rgba(255,255,255,0.20);"
+            "border-left: 1px solid rgba(255,255,255,0.12);"
+            "border-right: 1px solid rgba(31,88,156,0.55);"
+            "border-bottom: 1px solid rgba(22,67,122,0.72);"
+            "border-radius: 12px; padding: 8px 18px;"
+        )
+        self.productionRepairZone.setStyleSheet("background: transparent; border: none;")
+        self.productionRepairZoneBody.setStyleSheet(
+            "QFrame#ProductionRepairZoneBody {"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            "stop:0 #9b9b9b, stop:0.22 #c9c9c9, stop:0.50 #808080, stop:0.80 #565656, stop:1 #383838);"
+            "border: none; }"
+        )
+        timer_css = (
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "stop:0 #39404c, stop:0.55 #343b46, stop:1 #303742);"
+            "border: 6px solid #b1b1b1; border-radius: 16px; padding: 6px 10px;"
+        )
+        self.productionWaitingPanel.setStyleSheet(timer_css)
+        self.productionDowntimePanel.setStyleSheet(timer_css)
+        self._apply_widget_shadow(self.productionWaitingPanel, 12, 2, QColor(0, 0, 0, 62))
+        self._apply_widget_shadow(self.productionDowntimePanel, 12, 2, QColor(0, 0, 0, 62))
+        self._apply_widget_shadow(self.productionLiveReason, 16, 2, QColor(0, 0, 0, 45))
+        self._apply_widget_shadow(self.productionMaintenanceLine, 16, 2, QColor(0, 0, 0, 42))
+        self.productionActionBanner.setGraphicsEffect(None)
+
+    @staticmethod
+    def _apply_widget_shadow(widget: Optional[QWidget], blur: int, offset_y: int, color: QColor):
+        if widget is None:
+            return
+        shadow = QGraphicsDropShadowEffect(widget)
+        shadow.setBlurRadius(float(blur))
+        shadow.setOffset(0, float(offset_y))
+        shadow.setColor(color)
+        widget.setGraphicsEffect(shadow)
 
     def _tick_overlay_pulse(self):
         if self.productionOverlay.isVisible():
             self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
             self._apply_overlay_base_style()
+            phase = time.time() % 1.0
+            if phase < 0.18:
+                strength = 1.0
+            elif phase < 0.48:
+                strength = max(0.30, 1.0 - ((phase - 0.18) / 0.30) * 0.70)
+            else:
+                strength = 0.30
+            self._indicator_pulse_strength = strength
+            self._overlay_pulse_on = strength >= 0.75
+            self._apply_timer_indicator_state(
+                getattr(self, "_waiting_indicator_active", False),
+                getattr(self, "_downtime_indicator_active", False),
+            )
         if not self.productionOverlay.isVisible() or self._overlay_mode != "active":
             return
         self._tick_marquee()
@@ -5199,6 +5627,70 @@ QWidget#ClientUIRoot {{
         t.setObjectName("SectionTitle")
         f.layout().addWidget(t)
         return f
+
+    def _make_timer_status_indicator(self, role: str = "red") -> QLabel:
+        dot = QLabel()
+        dot.setFixedSize(10, 10)
+        dot._indicator_role = str(role or "red").strip().lower()  # type: ignore[attr-defined]
+        glow = QGraphicsDropShadowEffect(dot)
+        glow.setBlurRadius(34)
+        glow.setOffset(0, 0)
+        if getattr(dot, "_indicator_role", "red") == "green":
+            glow.setColor(QColor(34, 255, 102, 170))
+        else:
+            glow.setColor(QColor(239, 68, 68, 220))
+        dot.setGraphicsEffect(glow)
+        dot._glow_effect = glow  # type: ignore[attr-defined]
+        self._set_timer_indicator_style(dot)
+        return dot
+
+    def _apply_timer_indicator_state(self, waiting_active: bool, downtime_active: bool):
+        self._waiting_indicator_active = bool(waiting_active)
+        self._downtime_indicator_active = bool(downtime_active)
+        self._set_timer_indicator_style(getattr(self, "productionWaitingIndicator", None))
+        self._set_timer_indicator_style(getattr(self, "productionDowntimeIndicator", None))
+
+    def _set_timer_indicator_style(self, dot: Optional[QLabel]):
+        if dot is None:
+            return
+        role = str(getattr(dot, "_indicator_role", "red") or "red").strip().lower()
+        glow = getattr(dot, "_glow_effect", None)
+        is_active = bool(
+            getattr(self, "_waiting_indicator_active", False)
+            if role == "green"
+            else getattr(self, "_downtime_indicator_active", False)
+        )
+        if role == "green":
+            strength = float(self._indicator_pulse_strength) if is_active else 0.35
+            fill_alpha = max(70, min(255, int(120 + (135 * strength))))
+            glow_alpha = max(40, min(220, int(80 + (140 * strength))))
+            glow_blur = 12 + (12 * strength)
+            style = (
+                "background: qradialgradient(cx:0.34, cy:0.32, radius:1.0,"
+                f"stop:0 rgba(255,255,255,{min(255, fill_alpha + 35)}),"
+                f"stop:0.22 rgba(187,247,208,{min(255, fill_alpha + 18)}),"
+                f"stop:0.62 rgba(34,197,94,{fill_alpha}),"
+                f"stop:1 rgba(22,101,52,{max(110, fill_alpha - 42)}));"
+                "border: none; border-radius: 5px;"
+            )
+            if glow is not None:
+                glow.setBlurRadius(glow_blur)
+                glow.setColor(QColor(34, 255, 102, glow_alpha))
+        else:
+            fill_alpha = 255 if is_active else 150
+            glow_alpha = 165 if is_active else 70
+            style = (
+                "background: qradialgradient(cx:0.34, cy:0.32, radius:1.0,"
+                f"stop:0 rgba(255,255,255,{min(255, fill_alpha)}),"
+                f"stop:0.18 rgba(254,202,202,{min(255, fill_alpha)}),"
+                f"stop:0.62 rgba(239,68,68,{fill_alpha}),"
+                f"stop:1 rgba(127,29,29,{max(90, fill_alpha - 30)}));"
+                "border: none; border-radius: 5px;"
+            )
+            if glow is not None:
+                glow.setBlurRadius(14 if is_active else 8)
+                glow.setColor(QColor(239, 68, 68, glow_alpha))
+        dot.setStyleSheet(style)
 
     def _make_double_layer_card(self, title: str) -> tuple[QFrame, QFrame]:
         outer = QFrame()
@@ -5447,17 +5939,20 @@ QWidget#ClientUIRoot {{
         elif s.waiting_initial_cycle_qc_confirm:
             self._set_banner_text("Initial setup: Scan QC badge to confirm cycle time")
         elif s.waiting_cycle_time_input:
-            self._set_banner_text("Downtime resolve: enter cycle time, then confirm")
+            if str(s.cycle_time_new_input or "").strip():
+                self._set_banner_text("Downtime resolve: Scan QR to confirm")
+            else:
+                self._set_banner_text("Downtime resolve: Scan numkeys to input new cycle time")
         elif s.waiting_downtime_start_maintenance:
             self._set_banner_text("PDR waiting: scan Maintenance QR to start downtime")
         elif s.waiting_downtime_end_maintenance:
             self._set_banner_text('Downtime active: scan "pdr_done" when repair is done')
         elif s.waiting_maintenance_qr:
-            self._set_banner_text("Downtime resolve: Scan Maintenance QR")
+            self._set_banner_text("Downtime resolve: Scan Maintenance QR to stop downtime")
         elif s.waiting_supervisor_qr:
             self._set_banner_text("Downtime resolve: Scan Supervisor QR")
         elif s.waiting_operator_downtime_confirm:
-            self._set_banner_text("Downtime resolve: Scan Operator QR to confirm")
+            self._set_banner_text("Downtime resolve: Scan Operator QR to proceed")
         elif s.downtime_active:
             self._set_banner_text('Downtime active: scan "productiondailyreport~2" or SUR')
         else:
@@ -5604,26 +6099,65 @@ QWidget#ClientUIRoot {{
 
         if s.downtime_reason_code and s.downtime_reason_text:
             self.rightDowntimeReason.setText(f"Reason {s.downtime_reason_code}: {s.downtime_reason_text}")
+            self.productionLiveReason.setText(
+                f"REASON: {s.downtime_reason_code} {s.downtime_reason_text}"
+            )
         else:
             self.rightDowntimeReason.setText("Reason: -")
+            self.productionLiveReason.setText("REASON: -")
         if s.waiting_downtime_start_maintenance:
-            self.productionHint.setText("Scan Maintenance QR to start downtime")
+            action_text = "SCAN MAINTENANCE QR\nTO START DOWNTIME"
         elif s.waiting_downtime_end_maintenance:
-            self.productionHint.setText('Downtime running. Scan "pdr_done" when repair is done')
+            action_text = "SCAN PDR DONE QR WHEN\nREPAIR IS DONE"
         elif s.waiting_cycle_time_input:
-            self.productionHint.setText("Enter cycle time now. Downtime is still running")
+            if str(s.cycle_time_new_input or "").strip():
+                action_text = "SCAN QR\nTO CONFIRM"
+            else:
+                action_text = "SCAN NUMKEYS\nTO INPUT"
         elif s.waiting_maintenance_qr:
-            self.productionHint.setText("Scan Maintenance QR to stop maintenance downtime")
+            action_text = "SCAN MAINTENANCE QR\nTO STOP DOWNTIME"
         elif s.waiting_supervisor_qr:
-            self.productionHint.setText("Scan Supervisor QR to continue")
+            action_text = "MACHINE UNDER REPAIR /\nADJUSTMENT"
         elif s.waiting_operator_downtime_confirm:
-            self.productionHint.setText("Scan Operator QR to finish downtime confirmation")
-        elif self._overlay_mode == "active":
-            self.productionHint.setText("Machine under repair / adjustment")
+            action_text = "SCAN OPERATOR QR\nTO PROCEED"
+        else:
+            action_text = "MACHINE UNDER REPAIR /\nADJUSTMENT"
+        self.productionActionBanner.setText(action_text)
         self.rightStartupReject.setText(f"Start Up Reject: {s.startup_reject_total}")
         self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or '-'}")
+        self.productionMaintenanceLine.setText(f"MAINTENANCE: {s.maintenance_name or '-'}")
+        self.productionMaintenanceLine.setVisible(bool(self._overlay_mode == "active"))
         self.rightSupervisor.setText(f"Supervisor: {s.supervisor_name or '-'}")
         self.rightSupervisorLeft.setText(f"Supervisor: {s.supervisor_name or '-'}")
+
+        overlay_wait_seconds = None
+        if s.waiting_downtime_start_maintenance and s.downtime_wait_started_at:
+            overlay_wait_seconds = max(0, int(time.time() - s.downtime_wait_started_at))
+        elif s.downtime_wait_last_seconds is not None:
+            overlay_wait_seconds = int(s.downtime_wait_last_seconds)
+
+        overlay_downtime_seconds = None
+        if s.maintenance_downtime_seconds is not None:
+            overlay_downtime_seconds = int(s.maintenance_downtime_seconds)
+        elif s.downtime_started_at:
+            overlay_downtime_seconds = max(0, int(time.time() - s.downtime_started_at))
+        elif s.downtime_last_seconds is not None:
+            overlay_downtime_seconds = int(s.downtime_last_seconds)
+
+        waiting_indicator_active = bool(s.waiting_downtime_start_maintenance and s.downtime_wait_started_at)
+        downtime_indicator_active = bool(
+            s.maintenance_downtime_seconds is not None or s.downtime_started_at
+        )
+        self._apply_timer_indicator_state(waiting_indicator_active, downtime_indicator_active)
+
+        self._set_overlay_timer_value(
+            getattr(self, "productionWaitingValue", None),
+            self._format_timer_seconds(overlay_wait_seconds),
+        )
+        self._set_overlay_timer_value(
+            getattr(self, "productionDowntimeValue", None),
+            self._format_timer_seconds(overlay_downtime_seconds),
+        )
 
         if s.waiting_downtime_start_maintenance and s.downtime_wait_started_at:
             elapsed_wait = max(0, int(time.time() - s.downtime_wait_started_at))
@@ -5631,26 +6165,17 @@ QWidget#ClientUIRoot {{
             mm = (elapsed_wait % 3600) // 60
             ss = elapsed_wait % 60
             self.rightDowntimeTimer.setText(f"Waiting: {hh:02d}:{mm:02d}:{ss:02d}")
-            if self._overlay_mode == "active":
-                self.productionLiveReason.setText(self.rightDowntimeReason.text())
-                self.productionCounter.setText(f"WAITING TIME\n{hh:02d}:{mm:02d}:{ss:02d}")
         elif s.maintenance_downtime_seconds is not None:
             hh = s.maintenance_downtime_seconds // 3600
             mm = (s.maintenance_downtime_seconds % 3600) // 60
             ss = s.maintenance_downtime_seconds % 60
             self.rightDowntimeTimer.setText(f"Downtime: {hh:02d}:{mm:02d}:{ss:02d}")
-            if self._overlay_mode == "active":
-                self.productionLiveReason.setText(self.rightDowntimeReason.text())
-                self.productionCounter.setText(f"DOWNTIME\n{hh:02d}:{mm:02d}:{ss:02d}")
         elif s.downtime_started_at:
             elapsed = max(0, int(time.time() - s.downtime_started_at))
             hh = elapsed // 3600
             mm = (elapsed % 3600) // 60
             ss = elapsed % 60
             self.rightDowntimeTimer.setText(f"Downtime: {hh:02d}:{mm:02d}:{ss:02d}")
-            if self._overlay_mode == "active":
-                self.productionLiveReason.setText(self.rightDowntimeReason.text())
-                self.productionCounter.setText(f"DOWNTIME\n{hh:02d}:{mm:02d}:{ss:02d}")
         else:
             if s.downtime_last_seconds is not None:
                 hh = s.downtime_last_seconds // 3600
@@ -5659,8 +6184,124 @@ QWidget#ClientUIRoot {{
                 self.rightDowntimeTimer.setText(f"Downtime: {hh:02d}:{mm:02d}:{ss:02d}")
             else:
                 self.rightDowntimeTimer.setText("Downtime: 00:00:00")
-            if self._overlay_mode == "active":
-                self.productionCounter.setText("DOWNTIME\n00:00:00")
+
+    def _apply_production_timer_fonts(self):
+        family = str(getattr(self, "_digital_font_family", "") or "").strip() or "DS-Digital"
+        label_pairs = (
+            (getattr(self, "productionWaitingPanel", None), getattr(self, "productionWaitingLabel", None)),
+            (getattr(self, "productionDowntimePanel", None), getattr(self, "productionDowntimeLabel", None)),
+        )
+        value_pairs = (
+            (getattr(self, "productionWaitingPanel", None), getattr(self, "productionWaitingValue", None)),
+            (getattr(self, "productionDowntimePanel", None), getattr(self, "productionDowntimeValue", None)),
+        )
+        base_css = f"color: #38bdf8; background: transparent; border: none; font-family: '{family}';"
+        label_px = self._resolve_production_timer_font_px(
+            cached_attr="_production_timer_label_px",
+            panel=getattr(self, "productionWaitingPanel", None),
+            text="WAITING TIME",
+            min_px=26,
+            max_px=54,
+            width_ratio=0.80,
+            height_ratio=0.20,
+            family=family,
+        )
+        value_px = self._resolve_production_timer_font_px(
+            cached_attr="_production_timer_value_px",
+            panel=getattr(self, "productionWaitingPanel", None),
+            text="00:00:00",
+            min_px=42,
+            max_px=82,
+            width_ratio=0.86,
+            height_ratio=0.34,
+            family=family,
+        )
+        for panel, widget in label_pairs:
+            if panel is None or widget is None:
+                continue
+            widget.setStyleSheet(base_css + f"font-size: {label_px}px; line-height: 1.0;")
+            label_font = QFont(family)
+            label_font.setPixelSize(label_px)
+            label_metrics = QFontMetrics(label_font)
+            widget.setFixedHeight(max(26, label_metrics.height() + 2))
+        for panel, widget in value_pairs:
+            if panel is None or widget is None:
+                continue
+            widget.setStyleSheet(base_css + f"font-size: {value_px}px; line-height: 1.0;")
+            value_font = QFont(family)
+            value_font.setPixelSize(value_px)
+            value_metrics = QFontMetrics(value_font)
+            widget.setFixedHeight(max(44, value_metrics.height() + 2))
+
+    def _resolve_production_timer_font_px(
+        self,
+        cached_attr: str,
+        panel: Optional[QWidget],
+        text: str,
+        min_px: int,
+        max_px: int,
+        width_ratio: float,
+        height_ratio: float,
+        family: str,
+    ) -> int:
+        cached_px = getattr(self, cached_attr, None)
+        if isinstance(cached_px, int) and cached_px > 0:
+            return cached_px
+        fitted_px = self._fit_overlay_timer_font(
+            panel,
+            text,
+            min_px=min_px,
+            max_px=max_px,
+            width_ratio=width_ratio,
+            height_ratio=height_ratio,
+            family=family,
+        )
+        setattr(self, cached_attr, fitted_px)
+        return fitted_px
+
+    def _fit_overlay_timer_font(
+        self,
+        panel: Optional[QWidget],
+        text: str,
+        min_px: int,
+        max_px: int,
+        width_ratio: float,
+        height_ratio: float,
+        family: str,
+    ) -> int:
+        if panel is None:
+            return min_px
+        panel_w = max(1, int(panel.width()))
+        panel_h = max(1, int(panel.height()))
+        avail_w = max(1, int(panel_w * width_ratio))
+        avail_h = max(1, int(panel_h * height_ratio))
+        sample = str(text or "00:00:00")
+        best = min_px
+        for px in range(max_px, min_px - 1, -1):
+            font = QFont(family)
+            font.setPixelSize(px)
+            metrics = QFontMetrics(font)
+            text_w = max(1, metrics.horizontalAdvance(sample))
+            text_h = max(1, metrics.height())
+            if text_w <= avail_w and text_h <= avail_h:
+                best = px
+                break
+        return best
+
+    @staticmethod
+    def _format_timer_seconds(total_seconds: Optional[int]) -> str:
+        if total_seconds is None:
+            return "00:00:00"
+        safe_seconds = max(0, int(total_seconds))
+        hh = safe_seconds // 3600
+        mm = (safe_seconds % 3600) // 60
+        ss = safe_seconds % 60
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+    @staticmethod
+    def _set_overlay_timer_value(widget: Optional[QLabel], value: str):
+        if widget is not None:
+            widget.setText(str(value or "00:00:00"))
 
     def _refresh_linkage_panel(self):
         s = self.state
@@ -6169,6 +6810,20 @@ QWidget#ClientUIRoot {{
                 self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_new_input}")
             self.resolveOldCycleTitle.setText("STD CYCLE TIME")
             self._show_resolve_overlay()
+        elif s.waiting_cycle_time_input or s.waiting_supervisor_qr:
+            self.resolveTitle.setText("DOWNTIME NEW CYCLE TIME")
+            self.resolveOldCycleTitle.setText("NEW CYCLE TIME INPUT")
+            self.resolveNewCycleTitle.setText("CONFIRMED BY")
+            self.resolveOldCycle.setText(f"New Cycle Time Input: {s.cycle_time_new_input}")
+            self.resolveNewCycle.setText(f"Confirmed by: {s.cycle_time_confirmed_by or ''}")
+            if s.waiting_cycle_time_input:
+                if str(s.cycle_time_new_input or "").strip():
+                    self.resolveHint.setText("SCAN QR TO CONFIRM")
+                else:
+                    self.resolveHint.setText("SCAN NUMKEYS TO INPUT")
+            else:
+                self.resolveHint.setText("SCAN SUPERVISOR QR")
+            self._show_resolve_overlay()
 
     def _build_finished_job_payload(self) -> Dict[str, Any]:
         s = self.state
@@ -6430,21 +7085,27 @@ QWidget#ClientUIRoot {{
     def _begin_downtime_resolution(self):
         s = self.state
         self._reset_downtime_resolution_state()
+        s.cycle_time_confirmed_by = None
         s.waiting_cycle_time_input = True
         s.downtime_resolution_started_at = time.time()
         s.cycle_time_new_input = ""
         self._set_production_overlay_mode("active")
         self._show_production_overlay()
-        self.resolveTitle.setText("DOWNTIME RESOLUTION")
-        self.resolveHint.setText("Scan cycle time digits (num_0..num_9), backspace, then confirm. Downtime is still running.")
-        self.resolveOldCycleTitle.setText("OLD CYCLE TIME")
-        self.resolveNewCycleTitle.setText("CYCLE TIME INPUT")
-        self.resolveOldCycle.setText(f"Old Cycle Time: {s.cycle_time_current or '-'}")
-        self.resolveNewCycle.setText("Cycle Time: ")
+        self._hide_resolve_overlay()
+        self.resolveTitle.setText("DOWNTIME NEW CYCLE TIME")
+        self.resolveHint.setText("SCAN NUMKEYS TO INPUT")
+        self.resolveOldCycleTitle.setText("NEW CYCLE TIME INPUT")
+        self.resolveNewCycleTitle.setText("CONFIRMED BY")
+        self.resolveOldCycle.setText(f"New Cycle Time Input: {s.cycle_time_new_input}")
+        self.resolveNewCycle.setText("Confirmed by: ")
         self._show_resolve_overlay()
 
     def _update_cycle_input_display(self):
-        self.resolveNewCycle.setText(f"Cycle Time: {self.state.cycle_time_new_input}")
+        self.resolveOldCycle.setText(f"New Cycle Time Input: {self.state.cycle_time_new_input}")
+        if str(self.state.cycle_time_new_input or "").strip():
+            self.resolveHint.setText("SCAN QR TO CONFIRM")
+        else:
+            self.resolveHint.setText("SCAN NUMKEYS TO INPUT")
 
     def _refresh_reject_detail_grid(self):
         counts = self._normalized_reject_counts()
@@ -7547,6 +8208,9 @@ QWidget#ClientUIRoot {{
         if self._finish_anim_running:
             self.status.setText("Finish job in progress. Please wait.")
             return
+        if self._supervisor_validation_pending:
+            self.status.setText("Supervisor validation in progress. Please wait.")
+            return
         raw_s = str(raw).strip()
         raw_l = raw_s.lower()
         s = self.state
@@ -7865,27 +8529,54 @@ QWidget#ClientUIRoot {{
             if raw_l.startswith("num_") and raw_l[-1:].isdigit():
                 s.cycle_time_new_input += raw_l[-1]
                 self._update_cycle_input_display()
+                self._refresh_downtime_panel()
                 return
             if raw_l == "backspace":
                 s.cycle_time_new_input = s.cycle_time_new_input[:-1]
                 self._update_cycle_input_display()
+                self._refresh_downtime_panel()
                 return
             if raw_l == "confirm":
                 if not s.cycle_time_new_input:
                     self.status.setText("Cycle Time is empty. Scan digits first.")
                     return
-                self._set_cycle_time_current(s.cycle_time_new_input, source="downtime_resolution")
                 s.waiting_cycle_time_input = False
-                s.waiting_maintenance_qr = True
-                self.resolveOldCycleTitle.setText("RESOLVED CYCLE TIME")
-                self.resolveNewCycleTitle.setText("NEXT STEP")
-                self.resolveHint.setText("Scan Maintenance QR to confirm maintenance completed.")
-                self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_current}")
+                s.supervisor_downtime_confirmation_started_at = time.time()
+                s.waiting_supervisor_qr = True
+                self._refresh_ui()
+                self.resolveHint.setText("SCAN SUPERVISOR QR")
+                self._show_resolve_overlay()
                 return
             self.status.setText("Cycle Time input mode: scan num_0..num_9, backspace, confirm.")
             return
 
-        # Resolution step 2: Maintenance
+        # Resolution step 2: Supervisor
+        if s.waiting_supervisor_qr:
+            auth = self._authorized_person_from_scan(raw_s)
+            if auth and str(auth.get("can_supervisor", "0")) == "1":
+                s.supervisor_name = str(auth.get("name") or raw_s)
+                s.cycle_time_confirmed_by = s.supervisor_name
+                self._set_cycle_time_current(s.cycle_time_new_input, source="downtime_resolution")
+                if s.supervisor_downtime_confirmation_started_at:
+                    s.supervisor_downtime_confirmation_seconds = max(
+                        0, int(time.time() - s.supervisor_downtime_confirmation_started_at)
+                    )
+                s.waiting_supervisor_qr = False
+                s.waiting_maintenance_qr = True
+                self.resolveNewCycle.setText(f"Confirmed by: {s.cycle_time_confirmed_by or ''}")
+                self._supervisor_validation_pending = True
+                self.status.setText("Supervisor QR logged. Validating...")
+                QTimer.singleShot(1000, lambda name=s.supervisor_name: self._show_downtime_supervisor_saved_overlay(name))
+                return
+            scanned_name = str((auth or {}).get("name") or raw_s or "").strip()
+            self.resolveNewCycle.setText(f"Confirmed by: {scanned_name}")
+            self._supervisor_validation_failed_value = ""
+            self._supervisor_validation_pending = True
+            self.status.setText("Supervisor QR validation failed.")
+            QTimer.singleShot(1000, lambda: self._show_downtime_supervisor_failed_overlay("This is not supervisor QR"))
+            return
+
+        # Resolution step 3: Maintenance stops downtime, then operator can proceed
         if s.waiting_maintenance_qr:
             auth = self._authorized_person_from_scan(raw_s)
             if auth and str(auth.get("can_maintenance", "0")) == "1":
@@ -7893,35 +8584,13 @@ QWidget#ClientUIRoot {{
                 if s.downtime_started_at:
                     s.maintenance_downtime_seconds = max(0, int(time.time() - s.downtime_started_at))
                     s.downtime_last_seconds = s.maintenance_downtime_seconds
-                s.supervisor_downtime_confirmation_started_at = time.time()
+                s.downtime_started_at = None
                 s.waiting_maintenance_qr = False
-                s.waiting_supervisor_qr = True
-                self.resolveOldCycleTitle.setText("MAINTENANCE")
-                self.resolveNewCycleTitle.setText("NEXT STEP")
-                self.resolveHint.setText("Scan Supervisor QR to continue downtime confirmation.")
-                self._refresh_downtime_panel()
+                s.operator_downtime_confirmation_started_at = time.time()
+                s.waiting_operator_downtime_confirm = True
+                self._refresh_ui()
                 return
             self.status.setText("Scan valid Maintenance QR.")
-            return
-
-        # Resolution step 3: Supervisor
-        if s.waiting_supervisor_qr:
-            auth = self._authorized_person_from_scan(raw_s)
-            if auth and str(auth.get("can_supervisor", "0")) == "1":
-                s.supervisor_name = str(auth.get("name") or raw_s)
-                if s.supervisor_downtime_confirmation_started_at:
-                    s.supervisor_downtime_confirmation_seconds = max(
-                        0, int(time.time() - s.supervisor_downtime_confirmation_started_at)
-                    )
-                s.operator_downtime_confirmation_started_at = time.time()
-                s.waiting_supervisor_qr = False
-                s.waiting_operator_downtime_confirm = True
-                self.resolveOldCycleTitle.setText("SUPERVISOR")
-                self.resolveNewCycleTitle.setText("NEXT STEP")
-                self.resolveHint.setText("Scan Operator QR to confirm.")
-                self._refresh_downtime_panel()
-                return
-            self.status.setText("Scan valid Supervisor QR.")
             return
 
         # Resolution step 4: Operator confirmation
@@ -8158,7 +8827,7 @@ QWidget#ClientUIRoot {{
                 return
             s.waiting_downtime_end_maintenance = False
             self._begin_downtime_resolution()
-            self.status.setText("Downtime done. Enter cycle time, then scan Maintenance, Supervisor, and Operator QR.")
+            self.status.setText("Downtime done. Scan Maintenance QR, then input cycle time, confirm, Supervisor QR, and Operator QR.")
             return
 
         if s.waiting_reject_reason:

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import math
 import os
 import re
 from contextlib import asynccontextmanager
@@ -55,6 +56,7 @@ STATE_TICK_SECONDS = 0.25
 PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"  # legacy fallback
 PRODUCT_API_CONFIG_FILE = Path(__file__).resolve().parent / "Database" / "product_api_config.json"
 PRODUCT_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "product_catalog_cache.json"
+ACTIVE_MACHINE_SESSIONS_FILE = Path(__file__).resolve().parent / "Database" / "active_machine_sessions.json"
 PROFILE_REPRINT_ADMIN_PASSWORD = "0t1docmtl$tm"
 QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.1.149:5000").strip().rstrip("/")
 RAW_QR_O_SEGMENT = "O000000000240000010237800000000000"
@@ -807,6 +809,7 @@ class MachineSession:
     machine_name: str
     job_code: Optional[str] = None
     job_name: Optional[str] = None
+    job_started_at: Optional[str] = None
     operator_id: Optional[str] = None
     pack_total: int = 0
     good_total: int = 0
@@ -823,6 +826,7 @@ class MachineSession:
     downtime_last_seconds: Optional[int] = None
     downtime_active: bool = False
     cycle_time_current: Optional[str] = None
+    live_cycle_avg_seconds: Optional[float] = None
     job_payload: Dict[str, Any] = None
     linkage_enabled: bool = False
     linkage_jobs: List[Dict[str, Any]] = None
@@ -841,7 +845,67 @@ class MachineSession:
         return d
 
 
-SESSIONS: Dict[str, MachineSession] = {}  # key = machine_code
+def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSession]:
+    if not isinstance(raw, dict):
+        return None
+    machine_code = str(raw.get("machine_code") or "").strip()
+    if not machine_code:
+        return None
+    last_seen_utc = str(raw.get("last_seen_utc") or raw.get("saved_at_utc") or "").strip()
+    return MachineSession(
+        client_id=str(raw.get("client_id") or "SNAPSHOT").strip() or "SNAPSHOT",
+        machine_code=machine_code,
+        machine_name=_machine_display_name(machine_code, raw.get("machine_name", machine_code)),
+        job_code=str(raw.get("job_code") or "").strip() or None,
+        job_name=str(raw.get("job_name") or "").strip() or None,
+        job_started_at=str(raw.get("job_started_at") or "").strip() or None,
+        operator_id=str(raw.get("operator_id") or "").strip() or None,
+        pack_total=int(raw.get("pack_count", 0) or 0),
+        good_total=int(raw.get("good_total", 0) or 0),
+        butal_total=int(raw.get("butal_total", 0) or 0),
+        reject_total=int(raw.get("reject_total", 0) or 0),
+        reject_breakdown=dict(raw.get("reject_breakdown") or {}),
+        raw_sacks_count=int(raw.get("raw_sacks_count", 0) or 0),
+        raw_material_scans=list(raw.get("raw_material_scans") or []),
+        raw_material_logs=list(raw.get("raw_material_logs") or []),
+        startup_reject_total=int(raw.get("startup_reject_total", 0) or 0),
+        downtime_reason_code=raw.get("downtime_reason_code"),
+        downtime_reason_text=raw.get("downtime_reason_text"),
+        downtime_started_at=raw.get("downtime_started_at"),
+        downtime_last_seconds=raw.get("downtime_last_seconds"),
+        downtime_active=bool(raw.get("downtime_active", False)),
+        cycle_time_current=raw.get("cycle_time_current"),
+        live_cycle_avg_seconds=raw.get("live_cycle_avg_seconds"),
+        job_payload=dict(raw.get("job_payload") or {}),
+        linkage_enabled=bool(raw.get("linkage_enabled", False)),
+        linkage_jobs=list(raw.get("linkage_jobs") or []),
+        operator_shift_logs=list(raw.get("operator_shift_logs") or []),
+        last_event=str(raw.get("last_event") or "Recovered from active session snapshot").strip(),
+        last_seen_utc=last_seen_utc,
+    )
+
+
+def load_active_sessions_seed() -> Dict[str, MachineSession]:
+    try:
+        if not ACTIVE_MACHINE_SESSIONS_FILE.exists():
+            return {}
+        raw = json.loads(ACTIVE_MACHINE_SESSIONS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, MachineSession] = {}
+    for machine_code, row in raw.items():
+        item = dict(row or {}) if isinstance(row, dict) else {}
+        if "machine_code" not in item:
+            item["machine_code"] = machine_code
+        sess = _session_from_active_snapshot(item)
+        if sess is not None:
+            out[sess.machine_code] = sess
+    return out
+
+
+SESSIONS: Dict[str, MachineSession] = load_active_sessions_seed()  # key = machine_code
 WS_CLIENTS: List[WebSocket] = []
 STATE_TICK_TASK: Optional[asyncio.Task] = None
 MACHINE_STATUS_OVERRIDES: Dict[str, Dict[str, Any]] = {}
@@ -929,6 +993,192 @@ def _parse_iso_utc(iso: Any) -> Optional[datetime]:
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def _parse_number(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+    raw = str(value).strip()
+    if not raw:
+        return 0.0
+    m = re.search(r"-?\d+(?:\.\d+)?", raw)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(0))
+    except Exception:
+        return 0.0
+
+
+def _parse_cycle_seconds(value: Any) -> Optional[float]:
+    seconds = _parse_number(value)
+    return seconds if seconds > 0 else None
+
+
+def _extract_job_record_from_payload(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    if isinstance(data_obj.get("job"), dict):
+        return data_obj["job"]
+    if isinstance(payload.get("job"), dict):
+        return payload["job"]
+    return payload
+
+
+def _extract_job_details_from_payload(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    if isinstance(data_obj.get("job_details"), dict):
+        return data_obj["job_details"]
+    if isinstance(payload.get("job_details"), dict):
+        return payload["job_details"]
+    return {}
+
+
+def _extract_job_partials_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    partials = data_obj.get("partials") if isinstance(data_obj.get("partials"), list) else []
+    return [row for row in partials if isinstance(row, dict)]
+
+
+def _qty_per_shift_from_cycle(cycle_seconds: Optional[float], cavities: Any = 1) -> Optional[int]:
+    if cycle_seconds is None or cycle_seconds <= 0:
+        return None
+    try:
+        cavity_count = int(float(cavities or 1))
+    except Exception:
+        cavity_count = 1
+    cavity_count = max(1, cavity_count)
+    try:
+        return int(((12 * 60 * 60) / cycle_seconds) * cavity_count)
+    except Exception:
+        return None
+
+
+def _build_job_queue_rows() -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    now_utc = utc_now()
+    for sess in SESSIONS.values():
+        if not isinstance(sess, MachineSession):
+            continue
+        if not str(sess.machine_code or "").strip():
+            continue
+        if not str(sess.job_code or "").strip():
+            continue
+
+        payload = sess.job_payload if isinstance(sess.job_payload, dict) else {}
+        job = _extract_job_record_from_payload(payload)
+        job_details = _extract_job_details_from_payload(payload)
+        partials = _extract_job_partials_from_payload(payload)
+
+        target_qty_raw = job.get("approve_qty")
+        if _parse_number(target_qty_raw) <= 0:
+            target_qty_raw = job.get("request_qty")
+        target_qty = max(0, int(round(_parse_number(target_qty_raw))))
+
+        api_partial_total = 0
+        for part in partials:
+            api_partial_total += int(round(_parse_number(part.get("partial_qty"))))
+
+        live_good_total = max(0, int(sess.good_total or 0) + int(sess.butal_total or 0))
+        produced_now = max(0, api_partial_total + live_good_total)
+        remaining_qty = max(target_qty - produced_now, 0)
+        overrun_qty = max(produced_now - target_qty, 0)
+        last_seen_dt = _parse_iso_utc(sess.last_seen_utc)
+        is_connected = False
+        if last_seen_dt is not None:
+            try:
+                is_connected = (now_utc - last_seen_dt).total_seconds() <= float(ACTIVE_TTL_SECONDS or 0)
+            except Exception:
+                is_connected = False
+        eta_anchor_utc = now_utc if is_connected else (last_seen_dt or now_utc)
+
+        cavities_raw = (
+            job_details.get("no_of_cavity")
+            or job.get("custom_11")
+            or job.get("no_of_cavity")
+            or 1
+        )
+        try:
+            cavity_count = max(1, int(round(_parse_number(cavities_raw) or 1)))
+        except Exception:
+            cavity_count = 1
+
+        act_cycle_seconds = _parse_cycle_seconds(sess.cycle_time_current)
+        live_cycle_seconds = _parse_cycle_seconds(sess.live_cycle_avg_seconds)
+        act_qty_per_shift = _qty_per_shift_from_cycle(act_cycle_seconds, cavity_count)
+        live_qty_per_shift = _qty_per_shift_from_cycle(live_cycle_seconds, 1)
+
+        act_remaining_seconds: Optional[int] = None
+        live_remaining_seconds: Optional[int] = None
+        expected_finish_act_utc = ""
+        expected_finish_pack_utc = ""
+        if remaining_qty > 0 and act_cycle_seconds is not None:
+            act_remaining_seconds = max(0, int(math.ceil((remaining_qty / max(1, cavity_count)) * act_cycle_seconds)))
+            expected_finish_act_utc = (eta_anchor_utc + timedelta(seconds=act_remaining_seconds)).isoformat()
+        if remaining_qty > 0 and live_cycle_seconds is not None:
+            live_remaining_seconds = max(0, int(math.ceil(remaining_qty * live_cycle_seconds)))
+            expected_finish_pack_utc = (eta_anchor_utc + timedelta(seconds=live_remaining_seconds)).isoformat()
+
+        status = "RUNNING"
+        if not is_connected:
+            status = "DISCONNECTED"
+        elif target_qty <= 0:
+            status = "NO TARGET"
+        elif remaining_qty <= 0:
+            status = "DONE"
+        elif act_cycle_seconds is None and live_cycle_seconds is None:
+            status = "NO CYCLE"
+
+        rows.append(
+            {
+                "machine_code": str(sess.machine_code or "").strip(),
+                "machine_name": str(sess.machine_name or sess.machine_code or "").strip(),
+                "job_code": str(sess.job_code or "").strip(),
+                "job_name": str(sess.job_name or "").strip(),
+                "operator_id": str(sess.operator_id or "").strip(),
+                "job_started_at": str(sess.job_started_at or "").strip(),
+                "last_seen_utc": str(sess.last_seen_utc or "").strip(),
+                "is_connected": is_connected,
+                "status": status,
+                "target_qty": target_qty,
+                "api_partial_total": api_partial_total,
+                "live_good_total": live_good_total,
+                "produced_now": produced_now,
+                "remaining_qty": remaining_qty,
+                "overrun_qty": overrun_qty,
+                "pack_count": int(sess.pack_total or 0),
+                "good_total": int(sess.good_total or 0),
+                "butal_total": int(sess.butal_total or 0),
+                "cavity_count": cavity_count,
+                "act_cycle_seconds": act_cycle_seconds,
+                "live_cycle_seconds": live_cycle_seconds,
+                "act_qty_per_shift": act_qty_per_shift,
+                "live_qty_per_shift": live_qty_per_shift,
+                "remaining_seconds_act": act_remaining_seconds,
+                "remaining_seconds_pack": live_remaining_seconds,
+                "expected_finish_act_utc": expected_finish_act_utc,
+                "expected_finish_pack_utc": expected_finish_pack_utc,
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            1 if str(row.get("status") or "") == "DONE" else 0,
+            str(row.get("machine_name") or ""),
+            str(row.get("job_name") or row.get("job_code") or ""),
+        )
+    )
+    return rows
 
 
 def _close_machine_status_archive_entries(
@@ -1994,6 +2244,7 @@ async def broadcast_state():
         "type": "STATE",
         "active_ttl_seconds": ACTIVE_TTL_SECONDS,
         "sessions": [s.to_dict() for s in SESSIONS.values()],
+        "job_queue": _build_job_queue_rows(),
         "machine_status_overrides": MACHINE_STATUS_OVERRIDES,
         "machine_status_archive": MACHINE_STATUS_ARCHIVE,
         "finished_jobs": FINISHED_JOBS,
@@ -2096,6 +2347,15 @@ DASHBOARD_HTML = """
     .finished-grid div { font-size: 0.82rem; background: rgba(255,255,255,0.92); border: 1px solid #e6edf8; border-radius: 8px; padding: 7px 9px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
     .raw-list { margin-top: 10px; font-size: 0.81rem; background: #fff; border: 1px solid #e6edf8; border-radius: 8px; padding: 8px; max-height: 130px; overflow: auto; white-space: pre-wrap; }
     .finished-actions { margin-top: 10px; display: flex; justify-content: flex-end; }
+    .job-queue-summary { margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+    .job-queue-metric { border: 1px solid #dbe4f0; border-radius: 12px; padding: 12px; background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%); }
+    .job-queue-metric .k { font-size: 0.76rem; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: #64748b; }
+    .job-queue-metric .v { margin-top: 6px; font-size: 1.2rem; font-weight: 800; color: #0f172a; }
+    .queue-status-badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 9px; font-size: 0.74rem; font-weight: 800; letter-spacing: .02em; white-space: nowrap; }
+    .queue-status-badge.running { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
+    .queue-status-badge.done { background: #dbeafe; color: #1d4ed8; border: 1px solid #93c5fd; }
+    .queue-status-badge.disconnected { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
+    .queue-status-badge.no-target, .queue-status-badge.no-cycle { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
     .approve-print-btn {
       border: none;
       border-radius: 10px;
@@ -2496,13 +2756,10 @@ DASHBOARD_HTML = """
 
   <div id="jobQueueTab" class="main-tab-content">
     <div class="panel">
-      <h3>Job Queue Map</h3>
-      <div class="muted">UI shell ready. Queue data wiring can be added next.</div>
-      <div class="placeholder">Queue map placeholder</div>
-    </div>
-    <div class="panel">
-      <h3>Auto-Assign Job</h3>
-      <div class="placeholder">Form placeholder</div>
+      <h3>Job Queue</h3>
+      <div class="muted">Live queue from active sessions. ETA shows one estimate from act cycle time and one from live pack cycle time.</div>
+      <div id="jobQueueSummary" class="job-queue-summary"></div>
+      <div id="jobQueueTableWrap" class="table-wrap"></div>
     </div>
   </div>
 
@@ -2921,6 +3178,8 @@ DASHBOARD_HTML = """
   const lastMessageEl = document.getElementById("last-message");
   const machineCountEl = document.getElementById("machine-count");
   const machineGrid = document.getElementById("machineGrid");
+  const jobQueueSummary = document.getElementById("jobQueueSummary");
+  const jobQueueTableWrap = document.getElementById("jobQueueTableWrap");
   const finishedJobsList = document.getElementById("finishedJobsList");
   const archivedJobsTableWrap = document.getElementById("archivedJobsTableWrap");
   const machineStatusArchiveTableWrap = document.getElementById("machineStatusArchiveTableWrap");
@@ -4015,6 +4274,93 @@ DASHBOARD_HTML = """
     `;
   }
 
+  function queueStatusBadge(status){
+    const raw = String(status || "").trim();
+    const css = raw.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "running";
+    return `<span class="queue-status-badge ${esc(css)}">${esc(raw || "RUNNING")}</span>`;
+  }
+
+  function renderJobQueue(rows){
+    if(!jobQueueTableWrap) return;
+    const list = Array.isArray(rows) ? rows : [];
+    const runningRows = list.filter(r => {
+      const status = String(r?.status || "").trim();
+      return status !== "DONE" && status !== "DISCONNECTED";
+    });
+    const disconnectedRows = list.filter(r => String(r?.status || "").trim() === "DISCONNECTED");
+    const remainingTotal = runningRows.reduce((sum, r) => sum + Number(r?.remaining_qty || 0), 0);
+
+    if(jobQueueSummary){
+      jobQueueSummary.innerHTML = `
+        <div class="job-queue-metric"><div class="k">Active Jobs</div><div class="v">${esc(list.length)}</div></div>
+        <div class="job-queue-metric"><div class="k">Running Jobs</div><div class="v">${esc(runningRows.length)}</div></div>
+        <div class="job-queue-metric"><div class="k">Disconnected</div><div class="v">${esc(disconnectedRows.length)}</div></div>
+        <div class="job-queue-metric"><div class="k">Remaining Qty</div><div class="v">${esc(remainingTotal)}</div></div>
+      `;
+    }
+
+    if(!list.length){
+      jobQueueTableWrap.innerHTML = '<div class="placeholder">No active jobs in queue yet.</div>';
+      return;
+    }
+
+    jobQueueTableWrap.innerHTML = `
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Machine</th>
+            <th>Job</th>
+            <th>Operator</th>
+            <th>Started</th>
+            <th>Status</th>
+            <th>Produced</th>
+            <th>Target</th>
+            <th>Remaining</th>
+            <th>Time Remaining</th>
+            <th>Ends</th>
+            <th>Act Cycle ETA</th>
+            <th>Pack Cycle ETA</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${list.map((row) => {
+            const actCycleText = row?.act_cycle_seconds ? `${Number(row.act_cycle_seconds).toFixed(2)} sec | ${row?.act_qty_per_shift ?? "-"} / shift` : "-";
+            const packCycleText = row?.live_cycle_seconds ? `${Number(row.live_cycle_seconds).toFixed(2)} sec | ${row?.live_qty_per_shift ?? "-"} / shift` : "-";
+            const noTarget = Number(row?.target_qty || 0) <= 0;
+            const isDisconnected = !Boolean(row?.is_connected);
+            const startText = row?.job_started_at ? fmtDateLocal(row.job_started_at) : "-";
+            const actEtaDate = row?.expected_finish_act_utc ? fmtDateLocal(row.expected_finish_act_utc) : "";
+            const actEtaLeft = row?.expected_finish_act_utc ? `${fmtDowntimeSeconds(row?.remaining_seconds_act)} left${isDisconnected ? " (frozen)" : ""}` : (noTarget ? "No target qty" : (actCycleText === "-" ? "No act cycle time" : "Target reached"));
+            const packEtaDate = row?.expected_finish_pack_utc ? fmtDateLocal(row.expected_finish_pack_utc) : "";
+            const packEtaLeft = row?.expected_finish_pack_utc ? `${fmtDowntimeSeconds(row?.remaining_seconds_pack)} left${isDisconnected ? " (frozen)" : ""}` : (noTarget ? "No target qty" : (packCycleText === "-" ? "No pack cycle time" : "Target reached"));
+            const preferredRemaining = row?.remaining_seconds_pack ?? row?.remaining_seconds_act ?? null;
+            const preferredEnd = row?.expected_finish_pack_utc || row?.expected_finish_act_utc || "";
+            const remainingText = preferredRemaining != null
+              ? `${fmtDowntimeSeconds(preferredRemaining)}${isDisconnected ? " (frozen)" : ""}`
+              : (noTarget ? "No target qty" : "Target reached");
+            const endText = preferredEnd ? fmtDateLocal(preferredEnd) : (noTarget ? "No target qty" : "Target reached");
+            return `
+              <tr>
+                <td>${esc(row?.machine_name || row?.machine_code || "-")}<br><span class="muted">${esc(row?.machine_code || "-")}</span></td>
+                <td>${esc(row?.job_name || row?.job_code || "-")}<br><span class="muted">${esc(row?.job_code || "-")}</span></td>
+                <td>${esc(displayNameForId(row?.operator_id || "-"))}${row?.last_seen_utc ? `<br><span class="muted">Last seen ${esc(fmtDateLocal(row.last_seen_utc))}</span>` : ""}</td>
+                <td>${esc(startText)}</td>
+                <td>${queueStatusBadge(row?.status || "RUNNING")}</td>
+                <td>${esc(row?.produced_now ?? 0)}<br><span class="muted">Pack ${esc(row?.pack_count ?? 0)}</span></td>
+                <td>${esc(row?.target_qty ?? 0)}<br><span class="muted">Cavity ${esc(row?.cavity_count ?? 1)}</span></td>
+                <td>${esc(row?.remaining_qty ?? 0)}${Number(row?.overrun_qty || 0) > 0 ? `<br><span class="muted">Over ${esc(row?.overrun_qty || 0)}</span>` : ""}</td>
+                <td>${esc(remainingText)}</td>
+                <td>${esc(endText)}</td>
+                <td>${actEtaDate ? `${esc(actEtaDate)}<br>` : ""}<span class="muted">${esc(actEtaLeft)}</span><br><span class="muted">${esc(actCycleText)}</span></td>
+                <td>${packEtaDate ? `${esc(packEtaDate)}<br>` : ""}<span class="muted">${esc(packEtaLeft)}</span><br><span class="muted">${esc(packCycleText)}</span></td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
+    `;
+  }
+
   function setFinishedJobsInteractionLock(locked){
     finishedJobsInteractionLock = Boolean(locked);
     if(!finishedJobsInteractionLock && pendingFinishedJobsRows){
@@ -4210,6 +4556,7 @@ DASHBOARD_HTML = """
       if(card && card.parentNode) card.parentNode.removeChild(card);
       machineCardEls.delete(code);
     }
+    renderJobQueue(state.job_queue || []);
     renderFinishedJobs(state.finished_jobs || []);
     renderArchivedJobs(state.archived_jobs || []);
     renderMachineStatusArchive(machineStatusArchiveState);
@@ -5352,6 +5699,7 @@ async def api_event(req: Request):
             sess.machine_name = _machine_display_name(machine_code, snap.get("machine_name") or sess.machine_name or machine_code)
             sess.job_code = snap.get("job_code", sess.job_code)
             sess.job_name = snap.get("job_name", sess.job_name)
+            sess.job_started_at = snap.get("job_started_at", sess.job_started_at)
             sess.operator_id = snap.get("operator_id", sess.operator_id)
             sess.pack_total = int(snap.get("pack_count", sess.pack_total) or 0)
             sess.good_total = int(snap.get("good_total", sess.good_total) or 0)
@@ -5371,6 +5719,11 @@ async def api_event(req: Request):
             sess.downtime_last_seconds = snap.get("downtime_last_seconds", sess.downtime_last_seconds)
             sess.downtime_active = bool(snap.get("downtime_active", sess.downtime_active))
             sess.cycle_time_current = snap.get("cycle_time_current", sess.cycle_time_current)
+            live_avg = snap.get("live_cycle_avg_seconds", sess.live_cycle_avg_seconds)
+            try:
+                sess.live_cycle_avg_seconds = float(live_avg) if live_avg is not None else sess.live_cycle_avg_seconds
+            except Exception:
+                pass
             if isinstance(snap.get("job_payload"), dict):
                 sess.job_payload = dict(snap.get("job_payload") or {})
             sess.linkage_enabled = bool(snap.get("linkage_enabled", sess.linkage_enabled))
