@@ -12,9 +12,12 @@ QLabel {
 
 /* ===== Generic cards/panels ===== */
 QFrame#Panel {
-    background: #ffffff;
-    border: 1px solid #dbe4f0;
-    border-radius: 20px;
+    background: qradialgradient(cx:0.5, cy:0.34, radius:1.2, fx:0.5, fy:0.16,
+                                stop:0 rgba(120,124,134,232),
+                                stop:0.38 rgba(72,76,84,238),
+                                stop:1 rgba(24,26,31,248));
+    border: 1px solid #5b6069;
+    border-radius: 24px;
 }
 
 QFrame#RightPanel {
@@ -25,8 +28,10 @@ QFrame#RightPanel {
 
 /* Optional: use this objectName for inner sub-panels */
 QFrame#SubPanel {
-    background: #ffffff;
-    border: 1px solid #e3eaf5;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(100,104,112,220),
+                                stop:1 rgba(54,57,63,230));
+    border: 1px solid #737882;
     border-radius: 16px;
 }
 
@@ -36,9 +41,12 @@ QFrame#RightCardOuter {
     border-radius: 20px;
 }
 QFrame#RightCardInner {
-    background: #ffffff;
-    border: 1px solid #cfd6e1;
-    border-radius: 16px;
+    background: qradialgradient(cx:0.5, cy:0.34, radius:1.15, fx:0.5, fy:0.16,
+                                stop:0 rgba(120,124,134,232),
+                                stop:0.38 rgba(72,76,84,238),
+                                stop:1 rgba(24,26,31,248));
+    border: 1px solid #5d626c;
+    border-radius: 22px;
 }
 QFrame#LeftCardOuter {
     background: transparent;
@@ -46,45 +54,81 @@ QFrame#LeftCardOuter {
     border-radius: 20px;
 }
 QFrame#LeftCardInner {
-    background: #ffffff;
-    border: 1px solid #cfd6e1;
-    border-radius: 16px;
+    background: qradialgradient(cx:0.5, cy:0.34, radius:1.15, fx:0.5, fy:0.16,
+                                stop:0 rgba(120,124,134,232),
+                                stop:0.38 rgba(72,76,84,238),
+                                stop:1 rgba(24,26,31,248));
+    border: 1px solid #5d626c;
+    border-radius: 22px;
 }
 
 /* ===== Titles ===== */
 QLabel#PageTitle {
     font-size: 24px;
     font-weight: 800;
-    color: #0f172a;
+    color: #f8fafc;
     letter-spacing: 0.4px;
     padding-top: 2px;
+    background: transparent;
+}
+QFrame#HeaderCard {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(97,102,111,228),
+                                stop:0.5 rgba(68,72,79,232),
+                                stop:1 rgba(43,46,52,236));
+    border: 1px solid rgba(148, 163, 184, 0.42);
+    border-radius: 0px;
+}
+QLabel#HeaderMetaValue {
+    color: #f8fafc;
+    font-size: 15px;
+    font-weight: 800;
+    background: transparent;
+    border: none;
+    border-radius: 0px;
+    padding: 0px 2px;
+}
+QPushButton#HeaderSettingsButton {
+    background: transparent;
+    color: #f8fafc;
+    border: none;
+    border-radius: 12px;
+    font-size: 22px;
+    font-weight: 800;
+    padding: 0px;
+}
+QPushButton#HeaderSettingsButton:hover {
+    background: rgba(255,255,255,0.10);
+    border: none;
 }
 QLabel#SectionTitle,
 QLabel#RightTitle {
     font-size: 17px;
     font-weight: 750;
-    color: #0f172a;
+    color: #edf0f4;
 }
 QLabel#RightHint {
-    color: #6b7280;
+    color: #c5cad2;
     font-size: 12px;
 }
 QLabel#RightMonitorValue,
 QLabel#RightMonitorValueAccent {
-    color: #1e293b;
+    color: #edf0f4;
     font-size: 15px;
     font-weight: 800;
-    background: #ffffff;
-    border: 1px solid #dbe4f0;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(98,102,110,220),
+                                stop:1 rgba(50,53,60,228));
+    border: 1px solid #767b84;
     border-radius: 14px;
     padding: 8px 16px;
 }
 QLabel#RightMonitorValueAccent {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                stop:0 #a7c4ff,
-                                stop:0.42 #d7e4ff,
-                                stop:1 #ffffff);
-    border: 1px solid #cfd5df;
+                                stop:0 rgba(128,132,141,228),
+                                stop:0.42 rgba(108,112,121,228),
+                                stop:1 rgba(60,63,70,236));
+    border: 1px solid #858992;
 }
 QLabel#ProductionLiveReason {
     color: #0f172a;
@@ -170,12 +214,14 @@ QLabel#StatusBar {
 
 /* Machine state badge */
 QLabel#MachineAnim {
-    color: #14532d;
+    color: #fff7ed;
     font-size: 14px;
     font-weight: 800;
-    background: #dcfce7;
-    border: 1px solid #86efac;
-    border-radius: 14px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(251,146,60,245),
+                                stop:1 rgba(234,88,12,248));
+    border: 1px solid #fb923c;
+    border-radius: 16px;
     padding: 8px 12px;
 }
 QLabel#MachineAnim[mode="active"][pulse="1"] {
@@ -189,30 +235,36 @@ QLabel#MachineAnim[mode="active"][pulse="0"] {
     color: #14532d;
 }
 QLabel#MachineAnim[mode="idle"][pulse="1"] {
-    background: #ff9f1a;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(251,146,60,245),
+                                stop:1 rgba(234,88,12,248));
     border: 1px solid #f97316;
-    color: #7c2d12;
+    color: #fff7ed;
 }
 QLabel#MachineAnim[mode="idle"][pulse="0"] {
-    background: #ffd08a;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(251,146,60,245),
+                                stop:1 rgba(234,88,12,248));
     border: 1px solid #fb923c;
-    color: #9a3412;
+    color: #fff7ed;
 }
 
 /* ===== Meta fields (Machine/Job/Operator) ===== */
 QLabel#MetaLabel {
-    color: #64748b;
+    color: #c7ccd4;
     font-size: 12px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.6px;
 }
 QLabel#MetaValue {
-    color: #0f172a;
+    color: #edf0f4;
     font-size: 15px;
     font-weight: 700;
-    background: #ffffff;
-    border: 1px solid #dbe4f0;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(101,105,113,220),
+                                stop:1 rgba(53,56,62,228));
+    border: 1px solid #777c86;
     border-radius: 14px;
     padding: 10px 12px;
 }
@@ -282,6 +334,7 @@ QFrame#StatPack {
     border-left: 2px solid #4ade80;
     border-right: 2px solid #14532d;
     border-bottom: 2px solid #14532d;
+    border-radius: 18px;
 }
 QFrame#StatButal {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,

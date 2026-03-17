@@ -76,6 +76,7 @@ USER_QR_PROFILES_FILE = os.path.join(DATABASE_DIR, "user_qr_profiles.json")
 PRODUCT_CATALOG_CACHE_FILE = os.path.join(DATABASE_DIR, "product_catalog_cache.json")
 FINISHED_JOBS_FILE = os.path.join(DATABASE_DIR, "finished_jobs.json")
 SQL_CONFIG_FILE = os.path.join(DATABASE_DIR, "sql_config.json")
+MACHINE_BACKGROUND_IMAGE = os.path.join(IMAGES_DIR, "bgsteel.jpg")
 
 
 def _load_sql_config() -> Dict[str, Any]:
@@ -1515,7 +1516,7 @@ class CircleProgressBadge(QWidget):
                 p.setPen(QPen(QColor(20, g, 60), core_w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
             else:
-                p.setPen(QPen(QColor(50, 62, 80, 150), 1.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                p.setPen(QPen(QColor(238, 241, 245, 95), 1.9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
         number_font = QFont("DS-Digital", max(12, int(min(w, h) * 0.10)), QFont.Weight.Bold)
@@ -1528,7 +1529,7 @@ class CircleProgressBadge(QWidget):
             val_text = f"{int(round(value_pct))}%"
         else:
             val_text = f"{value_pct:.1f}%" if (0.0 < value_pct < 1.0) else f"{int(round(value_pct))}%"
-        p.setPen(QColor("#5f6978"))
+        p.setPen(QColor("#f3f4f6"))
         p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, val_text)
         p.end()
 
@@ -1930,7 +1931,6 @@ class HistoryAnimatedColumn(QFrame):
         opacity_seq = QSequentialAnimationGroup(self)
         a1 = QPropertyAnimation(self.latestCard.graphicsEffect(), b"opacity")
         a1.setDuration(120)
-        a1.setStartValue(1.0)
         a1.setEndValue(0.9)
         a2 = QPropertyAnimation(self.latestCard.graphicsEffect(), b"opacity")
         a2.setDuration(210)
@@ -2010,6 +2010,7 @@ class ClientUI(QWidget):
         self._product_catalog_sku_by_id: Optional[Dict[str, str]] = None
         self._product_catalog_last_refresh_attempt = 0.0
         self._action_logs: List[str] = []
+        self._background_pixmap = QPixmap(MACHINE_BACKGROUND_IMAGE)
 
         self.setWindowTitle("Machine Client Dashboard")
         self.setMinimumSize(0, 0)
@@ -2018,7 +2019,7 @@ class ClientUI(QWidget):
             APP_STYLESHEET
             + f"""
 QWidget#ClientUIRoot {{
-    background: #ffffff;
+    background: transparent;
 }}
 """
         )
@@ -2027,11 +2028,12 @@ QWidget#ClientUIRoot {{
         self.enable_pulse_effects = True
 
         root = QVBoxLayout()
-        root.setContentsMargins(10, 10, 10, 8)
-        root.setSpacing(6)
+        root.setContentsMargins(0, 0, 0, 8)
+        root.setSpacing(0)
 
         leftWrap = QWidget()
         self.leftWrap = leftWrap
+        self.leftWrap.setStyleSheet("background: transparent;")
         left = QVBoxLayout()
         left.setContentsMargins(0, 0, 0, 0)
         left.setSpacing(6)
@@ -2043,32 +2045,36 @@ QWidget#ClientUIRoot {{
         self.pageTitle.setMinimumHeight(40)
         self.pageTitle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.headerJobStart = QLabel("")
-        self.headerJobStart.setObjectName("MetaValue")
+        self.headerJobStart.setObjectName("HeaderMetaValue")
         self.headerJobStart.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.headerJobStart.setMinimumWidth(0)
         self.headerJobStart.hide()
         self.headerJobDuration = QLabel("")
-        self.headerJobDuration.setObjectName("MetaValue")
+        self.headerJobDuration.setObjectName("HeaderMetaValue")
         self.headerJobDuration.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.headerJobDuration.setMinimumWidth(0)
         self.headerJobDuration.hide()
         self.headerDateTime = QLabel("")
-        self.headerDateTime.setObjectName("MetaValue")
+        self.headerDateTime.setObjectName("HeaderMetaValue")
         self.headerDateTime.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.btnSettings = QPushButton("\u2699")
-        self.btnSettings.setObjectName("SettingsButton")
+        self.btnSettings.setObjectName("HeaderSettingsButton")
         self.btnSettings.setFixedSize(40, 40)
         self.btnSettings.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btnSettings.clicked.connect(self._show_settings_overlay)
 
         headerRow = QHBoxLayout()
-        headerRow.setContentsMargins(0, 0, 0, 0)
-        headerRow.setSpacing(4)
+        headerRow.setContentsMargins(14, 8, 14, 8)
+        headerRow.setSpacing(8)
         headerRow.addWidget(self.btnSettings, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.pageTitle, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.headerJobStart, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.headerJobDuration, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.headerDateTime, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.headerCard = QFrame()
+        self.headerCard.setObjectName("HeaderCard")
+        self.headerCard.setLayout(headerRow)
 
         self.headerDivider = QFrame()
         self.headerDivider.setFrameShape(QFrame.Shape.HLine)
@@ -2083,6 +2089,11 @@ QWidget#ClientUIRoot {{
         self.banner.setMinimumHeight(68)
         self.banner.setMaximumHeight(92)
         self.banner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.banner.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2f6aea, stop:1 #2454c6);"
+            "color: #ffffff; border: 1px solid #1d4ed8; border-radius: 16px;"
+            "padding: 10px 14px; font-size: 20px; font-weight: 800; letter-spacing: 0.2px;"
+        )
         self.status = QLabel("Waiting...")
         self.status.setObjectName("StatusBar")
         self.status.setWordWrap(True)
@@ -2093,6 +2104,7 @@ QWidget#ClientUIRoot {{
         self.machineAnim.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.machineAnim.setProperty("mode", "idle")
         self.machineAnim.setProperty("pulse", "0")
+        self._apply_machine_anim_style("idle")
         self.scanSectionDivider = QFrame()
         self.scanSectionDivider.setFrameShape(QFrame.Shape.HLine)
         self.scanSectionDivider.setFrameShadow(QFrame.Shadow.Plain)
@@ -2137,6 +2149,41 @@ QWidget#ClientUIRoot {{
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             card.setMinimumHeight(60)
             statRow.addWidget(card, 1)
+        self.cardStatPack.setStyleSheet(
+            "QFrame#StatPack { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1f7a3d, stop:0.48 #166534, stop:1 #14532d);"
+            " border: 1px solid #22c55e; border-top: 2px solid #4ade80; border-left: 2px solid #4ade80;"
+            " border-right: 2px solid #14532d; border-bottom: 2px solid #14532d; border-radius: 18px; padding: 10px; }"
+            "QLabel#StatTitle { color: #e2e8f0; font-size: 16px; font-weight: 900; }"
+            "QLabel#StatValue { color: #86efac; font-size: 46px; font-weight: 900; }"
+        )
+        self.cardStatGood.setStyleSheet(
+            "QFrame#StatGood { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1f7a3d, stop:0.48 #166534, stop:1 #14532d);"
+            " border: 1px solid #22c55e; border-top: 2px solid #4ade80; border-left: 2px solid #4ade80;"
+            " border-right: 2px solid #14532d; border-bottom: 2px solid #14532d; border-radius: 18px; padding: 10px; }"
+            "QLabel#StatTitle { color: #e2e8f0; font-size: 16px; font-weight: 900; }"
+            "QLabel#StatValue { color: #86efac; font-size: 46px; font-weight: 900; }"
+        )
+        self.cardStatButal.setStyleSheet(
+            "QFrame#StatButal { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1f7a3d, stop:0.48 #166534, stop:1 #14532d);"
+            " border: 1px solid #22c55e; border-top: 2px solid #4ade80; border-left: 2px solid #4ade80;"
+            " border-right: 2px solid #14532d; border-bottom: 2px solid #14532d; border-radius: 18px; padding: 10px; }"
+            "QLabel#StatTitle { color: #e2e8f0; font-size: 16px; font-weight: 900; }"
+            "QLabel#StatValue { color: #86efac; font-size: 46px; font-weight: 900; }"
+        )
+        self.cardStatReject.setStyleSheet(
+            "QFrame#StatReject { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #b91c1c, stop:0.48 #991b1b, stop:1 #7f1d1d);"
+            " border: 1px solid #ef4444; border-top: 2px solid #f87171; border-left: 2px solid #f87171;"
+            " border-right: 2px solid #7f1d1d; border-bottom: 2px solid #7f1d1d; border-radius: 18px; padding: 10px; }"
+            "QLabel#StatTitle { color: #e2e8f0; font-size: 16px; font-weight: 900; }"
+            "QLabel#StatValue { color: #fecdd3; font-size: 46px; font-weight: 900; }"
+        )
+        self.cardStatTotalGood.setStyleSheet(
+            "QFrame#StatTotalGood { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2a8a49, stop:0.5 #1b6d3a, stop:1 #165c32);"
+            " border: 1px solid #4ade80; border-top: 2px solid #86efac; border-left: 2px solid #86efac;"
+            " border-right: 2px solid #165c32; border-bottom: 2px solid #165c32; border-radius: 18px; padding: 10px; }"
+            "QLabel#StatTitle { color: #e2e8f0; font-size: 16px; font-weight: 900; }"
+            "QLabel#StatValue { color: #bbf7d0; font-size: 46px; font-weight: 900; }"
+        )
         self.cardProduction.layout().addLayout(statRow)
         self.cardProductionOuter.setMinimumHeight(100)
         self.cardProductionOuter.setMaximumHeight(120)
@@ -2223,7 +2270,7 @@ QWidget#ClientUIRoot {{
             " border: none; border-right: 1px solid rgba(148,163,184,0.45);"
             " border-bottom: 1px solid rgba(148,163,184,0.5); padding: 6px; }"
             "QHeaderView::section:last { border-right: none; }"
-            "QTableWidget::item { padding: 2px; color: #0f172a; font-weight: 900;"
+            "QTableWidget::item { padding: 2px; color: #f3f4f6; font-weight: 900;"
             " border-right: 1px solid rgba(148,163,184,0.35); background: transparent; }"
             "QTableWidget::item:last { border-right: none; }"
         )
@@ -2242,21 +2289,24 @@ QWidget#ClientUIRoot {{
         # Product parts panel
         self.cardJobDetailsOuter, self.cardJobDetails = self._make_double_layer_card("PRODUCT PARTS")
         self.jobPartsTable = QTableWidget(0, 4)
+        self.jobPartsTable.setObjectName("ProductPartsTable")
         self.jobPartsTable.setHorizontalHeaderLabels(
             ["SKU", "Name", "Part Qty/Unit", "Request Part Qty"]
         )
-        self.jobPartsTable.setAlternatingRowColors(True)
+        self.jobPartsTable.setAlternatingRowColors(False)
         self.jobPartsTable.setWordWrap(True)
         self.jobPartsTable.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.jobPartsTable.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.jobPartsTable.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.jobPartsTable.verticalHeader().setVisible(False)
-        self.jobPartsTable.verticalHeader().setDefaultSectionSize(30)
+        self.jobPartsTable.verticalHeader().setDefaultSectionSize(42)
         self.jobPartsTable.horizontalHeader().setStretchLastSection(False)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.jobPartsTable.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.jobPartsTable.horizontalHeader().setFixedHeight(48)
         self.jobPartsTable.setColumnWidth(0, 260)
         # Size table to show up to 10 visible rows without clipping.
         parts_row_h = self.jobPartsTable.verticalHeader().defaultSectionSize()
@@ -2265,40 +2315,107 @@ QWidget#ClientUIRoot {{
         parts_target_h = parts_header_h + (parts_row_h * 9) + parts_frame_h
         self.jobPartsTable.setMinimumHeight(parts_target_h)
         self.jobPartsTable.setMaximumHeight(parts_target_h)
-        self.cardJobDetails.layout().addWidget(self.jobPartsTable)
+        self.jobPartsTableShell = QFrame()
+        self.jobPartsTableShell.setObjectName("ProductPartsTableShell")
+        self.jobPartsTableShell.setLayout(QVBoxLayout())
+        self.jobPartsTableShell.layout().setContentsMargins(0, 0, 0, 0)
+        self.jobPartsTableShell.layout().setSpacing(0)
+        self.jobPartsTableShell.layout().addWidget(self.jobPartsTable)
+        self.cardJobDetails.layout().addWidget(self.jobPartsTableShell)
         self.cardJobDetails.layout().addStretch(1)
-        self.cardJobDetailsOuter.setStyleSheet("QFrame#LeftCardOuter { background: transparent; border: none; }")
-        self.cardJobDetails.setStyleSheet(
-            "QFrame#LeftCardInner { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
-            "QLabel#SectionTitle { background: #d9e0ec; color: #0f172a; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; padding: 8px 12px; }"
+        _product_parts_title = self.cardJobDetails.findChild(QLabel, "SectionTitle")
+        if _product_parts_title is not None:
+            _product_parts_title.setMinimumHeight(56)
+            _product_parts_title.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        self.cardJobDetailsOuter.setStyleSheet(
+            "QFrame#LeftCardOuter {"
+            " background: transparent;"
+            " border: none;"
+            "}"
+            "QFrame#ProductPartsTableShell {"
+            " background: transparent;"
+            " border: none;"
+            " border-radius: 0px;"
+            "}"
         )
-        self.cardJobDetails.layout().setContentsMargins(0, 0, 0, 14)
-        self.cardJobDetails.layout().setSpacing(8)
+        self.cardJobDetails.setStyleSheet(
+            "QFrame#LeftCardInner {"
+            " background: qradialgradient(cx:0.5, cy:0.36, radius:1.25, fx:0.5, fy:0.18,"
+            "                           stop:0 rgba(120,124,134,232),"
+            "                           stop:0.36 rgba(70,74,82,238),"
+            "                           stop:1 rgba(24,26,31,248));"
+            " border: 1px solid rgba(88,92,101,240);"
+            " border-radius: 34px;"
+            "}"
+            "QLabel#SectionTitle {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(103,108,118,226),"
+            "                             stop:0.48 rgba(68,72,81,216),"
+            "                             stop:1 rgba(40,43,50,198));"
+            " color: rgba(236,238,241,230);"
+            " border: none;"
+            " border-top-left-radius: 34px;"
+            " border-top-right-radius: 34px;"
+            " border-bottom: 1px solid rgba(146,151,162,95);"
+            " padding: 10px 18px 12px 18px;"
+            " font-size: 19px;"
+            " font-weight: 900;"
+            " letter-spacing: 0.5px;"
+            "}"
+        )
+        self.cardJobDetails.layout().setContentsMargins(0, 0, 0, 0)
+        self.cardJobDetails.layout().setSpacing(0)
         self.jobPartsTable.setStyleSheet(
-            "QTableWidget {"
-            " background: rgba(255,255,255,0.86);"
-            " border: 1px solid #d5dde9;"
-            " border-radius: 12px;"
-            " gridline-color: rgba(148,163,184,0.30);"
+            "QTableWidget#ProductPartsTable {"
+            " background: transparent;"
+            " color: rgba(234,236,239,225);"
+            " border: none;"
+            " border-radius: 0px;"
+            " gridline-color: rgba(112,116,126,150);"
+            " outline: none;"
+            "}"
+            "QTableWidget#ProductPartsTable::item {"
+            " background: transparent;"
+            " color: rgba(239,240,242,226);"
+            " border-top: 1px solid rgba(126,130,140,132);"
+            " border-right: 1px solid rgba(126,130,140,145);"
+            " border-bottom: 1px solid rgba(126,130,140,132);"
+            " padding: 8px 14px;"
+            " selection-background-color: transparent;"
+            " selection-color: rgba(239,240,242,226);"
             "}"
             "QHeaderView::section {"
-            " background: rgba(226,232,240,0.92);"
-            " color: #0f172a;"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(112,116,126,232),"
+            "                             stop:1 rgba(58,61,69,225));"
+            " color: rgba(240,242,245,232);"
             " font-weight: 900;"
             " border: none;"
-            " border-bottom: 1px solid rgba(148,163,184,0.45);"
-            " border-right: 1px solid rgba(148,163,184,0.28);"
-            " padding: 6px 8px;"
+            " border-bottom: 1px solid rgba(136,140,149,150);"
+            " border-right: 1px solid rgba(122,126,135,140);"
+            " padding: 8px 12px;"
             "}"
             "QHeaderView::section:last { border-right: none; }"
-            "QTableWidget::item {"
-            " border-right: 1px solid rgba(148,163,184,0.20);"
-            " border-bottom: 1px solid rgba(148,163,184,0.20);"
-            " padding: 6px;"
+            "QScrollBar:vertical {"
+            " background: rgba(27,29,34,150);"
+            " width: 12px;"
+            " margin: 22px 2px 22px 2px;"
+            " border-radius: 6px;"
+            "}"
+            "QScrollBar::handle:vertical {"
+            " background: rgba(140,145,154,180);"
+            " min-height: 24px;"
+            " border-radius: 6px;"
+            "}"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+            " height: 0px;"
+            "}"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {"
+            " background: transparent;"
             "}"
         )
-        self.cardJobDetailsOuter.setMinimumHeight(292)
-        self.cardJobDetailsOuter.setMaximumHeight(372)
+        self.cardJobDetailsOuter.setMinimumHeight(340)
+        self.cardJobDetailsOuter.setMaximumHeight(430)
         self.cardJobDetailsOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
         # Job details panel beside Session.
@@ -2346,13 +2463,39 @@ QWidget#ClientUIRoot {{
             _session_activity_title.deleteLater()
         self.cardSessionActivity.layout().setContentsMargins(0, 0, 0, 0)
         self.cardSessionActivity.layout().setSpacing(6)
+        self.cardSessionActivityOuter.setStyleSheet("QFrame#LeftCardOuter { background: transparent; border: none; }")
+        self.cardSessionActivity.setStyleSheet(
+            "QFrame#LeftCardInner {"
+            " background: qradialgradient(cx:0.5, cy:0.34, radius:1.16, fx:0.5, fy:0.14,"
+            "                           stop:0 rgba(121,125,135,232),"
+            "                           stop:0.40 rgba(73,77,85,238),"
+            "                           stop:1 rgba(24,26,31,246));"
+            " border: 1px solid rgba(90,94,103,240);"
+            " border-radius: 24px;"
+            "}"
+            "QLabel#SectionTitle {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(108,112,121,228),"
+            "                             stop:1 rgba(58,61,68,220));"
+            " color: rgba(237,240,244,230);"
+            " border: none;"
+            " border-top-left-radius: 22px;"
+            " border-top-right-radius: 22px;"
+            " border-bottom: 1px solid rgba(146,151,162,95);"
+            " padding: 8px 12px;"
+            " font-weight: 900;"
+            "}"
+        )
         self.jobDetailsUnifiedTitle = QLabel("Job Details")
         self.jobDetailsUnifiedTitle.setObjectName("SectionTitle")
         self.jobDetailsUnifiedTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.jobDetailsUnifiedTitle.setStyleSheet(
-            "background: #c7cfdd; color: #0f172a; border: none; "
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
+            "stop:0 rgba(108,112,121,228), stop:1 rgba(58,61,68,220)); "
+            "color: rgba(237,240,244,230); border: none; "
             "border-top-left-radius: 16px; border-top-right-radius: 16px; "
             "border-bottom-left-radius: 0px; border-bottom-right-radius: 0px; "
+            "border-bottom: 1px solid rgba(146,151,162,95); "
             "padding: 8px 12px; font-weight: 900;"
         )
         self.jobDetailsUnifiedTitle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -2402,11 +2545,6 @@ QWidget#ClientUIRoot {{
         unified_fields_grid.addWidget(self.topCycleCount, 3, 2)
         self.cardSessionActivity.layout().addLayout(unified_fields_grid)
         self.cardSessionActivity.layout().addSpacing(8)
-        self.rejectDetailsUnifiedTitle = QLabel("Reject Details")
-        self.rejectDetailsUnifiedTitle.setObjectName("SectionTitle")
-        self.rejectDetailsUnifiedTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.cardSessionActivity.layout().addWidget(self.rejectDetailsUnifiedTitle)
-        self.cardSessionActivity.layout().addSpacing(4)
         self.cardSessionActivity.layout().addWidget(self.rejectDetailTable)
 
         self.cardSessionActivityOuter.setMinimumHeight(300)
@@ -2482,8 +2620,14 @@ QWidget#ClientUIRoot {{
             self.rawPreviewNames.append(name)
             self.rawPreviewRings.append(ring)
         self.rawPreviewWrap.setStyleSheet(
-            "QFrame#RawPreviewCol { background: #e7ecf5; border: 1px solid #d6deeb; border-radius: 12px; }"
-            "QLabel#RawPreviewName { color: #334a6a; font-size: 11px; font-weight: 900; }"
+            "QFrame#RawPreviewCol {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(101,105,113,222),"
+            "                             stop:1 rgba(53,56,62,230));"
+            " border: 1px solid #787d86;"
+            " border-radius: 12px;"
+            "}"
+            "QLabel#RawPreviewName { color: #edf0f4; font-size: 11px; font-weight: 900; }"
         )
         self.rightRawSacks.setMinimumHeight(44)
         self.rightRawField.setMinimumHeight(44)
@@ -2574,10 +2718,25 @@ QWidget#ClientUIRoot {{
         rawCol.addWidget(rawBody)
         rawFrame.setStyleSheet(
             "QFrame#RawMirrorHost { background: transparent; border: none; }"
-            "QFrame#RawMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
-            "QFrame#RawMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
-            "QFrame#RawMirrorHeader QLabel#RightTitle { color: #0f172a; }"
-            "QFrame#RawMirrorHeader QLabel { color: #0f172a; }"
+            "QFrame#RawMirrorBody {"
+            " background: qradialgradient(cx:0.5, cy:0.34, radius:1.16, fx:0.5, fy:0.14,"
+            "                           stop:0 rgba(121,125,135,232),"
+            "                           stop:0.40 rgba(73,77,85,238),"
+            "                           stop:1 rgba(24,26,31,246));"
+            " border: 1px solid rgba(90,94,103,240);"
+            " border-radius: 24px;"
+            "}"
+            "QFrame#RawMirrorHeader {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(108,112,121,228),"
+            "                             stop:1 rgba(58,61,68,220));"
+            " border: none;"
+            " border-top-left-radius: 24px;"
+            " border-top-right-radius: 24px;"
+            " border-bottom: 1px solid rgba(146,151,162,95);"
+            "}"
+            "QFrame#RawMirrorHeader QLabel#RightTitle { color: #edf0f4; }"
+            "QFrame#RawMirrorHeader QLabel { color: #edf0f4; }"
         )
         rawOuterLay.addWidget(rawFrame)
 
@@ -2632,10 +2791,25 @@ QWidget#ClientUIRoot {{
         downtimeCol.addWidget(downtimeBody)
         downtimeFrame.setStyleSheet(
             "QFrame#DowntimeMirrorHost { background: transparent; border: none; }"
-            "QFrame#DowntimeMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
-            "QFrame#DowntimeMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
-            "QFrame#DowntimeMirrorHeader QLabel#RightTitle { color: #0f172a; }"
-            "QFrame#DowntimeMirrorHeader QLabel { color: #0f172a; }"
+            "QFrame#DowntimeMirrorBody {"
+            " background: qradialgradient(cx:0.5, cy:0.34, radius:1.16, fx:0.5, fy:0.14,"
+            "                           stop:0 rgba(121,125,135,232),"
+            "                           stop:0.40 rgba(73,77,85,238),"
+            "                           stop:1 rgba(24,26,31,246));"
+            " border: 1px solid rgba(90,94,103,240);"
+            " border-radius: 24px;"
+            "}"
+            "QFrame#DowntimeMirrorHeader {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(108,112,121,228),"
+            "                             stop:1 rgba(58,61,68,220));"
+            " border: none;"
+            " border-top-left-radius: 24px;"
+            " border-top-right-radius: 24px;"
+            " border-bottom: 1px solid rgba(146,151,162,95);"
+            "}"
+            "QFrame#DowntimeMirrorHeader QLabel#RightTitle { color: #edf0f4; }"
+            "QFrame#DowntimeMirrorHeader QLabel { color: #edf0f4; }"
         )
         downtimeOuterLay.addWidget(downtimeFrame)
 
@@ -2753,19 +2927,48 @@ QWidget#ClientUIRoot {{
         linkageFrame.setMinimumHeight(170)
         linkageFrame.setStyleSheet(
             "QFrame#LinkageMirrorHost { background: transparent; border: none; }"
-            "QFrame#LinkageMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
+            "QFrame#LinkageMirrorBody {"
+            " background: qradialgradient(cx:0.5, cy:0.34, radius:1.16, fx:0.5, fy:0.14,"
+            "                           stop:0 rgba(121,125,135,232),"
+            "                           stop:0.40 rgba(73,77,85,238),"
+            "                           stop:1 rgba(24,26,31,246));"
+            " border: 1px solid rgba(90,94,103,240);"
+            " border-radius: 24px;"
+            "}"
             "QFrame#LinkageMirrorLeft { background: transparent; border: none; }"
-            "QFrame#LinkageMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
-            "QFrame#LinkageMirrorHeader QLabel#RightTitle { color: #0f172a; }"
-            "QFrame#LinkageMirrorHeader QLabel { color: #0f172a; }"
+            "QFrame#LinkageMirrorHeader {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(108,112,121,228),"
+            "                             stop:1 rgba(58,61,68,220));"
+            " border: none;"
+            " border-top-left-radius: 24px;"
+            " border-top-right-radius: 24px;"
+            " border-bottom: 1px solid rgba(146,151,162,95);"
+            "}"
+            "QFrame#LinkageMirrorHeader QLabel#RightTitle { color: #edf0f4; }"
+            "QFrame#LinkageMirrorHeader QLabel { color: #edf0f4; }"
             "QWidget#LinkageMirrorContent { background: transparent; border: none; }"
-            "QFrame#LinkageMirrorJobRow { background: #f7f7f8; border: 1px solid #cfd8e3; border-radius: 16px; }"
-            "QLabel#LinkageMirrorJobKey { color: #0f172a; font-size: 13px; font-weight: 900; }"
-            "QLabel#LinkageMirrorJobVal { color: #0f172a; font-size: 16px; font-weight: 900; }"
+            "QFrame#LinkageMirrorJobRow {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(103,107,115,220),"
+            "                             stop:1 rgba(56,59,66,230));"
+            " border: 1px solid #7a8089;"
+            " border-radius: 16px;"
+            "}"
+            "QLabel#LinkageMirrorJobKey { color: #edf0f4; font-size: 13px; font-weight: 900; }"
+            "QLabel#LinkageMirrorJobVal { color: #edf0f4; font-size: 16px; font-weight: 900; }"
             "QFrame#LinkageMirrorRight { background: transparent; border: none; }"
-            "QFrame#LinkageMirrorCounterCard { background: #e7ecf5; border: 1px solid #dde3ee; border-radius: 10px; min-height: 40px; max-height: 40px; }"
-            "QLabel#LinkageMirrorCounterTitle { color: #334a6a; font-size: 13px; font-weight: 900; }"
-            "QLabel#LinkageMirrorCounterValue { color: #7a93b7; font-size: 18px; font-weight: 900; }"
+            "QFrame#LinkageMirrorCounterCard {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(103,107,115,220),"
+            "                             stop:1 rgba(56,59,66,230));"
+            " border: 1px solid #7a8089;"
+            " border-radius: 10px;"
+            " min-height: 40px;"
+            " max-height: 40px;"
+            "}"
+            "QLabel#LinkageMirrorCounterTitle { color: #edf0f4; font-size: 13px; font-weight: 900; }"
+            "QLabel#LinkageMirrorCounterValue { color: #f3f4f6; font-size: 18px; font-weight: 900; }"
         )
         linkageOuterLay.addWidget(linkageFrame)
         self.linkageMirrorOuter = linkageOuter
@@ -2873,21 +3076,37 @@ QWidget#ClientUIRoot {{
             frame_lay.addWidget(body, 1)
             frame.setStyleSheet(
                 "QFrame#HistoryMirrorHost { background: transparent; border: none; }"
-                "QFrame#HistoryMirrorBody { background: #edf2fa; border: 1px solid #d5dde9; border-radius: 18px; }"
-                "QFrame#HistoryMirrorHeader { background: #d9e0ec; border: none; border-top-left-radius: 18px; border-top-right-radius: 18px; }"
-                "QFrame#HistoryMirrorHeader QLabel#RightTitle { color: #0f172a; }"
-                "QFrame#HistoryMirrorHeader QLabel { color: #0f172a; }"
+                "QFrame#HistoryMirrorBody {"
+                " background: qradialgradient(cx:0.5, cy:0.34, radius:1.16, fx:0.5, fy:0.14,"
+                "                           stop:0 rgba(121,125,135,232),"
+                "                           stop:0.40 rgba(73,77,85,238),"
+                "                           stop:1 rgba(24,26,31,246));"
+                " border: 1px solid rgba(90,94,103,240);"
+                " border-radius: 24px;"
+                "}"
+                "QFrame#HistoryMirrorHeader {"
+                " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+                "                             stop:0 rgba(108,112,121,228),"
+                "                             stop:1 rgba(58,61,68,220));"
+                " border: none;"
+                " border-top-left-radius: 24px;"
+                " border-top-right-radius: 24px;"
+                " border-bottom: 1px solid rgba(146,151,162,95);"
+                "}"
+                "QFrame#HistoryMirrorHeader QLabel#RightTitle { color: #edf0f4; }"
+                "QFrame#HistoryMirrorHeader QLabel { color: #edf0f4; }"
                 "QWidget#HistoryMirrorContent { background: transparent; border: none; }"
-                "QFrame#HistoryCol { background: #e7ecf5; border: none; border-radius: 12px; }"
-                "QFrame#HistoryLatestCard { background: #f4f7fc; border: none; border-radius: 10px; }"
+                "QFrame#HistoryCol { background: rgba(77,81,89,165); border: 1px solid rgba(132,137,148,110); border-radius: 12px; }"
+                "QFrame#HistoryLatestCard { background: rgba(102,106,114,200); border: 1px solid rgba(132,137,148,110); border-radius: 10px; }"
                 "QFrame#HistoryRecentPanel { background: transparent; border: none; }"
-                "QFrame#HistoryRecentRow { background: #f4f7fc; border: none; border-radius: 10px; }"
+                "QFrame#HistoryRecentRow { background: rgba(102,106,114,188); border: 1px solid rgba(132,137,148,90); border-radius: 10px; }"
             )
             outer_lay.addWidget(frame, 1)
             return outer, col
 
         self.historyRowOuter = QFrame()
         self.historyRowOuter.setObjectName("HistoryRowOuter")
+        self.historyRowOuter.setStyleSheet("QFrame#HistoryRowOuter { background: transparent; border: none; }")
         self.historyRowOuter.setLayout(QHBoxLayout())
         self.historyRowOuter.layout().setContentsMargins(0, 0, 0, 0)
         self.historyRowOuter.layout().setSpacing(6)
@@ -2901,6 +3120,7 @@ QWidget#ClientUIRoot {{
         self.historyRowOuter.layout().addWidget(self.actionsHistoryOuter, 1)
 
         self.rightTopRow = QWidget()
+        self.rightTopRow.setStyleSheet("background: transparent;")
         self.rightTopRow.setLayout(QHBoxLayout())
         self.rightTopRow.layout().setContentsMargins(0, 0, 0, 0)
         self.rightTopRow.layout().setSpacing(6)
@@ -2919,6 +3139,7 @@ QWidget#ClientUIRoot {{
         rawCycleSwapWrap.setLayout(rawDowntimeCol)
         rawCycleSwapWrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         rawCycleSwapWrap.setMinimumHeight(360)
+        rawCycleSwapWrap.setStyleSheet("background: transparent;")
         self.rawCycleSwapWrap = rawCycleSwapWrap
         grid.addWidget(rawCycleSwapWrap, 3, 0, 1, 2)
 
@@ -2929,10 +3150,11 @@ QWidget#ClientUIRoot {{
         contentRow.addWidget(self.rightPanel, 1)
 
         self.topSafeSpacer = QWidget()
-        self.topSafeSpacer.setFixedHeight(6)
+        self.topSafeSpacer.setFixedHeight(0)
         self.topSafeSpacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.topSafeSpacer.setStyleSheet("background: transparent;")
         root.addWidget(self.topSafeSpacer)
-        root.addLayout(headerRow)
+        root.addWidget(self.headerCard)
         root.addWidget(self.headerDivider)
         root.addLayout(contentRow, 1)
 
@@ -4098,6 +4320,22 @@ QWidget#ClientUIRoot {{
         self._refresh_ui()
         QTimer.singleShot(0, self._apply_adaptive_ui_scale)
         QTimer.singleShot(0, self._sync_right_panel_top_alignment)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._background_pixmap.isNull():
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        scaled = self._background_pixmap.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        offset_x = (self.width() - scaled.width()) // 2
+        offset_y = (self.height() - scaled.height()) // 2
+        painter.drawPixmap(offset_x, offset_y, scaled)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -5988,6 +6226,36 @@ QWidget#ClientUIRoot {{
             and not s.downtime_active
         )
 
+    def _apply_machine_anim_style(self, mode: str):
+        mode = "active" if str(mode or "").strip().lower() == "active" else "idle"
+        if mode == "active":
+            css = (
+                "QLabel#MachineAnim {"
+                " color: #14532d;"
+                " font-size: 14px;"
+                " font-weight: 800;"
+                " background: #b9fbcf;"
+                " border: 1px solid #4ade80;"
+                " border-radius: 16px;"
+                " padding: 8px 12px;"
+                "}"
+            )
+        else:
+            css = (
+                "QLabel#MachineAnim {"
+                " color: #fff7ed;"
+                " font-size: 14px;"
+                " font-weight: 800;"
+                " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+                "                             stop:0 rgba(251,146,60,245),"
+                "                             stop:1 rgba(234,88,12,248));"
+                " border: 1px solid #fb923c;"
+                " border-radius: 16px;"
+                " padding: 8px 12px;"
+                "}"
+            )
+        self.machineAnim.setStyleSheet(css)
+
     def _tick_motion(self):
         is_active = self._session_is_running() or bool(self.state.machine_code)
         status_text = "ACTIVE" if is_active else "IDLE"
@@ -5996,9 +6264,7 @@ QWidget#ClientUIRoot {{
         if self.machineAnim.property("mode") != mode:
             self.machineAnim.setProperty("mode", mode)
             self.machineAnim.setProperty("pulse", "0")
-            self.machineAnim.setStyleSheet("")
-            self.machineAnim.style().unpolish(self.machineAnim)
-            self.machineAnim.style().polish(self.machineAnim)
+        self._apply_machine_anim_style(mode)
         self._sync_machine_status_pulse_overlay()
         self.machinePulseOverlay.set_mode(is_active)
         self.machinePulseOverlay.advance(self.enable_pulse_effects, dt=0.06)
@@ -7157,9 +7423,7 @@ QWidget#ClientUIRoot {{
         if not self.enable_pulse_effects:
             self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
             self._apply_overlay_base_style()
-            self.machineAnim.setStyleSheet("")
-            self.machineAnim.style().unpolish(self.machineAnim)
-            self.machineAnim.style().polish(self.machineAnim)
+        self._apply_machine_anim_style(str(self.machineAnim.property("mode") or "idle"))
 
     def _show_settings_section(self, section: str):
         is_graphics = section == "graphics"
@@ -7872,12 +8136,21 @@ QWidget#ClientUIRoot {{
                 ]
                 for c, val in enumerate(values):
                     item = QTableWidgetItem(val)
-                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
+                    if c in (2, 3):
+                        item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                    else:
+                        item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
                     self.jobPartsTable.setItem(r, c, item)
             if self.jobPartsTable.rowCount() == 0:
                 self.jobPartsTable.insertRow(0)
                 for c in range(4):
-                    self.jobPartsTable.setItem(0, c, QTableWidgetItem("-"))
+                    item = QTableWidgetItem("-")
+                    item.setTextAlignment(
+                        int(Qt.AlignmentFlag.AlignCenter)
+                        if c in (2, 3)
+                        else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    )
+                    self.jobPartsTable.setItem(0, c, item)
 
         # Cycle monitor values are computed live in _refresh_ui from:
         # - Act cycle time entered/confirmed by operator
