@@ -13,6 +13,8 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Set
+from PyQt6.QtWidgets import QLabel  # (already at top of file)
+from PyQt6.QtCore import Qt
 
 import requests
 
@@ -2246,6 +2248,7 @@ QWidget#ClientUIRoot {{
         self.cardSessionOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
         # Reject detail panel
+        
         self.cardRejectOuter, self.cardReject = self._make_double_layer_card("Reject Details")
         self.rejectDetailTable = QTableWidget(1, len(REJECT_DETAIL_ITEMS))
         self.rejectDetailTable.setHorizontalHeaderLabels([code for code, _ in REJECT_DETAIL_ITEMS])
@@ -2544,7 +2547,16 @@ QWidget#ClientUIRoot {{
         unified_fields_grid.addWidget(self.lblActivitySticker, 3, 1)
         unified_fields_grid.addWidget(self.topCycleCount, 3, 2)
         self.cardSessionActivity.layout().addLayout(unified_fields_grid)
-        self.cardSessionActivity.layout().addSpacing(8)
+        self.cardSessionActivity.layout().addSpacing(12)
+        self.rejectLabel = QLabel("Reject Details")
+        self.rejectLabel.setObjectName("SectionLabel")
+        self.rejectLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rejectLabel.setStyleSheet(
+            "background: transparent; color: white; font-size: 19px; "
+            "font-weight: 900; letter-spacing: 0.5px;"
+        )
+        self.cardSessionActivity.layout().addWidget(self.rejectLabel)
+        self.cardSessionActivity.layout().addSpacing(6)
         self.cardSessionActivity.layout().addWidget(self.rejectDetailTable)
 
         self.cardSessionActivityOuter.setMinimumHeight(300)
