@@ -38,7 +38,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy,
     QGraphicsDropShadowEffect, QGraphicsBlurEffect, QGraphicsOpacityEffect, QProgressBar, QPushButton, QComboBox, QScrollArea,
-    QLineEdit, QInputDialog, QTableWidget, QTableWidgetItem, QHeaderView
+    QLineEdit, QInputDialog, QTableWidget, QTableWidgetItem, QHeaderView, QStyleOptionHeader
 )
 
 from mappings import parse_scan, ScanResult, MACHINE_MAP, JOB_MAP, REJECT_REASON_MAP
@@ -1738,6 +1738,44 @@ class HazardStripeWidget(QWidget):
         p.end()
 
 
+class RejectDetailHeaderView(QHeaderView):
+    def __init__(self, orientation: Qt.Orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._flash_cols: set[int] = set()
+        self._flash_on: bool = False
+
+    def set_flash_columns(self, cols):
+        self._flash_cols = {int(col) for col in (cols or []) if col is not None}
+        self.viewport().update()
+
+    def set_flash_on(self, on: bool):
+        self._flash_on = bool(on)
+        self.viewport().update()
+
+    def paintSection(self, painter: QPainter, rect: QRect, logicalIndex: int):
+        if (
+            self.orientation() == Qt.Orientation.Horizontal
+            and logicalIndex in self._flash_cols
+            and rect.isValid()
+        ):
+            painter.save()
+            bg = QColor(220, 38, 38) if self._flash_on else QColor(254, 202, 202)
+            fg = QColor(255, 255, 255) if self._flash_on else QColor("#7f1d1d")
+            painter.fillRect(rect, bg)
+            painter.setPen(fg)
+            text = ""
+            try:
+                m = self.model()
+                if m is not None:
+                    text = str(m.headerData(logicalIndex, self.orientation(), Qt.ItemDataRole.DisplayRole) or "")
+            except Exception:
+                text = ""
+            painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), text)
+            painter.restore()
+            return
+        super().paintSection(painter, rect, logicalIndex)
+
+
 class HistoryAnimatedColumn(QFrame):
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
@@ -1765,6 +1803,7 @@ class HistoryAnimatedColumn(QFrame):
         self.latestCard.graphicsEffect().setOpacity(1.0)
         self.latestCardLabel = QLabel("No scan yet", self.latestCard)
         self.latestCardLabel.setObjectName("MetaValue")
+        self.latestCardLabel.setStyleSheet("color: #ffffff; font-size: 12px; font-weight: 800;")
         self.latestCardLabel.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.latestCardLabel.setWordWrap(False)
 
@@ -1827,7 +1866,7 @@ class HistoryAnimatedColumn(QFrame):
         row.graphicsEffect().setOpacity(1.0)
         lbl = QLabel(str(text or ""), row)
         lbl.setObjectName("HistoryRecentValue")
-        lbl.setStyleSheet("font-size: 11px; font-weight: 700;")
+        lbl.setStyleSheet("color: #ffffff; font-size: 11px; font-weight: 700;")
         lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         lbl.setWordWrap(False)
         row._inner_label = lbl  # type: ignore[attr-defined]
@@ -2252,6 +2291,10 @@ QWidget#ClientUIRoot {{
         self.cardRejectOuter, self.cardReject = self._make_double_layer_card("Reject Details")
         self.rejectDetailTable = QTableWidget(1, len(REJECT_DETAIL_ITEMS))
         self.rejectDetailTable.setHorizontalHeaderLabels([code for code, _ in REJECT_DETAIL_ITEMS])
+        self._reject_detail_col_by_code = {code: i for i, (code, _label) in enumerate(REJECT_DETAIL_ITEMS)}
+        self._reject_detail_active_codes: set[str] = set()
+        _rej_hdr = RejectDetailHeaderView(Qt.Orientation.Horizontal, self.rejectDetailTable)
+        self.rejectDetailTable.setHorizontalHeader(_rej_hdr)
         self.rejectDetailTable.setAlternatingRowColors(False)
         self.rejectDetailTable.setWordWrap(False)
         self.rejectDetailTable.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -2291,10 +2334,10 @@ QWidget#ClientUIRoot {{
 
         # Product parts panel
         self.cardJobDetailsOuter, self.cardJobDetails = self._make_double_layer_card("PRODUCT PARTS")
-        self.jobPartsTable = QTableWidget(0, 4)
+        self.jobPartsTable = QTableWidget(0, 5)
         self.jobPartsTable.setObjectName("ProductPartsTable")
         self.jobPartsTable.setHorizontalHeaderLabels(
-            ["SKU", "Name", "Part Qty/Unit", "Request Part Qty"]
+            ["SKU", "Name", "Part Qty/Unit", "Request Part Qty", "Remaining"]
         )
         self.jobPartsTable.setAlternatingRowColors(False)
         self.jobPartsTable.setWordWrap(True)
@@ -2302,14 +2345,15 @@ QWidget#ClientUIRoot {{
         self.jobPartsTable.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.jobPartsTable.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.jobPartsTable.verticalHeader().setVisible(False)
-        self.jobPartsTable.verticalHeader().setDefaultSectionSize(42)
+        self.jobPartsTable.verticalHeader().setDefaultSectionSize(30)
         self.jobPartsTable.horizontalHeader().setStretchLastSection(False)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.jobPartsTable.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.jobPartsTable.horizontalHeader().setFixedHeight(48)
+        self.jobPartsTable.horizontalHeader().setFixedHeight(32)
         self.jobPartsTable.setColumnWidth(0, 260)
         # Size table to show up to 10 visible rows without clipping.
         parts_row_h = self.jobPartsTable.verticalHeader().defaultSectionSize()
@@ -2328,7 +2372,7 @@ QWidget#ClientUIRoot {{
         self.cardJobDetails.layout().addStretch(1)
         _product_parts_title = self.cardJobDetails.findChild(QLabel, "SectionTitle")
         if _product_parts_title is not None:
-            _product_parts_title.setMinimumHeight(56)
+            _product_parts_title.setMinimumHeight(38)
             _product_parts_title.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.cardJobDetailsOuter.setStyleSheet(
             "QFrame#LeftCardOuter {"
@@ -2352,18 +2396,15 @@ QWidget#ClientUIRoot {{
             "}"
             "QLabel#SectionTitle {"
             " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
-            "                             stop:0 rgba(103,108,118,226),"
-            "                             stop:0.48 rgba(68,72,81,216),"
-            "                             stop:1 rgba(40,43,50,198));"
-            " color: rgba(236,238,241,230);"
+            "                             stop:0 rgba(108,112,121,228),"
+            "                             stop:1 rgba(58,61,68,220));"
+            " color: rgba(237,240,244,230);"
             " border: none;"
-            " border-top-left-radius: 34px;"
-            " border-top-right-radius: 34px;"
+            " border-top-left-radius: 22px;"
+            " border-top-right-radius: 22px;"
             " border-bottom: 1px solid rgba(146,151,162,95);"
-            " padding: 10px 18px 12px 18px;"
-            " font-size: 19px;"
+            " padding: 8px 12px;"
             " font-weight: 900;"
-            " letter-spacing: 0.5px;"
             "}"
         )
         self.cardJobDetails.layout().setContentsMargins(0, 0, 0, 0)
@@ -2380,10 +2421,11 @@ QWidget#ClientUIRoot {{
             "QTableWidget#ProductPartsTable::item {"
             " background: transparent;"
             " color: rgba(239,240,242,226);"
+            " font-size: 9px;"
             " border-top: 1px solid rgba(126,130,140,132);"
             " border-right: 1px solid rgba(126,130,140,145);"
             " border-bottom: 1px solid rgba(126,130,140,132);"
-            " padding: 8px 14px;"
+            " padding: 2px 8px;"
             " selection-background-color: transparent;"
             " selection-color: rgba(239,240,242,226);"
             "}"
@@ -2396,7 +2438,7 @@ QWidget#ClientUIRoot {{
             " border: none;"
             " border-bottom: 1px solid rgba(136,140,149,150);"
             " border-right: 1px solid rgba(122,126,135,140);"
-            " padding: 8px 12px;"
+            " padding: 4px 8px;"
             "}"
             "QHeaderView::section:last { border-right: none; }"
             "QScrollBar:vertical {"
@@ -2552,7 +2594,7 @@ QWidget#ClientUIRoot {{
         self.rejectLabel.setObjectName("SectionLabel")
         self.rejectLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.rejectLabel.setStyleSheet(
-            "background: transparent; color: white; font-size: 19px; "
+            "background: transparent; color: white; font-size: 17px; "
             "font-weight: 900; letter-spacing: 0.5px;"
         )
         self.cardSessionActivity.layout().addWidget(self.rejectLabel)
@@ -3150,7 +3192,7 @@ QWidget#ClientUIRoot {{
         rawCycleSwapWrap = QWidget()
         rawCycleSwapWrap.setLayout(rawDowntimeCol)
         rawCycleSwapWrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        rawCycleSwapWrap.setMinimumHeight(360)
+        rawCycleSwapWrap.setMinimumHeight(440)
         rawCycleSwapWrap.setStyleSheet("background: transparent;")
         self.rawCycleSwapWrap = rawCycleSwapWrap
         grid.addWidget(rawCycleSwapWrap, 3, 0, 1, 2)
@@ -7400,18 +7442,30 @@ QWidget#ClientUIRoot {{
             else:
                 item.setBackground(QColor(0, 0, 0, 0))
                 item.setForeground(QColor("#0f172a"))
+        self._reject_detail_active_codes = {
+            code for code, _label in REJECT_DETAIL_ITEMS if int(counts.get(code, 0)) > 0
+        }
+        self._sync_reject_detail_header_flash()
         self.rejectDetailTable.viewport().update()
 
+    def _sync_reject_detail_header_flash(self):
+        hdr = self.rejectDetailTable.horizontalHeader()
+        if isinstance(hdr, RejectDetailHeaderView):
+            hdr.set_flash_columns(
+                [self._reject_detail_col_by_code.get(code) for code in self._reject_detail_active_codes]
+            )
+            hdr.set_flash_on(bool(getattr(self, "_reject_detail_flash_on", False)))
+
     def _tick_reject_detail_flash(self):
-        if not self.enable_flashing_lights:
-            return
         self._reject_detail_flash_on = not self._reject_detail_flash_on
-        for item in self.reject_detail_labels.values():
-            if int(item.data(Qt.ItemDataRole.UserRole) or 0) == 1:
-                if self._reject_detail_flash_on:
-                    item.setBackground(QColor(252, 165, 165, 130))
-                else:
-                    item.setBackground(QColor(254, 226, 226, 90))
+        if self.enable_flashing_lights:
+            for item in self.reject_detail_labels.values():
+                if int(item.data(Qt.ItemDataRole.UserRole) or 0) == 1:
+                    if self._reject_detail_flash_on:
+                        item.setBackground(QColor(252, 165, 165, 130))
+                    else:
+                        item.setBackground(QColor(254, 226, 226, 90))
+        self._sync_reject_detail_header_flash()
         self.rejectDetailTable.viewport().update()
 
     def _on_setting_check_animation_toggled(self, checked: bool):
@@ -8138,6 +8192,8 @@ QWidget#ClientUIRoot {{
             for part in part_rows:
                 r = self.jobPartsTable.rowCount()
                 self.jobPartsTable.insertRow(r)
+                request_part_qty = self._parse_number(part.get("request_part_qty"))
+                remaining_part_qty = max(request_part_qty - consumed_raw_qty, 0.0)
                 values = [
                     self._safe_text(part.get("sku"), "-"),
                     self._safe_text(part.get("name"), "-"),
@@ -8145,21 +8201,22 @@ QWidget#ClientUIRoot {{
                     (
                         f"{_fmt_number(consumed_raw_qty)} / {self._safe_text(part.get('request_part_qty'), '-')}"
                     ),
+                    _fmt_number(remaining_part_qty),
                 ]
                 for c, val in enumerate(values):
                     item = QTableWidgetItem(val)
-                    if c in (2, 3):
+                    if c in (2, 3, 4):
                         item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
                     else:
                         item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
                     self.jobPartsTable.setItem(r, c, item)
             if self.jobPartsTable.rowCount() == 0:
                 self.jobPartsTable.insertRow(0)
-                for c in range(4):
+                for c in range(5):
                     item = QTableWidgetItem("-")
                     item.setTextAlignment(
                         int(Qt.AlignmentFlag.AlignCenter)
-                        if c in (2, 3)
+                        if c in (2, 3, 4)
                         else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
                     )
                     self.jobPartsTable.setItem(0, c, item)
@@ -9740,5 +9797,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
