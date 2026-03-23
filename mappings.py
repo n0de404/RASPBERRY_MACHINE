@@ -171,7 +171,7 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
 
     # Operator handoff trigger
     if s_l in ("operatorshift~1", "operator_shift~1", "shiftchange~1"):
-        return ScanResult(kind="OPERATOR_SHIFT_TRIGGER", raw=raw, value="Operator shift handoff")
+        return ScanResult(kind="OPERATOR_SHIFT_TRIGGER", raw=raw, value="Finish shift")
 
     # Production daily report trigger
     if s_l == "productiondailyreport~1":
@@ -242,6 +242,10 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="RAW_MATERIAL", raw=raw, value=material, qty=qty)
     if s_l in ("rawmat", "rawmaterial", "rm"):
         return ScanResult(kind="RAW_MATERIAL", raw=raw, value="Sack", qty=1)
+
+    # Butal simple trigger
+    if s_l in ("butal~1", "butal", "btl~1"):
+        return ScanResult(kind="BUTAL", raw=raw, value="Butal", qty=1)
 
     # Butal (QB first, because it contains Q)
     if "V2" in s and "QB" in s:

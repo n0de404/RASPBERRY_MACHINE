@@ -68,7 +68,7 @@ QLabel#PageTitle {
     font-weight: 800;
     color: #f8fafc;
     letter-spacing: 0.4px;
-    padding-top: 2px;
+    padding-top: 0px;
     background: transparent;
 }
 QFrame#HeaderCard {
@@ -76,8 +76,13 @@ QFrame#HeaderCard {
                                 stop:0 rgba(97,102,111,228),
                                 stop:0.5 rgba(68,72,79,232),
                                 stop:1 rgba(43,46,52,236));
-    border: 1px solid rgba(148, 163, 184, 0.42);
+    border-left: 1px solid rgba(148, 163, 184, 0.42);
+    border-right: 1px solid rgba(148, 163, 184, 0.42);
+    border-bottom: 1px solid rgba(148, 163, 184, 0.42);
+    border-top: none;
     border-radius: 0px;
+    margin: 0px;
+    padding: 0px;
 }
 QLabel#HeaderMetaValue {
     color: #f8fafc;

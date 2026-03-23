@@ -61,6 +61,7 @@ PROFILE_REPRINT_ADMIN_PASSWORD = "0t1docmtl$tm"
 QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.1.149:5000").strip().rstrip("/")
 RAW_QR_O_SEGMENT = "O000000000240000010237800000000000"
 RAW_QR_REMARK = "V2"
+TEMP_PART_QTY_PER_UNIT = 0.0848
 WIDTH_P = 11
 WIDTH_Q = 11
 WIDTH_I = 11
@@ -1556,14 +1557,23 @@ def _zpad_digits(value: Any, width: int) -> str:
     return d.zfill(width)
 
 
-def _build_raw_material_qr_value(product_id: str, po_number: str = "") -> str:
+def _build_raw_material_qr_value(
+    product_id: str,
+    po_number: str = "",
+    *,
+    qty: Any = 1,
+    index_value: Any = 1,
+    total: Any = 1,
+    lot_number: str = "",
+) -> str:
     stamp = datetime.now().strftime("%Y%m%d%H%M%S")
     p = "P" + _zpad_digits(product_id, WIDTH_P)
-    q = "Q" + _zpad_digits("1", WIDTH_Q)
-    i = "I" + _zpad_digits("1", WIDTH_I)
-    t = "T" + _zpad_digits("1", WIDTH_T)
+    q = "Q" + _zpad_digits(qty, WIDTH_Q)
+    i = "I" + _zpad_digits(index_value, WIDTH_I)
+    t = "T" + _zpad_digits(total, WIDTH_T)
     po_digits = _zpad_digits(po_number, 12)
-    l = "L" + f"{stamp}-{po_digits}"
+    lot_digits = re.sub(r"[^0-9A-Za-z\-]+", "", str(lot_number or "").strip())
+    l = "L" + (lot_digits or f"{stamp}-{po_digits}")
     return f"{RAW_QR_O_SEGMENT}{RAW_QR_REMARK}{p}{q}{i}{t}{l}"
 
 
@@ -1577,6 +1587,154 @@ def _raw_qr_format_template() -> str:
         "T00000000001"
         "LYYYYMMDDHHMMSS-000000000000"
     )
+
+
+def _parse_number_like(value: Any) -> float:
+    raw = str(value or "").strip().replace(",", "")
+    if not raw:
+        return 0.0
+    try:
+        return float(raw)
+    except Exception:
+        m = re.search(r"-?\d+(?:\.\d+)?", raw)
+        if not m:
+            return 0.0
+        try:
+            return float(m.group(0))
+        except Exception:
+            return 0.0
+
+
+def _extract_primary_part_row(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    job_details = data_obj.get("job_details") if isinstance(data_obj.get("job_details"), dict) else {}
+    part_rows: List[Dict[str, Any]] = []
+    if isinstance(data_obj.get("parts"), list):
+        part_rows = [r for r in data_obj.get("parts") or [] if isinstance(r, dict)]
+    elif isinstance(job_details.get("parts"), list):
+        part_rows = [r for r in job_details.get("parts") or [] if isinstance(r, dict)]
+    elif isinstance(job_details.get("part_ids"), list):
+        part_rows = [r for r in job_details.get("part_ids") or [] if isinstance(r, dict)]
+    elif isinstance(job_details.get("part_ids"), dict):
+        part_rows = [job_details.get("part_ids") or {}]
+    elif isinstance(data_obj.get("part_ids"), list):
+        part_rows = [r for r in data_obj.get("part_ids") or [] if isinstance(r, dict)]
+    return part_rows[0] if part_rows else {}
+
+
+def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, po_number: str) -> List[Dict[str, Any]]:
+    row = finished_job if isinstance(finished_job, dict) else {}
+    payload = row.get("job_payload") if isinstance(row.get("job_payload"), dict) else {}
+    part_row = _extract_primary_part_row(payload)
+    part_qty_per_unit = _parse_number_like(part_row.get("part_qty_per_unit"))
+    if part_qty_per_unit <= 0:
+        part_qty_per_unit = TEMP_PART_QTY_PER_UNIT
+    total_good = max(0.0, _parse_number_like(row.get("total_good", 0)))
+    raw_logs = row.get("raw_material_logs") if isinstance(row.get("raw_material_logs"), list) else []
+    pack_logs = row.get("product_pack_history_logs") if isinstance(row.get("product_pack_history_logs"), list) else []
+    scanned_raw_qty = 0.0
+    for item in raw_logs:
+        if not isinstance(item, dict):
+            continue
+        scanned_raw_qty += max(0.0, _parse_number_like(item.get("qty", 0)))
+    used_raw_qty = min(scanned_raw_qty, total_good * part_qty_per_unit)
+    available_raw_qty = max(0.0, scanned_raw_qty - used_raw_qty)
+    butal_total = max(0, int(round(_parse_number_like(row.get("butal_total", 0)))))
+    plan: List[Dict[str, Any]] = []
+    base_lot = _zpad_digits(po_number, 12)
+    excess_qty = max(0, int(math.floor(available_raw_qty)))
+    if excess_qty > 0:
+        raw_name = ""
+        raw_meta = {"id": str(product_id or "").strip(), "name": "", "sku": ""}
+        if raw_logs:
+            latest_raw = raw_logs[-1] if isinstance(raw_logs[-1], dict) else {}
+            raw_name = str(latest_raw.get("material_name") or latest_raw.get("material") or "").strip()
+            raw_meta = _lookup_product_meta_by_text(raw_name)
+        plan.append(
+            {
+                "stage_kind": "RAW_EXCESS",
+                "stage_title": "Raw Material Excess",
+                "product_id": raw_meta.get("id", "") or str(product_id or "").strip(),
+                "product_name": raw_meta.get("name", "") or raw_name,
+                "product_sku": raw_meta.get("sku", ""),
+                "qty": str(excess_qty),
+                "index": "1",
+                "total": "1",
+                "po_required": False,
+                "po_number": "",
+                "lot_number": f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{base_lot}",
+            }
+        )
+    if butal_total > 0:
+        latest_pack = pack_logs[-1] if pack_logs and isinstance(pack_logs[-1], dict) else {}
+        pack_product_id = str(latest_pack.get("product_p") or latest_pack.get("product_id") or "").strip()
+        pack_meta = _lookup_product_meta(pack_product_id.lstrip("0") if pack_product_id.isdigit() else pack_product_id)
+        plan.append(
+            {
+                "stage_kind": "BUTAL",
+                "stage_title": "Butal Return",
+                "product_id": pack_meta.get("id", "") or (pack_product_id.lstrip("0") if pack_product_id.isdigit() else pack_product_id),
+                "product_name": pack_meta.get("name", ""),
+                "product_sku": pack_meta.get("sku", ""),
+                "pack_hist": latest_pack,
+                "qty": str(butal_total),
+                "index": "1",
+                "total": "1",
+                "po_required": True,
+                "po_number": str(po_number or "").strip(),
+                "lot_number": f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{base_lot}",
+            }
+        )
+    if not plan:
+        plan.append(
+            {
+                "stage_kind": "DEFAULT",
+                "stage_title": "Raw Material QR",
+                "product_id": str(product_id or "").strip(),
+                "product_name": "",
+                "product_sku": "",
+                "qty": "1",
+                "index": "1",
+                "total": "1",
+                "po_required": False,
+                "po_number": "",
+                "lot_number": f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{base_lot}",
+            }
+        )
+    enriched: List[Dict[str, Any]] = []
+    total_stages = len(plan)
+    for idx, entry in enumerate(plan, start=1):
+        entry_product_id = str(entry.get("product_id", "")).strip() or str(product_id or "").strip()
+        if str(entry.get("stage_kind") or "").upper() == "BUTAL" and isinstance(entry.get("pack_hist"), dict):
+            stage_po = str(entry.get("po_number", "")).strip()
+            payload_text = ""
+            if stage_po:
+                pack_hist = dict(entry.get("pack_hist") or {})
+                pack_hist["po_number"] = stage_po
+                payload_text = _build_butal_qr_from_pack_history(pack_hist, entry.get("qty", "1"), index_value=entry.get("index", "1"))
+        else:
+            payload_text = _build_raw_material_qr_value(
+                entry_product_id,
+                po_number=str(entry.get("po_number", "")).strip(),
+                qty=entry.get("qty", "1"),
+                index_value=entry.get("index", "1"),
+                total=entry.get("total", "1"),
+                lot_number=str(entry.get("lot_number", "")).strip(),
+            )
+        parsed = _parse_qr_segments(payload_text)
+        enriched.append(
+            {
+                **entry,
+                "stage_index": idx,
+                "stage_total": total_stages,
+                "stage_label": f"{idx} / {total_stages} - {entry.get('stage_title', 'QR')}",
+                "qr_payload": payload_text,
+                "parsed": parsed,
+            }
+        )
+    return enriched
 
 
 def _qr_png_data_url(payload: str) -> str:
@@ -1605,6 +1763,37 @@ def _lookup_product_meta(product_id: str) -> Dict[str, str]:
                 "sku": str(it.get("sku", "")).strip(),
             }
     return {"id": str(product_id or "").strip(), "name": "", "sku": ""}
+
+
+def _lookup_product_meta_by_text(text: str) -> Dict[str, str]:
+    q = str(text or "").strip().casefold()
+    if not q:
+        return {"id": "", "name": "", "sku": ""}
+    items = get_products(force_refresh=False).get("items") or []
+    for it in items:
+        name = str(it.get("name", "")).strip()
+        sku = str(it.get("sku", "")).strip()
+        if q == name.casefold() or q == sku.casefold() or q == f"{sku} - {name}".strip().casefold():
+            return {"id": str(it.get("id", "")).strip(), "name": name, "sku": sku}
+    for it in items:
+        name = str(it.get("name", "")).strip()
+        sku = str(it.get("sku", "")).strip()
+        hay = f"{sku} {name}".casefold()
+        if q and q in hay:
+            return {"id": str(it.get("id", "")).strip(), "name": name, "sku": sku}
+    return {"id": "", "name": str(text or "").strip(), "sku": ""}
+
+
+def _build_butal_qr_from_pack_history(pack_hist: Dict[str, Any], qty: Any, index_value: Any = 1) -> str:
+    p_digits = _zpad_digits(pack_hist.get("product_p") or pack_hist.get("product_id"), WIDTH_P)
+    q_digits = _zpad_digits(qty, WIDTH_Q)
+    i_digits = _zpad_digits(index_value, WIDTH_I)
+    t_digits = _zpad_digits(1, WIDTH_T)
+    lot_number = str(pack_hist.get("lot_number") or "").strip()
+    po_number = str(pack_hist.get("po_number") or "").strip()
+    if len(re.sub(r"\D+", "", lot_number)) != 14:
+        lot_number = datetime.now().strftime("%Y%m%d%H%M%S")
+    return f"{RAW_QR_O_SEGMENT}{RAW_QR_REMARK}P{p_digits}QB{q_digits}I{i_digits}T{t_digits}L{lot_number}-{_zpad_digits(po_number, 12)}"
 
 
 def _extract_seg(qr_value: str, tag: str, width: int) -> str:
@@ -2310,6 +2499,12 @@ DASHBOARD_HTML = """
     .main-tab-button.active { background: #1f8ef1; color: #fff; }
     .main-tab-content { display: none; padding: 0 20px 20px; }
     .main-tab-content.active { display: block; }
+    .sub-tabs { display:flex; gap:8px; margin-top:12px; margin-bottom:12px; flex-wrap:wrap; }
+    .sub-tab-button { background:#fff; border:1px solid #cbd5e1; border-radius:999px; padding:8px 14px; font-weight:700; color:#334155; cursor:pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
+    .sub-tab-button:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(15,23,42,0.08); }
+    .sub-tab-button.active { background:#1f8ef1; color:#fff; border-color:#1f8ef1; }
+    .sub-tab-content { display:none; }
+    .sub-tab-content.active { display:block; }
     .grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 18px; }
     .card { background: #fff; border-radius: 12px; padding: 16px; border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform .12s ease, box-shadow .12s ease; }
     .card:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(0,0,0,0.12); }
@@ -2432,10 +2627,13 @@ DASHBOARD_HTML = """
     .review-edge-arrow.right { right: -54px; }
     .review-subslide { display: none; animation: reviewSlideIn .16s ease; }
     .review-subslide.active { display: block; }
+    #overlayReviewStep.single-page .review-subslide { display: block; margin-bottom: 12px; }
+    #overlayReviewStep.single-page .review-subslide:last-child { margin-bottom: 0; }
     #overlayReviewStep { padding: 0; width: min(690px, 100%); margin: 0 auto; }
     #overlayReviewStep .overlay-row { grid-template-columns: 190px 1fr; }
     #overlayReviewStep .overlay-row input[readonly] { background: #fff; }
     #overlayReviewStep .overlay-row textarea[readonly] { background: #fff; }
+    #overlayReviewStep.single-page .review-slide-status { display: none; }
     .review-panel {
       background: #f7f8fb;
       border: 1px solid #d0d5de;
@@ -2610,6 +2808,8 @@ DASHBOARD_HTML = """
     body[data-theme="Soft Gray"] .card.maintenance { border-color: #d6a56a; animation: cardPulseOrange 1.5s ease-in-out infinite; }
     body[data-theme="Soft Gray"] .main-tab-button.active { background: #64748b; color: #fff; }
     body[data-theme="Soft Gray"] .main-tab-content { background: linear-gradient(180deg, rgba(248,250,252,.92), rgba(241,245,249,.82)); border-radius: 16px; }
+    body[data-theme="Soft Gray"] .sub-tab-button { background:#fff; color:#475569; border-color:#dbe2eb; }
+    body[data-theme="Soft Gray"] .sub-tab-button.active { background:#64748b; color:#fff; border-color:#64748b; }
     body[data-theme="Soft Gray"] .finished-item { background: linear-gradient(160deg, #ffffff 0%, #f8fafc 60%, #eef2f7 100%); border-color: #dbe2eb; box-shadow: 0 5px 14px rgba(51,65,85,.10); }
     body[data-theme="Soft Gray"] .finished-item h4 { color: #1f2937; }
     body[data-theme="Soft Gray"] .finished-grid div { background: #fff; border-color: #e5e7eb; color: #334155; }
@@ -2621,6 +2821,8 @@ DASHBOARD_HTML = """
     body[data-theme="Dark"] .main-tab-button { background: #1f2937; color: #d1d5db; }
     body[data-theme="Dark"] .main-tab-button.active { background: #2563eb; color: #fff; }
     body[data-theme="Dark"] .main-tab-content { background: linear-gradient(180deg, rgba(2,6,23,.42), rgba(2,6,23,.22)); border-radius: 16px; }
+    body[data-theme="Dark"] .sub-tab-button { background:#0f172a; color:#d1d5db; border-color:#334155; }
+    body[data-theme="Dark"] .sub-tab-button.active { background:#2563eb; color:#fff; border-color:#3b82f6; }
     body[data-theme="Dark"] .card,
     body[data-theme="Dark"] .panel,
     body[data-theme="Dark"] .table-wrap { background: #111827; color: #e5e7eb; border-color: #334155; }
@@ -2679,6 +2881,8 @@ DASHBOARD_HTML = """
     body[data-theme="Red"] .main-tab-button { background: #fee2e2; color: #7f1d1d; }
     body[data-theme="Red"] .main-tab-button.active { background: #dc2626; color: #fff; }
     body[data-theme="Red"] .main-tab-content { background: linear-gradient(180deg, rgba(254,242,242,.95), rgba(255,255,255,.88)); border-radius: 16px; }
+    body[data-theme="Red"] .sub-tab-button { background:#fff; color:#7f1d1d; border-color:#fecaca; }
+    body[data-theme="Red"] .sub-tab-button.active { background:#dc2626; color:#fff; border-color:#dc2626; }
     body[data-theme="Red"] .finished-item { border-color: #fecaca; background: linear-gradient(160deg, #fff 0%, #fff1f2 66%, #ffe4e6 100%); }
     body[data-theme="Red"] .operator-directory-row { border-bottom-color:#fee2e2; }
     body[data-theme="Red"] .operator-directory-row.header { background:#fef2f2; color:#991b1b; }
@@ -2744,6 +2948,7 @@ DASHBOARD_HTML = """
   <div class="main-tabs">
     <button class="main-tab-button active" data-target="machinesTab">Machines</button>
     <button class="main-tab-button" data-target="jobQueueTab">Job Queue</button>
+    <button class="main-tab-button" data-target="finishShiftTab">Finish Shift</button>
     <button class="main-tab-button" data-target="finishedJobsTab">Finished Jobs</button>
     <button class="main-tab-button" data-target="archivedJobsTab">Archived Jobs</button>
     <button class="main-tab-button" data-target="machineArchiveTab">Machine Archive</button>
@@ -2763,10 +2968,27 @@ DASHBOARD_HTML = """
     </div>
   </div>
 
+  <div id="finishShiftTab" class="main-tab-content">
+    <div class="panel">
+      <h3>Finish Shift Review</h3>
+      <div class="muted">Pending and approved finished shifts saved from Finish Shift scans.</div>
+      <div class="sub-tabs">
+        <button class="sub-tab-button active" data-target="finishShiftQueuePane" type="button">Finished Shifts</button>
+        <button class="sub-tab-button" data-target="finishShiftProgressPane" type="button">Job Progress</button>
+      </div>
+      <div id="finishShiftQueuePane" class="sub-tab-content active">
+        <div id="finishedShiftQueueList" class="finished-wrap"></div>
+      </div>
+      <div id="finishShiftProgressPane" class="sub-tab-content">
+        <div id="finishedShiftJobProgress" class="finished-wrap"></div>
+      </div>
+    </div>
+  </div>
+
   <div id="finishedJobsTab" class="main-tab-content">
     <div class="panel">
       <h3>Finished Job Confirmation</h3>
-      <div class="muted">Stored from Finish Job QR scans (server JSON-backed).</div>
+      <div class="muted">Closed whole jobs stored from Finish Job QR scans, with approved shift partial context.</div>
       <div id="finishedJobsList" class="finished-wrap"></div>
     </div>
   </div>
@@ -2805,8 +3027,6 @@ DASHBOARD_HTML = """
         <div class="overlay-title">Approve and Print QR</div>
         <button id="overlayCloseBtn" class="overlay-close" type="button">Close</button>
       </div>
-      <button id="overlayReviewPrevBtn" class="review-slide-arrow review-edge-arrow left" type="button" style="display:none;">&#8592;</button>
-      <button id="overlayReviewNextBtn" class="review-slide-arrow review-edge-arrow right" type="button" style="display:none;">&#8594;</button>
       <div class="overlay-body">
         <div id="overlayReviewStep">
         <div id="overlayReviewSlideStatus" class="review-slide-status">Slide 1 / 4</div>
@@ -2854,9 +3074,8 @@ DASHBOARD_HTML = """
           <div class="overlay-row" style="display:none;"><label>Scan QR Input</label><input id="overlayReviewerScanInput" type="text" placeholder="Click 'Open QR Field' then scan..." style="display:none;" /></div>
           <div class="overlay-row"><label>Reviewer (Supervisor/QC QR)</label><input id="overlayReviewerBadge" type="text" placeholder="Scan supervisor/QC QR badge..." /></div>
           <div class="overlay-row"><label>Remarks</label><textarea id="overlayReviewRemarks" placeholder="Remarks required..."></textarea></div>
-          <div class="overlay-row"><label>Decision</label><select id="overlayReviewAction"><option value="approve">Approved</option><option value="disapprove">Not Approved</option></select></div>
           <div class="overlay-row"><label>QR Scan Helper</label><button id="overlayOpenScanFieldBtn" class="btn-secondary" type="button">Open QR Field</button></div>
-          <div id="overlayDisapproveFields" style="display:none;">
+          <div id="overlayDisapproveFields">
             <div class="overlay-row"><label>Pack Count</label><input id="editPackCount" type="number" min="0" /></div>
             <div class="overlay-row"><label>Good</label><input id="editGoodTotal" type="number" min="0" /></div>
             <div class="overlay-row"><label>Butal</label><input id="editButalTotal" type="number" min="0" /></div>
@@ -3097,7 +3316,7 @@ DASHBOARD_HTML = """
       <div class="settings-content" style="padding:14px;">
         <div class="settings-form">
           <div class="settings-row">
-            <label>Scan QR (Supervisor or QC)</label>
+            <label>Scan Supervisor QR</label>
             <input id="dailyRoleBadgeInput" type="text" placeholder="Scan QR badge then press Enter..." />
           </div>
           <div class="settings-row">
@@ -3180,6 +3399,8 @@ DASHBOARD_HTML = """
   const machineGrid = document.getElementById("machineGrid");
   const jobQueueSummary = document.getElementById("jobQueueSummary");
   const jobQueueTableWrap = document.getElementById("jobQueueTableWrap");
+  const finishedShiftQueueList = document.getElementById("finishedShiftQueueList");
+  const finishedShiftJobProgress = document.getElementById("finishedShiftJobProgress");
   const finishedJobsList = document.getElementById("finishedJobsList");
   const archivedJobsTableWrap = document.getElementById("archivedJobsTableWrap");
   const machineStatusArchiveTableWrap = document.getElementById("machineStatusArchiveTableWrap");
@@ -3222,8 +3443,6 @@ DASHBOARD_HTML = """
   const overlayReviewStep = document.getElementById("overlayReviewStep");
   const overlayQrStep = document.getElementById("overlayQrStep");
   const overlayReviewSlideStatus = document.getElementById("overlayReviewSlideStatus");
-  const overlayReviewPrevBtn = document.getElementById("overlayReviewPrevBtn");
-  const overlayReviewNextBtn = document.getElementById("overlayReviewNextBtn");
   const reviewSubslide1 = document.getElementById("reviewSubslide1");
   const reviewSubslide2 = document.getElementById("reviewSubslide2");
   const reviewSubslide3 = document.getElementById("reviewSubslide3");
@@ -3236,6 +3455,7 @@ DASHBOARD_HTML = """
   const overlayIndex = document.getElementById("overlayIndex");
   const overlayTotal = document.getElementById("overlayTotal");
   const overlayLotNumber = document.getElementById("overlayLotNumber");
+  const overlayPoNumberRow = overlayPoNumber ? overlayPoNumber.closest(".overlay-row") : null;
   const machineDetailOverlay = document.getElementById("machineDetailOverlay");
   const machineDetailSettingsBtn = document.getElementById("machineDetailSettingsBtn");
   const machineDetailCloseBtn = document.getElementById("machineDetailCloseBtn");
@@ -3279,6 +3499,7 @@ DASHBOARD_HTML = """
   let operatorDirectoryState = [];
   const machineCardEls = new Map();
   let finishedJobsState = [];
+  let finishedShiftState = [];
   let archivedJobsState = [];
   let machineStatusArchiveState = [];
   let finishedJobsInteractionLock = false;
@@ -3296,9 +3517,15 @@ DASHBOARD_HTML = """
     index: "",
     total: "",
     lotNumber: "",
+    stageLabel: "",
+    stageKind: "",
+    plan: [],
+    planIndex: 0,
+    printRequests: [],
   };
   let overlayReviewSavedApproved = false;
   let reviewSlideIndex = 0;
+  let overlayReviewMode = "job";
   let serverSettingsState = { theme: "Default", qrgen_base_url: "" };
   let dailyRolesState = {};
   let settingsProfilesState = [];
@@ -3916,15 +4143,27 @@ DASHBOARD_HTML = """
     overlayReviewStep.style.display = isReview ? "" : "none";
     overlayQrStep.style.display = isReview ? "none" : "";
     overlayReviewSubmitBtn.style.display = isReview ? "" : "none";
-    overlayReviewContinueBtn.style.display = isReview ? "" : "none";
+    overlayReviewContinueBtn.style.display = (isReview && overlayReviewMode !== "shift") ? "" : "none";
     overlayBackToReviewBtn.style.display = isReview ? "none" : "";
-    overlayGenerateBtn.style.display = isReview ? "none" : "";
+    overlayGenerateBtn.style.display = "none";
     overlayRequestBtn.style.display = isReview ? "none" : "";
+    if(overlayReviewStep){
+      overlayReviewStep.classList.toggle("single-page", overlayReviewMode === "shift" && isReview);
+    }
     syncReviewSubslides();
   }
 
   function syncReviewSubslides(){
     const slides = [reviewSubslide1, reviewSubslide2, reviewSubslide3, reviewSubslide4];
+    if(overlayReviewMode === "shift"){
+      slides.forEach((el) => {
+        if(el) el.classList.add("active");
+      });
+      if(overlayReviewSlideStatus){
+        overlayReviewSlideStatus.textContent = "Shift Review";
+      }
+      return;
+    }
     const total = slides.length;
     reviewSlideIndex = Math.max(0, Math.min(total - 1, Number(reviewSlideIndex || 0)));
     slides.forEach((el, idx) => {
@@ -3933,14 +4172,6 @@ DASHBOARD_HTML = """
     if(overlayReviewSlideStatus){
       const labels = ["Job Summary", "Raw Mats / Cycle", "Downtime / Team", "Approval"];
       overlayReviewSlideStatus.textContent = `Slide ${reviewSlideIndex + 1} / ${total} - ${labels[reviewSlideIndex] || ""}`;
-    }
-    if(overlayReviewPrevBtn){
-      overlayReviewPrevBtn.disabled = reviewSlideIndex <= 0;
-      overlayReviewPrevBtn.style.display = overlayReviewStep.style.display === "none" ? "none" : "";
-    }
-    if(overlayReviewNextBtn){
-      overlayReviewNextBtn.disabled = reviewSlideIndex >= total - 1;
-      overlayReviewNextBtn.style.display = overlayReviewStep.style.display === "none" ? "none" : "";
     }
   }
 
@@ -4001,8 +4232,196 @@ DASHBOARD_HTML = """
     `;
   }
 
-  function renderFinishedJobs(rows){
+  function isShiftPartialRecord(row){
+    return String(row?.record_type || "").toUpperCase() === "SHIFT_PARTIAL";
+  }
+
+  function isApprovedShiftRecord(row){
+    return isShiftPartialRecord(row) && String(row?.review_status || "").toUpperCase() === "APPROVED";
+  }
+
+  function renderFinishedShiftQueue(rows){
     const items = Array.isArray(rows) ? rows : [];
+    if(!finishedShiftQueueList) return;
+    if(!items.length){
+      finishedShiftQueueList.innerHTML = '<div class="placeholder">No finished shifts yet.</div>';
+      return;
+    }
+    const sorted = [...items].reverse();
+    finishedShiftQueueList.innerHTML = sorted.map((r, idx) => {
+      const machineCode = String(r.machine_code || "").trim();
+      const machineName = r.machine_name || MACHINE_NAME_MAP[machineCode] || machineCode || "-";
+      const rawLogs = Array.isArray(r.raw_material_logs) ? r.raw_material_logs : [];
+      const rawText = rawLogs.length
+        ? rawLogs.map((x, rowIdx) => `${rowIdx+1}. ${x.material_name || x.material || "-"} | qty=${x.qty || 0}`).join("\\n")
+        : "No raw materials scanned.";
+      return `
+        <div class="finished-item">
+          <div class="finished-head">
+            <h4>${esc(r.job_name || r.job_code || "Shift")} - ${esc(machineName)}</h4>
+            <span class="finished-badge">${esc(r.review_status || "PENDING")}</span>
+          </div>
+          <div class="finished-grid">
+            <div><strong>Shift End:</strong> ${esc(fmtDateLocal(r.finished_at_utc || r.ended_at_utc || ""))}</div>
+            <div><strong>Operator:</strong> ${esc(displayNameForId(r.operator_id || "-"))}</div>
+            <div><strong>Pack:</strong> ${esc(r.pack_count ?? 0)}</div>
+            <div><strong>Total Good:</strong> ${esc(r.total_good ?? r.partial_qty ?? 0)}</div>
+            <div><strong>Reject:</strong> ${esc(r.reject_total ?? 0)}</div>
+            <div><strong>Downtime:</strong> ${esc(fmtDowntimeSeconds(r.downtime_last_seconds))}</div>
+          </div>
+          <div class="raw-list">${esc(rawText)}</div>
+          <div class="finished-actions">
+            <button class="approve-print-btn shift-review-btn" data-row-index="${idx}" type="button">Review Shift</button>
+          </div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  function renderFinishedShiftJobProgress(rows){
+    const approved = (Array.isArray(rows) ? rows : []).filter(isApprovedShiftRecord);
+    if(!finishedShiftJobProgress) return;
+    if(!approved.length){
+      finishedShiftJobProgress.innerHTML = '<div class="placeholder">No approved shift partials yet.</div>';
+      return;
+    }
+    const grouped = new Map();
+    approved.forEach(row => {
+      const key = String(row.job_code || row.job_name || "").trim() || "UNKNOWN";
+      if(!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push(row);
+    });
+    const cards = Array.from(grouped.entries()).map(([key, list]) => {
+      const first = list[0] || {};
+      const approvedQty = list.reduce((sum, row) => sum + Number(row.partial_qty || row.total_good || 0), 0);
+      const apiPartials = Array.isArray(first?.job_payload?.data?.partials) ? first.job_payload.data.partials : [];
+      const apiPartialQty = apiPartials.reduce((sum, row) => sum + Number(row?.partial_qty || 0), 0);
+      const targetQty = Number(first?.job_payload?.data?.job?.approve_qty || first?.job_payload?.data?.job?.request_qty || 0);
+      const producedQty = approvedQty + apiPartialQty;
+      const remainingQty = Math.max(0, targetQty - producedQty);
+      const lines = list
+        .slice()
+        .sort((a, b) => String(a.finished_at_utc || a.ended_at_utc || "").localeCompare(String(b.finished_at_utc || b.ended_at_utc || "")))
+        .map((row, idx) => `${idx + 1}. ${fmtDateLocal(row.finished_at_utc || row.ended_at_utc || "")} | Qty ${row.partial_qty || row.total_good || 0} | Reject ${row.reject_total || 0} | Downtime ${fmtDowntimeSeconds(row.downtime_last_seconds)}`);
+      return `
+        <div class="finished-item">
+          <div class="finished-head">
+            <h4>${esc(first.job_name || first.job_code || key)}</h4>
+            <span class="finished-badge">APPROVED PARTIALS</span>
+          </div>
+          <div class="finished-grid">
+            <div><strong>Job Code:</strong> ${esc(first.job_code || key)}</div>
+            <div><strong>Approved Shifts:</strong> ${esc(list.length)}</div>
+            <div><strong>API Partials:</strong> ${esc(apiPartialQty)}</div>
+            <div><strong>Approved Shift Qty:</strong> ${esc(approvedQty)}</div>
+            <div><strong>Produced:</strong> ${esc(producedQty)}</div>
+            <div><strong>Remaining:</strong> ${esc(remainingQty)}</div>
+          </div>
+          <div class="raw-list">${esc(lines.join("\\n"))}</div>
+        </div>
+      `;
+    });
+    finishedShiftJobProgress.innerHTML = cards.join("");
+  }
+
+  function applyGeneratedQrPlanEntry(entry){
+    const item = entry && typeof entry === "object" ? entry : {};
+    const poRequired = Boolean(item.po_required);
+    const stagePo = String(item.po_number || "").trim();
+    const payloadText = (poRequired && !stagePo) ? "" : String(item.qr_payload || item.payload || "").trim();
+    const parsed = item.parsed && typeof item.parsed === "object" ? item.parsed : {};
+    if(overlayQrStageLabel) overlayQrStageLabel.value = String(item.stage_label || "2 / 2 - QR Print");
+    overlayQrPayload.value = payloadText || (poRequired ? "PO Number required for Butal QR. Enter PO Number, then Generate QR Payload." : "");
+    overlayQty.value = parsed.qty || item.qty || "";
+    overlayIndex.value = parsed.index || item.index || "";
+    overlayTotal.value = parsed.total || item.total || "";
+    overlayLotNumber.value = parsed.lot_number || item.lot_number || "";
+    generatedQrState.payload = overlayQrPayload.value || "";
+    generatedQrState.qty = overlayQty.value || "";
+    generatedQrState.index = overlayIndex.value || "";
+    generatedQrState.total = overlayTotal.value || "";
+    generatedQrState.lotNumber = overlayLotNumber.value || "";
+    generatedQrState.stageLabel = String(item.stage_label || "");
+    generatedQrState.stageKind = String(item.stage_kind || "");
+    if(overlayPoNumberRow){
+      overlayPoNumberRow.style.display = poRequired ? "" : "none";
+    }
+    if(overlayPoNumber){
+      overlayPoNumber.value = stagePo;
+      overlayPoNumber.placeholder = poRequired ? "Enter PO Number..." : "Not required for raw excess";
+    }
+    if(overlayProductSelect){
+      const sku = String(item.product_sku || "").trim();
+      const name = String(item.product_name || "").trim();
+      overlayProductSelect.value = (sku && name) ? `${sku} - ${name}` : (name || sku || overlayProductSelect.value || "");
+    }
+  }
+
+  async function refreshQrStagePayload(){
+    if(!overlayReviewSavedApproved){
+      overlayQrPayload.value = "Review approval is required before generating QR.";
+      return;
+    }
+    const productId = resolveProductIdFromText(overlayProductSelect.value || "");
+    const poNumber = (overlayPoNumber.value || "").trim();
+    const needsPo = generatedQrState.stageKind === "BUTAL";
+    if(needsPo && !poNumber){
+      overlayQrPayload.value = "Enter PO Number for Butal.";
+      return;
+    }
+    const resp = await fetch("/api/raw-material-qr", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        product_id: productId,
+        po_number: poNumber,
+        finished_job: activeJobRow || {},
+        stage_index: generatedQrState.plan && generatedQrState.plan.length ? generatedQrState.planIndex : 0,
+      }),
+    });
+    const out = await resp.json();
+    const plan = Array.isArray(out.qr_plan) ? out.qr_plan : [];
+    const payloadText = out.qr_payload || out.error || "Failed to generate.";
+    const existingRequests = Array.isArray(generatedQrState.printRequests) ? generatedQrState.printRequests : [];
+    generatedQrState = {
+      jobKey: jobKeyOf(activeJobRow),
+      payload: payloadText,
+      qty: "",
+      index: "",
+      total: "",
+      lotNumber: "",
+      stageLabel: String(out.stage_label || ""),
+      stageKind: "",
+      plan: plan,
+      planIndex: Number(out.selected_stage_index || 0),
+      printRequests: existingRequests,
+    };
+    if(plan.length){
+      applyGeneratedQrPlanEntry(plan[generatedQrState.planIndex] || plan[0]);
+    } else {
+      overlayQrPayload.value = payloadText;
+      const parsed = out.parsed || {};
+      overlayQty.value = parsed.qty || "";
+      overlayIndex.value = parsed.index || "";
+      overlayTotal.value = parsed.total || "";
+      overlayLotNumber.value = parsed.lot_number || "";
+      if(overlayQrStageLabel) overlayQrStageLabel.value = String(out.stage_label || "1 / 1 - QR Print");
+      generatedQrState.qty = overlayQty.value || "";
+      generatedQrState.index = overlayIndex.value || "";
+      generatedQrState.total = overlayTotal.value || "";
+      generatedQrState.lotNumber = overlayLotNumber.value || "";
+      generatedQrState.stageKind = "DEFAULT";
+    }
+  }
+
+  function renderFinishedJobs(rows){
+    const allItems = Array.isArray(rows) ? rows : [];
+    const shiftItems = allItems.filter(isShiftPartialRecord);
+    const finalItems = allItems.filter(r => !isShiftPartialRecord(r));
+    finishedShiftState = shiftItems;
+    renderFinishedShiftQueue(shiftItems);
+    renderFinishedShiftJobProgress(shiftItems);
+    const items = finalItems;
     if(finishedJobsInteractionLock){
       pendingFinishedJobsRows = items;
       finishedJobsState = items;
@@ -4019,9 +4438,13 @@ DASHBOARD_HTML = """
       const machineCode = String(r.machine_code || "").trim();
       const machineName = (r.machine_name || MACHINE_NAME_MAP[machineCode] || machineCode || "-");
       const rawLogs = Array.isArray(r.raw_material_logs) ? r.raw_material_logs : [];
+      const relatedApprovedShifts = shiftItems.filter(x => isApprovedShiftRecord(x) && String(x.job_code || "") === String(r.job_code || ""));
       const rawText = rawLogs.length
         ? rawLogs.map((x, idx) => `${idx+1}. ${x.material || "-"} | qty=${x.qty || 0}`).join("\\n")
         : "No raw materials scanned.";
+      const partialSummaryText = relatedApprovedShifts.length
+        ? relatedApprovedShifts.map((x, rowIdx) => `${rowIdx + 1}. ${fmtDateLocal(x.finished_at_utc || x.ended_at_utc || "")} | Qty ${x.partial_qty || x.total_good || 0} | Reject ${x.reject_total || 0} | Downtime ${fmtDowntimeSeconds(x.downtime_last_seconds)}`).join("\\n")
+        : "No approved shift partials linked to this job yet.";
       const linkageRole = String(r.linkage_role || "").toUpperCase();
       const linkageTotal = Number(r.linkage_group_total_jobs || 0);
       const linkageBadge = linkageRole ? `<span class="linkage-pill">${esc(linkageRole)}${linkageTotal ? ` (${linkageTotal})` : ""}</span>` : "";
@@ -4042,8 +4465,11 @@ DASHBOARD_HTML = """
             <div><strong>Total Good:</strong> ${esc(r.total_good ?? 0)}</div>
             <div><strong>Startup Reject:</strong> ${esc(r.startup_reject_total ?? 0)}</div>
             <div><strong>Raw Sacks:</strong> ${esc(r.raw_sacks_count ?? 0)}</div>
+            <div><strong>Approved Shifts:</strong> ${esc(relatedApprovedShifts.length)}</div>
+            <div><strong>Approved Shift Qty:</strong> ${esc(relatedApprovedShifts.reduce((sum, x) => sum + Number(x.partial_qty || x.total_good || 0), 0))}</div>
           </div>
           <div class="raw-list">${esc(rawText)}</div>
+          <div class="raw-list">${esc(partialSummaryText)}</div>
           ${linkageNote ? `<div class="finished-linkage-note"><strong>Link Info:</strong> ${esc(linkageNote)}</div>` : ""}
           <div class="finished-actions">
             <button class="approve-print-btn" data-row-index="${idx}" type="button">Approve and Print QR</button>
@@ -4393,6 +4819,9 @@ DASHBOARD_HTML = """
   function openApprovePrintOverlay(job){
     activeJobRow = job || null;
     overlayReviewSavedApproved = false;
+    overlayReviewMode = isShiftPartialRecord(activeJobRow) ? "shift" : "job";
+    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = overlayReviewMode === "shift" ? "Save Changes" : "Save Review";
+    if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = overlayReviewMode === "shift" ? "none" : "";
     const title = activeJobRow
       ? `${activeJobRow.job_name || activeJobRow.job_code || "Finished Job"} | ${activeJobRow.machine_name || activeJobRow.machine_code || "-"}`
       : "Finished Job";
@@ -4433,25 +4862,23 @@ DASHBOARD_HTML = """
       overlayReviewerScanInput.style.display = "none";
     }
     if(overlayReviewRemarks) overlayReviewRemarks.value = "";
-    if(overlayReviewAction) overlayReviewAction.value = "approve";
-    if(overlayDisapproveFields) overlayDisapproveFields.style.display = "none";
     fillDisapproveFields(activeJobRow);
     reviewSlideIndex = 0;
     syncReviewSubslides();
     setOverlayStep("review");
-    if(generatedQrState.jobKey === key){
-      overlayQrPayload.value = generatedQrState.payload || "";
-      overlayQty.value = generatedQrState.qty || "";
-      overlayIndex.value = generatedQrState.index || "";
-      overlayTotal.value = generatedQrState.total || "";
-      overlayLotNumber.value = generatedQrState.lotNumber || "";
-    } else {
-      generatedQrState = { jobKey: key, payload: "", qty: "", index: "", total: "", lotNumber: "" };
-      overlayQrPayload.value = "";
-      overlayQty.value = "";
-      overlayIndex.value = "";
-      overlayTotal.value = "";
-      overlayLotNumber.value = "";
+    generatedQrState = { jobKey: key, payload: "", qty: "", index: "", total: "", lotNumber: "", stageLabel: "", stageKind: "", plan: [], planIndex: 0, printRequests: [] };
+    overlayQrPayload.value = "";
+    overlayQty.value = "";
+    overlayIndex.value = "";
+    overlayTotal.value = "";
+    overlayLotNumber.value = "";
+    if(overlayQrStageLabel) overlayQrStageLabel.value = "2 / 2 - QR Print";
+    if(overlayPoNumber){
+      overlayPoNumber.value = "";
+      overlayPoNumber.placeholder = "Enter PO Number...";
+    }
+    if(overlayPoNumberRow){
+      overlayPoNumberRow.style.display = "none";
     }
     approvePrintOverlay.classList.add("active");
     if(productItems.length){
@@ -4463,6 +4890,7 @@ DASHBOARD_HTML = """
     approvePrintOverlay.classList.remove("active");
     activeJobRow = null;
     overlayReviewSavedApproved = false;
+    overlayReviewMode = "job";
     reviewSlideIndex = 0;
     syncReviewSubslides();
     setOverlayStep("review");
@@ -4571,6 +4999,17 @@ DASHBOARD_HTML = """
       document.querySelectorAll(".main-tab-content").forEach(c => c.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById(target)?.classList.add("active");
+    });
+  });
+  document.querySelectorAll(".sub-tab-button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const host = btn.closest(".panel");
+      if(!host) return;
+      const target = btn.getAttribute("data-target");
+      host.querySelectorAll(".sub-tab-button").forEach(b => b.classList.remove("active"));
+      host.querySelectorAll(".sub-tab-content").forEach(c => c.classList.remove("active"));
+      btn.classList.add("active");
+      host.querySelector(`#${target}`)?.classList.add("active");
     });
   });
 
@@ -4700,6 +5139,19 @@ DASHBOARD_HTML = """
     }
     setTimeout(() => setFinishedJobsInteractionLock(false), 0);
   });
+  finishedShiftQueueList?.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest(".shift-review-btn");
+    if(!btn) return;
+    const idx = Number(btn.getAttribute("data-row-index"));
+    if(Number.isNaN(idx) || idx < 0) return;
+    const sorted = [...(finishedShiftState || [])].reverse();
+    const row = sorted[idx];
+    if(!row) return;
+    openApprovePrintOverlay(row);
+    setOverlayStep("review");
+    if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = "none";
+    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = "Save Changes";
+  });
   finishedJobsList.addEventListener("mouseover", (ev) => {
     if(ev.target.closest(".approve-print-btn")) setFinishedJobsInteractionLock(true);
   });
@@ -4726,29 +5178,6 @@ DASHBOARD_HTML = """
 
   overlayCloseBtn.addEventListener("click", closeApprovePrintOverlay);
   overlayCancelBtn.addEventListener("click", closeApprovePrintOverlay);
-  if(overlayReviewAction){
-    overlayReviewAction.addEventListener("change", () => {
-      if(overlayDisapproveFields){
-        overlayDisapproveFields.style.display = overlayReviewAction.value === "disapprove" ? "" : "none";
-      }
-      if(overlayReviewAction.value === "disapprove" && reviewSlideIndex < 3){
-        reviewSlideIndex = 3;
-        syncReviewSubslides();
-      }
-    });
-  }
-  if(overlayReviewPrevBtn){
-    overlayReviewPrevBtn.addEventListener("click", () => {
-      reviewSlideIndex = Math.max(0, reviewSlideIndex - 1);
-      syncReviewSubslides();
-    });
-  }
-  if(overlayReviewNextBtn){
-    overlayReviewNextBtn.addEventListener("click", () => {
-      reviewSlideIndex = Math.min(3, reviewSlideIndex + 1);
-      syncReviewSubslides();
-    });
-  }
   if(overlayOpenScanFieldBtn && overlayReviewerScanInput){
     overlayOpenScanFieldBtn.addEventListener("click", () => {
       openQrScanCaptureOverlay();
@@ -4854,6 +5283,16 @@ DASHBOARD_HTML = """
   overlayProductSelect.addEventListener("input", () => {
     renderProductSuggestions(overlayProductSelect.value || "");
   });
+  overlayPoNumber?.addEventListener("input", () => {
+    if(generatedQrState.stageKind === "BUTAL"){
+      const po = (overlayPoNumber.value || "").trim();
+      if(!po){
+        overlayQrPayload.value = "Enter PO Number for Butal.";
+        return;
+      }
+      refreshQrStagePayload().catch(() => {});
+    }
+  });
 
   overlayProductSelect.addEventListener("keydown", (ev) => {
     if(!overlayProductSuggest.classList.contains("active")){
@@ -4905,45 +5344,7 @@ DASHBOARD_HTML = """
   });
 
   overlayGenerateBtn.addEventListener("click", async () => {
-    if(!overlayReviewSavedApproved){
-      overlayQrPayload.value = "Review approval is required before generating QR.";
-      return;
-    }
-    const productId = resolveProductIdFromText(overlayProductSelect.value || "");
-    if(!productId){
-      overlayQrPayload.value = "Select a product first.";
-      return;
-    }
-    const poNumber = (overlayPoNumber.value || "").trim();
-    if(!poNumber){
-      overlayQrPayload.value = "Provide PO Number first.";
-      return;
-    }
-    const resp = await fetch("/api/raw-material-qr", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        product_id: productId,
-        po_number: poNumber,
-        finished_job: activeJobRow || {},
-      }),
-    });
-    const out = await resp.json();
-    const payloadText = out.qr_payload || out.error || "Failed to generate.";
-    overlayQrPayload.value = payloadText;
-    const parsed = out.parsed || {};
-    overlayQty.value = parsed.qty || "";
-    overlayIndex.value = parsed.index || "";
-    overlayTotal.value = parsed.total || "";
-    overlayLotNumber.value = parsed.lot_number || "";
-    generatedQrState = {
-      jobKey: jobKeyOf(activeJobRow),
-      payload: payloadText,
-      qty: overlayQty.value || "",
-      index: overlayIndex.value || "",
-      total: overlayTotal.value || "",
-      lotNumber: overlayLotNumber.value || "",
-    };
+    await refreshQrStagePayload();
   });
 
   overlayRequestBtn.addEventListener("click", async () => {
@@ -4960,8 +5361,11 @@ DASHBOARD_HTML = """
     const total = (overlayTotal.value || "").trim();
     const poNumber = (overlayPoNumber.value || "").trim();
     const lotNumber = (overlayLotNumber.value || "").trim();
-    if(!quantity || !total || !poNumber || !lotNumber){
-      overlayQrPayload.value = "Generate QR first so Quantity/Total/Lot/PO are complete.";
+    const stageNeedsPo = generatedQrState.stageKind === "BUTAL";
+    if(!quantity || !total || !lotNumber || (stageNeedsPo && !poNumber)){
+      overlayQrPayload.value = stageNeedsPo
+        ? "Generate QR first so Quantity/Total/Lot/PO are complete."
+        : "Generate QR first so Quantity/Total/Lot are complete.";
       return;
     }
 
@@ -4974,6 +5378,7 @@ DASHBOARD_HTML = """
       product_desc: (activeJobRow && (activeJobRow.job_name || activeJobRow.job_code)) || "",
       requested_at_ph: "",
       lot_number: lotNumber,
+      qr_stage_label: generatedQrState.stageLabel || "",
     };
 
     const resp = await fetch("/api/qrgen/pending-request", {
@@ -4983,7 +5388,19 @@ DASHBOARD_HTML = """
     });
     const out = await resp.json();
     if(out.ok){
-      overlayQrPayload.value = `${overlayQrPayload.value}\n\nPrint request sent.`;
+      generatedQrState.printRequests = [...(generatedQrState.printRequests || []), requestPayload];
+      const hasNext = Array.isArray(generatedQrState.plan) && generatedQrState.planIndex < (generatedQrState.plan.length - 1);
+      if(hasNext){
+        generatedQrState.planIndex += 1;
+        applyGeneratedQrPlanEntry(generatedQrState.plan[generatedQrState.planIndex]);
+        if(generatedQrState.stageKind === "BUTAL"){
+          overlayQrPayload.value = "Enter PO Number for Butal.";
+        } else {
+          overlayQrPayload.value = `${overlayQrPayload.value}\n\nPrint request sent. Next QR stage loaded.`;
+        }
+        return;
+      }
+      overlayQrPayload.value = `${overlayQrPayload.value}\n\nPrint request sent. Shift finished.`;
       try {
         const archiveResp = await fetch("/api/finished-jobs/archive", {
           method: "POST",
@@ -4992,6 +5409,7 @@ DASHBOARD_HTML = """
             job_key: jobKeyOf(activeJobRow),
             qr_payload: overlayQrPayload.value || "",
             print_payload: requestPayload,
+            print_payloads: generatedQrState.printRequests || [],
           }),
         });
         const archiveOut = await archiveResp.json();
@@ -5008,7 +5426,10 @@ DASHBOARD_HTML = """
         overlayQrPayload.value = `${overlayQrPayload.value}\nArchive warning: ${e}`;
       }
     } else {
-      overlayQrPayload.value = out.error || "Print request failed.";
+      const apiMsg = out?.target_base_url
+        ? `QR generator API is not available. ${out.error || "Request failed."}`
+        : (out.error || "Print request failed.");
+      overlayQrPayload.value = apiMsg;
     }
   });
 
@@ -5016,7 +5437,9 @@ DASHBOARD_HTML = """
     if(!activeJobRow) return;
     const reviewerBadge = (overlayReviewerBadge.value || "").trim();
     const remarks = (overlayReviewRemarks.value || "").trim();
-    const action = actionMode === "continue" ? "approve" : (overlayReviewAction.value || "approve");
+    const action = overlayReviewMode === "shift"
+      ? "update"
+      : (actionMode === "continue" ? "approve" : "disapprove");
     if(!reviewerBadge){
       overlayReviewRemarks.value = remarks;
       alert("Reviewer QR / badge is required.");
@@ -5026,24 +5449,21 @@ DASHBOARD_HTML = """
       alert("Remarks are required.");
       return;
     }
-    let changes = {};
-    if(action === "disapprove"){
-      let rejectBreakdown = {};
-      try {
-        rejectBreakdown = JSON.parse((editRejectBreakdown.value || "{}").trim() || "{}");
-      } catch {
-        alert("Reject Details JSON is invalid.");
-        return;
-      }
-      changes = {
-        pack_count: Number(editPackCount.value || 0),
-        good_total: Number(editGoodTotal.value || 0),
-        butal_total: Number(editButalTotal.value || 0),
-        reject_total: Number(editRejectTotal.value || 0),
-        total_good: Number(editTotalGood.value || 0),
-        reject_breakdown: rejectBreakdown,
-      };
+    let rejectBreakdown = {};
+    try {
+      rejectBreakdown = JSON.parse((editRejectBreakdown.value || "{}").trim() || "{}");
+    } catch {
+      alert("Reject Details JSON is invalid.");
+      return;
     }
+    const changes = {
+      pack_count: Number(editPackCount.value || 0),
+      good_total: Number(editGoodTotal.value || 0),
+      butal_total: Number(editButalTotal.value || 0),
+      reject_total: Number(editRejectTotal.value || 0),
+      total_good: Number(editTotalGood.value || 0),
+      reject_breakdown: rejectBreakdown,
+    };
     const resp = await fetch("/api/finished-jobs/review", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -5076,10 +5496,20 @@ DASHBOARD_HTML = """
     if(actionMode === "continue"){
       overlayReviewSavedApproved = true;
       setOverlayStep("qr");
+      generatedQrState = { jobKey: jobKeyOf(activeJobRow), payload: "", qty: "", index: "", total: "", lotNumber: "", stageLabel: "", stageKind: "", plan: [], planIndex: 0, printRequests: [] };
+      if(overlayPoNumber){
+        overlayPoNumber.value = "";
+      }
+      if(overlayPoNumberRow){
+        overlayPoNumberRow.style.display = "none";
+      }
+      setTimeout(() => { refreshQrStagePayload().catch(() => {}); }, 0);
     } else {
       overlayReviewSavedApproved = action === "approve";
       if(action === "approve"){
         alert("Approved and saved. You can now continue to QR.");
+      } else if(action === "update"){
+        alert("Shift review changes saved.");
       } else {
         alert("Disapproved changes saved. Review again and approve to continue to QR.");
       }
@@ -5672,7 +6102,12 @@ async def api_event(req: Request):
     # apply event counters if provided
     ev = data.get("event") or {}
     ev_type = str(ev.get("type", "")).upper()
-    if ev_type == "FINISH_JOB":
+    if ev_type == "FINISH_SHIFT":
+        finished_job = ev.get("finished_job")
+        if isinstance(finished_job, dict):
+            FINISHED_JOBS.append(finished_job)
+            save_finished_jobs(FINISHED_JOBS)
+    elif ev_type == "FINISH_JOB":
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
             FINISHED_JOBS.append(finished_job)
@@ -5827,21 +6262,23 @@ async def api_finished_jobs_review(req: Request):
     global FINISHED_JOBS
     data = await req.json()
     job_key = str(data.get("job_key", "")).strip()
-    action = str(data.get("action", "")).strip().lower()  # approve | disapprove
+    action = str(data.get("action", "")).strip().lower()  # approve | disapprove | update
     remarks = str(data.get("remarks", "")).strip()
     reviewer_badge = str(data.get("reviewer_badge", "")).strip()
     changes = data.get("changes") if isinstance(data.get("changes"), dict) else {}
 
     if not job_key:
         return JSONResponse({"ok": False, "error": "job_key is required"}, status_code=400)
-    if action not in ("approve", "disapprove"):
-        return JSONResponse({"ok": False, "error": "action must be approve or disapprove"}, status_code=400)
+    if action not in ("approve", "disapprove", "update"):
+        return JSONResponse({"ok": False, "error": "action must be approve, disapprove, or update"}, status_code=400)
     if not remarks:
         return JSONResponse({"ok": False, "error": "remarks is required"}, status_code=400)
 
     reviewer = _reviewer_from_badge(reviewer_badge)
     if reviewer is None:
-        return JSONResponse({"ok": False, "error": "Invalid reviewer QR/badge. Supervisor or QC badge required."}, status_code=400)
+        return JSONResponse({"ok": False, "error": "Invalid reviewer QR/badge. Supervisor badge required."}, status_code=400)
+    if str(reviewer.get("rights") or "").strip().lower() not in ("supervisor", "both"):
+        return JSONResponse({"ok": False, "error": "Only Supervisor QR can approve or edit shift/job data."}, status_code=403)
 
     idx = _find_finished_job_index(FINISHED_JOBS, job_key)
     if idx < 0:
@@ -5901,17 +6338,30 @@ async def api_finished_jobs_review(req: Request):
         row["changed_by_role"] = reviewer["role"]
         row["change_remarks"] = remarks
         row["changed_at_utc"] = now_utc
-        row["review_status"] = "DISAPPROVED_CHANGED"
-        row["last_original_snapshot"] = original_snapshot
-        row["review_history"].append({
-            "action": "DISAPPROVE_CHANGE",
-            "remarks": remarks,
-            "actor_name": reviewer["name"],
-            "actor_code": reviewer["code"],
-            "actor_role": reviewer["role"],
-            "timestamp_utc": now_utc,
-            "changes": changes,
-        })
+        if action == "disapprove":
+            row["review_status"] = "DISAPPROVED_CHANGED"
+            row["last_original_snapshot"] = original_snapshot
+            row["review_history"].append({
+                "action": "DISAPPROVE_CHANGE",
+                "remarks": remarks,
+                "actor_name": reviewer["name"],
+                "actor_code": reviewer["code"],
+                "actor_role": reviewer["role"],
+                "timestamp_utc": now_utc,
+                "changes": changes,
+            })
+        else:
+            row["review_status"] = row.get("review_status") or "PENDING_SUPERVISOR"
+            row["last_original_snapshot"] = original_snapshot
+            row["review_history"].append({
+                "action": "UPDATE",
+                "remarks": remarks,
+                "actor_name": reviewer["name"],
+                "actor_code": reviewer["code"],
+                "actor_role": reviewer["role"],
+                "timestamp_utc": now_utc,
+                "changes": changes,
+            })
 
     FINISHED_JOBS[idx] = row
     save_finished_jobs(FINISHED_JOBS)
@@ -5925,6 +6375,7 @@ async def api_finished_jobs_archive(req: Request):
     data = await req.json()
     job_key = str(data.get("job_key", "")).strip()
     print_payload = data.get("print_payload") if isinstance(data.get("print_payload"), dict) else {}
+    print_payloads = data.get("print_payloads") if isinstance(data.get("print_payloads"), list) else []
     qr_payload = str(data.get("qr_payload", "")).strip()
     if not job_key:
         return JSONResponse({"ok": False, "error": "job_key is required"}, status_code=400)
@@ -5937,6 +6388,8 @@ async def api_finished_jobs_archive(req: Request):
     row["printed_at_utc"] = now_utc
     row["archived_at_utc"] = now_utc
     row["print_request_payload"] = print_payload
+    if print_payloads:
+        row["print_request_payloads"] = list(print_payloads)
     if qr_payload:
         row["printed_qr_payload"] = qr_payload
     row["archive_status"] = "PRINTED_ARCHIVED"
@@ -5973,14 +6426,20 @@ async def api_raw_material_qr(req: Request):
     data = await req.json()
     product_id = str(data.get("product_id", "")).strip()
     po_number = str(data.get("po_number", "")).strip()
-    if not product_id:
-        return JSONResponse({"ok": False, "error": "product_id is required"}, status_code=400)
-    if not po_number:
-        return JSONResponse({"ok": False, "error": "po_number is required"}, status_code=400)
-    payload = _build_raw_material_qr_value(product_id, po_number=po_number)
-    product_meta = _lookup_product_meta(product_id)
-    product_name = product_meta.get("name", "")
-    product_sku = product_meta.get("sku", "")
+    finished_job = data.get("finished_job") if isinstance(data.get("finished_job"), dict) else {}
+    stage_index = int(data.get("stage_index", 0) or 0)
+    qr_plan = _build_finished_job_qr_plan(finished_job, product_id, po_number)
+    selected_index = max(0, min(stage_index, max(len(qr_plan) - 1, 0)))
+    first_entry = qr_plan[selected_index] if qr_plan else {}
+    stage_product_id = str(first_entry.get("product_id", "")).strip() or product_id
+    payload = str(first_entry.get("qr_payload", "")).strip() or _build_raw_material_qr_value(stage_product_id, po_number=str(first_entry.get("po_number", "")).strip())
+    product_meta = _lookup_product_meta(stage_product_id)
+    product_name = str(first_entry.get("product_name", "")).strip() or product_meta.get("name", "")
+    product_sku = str(first_entry.get("product_sku", "")).strip() or product_meta.get("sku", "")
+    parsed_first = first_entry.get("parsed") if isinstance(first_entry.get("parsed"), dict) else _parse_qr_segments(payload)
+    qty_value = int(_parse_number_like(parsed_first.get("qty") or 1) or 1)
+    index_value = int(_parse_number_like(parsed_first.get("index") or 1) or 1)
+    total_value = int(_parse_number_like(parsed_first.get("total") or 1) or 1)
     try:
         image_url = _qr_png_data_url(payload)
     except Exception:
@@ -5988,12 +6447,12 @@ async def api_raw_material_qr(req: Request):
     try:
         label_url = _label_png_data_url(
             payload,
-            product_id=product_id,
+            product_id=stage_product_id,
             product_name=product_name,
             product_sku=product_sku,
-            qty=1,
-            index_value=1,
-            total=1,
+            qty=qty_value,
+            index_value=index_value,
+            total=total_value,
         )
     except Exception:
         label_url = image_url
@@ -6002,7 +6461,10 @@ async def api_raw_material_qr(req: Request):
         "qr_payload": payload,
         "qr_image_data_url": image_url,
         "label_image_data_url": label_url,
-        "parsed": _parse_qr_segments(payload),
+        "parsed": parsed_first,
+        "qr_plan": qr_plan,
+        "selected_stage_index": selected_index,
+        "stage_label": first_entry.get("stage_label", "1 / 1 - QR"),
         "qr_format": _raw_qr_format_template(),
     }
 
@@ -6017,6 +6479,8 @@ async def api_qrgen_pending_request(req: Request):
     product_desc = str(data.get("product_desc", "")).strip()
     lot_number = str(data.get("lot_number", "")).strip()
     requested_at_ph = str(data.get("requested_at_ph", "")).strip() or _requested_at_ph_str()
+    qr_stage_label = str(data.get("qr_stage_label", "")).strip()
+    stage_requires_po = "butal" in qr_stage_label.lower()
 
     if not product_name:
         return JSONResponse({"ok": False, "error": "product_name is required"}, status_code=400)
@@ -6024,14 +6488,14 @@ async def api_qrgen_pending_request(req: Request):
         return JSONResponse({"ok": False, "error": "quantity is required"}, status_code=400)
     if not total:
         return JSONResponse({"ok": False, "error": "total is required"}, status_code=400)
-    if not po_number:
+    if stage_requires_po and not po_number:
         return JSONResponse({"ok": False, "error": "po_number is required"}, status_code=400)
 
     outbound = {
         "product_name": product_name,
         "quantity": quantity,
         "total": total,
-        "po_number": po_number,
+        "po_number": po_number or "",
         "product_desc": product_desc,
         "requested_at_ph": requested_at_ph,
     }

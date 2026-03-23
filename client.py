@@ -78,6 +78,12 @@ USER_QR_PROFILES_FILE = os.path.join(DATABASE_DIR, "user_qr_profiles.json")
 PRODUCT_CATALOG_CACHE_FILE = os.path.join(DATABASE_DIR, "product_catalog_cache.json")
 FINISHED_JOBS_FILE = os.path.join(DATABASE_DIR, "finished_jobs.json")
 SQL_CONFIG_FILE = os.path.join(DATABASE_DIR, "sql_config.json")
+RECORD_TYPE_SHIFT_PARTIAL = "SHIFT_PARTIAL"
+RECORD_TYPE_FINAL_JOB = "FINAL_JOB"
+REVIEW_STATUS_PENDING = "PENDING_SUPERVISOR"
+REVIEW_STATUS_APPROVED = "APPROVED"
+REVIEW_STATUS_CLOSED = "CLOSED_JOB"
+TEMP_PART_QTY_PER_UNIT = 0.0848
 MACHINE_BACKGROUND_IMAGE = os.path.join(IMAGES_DIR, "bgsteel.jpg")
 
 
@@ -846,6 +852,50 @@ def _insert_finished_job_sql(row: Dict[str, Any]) -> bool:
         conn.close()
 
 
+def _load_finished_jobs_sql() -> List[Dict[str, Any]]:
+    conn = _sql_conn()
+    if conn is None:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT `raw_json` FROM `finished_jobs` ORDER BY `id` ASC")
+            rows = cur.fetchall() or []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            raw = row.get("raw_json") if isinstance(row, dict) else None
+            try:
+                item = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                item = None
+            if isinstance(item, dict):
+                out.append(item)
+        return out
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def _replace_finished_jobs_sql(rows: List[Dict[str, Any]]) -> bool:
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM `finished_jobs`")
+        conn.commit()
+        ok = True
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ok = _insert_finished_job_sql(row) and ok
+        return ok
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
 _ensure_sql_schema()
 _migrate_active_sessions_json_to_sql()
 
@@ -1131,6 +1181,264 @@ class ClientState:
 @dataclass
 class StatusPulse:
     age: float
+
+
+@dataclass
+class FloatingText:
+    text: str
+    x: float
+    y: float
+    start_y: float
+    age: float = 0.0
+    duration: float = 1.4
+
+
+class CounterCard(QWidget):
+    def __init__(self, title: str, theme: str = "green"):
+        super().__init__()
+        self.title = title
+        self.theme = str(theme or "green").lower()
+        self._value = 0
+        self._display_value = 0.0
+        self._glow = 0.0
+        self._scale = 0.0
+        self._flash = 0.0
+        self._floating: List[FloatingText] = []
+
+        self.setMinimumSize(128, 78)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(16)
+
+        self.num_anim = QVariantAnimation(self)
+        self.num_anim.setDuration(500)
+        self.num_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.num_anim.valueChanged.connect(self._num_update)
+
+        self.glow_anim = QPropertyAnimation(self, b"glow", self)
+        self.glow_anim.setDuration(1300)
+        self.glow_anim.setStartValue(0.0)
+        self.glow_anim.setKeyValueAt(0.5, 1.0)
+        self.glow_anim.setEndValue(0.0)
+        self.glow_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+
+        self.scale_anim = QPropertyAnimation(self, b"scale", self)
+        self.scale_anim.setDuration(1100)
+        self.scale_anim.setStartValue(0.0)
+        self.scale_anim.setKeyValueAt(0.4, 1.0)
+        self.scale_anim.setEndValue(0.0)
+        self.scale_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        self.flash_anim = QPropertyAnimation(self, b"flash", self)
+        self.flash_anim.setDuration(900)
+        self.flash_anim.setStartValue(0.0)
+        self.flash_anim.setKeyValueAt(0.3, 1.0)
+        self.flash_anim.setEndValue(0.0)
+        self.flash_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def getGlow(self):
+        return self._glow
+
+    def setGlow(self, value):
+        self._glow = float(value)
+        self.update()
+
+    glow = pyqtProperty(float, fget=getGlow, fset=setGlow)
+
+    def getScale(self):
+        return self._scale
+
+    def setScale(self, value):
+        self._scale = float(value)
+        self.update()
+
+    scale = pyqtProperty(float, fget=getScale, fset=setScale)
+
+    def getFlash(self):
+        return self._flash
+
+    def setFlash(self, value):
+        self._flash = float(value)
+        self.update()
+
+    flash = pyqtProperty(float, fget=getFlash, fset=setFlash)
+
+    def add_points(self, val: int):
+        delta = int(val or 0)
+        if delta <= 0:
+            return
+        old_value = self._value
+        self._value += delta
+
+        self.num_anim.stop()
+        self.num_anim.setStartValue(float(old_value))
+        self.num_anim.setEndValue(float(self._value))
+        self.num_anim.start()
+
+        self.glow_anim.stop()
+        self.glow_anim.start()
+        self.scale_anim.stop()
+        self.scale_anim.start()
+        self.flash_anim.stop()
+        self.flash_anim.start()
+
+        self._floating.append(
+            FloatingText(
+                text=f"+{delta}",
+                x=self.width() * 0.72,
+                y=self.height() * 0.42,
+                start_y=self.height() * 0.42,
+            )
+        )
+
+    def set_value(self, value: int):
+        self._value = max(0, int(value))
+        self._display_value = float(self._value)
+        self.update()
+
+    def _num_update(self, value):
+        self._display_value = float(value)
+        self.update()
+
+    def _tick(self):
+        kept = []
+        dt = 0.016
+        for f in self._floating:
+            f.age += dt
+            t = min(1.0, f.age / f.duration)
+            eased = 1.0 - (1.0 - t) * (1.0 - t)
+            f.y = f.start_y - 40 * eased
+            if t < 1.0:
+                kept.append(f)
+        self._floating = kept
+        if kept:
+            self.update()
+
+    def colors(self):
+        if self.theme == "red":
+            return {
+                "base": QColor(190, 20, 20),
+                "dark": QColor(140, 10, 10),
+                "glow": QColor(255, 120, 120),
+                "border": QColor(255, 140, 140),
+                "title": QColor(255, 245, 245),
+                "value": QColor(255, 235, 235),
+                "flash": QColor(255, 255, 255),
+                "float": QColor(255, 240, 240),
+            }
+        return {
+            "base": QColor(26, 132, 62),
+            "dark": QColor(12, 95, 42),
+            "glow": QColor(120, 255, 180),
+            "border": QColor(72, 255, 170),
+            "title": QColor(245, 245, 245),
+            "value": QColor(180, 255, 210),
+            "flash": QColor(255, 255, 255),
+            "float": QColor(230, 255, 238),
+        }
+
+    def paintEvent(self, event):
+        c = self.colors()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        rect = QRectF(5, 5, self.width() - 10, self.height() - 10)
+        radius = 20.0
+
+        scale_factor = 1.0 + self._scale * 0.06
+        painter.translate(rect.center())
+        painter.scale(scale_factor, scale_factor)
+        painter.translate(-rect.center())
+
+        self._draw_glow(painter, rect, radius, c)
+        self._draw_shadow(painter, rect, radius)
+        self._draw_body(painter, rect, radius, c)
+        self._draw_flash(painter, rect, radius, c)
+        self._draw_title(painter, rect, c)
+        self._draw_value(painter, rect, c)
+        self._draw_floating_text(painter, c)
+        painter.end()
+
+    def _draw_glow(self, painter: QPainter, rect: QRectF, radius: float, c: dict):
+        if self._glow <= 0.001:
+            return
+        for i in range(12):
+            alpha = max(0, int(125 * self._glow) - i * 10)
+            if alpha <= 0:
+                continue
+            expand = i * 2.0
+            painter.setPen(QPen(QColor(c["glow"].red(), c["glow"].green(), c["glow"].blue(), alpha), 3))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(-expand, -expand, expand, expand), radius + expand, radius + expand)
+
+    def _draw_shadow(self, painter: QPainter, rect: QRectF, radius: float):
+        shadow_color = QColor(0, 0, 0, 90)
+        for i in range(4):
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(shadow_color.red(), shadow_color.green(), shadow_color.blue(), 30 - i * 6))
+            painter.drawRoundedRect(rect.adjusted(i + 1, i + 3, i + 1, i + 3), radius, radius)
+
+    def _draw_body(self, painter: QPainter, rect: QRectF, radius: float, c: dict):
+        grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        grad.setColorAt(0.0, c["base"])
+        grad.setColorAt(1.0, c["dark"])
+        painter.setPen(QPen(c["border"], 1.5))
+        painter.setBrush(grad)
+        painter.drawRoundedRect(rect, radius, radius)
+
+        highlight = QRectF(rect.left() + 2, rect.top() + 2, rect.width() - 4, rect.height() * 0.42)
+        highlight_grad = QLinearGradient(highlight.topLeft(), highlight.bottomLeft())
+        highlight_grad.setColorAt(0.0, QColor(255, 255, 255, 42))
+        highlight_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(highlight_grad)
+        painter.drawRoundedRect(highlight, radius - 2, radius - 2)
+
+    def _draw_flash(self, painter: QPainter, rect: QRectF, radius: float, c: dict):
+        if self._flash <= 0.001:
+            return
+        rg = QRadialGradient(rect.center(), rect.width() / 1.5)
+        rg.setColorAt(0.0, QColor(c["flash"].red(), c["flash"].green(), c["flash"].blue(), int(165 * self._flash)))
+        rg.setColorAt(0.45, QColor(c["flash"].red(), c["flash"].green(), c["flash"].blue(), int(70 * self._flash)))
+        rg.setColorAt(1.0, QColor(c["flash"].red(), c["flash"].green(), c["flash"].blue(), 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(rg)
+        painter.drawRoundedRect(rect, radius, radius)
+
+    def _draw_title(self, painter: QPainter, rect: QRectF, c: dict):
+        title_px = max(10, min(16, int(rect.height() * 0.17)))
+        font = QFont("Segoe UI", title_px, QFont.Weight.Bold)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
+        painter.setFont(font)
+        painter.setPen(c["title"])
+        title_rect = QRectF(rect.left(), rect.top() + max(4, int(rect.height() * 0.06)), rect.width(), max(18, int(rect.height() * 0.22)))
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, self.title)
+
+    def _draw_value(self, painter: QPainter, rect: QRectF, c: dict):
+        text = str(int(round(self._display_value)))
+        value_rect = QRectF(rect.left(), rect.top() + max(18, int(rect.height() * 0.24)), rect.width(), rect.height() - max(20, int(rect.height() * 0.22)))
+        glow_alpha = int(170 + 85 * self._glow)
+        value_px = max(22, min(40, int(rect.height() * 0.36)))
+        painter.setFont(QFont("Consolas", value_px, QFont.Weight.Bold))
+        for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2), (0, 0)]:
+            painter.setPen(QColor(c["glow"].red(), c["glow"].green(), c["glow"].blue(), min(255, glow_alpha)))
+            painter.drawText(value_rect.translated(dx, dy), Qt.AlignmentFlag.AlignCenter, text)
+        painter.setPen(c["value"])
+        painter.drawText(value_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _draw_floating_text(self, painter: QPainter, c: dict):
+        if not self._floating:
+            return
+        painter.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        for f in self._floating:
+            t = min(1.0, f.age / f.duration)
+            alpha = int(255 * (1.0 - t))
+            painter.setPen(QColor(c["float"].red(), c["float"].green(), c["float"].blue(), alpha))
+            painter.drawText(QPointF(f.x, f.y), f.text)
 
 
 class ScannerFilter(QObject):
@@ -2083,7 +2391,7 @@ QWidget#ClientUIRoot {{
         self.pageTitle = QLabel("Machine Dashboard")
         self.pageTitle.setObjectName("PageTitle")
         self.pageTitle.setWordWrap(False)
-        self.pageTitle.setMinimumHeight(40)
+        self.pageTitle.setMinimumHeight(34)
         self.pageTitle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.headerJobStart = QLabel("")
         self.headerJobStart.setObjectName("HeaderMetaValue")
@@ -2105,7 +2413,7 @@ QWidget#ClientUIRoot {{
         self.btnSettings.clicked.connect(self._show_settings_overlay)
 
         headerRow = QHBoxLayout()
-        headerRow.setContentsMargins(14, 8, 14, 8)
+        headerRow.setContentsMargins(14, 5, 14, 5)
         headerRow.setSpacing(8)
         headerRow.addWidget(self.btnSettings, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.pageTitle, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -2127,8 +2435,8 @@ QWidget#ClientUIRoot {{
         self.banner.setObjectName("Banner")
         self.banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.banner.setWordWrap(True)
-        self.banner.setMinimumHeight(68)
-        self.banner.setMaximumHeight(92)
+        self.banner.setMinimumHeight(56)
+        self.banner.setMaximumHeight(76)
         self.banner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.banner.setStyleSheet(
             "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2f6aea, stop:1 #2454c6);"
@@ -2143,6 +2451,7 @@ QWidget#ClientUIRoot {{
         self.machineAnim = QLabel("[M] ----")
         self.machineAnim.setObjectName("MachineAnim")
         self.machineAnim.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.machineAnim.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.machineAnim.setProperty("mode", "idle")
         self.machineAnim.setProperty("pulse", "0")
         self._apply_machine_anim_style("idle")
@@ -2170,16 +2479,21 @@ QWidget#ClientUIRoot {{
             _production_title.hide()
         statRow = QHBoxLayout()
         statRow.setSpacing(6)
-        self.lblPack = QLabel("0")
-        self.lblGood = QLabel("0")
-        self.lblButal = QLabel("0")
-        self.lblReject = QLabel("0")
-        self.lblTotalGood = QLabel("0")
-        self.cardStatPack = self._make_stat_card("Pack", self.lblPack, "StatPack")
-        self.cardStatGood = self._make_stat_card("Good", self.lblGood, "StatGood")
-        self.cardStatButal = self._make_stat_card("Butal", self.lblButal, "StatButal")
-        self.cardStatReject = self._make_stat_card("Reject", self.lblReject, "StatReject")
-        self.cardStatTotalGood = self._make_stat_card("Total Good", self.lblTotalGood, "StatTotalGood")
+        self.lblPack = CounterCard("PACK")
+        self.lblGood = CounterCard("GOOD")
+        self.lblButal = CounterCard("BUTAL")
+        self.lblReject = CounterCard("REJECT", "red")
+        self.lblTotalGood = CounterCard("TOTAL GOOD")
+        self.lblPack.setObjectName("StatPack")
+        self.lblGood.setObjectName("StatGood")
+        self.lblButal.setObjectName("StatButal")
+        self.lblReject.setObjectName("StatReject")
+        self.lblTotalGood.setObjectName("StatTotalGood")
+        self.cardStatPack = self.lblPack
+        self.cardStatGood = self.lblGood
+        self.cardStatButal = self.lblButal
+        self.cardStatReject = self.lblReject
+        self.cardStatTotalGood = self.lblTotalGood
         for card in (
             self.cardStatPack,
             self.cardStatGood,
@@ -2188,46 +2502,12 @@ QWidget#ClientUIRoot {{
             self.cardStatTotalGood,
         ):
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-            card.setMinimumHeight(60)
+            card.setMinimumHeight(92)
+            card.setMaximumHeight(104)
             statRow.addWidget(card, 1)
-        self.cardStatPack.setStyleSheet(
-            "QFrame#StatPack { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1f7a3d, stop:0.48 #166534, stop:1 #14532d);"
-            " border: 1px solid #22c55e; border-top: 2px solid #4ade80; border-left: 2px solid #4ade80;"
-            " border-right: 2px solid #14532d; border-bottom: 2px solid #14532d; border-radius: 18px; padding: 10px; }"
-            "QLabel#StatTitle { color: #e2e8f0; font-size: 16px; font-weight: 900; }"
-            "QLabel#StatValue { color: #86efac; font-size: 46px; font-weight: 900; }"
-        )
-        self.cardStatGood.setStyleSheet(
-            "QFrame#StatGood { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1f7a3d, stop:0.48 #166534, stop:1 #14532d);"
-            " border: 1px solid #22c55e; border-top: 2px solid #4ade80; border-left: 2px solid #4ade80;"
-            " border-right: 2px solid #14532d; border-bottom: 2px solid #14532d; border-radius: 18px; padding: 10px; }"
-            "QLabel#StatTitle { color: #e2e8f0; font-size: 16px; font-weight: 900; }"
-            "QLabel#StatValue { color: #86efac; font-size: 46px; font-weight: 900; }"
-        )
-        self.cardStatButal.setStyleSheet(
-            "QFrame#StatButal { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #1f7a3d, stop:0.48 #166534, stop:1 #14532d);"
-            " border: 1px solid #22c55e; border-top: 2px solid #4ade80; border-left: 2px solid #4ade80;"
-            " border-right: 2px solid #14532d; border-bottom: 2px solid #14532d; border-radius: 18px; padding: 10px; }"
-            "QLabel#StatTitle { color: #e2e8f0; font-size: 16px; font-weight: 900; }"
-            "QLabel#StatValue { color: #86efac; font-size: 46px; font-weight: 900; }"
-        )
-        self.cardStatReject.setStyleSheet(
-            "QFrame#StatReject { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #b91c1c, stop:0.48 #991b1b, stop:1 #7f1d1d);"
-            " border: 1px solid #ef4444; border-top: 2px solid #f87171; border-left: 2px solid #f87171;"
-            " border-right: 2px solid #7f1d1d; border-bottom: 2px solid #7f1d1d; border-radius: 18px; padding: 10px; }"
-            "QLabel#StatTitle { color: #e2e8f0; font-size: 16px; font-weight: 900; }"
-            "QLabel#StatValue { color: #fecdd3; font-size: 46px; font-weight: 900; }"
-        )
-        self.cardStatTotalGood.setStyleSheet(
-            "QFrame#StatTotalGood { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2a8a49, stop:0.5 #1b6d3a, stop:1 #165c32);"
-            " border: 1px solid #4ade80; border-top: 2px solid #86efac; border-left: 2px solid #86efac;"
-            " border-right: 2px solid #165c32; border-bottom: 2px solid #165c32; border-radius: 18px; padding: 10px; }"
-            "QLabel#StatTitle { color: #e2e8f0; font-size: 16px; font-weight: 900; }"
-            "QLabel#StatValue { color: #bbf7d0; font-size: 46px; font-weight: 900; }"
-        )
         self.cardProduction.layout().addLayout(statRow)
-        self.cardProductionOuter.setMinimumHeight(100)
-        self.cardProductionOuter.setMaximumHeight(120)
+        self.cardProductionOuter.setMinimumHeight(106)
+        self.cardProductionOuter.setMaximumHeight(126)
         self.cardProductionOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         grid.addWidget(self.cardProductionOuter, 0, 0, 1, 2)
 
@@ -2334,16 +2614,17 @@ QWidget#ClientUIRoot {{
 
         # Product parts panel
         self.cardJobDetailsOuter, self.cardJobDetails = self._make_double_layer_card("PRODUCT PARTS")
-        self.jobPartsTable = QTableWidget(0, 5)
+        self.jobPartsTable = QTableWidget(0, 6)
         self.jobPartsTable.setObjectName("ProductPartsTable")
         self.jobPartsTable.setHorizontalHeaderLabels(
-            ["SKU", "Name", "Part Qty/Unit", "Request Part Qty", "Remaining"]
+            ["SKU", "Name", "Part Qty/Unit", "Available", "Rqst Part Qty", "Remaining"]
         )
         self.jobPartsTable.setAlternatingRowColors(False)
         self.jobPartsTable.setWordWrap(True)
         self.jobPartsTable.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.jobPartsTable.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.jobPartsTable.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.jobPartsTable.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.jobPartsTable.verticalHeader().setVisible(False)
         self.jobPartsTable.verticalHeader().setDefaultSectionSize(30)
         self.jobPartsTable.horizontalHeader().setStretchLastSection(False)
@@ -2352,14 +2633,15 @@ QWidget#ClientUIRoot {{
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.jobPartsTable.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.jobPartsTable.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.jobPartsTable.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
         self.jobPartsTable.horizontalHeader().setFixedHeight(32)
-        self.jobPartsTable.setColumnWidth(0, 260)
+        self.jobPartsTable.setColumnWidth(0, 220)
         # Size table to show up to 10 visible rows without clipping.
         parts_row_h = self.jobPartsTable.verticalHeader().defaultSectionSize()
         parts_header_h = self.jobPartsTable.horizontalHeader().height()
         parts_frame_h = self.jobPartsTable.frameWidth() * 2
-        parts_target_h = parts_header_h + (parts_row_h * 9) + parts_frame_h
+        parts_target_h = parts_header_h + (parts_row_h * 10) + parts_frame_h
         self.jobPartsTable.setMinimumHeight(parts_target_h)
         self.jobPartsTable.setMaximumHeight(parts_target_h)
         self.jobPartsTableShell = QFrame()
@@ -2601,8 +2883,8 @@ QWidget#ClientUIRoot {{
         self.cardSessionActivity.layout().addSpacing(6)
         self.cardSessionActivity.layout().addWidget(self.rejectDetailTable)
 
-        self.cardSessionActivityOuter.setMinimumHeight(300)
-        self.cardSessionActivityOuter.setMaximumHeight(380)
+        self.cardSessionActivityOuter.setMinimumHeight(326)
+        self.cardSessionActivityOuter.setMaximumHeight(402)
         self.cardSessionActivityOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         grid.addWidget(self.cardSessionActivityOuter, 1, 0, 1, 2)
         # Machine status now lives in the unified frame, so pulse overlay must follow that parent.
@@ -2618,8 +2900,7 @@ QWidget#ClientUIRoot {{
         grid.setRowStretch(1, 2)  # Session + Activity
         grid.setRowStretch(2, 0)
         grid.setRowStretch(3, 0)  # Raw Materials + Cycle row
-        left.addLayout(grid, 0)
-        left.addStretch(1)
+        left.addLayout(grid, 1)
 
         # Keep in-memory logging, but remove the temporary visible Job API logs panel.
         self.cardJobApiLogsOuter = None
@@ -2632,7 +2913,7 @@ QWidget#ClientUIRoot {{
         self.rightPanel = QFrame()
         self.rightPanel.setObjectName("RightPanel")
         rightLayout = QVBoxLayout()
-        rightLayout.setContentsMargins(16, 0, 16, 14)
+        rightLayout.setContentsMargins(16, 0, 16, 0)
         rightLayout.setSpacing(0)
         self.rightPanel.setLayout(rightLayout)
         self.rightTopSpacer = QWidget()
@@ -2683,10 +2964,10 @@ QWidget#ClientUIRoot {{
             "}"
             "QLabel#RawPreviewName { color: #edf0f4; font-size: 11px; font-weight: 900; }"
         )
-        self.rightRawSacks.setMinimumHeight(44)
-        self.rightRawField.setMinimumHeight(44)
-        self.rightRawTotalScans.setMinimumHeight(44)
-        self.rawPreviewWrap.setMinimumHeight(148)
+        self.rightRawSacks.setMinimumHeight(38)
+        self.rightRawField.setMinimumHeight(38)
+        self.rightRawTotalScans.setMinimumHeight(38)
+        self.rawPreviewWrap.setMinimumHeight(128)
 
         self.rightDowntimeTimer = QLabel("Downtime: 00:00:00")
         self.rightDowntimeTimer.setObjectName("RightMonitorValueAccent")
@@ -2713,6 +2994,16 @@ QWidget#ClientUIRoot {{
         self.rightSupervisor.setObjectName("RightMonitorValue")
         self.rightSupervisorLeft = QLabel("Supervisor: -")
         self.rightSupervisorLeft.setObjectName("RightMonitorValue")
+        for downtime_field in (
+            self.rightDowntimeTimer,
+            self.rightDowntimeReason,
+            self.rightStartupReject,
+            self.rightMaintenance,
+            self.rightSupervisorLeft,
+            self.rightSupervisor,
+        ):
+            downtime_field.setMinimumHeight(38)
+            downtime_field.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         rawDowntimeCol = QVBoxLayout()
         rawDowntimeCol.setContentsMargins(0, 0, 0, 0)
@@ -2794,9 +3085,10 @@ QWidget#ClientUIRoot {{
         )
         rawOuterLay.addWidget(rawFrame)
 
-        rawOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        rawFrame.setMinimumHeight(154)
-        rawDowntimeCol.addWidget(rawOuter)
+        rawOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        rawFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        rawFrame.setMinimumHeight(150)
+        rawDowntimeCol.addWidget(rawOuter, 1)
 
         downtimeOuter = QFrame()
         downtimeOuter.setObjectName("RightCardOuter")
@@ -2807,7 +3099,7 @@ QWidget#ClientUIRoot {{
 
         downtimeFrame = QFrame()
         downtimeFrame.setObjectName("DowntimeMirrorHost")
-        downtimeFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        downtimeFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         downtimeCol = QVBoxLayout()
         downtimeCol.setContentsMargins(0, 0, 0, 0)
         downtimeCol.setSpacing(6)
@@ -2822,17 +3114,18 @@ QWidget#ClientUIRoot {{
         downtimeHeader = QFrame()
         downtimeHeader.setObjectName("DowntimeMirrorHeader")
         downtimeHeader.setLayout(QVBoxLayout())
-        downtimeHeader.layout().setContentsMargins(12, 10, 12, 10)
+        downtimeHeader.layout().setContentsMargins(12, 8, 12, 8)
         downtimeHeader.layout().setSpacing(0)
         downtimeTitle = QLabel("Downtime Monitor")
         downtimeTitle.setObjectName("RightTitle")
         downtimeTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         downtimeHeader.layout().addWidget(downtimeTitle)
-        rawHeader.setFixedHeight(downtimeHeader.sizeHint().height())
+        shared_header_h = max(rawHeader.sizeHint().height(), downtimeHeader.sizeHint().height()) + 4
+        rawHeader.setMinimumHeight(shared_header_h)
         downtimeBody.layout().addWidget(downtimeHeader)
 
         downtimeGrid = QGridLayout()
-        downtimeGrid.setContentsMargins(10, 0, 10, 10)
+        downtimeGrid.setContentsMargins(10, 6, 10, 12)
         downtimeGrid.setHorizontalSpacing(8)
         downtimeGrid.setVerticalSpacing(8)
         downtimeGrid.addWidget(self.rightDowntimeTimer, 0, 0)
@@ -2841,6 +3134,9 @@ QWidget#ClientUIRoot {{
         downtimeGrid.addWidget(self.rightMaintenance, 1, 1)
         downtimeGrid.addWidget(self.rightSupervisorLeft, 2, 0)
         downtimeGrid.addWidget(self.rightSupervisor, 2, 1)
+        downtimeGrid.setRowStretch(0, 1)
+        downtimeGrid.setRowStretch(1, 1)
+        downtimeGrid.setRowStretch(2, 1)
         downtimeBody.layout().addLayout(downtimeGrid)
         downtimeCol.addWidget(downtimeBody)
         downtimeFrame.setStyleSheet(
@@ -2866,8 +3162,10 @@ QWidget#ClientUIRoot {{
             "QFrame#DowntimeMirrorHeader QLabel { color: #edf0f4; }"
         )
         downtimeOuterLay.addWidget(downtimeFrame)
+        downtimeOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        downtimeFrame.setMinimumHeight(150)
 
-        rawDowntimeCol.addWidget(downtimeOuter)
+        rawDowntimeCol.addWidget(downtimeOuter, 1)
 
         linkageOuter = QFrame()
         linkageOuter.setObjectName("RightCardOuter")
@@ -2898,7 +3196,7 @@ QWidget#ClientUIRoot {{
         linkageMirrorTitle.setObjectName("RightTitle")
         linkageMirrorTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         linkageHeader.layout().addWidget(linkageMirrorTitle)
-        linkageHeader.setFixedHeight(downtimeHeader.sizeHint().height())
+        linkageHeader.setMinimumHeight(shared_header_h)
         linkageBody.layout().addWidget(linkageHeader)
 
         linkageContent = QWidget()
@@ -3056,7 +3354,7 @@ QWidget#ClientUIRoot {{
         qtyTitle.setObjectName("RightTitle")
         qtyTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         qtyHeader.layout().addWidget(qtyTitle)
-        qtyHeader.setFixedHeight(downtimeHeader.sizeHint().height())
+        qtyHeader.setMinimumHeight(shared_header_h)
         qtyBody.layout().addWidget(qtyHeader)
 
         qtyContent = QWidget()
@@ -3915,11 +4213,92 @@ QWidget#ClientUIRoot {{
         self.finishStatus = QLabel("Processing...")
         self.finishStatus.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
         self.finishStatus.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.finishReviewHint = QLabel("Scan Supervisor QR to approve this finished shift.")
+        self.finishReviewHint.setStyleSheet("color: #0f766e; font-size: 13px; font-weight: 800;")
+        self.finishReviewHint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.finishReviewHint.setWordWrap(True)
+        self.finishReviewHint.hide()
         self.finishProgressBar = QProgressBar()
         self.finishProgressBar.setRange(0, 100)
         self.finishProgressBar.setValue(0)
         self.finishProgressBar.setTextVisible(False)
         self.finishProgressBar.setFixedWidth(300)
+        self.finishSummaryScroll = QScrollArea()
+        self.finishSummaryScroll.setWidgetResizable(True)
+        self.finishSummaryScroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.finishSummaryScroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+            "QScrollBar:vertical { background: rgba(15,23,42,0.10); width: 12px; margin: 2px; border-radius: 6px; }"
+            "QScrollBar::handle:vertical { background: rgba(71,85,105,0.75); min-height: 36px; border-radius: 6px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
+        )
+        self.finishSummaryBody = QWidget()
+        self.finishSummaryBody.setLayout(QVBoxLayout())
+        self.finishSummaryBody.layout().setContentsMargins(4, 4, 4, 4)
+        self.finishSummaryBody.layout().setSpacing(10)
+        self.finishSummaryScroll.setWidget(self.finishSummaryBody)
+        self.finishSummaryScroll.hide()
+
+        self.finishSummaryCards: Dict[str, QLabel] = {}
+        finish_card_grid = QGridLayout()
+        finish_card_grid.setContentsMargins(0, 0, 0, 0)
+        finish_card_grid.setHorizontalSpacing(8)
+        finish_card_grid.setVerticalSpacing(8)
+        for idx, title in enumerate((
+            "Machine", "Job", "Operator", "Shift Window",
+            "Pack Count", "Good", "Butal", "Reject",
+            "Total Good", "Raw Sacks", "Cycle Time", "Downtime",
+        )):
+            card = QFrame()
+            card.setStyleSheet(
+                "QFrame { background: rgba(255,255,255,0.78); border: 1px solid rgba(148,163,184,0.55); border-radius: 12px; }"
+                "QLabel[role='title'] { color: #64748b; font-size: 11px; font-weight: 900; }"
+                "QLabel[role='value'] { color: #0f172a; font-size: 14px; font-weight: 900; }"
+            )
+            card.setLayout(QVBoxLayout())
+            card.layout().setContentsMargins(10, 8, 10, 8)
+            card.layout().setSpacing(2)
+            title_lbl = QLabel(title)
+            title_lbl.setProperty("role", "title")
+            value_lbl = QLabel("-")
+            value_lbl.setProperty("role", "value")
+            value_lbl.setWordWrap(True)
+            card.layout().addWidget(title_lbl)
+            card.layout().addWidget(value_lbl)
+            finish_card_grid.addWidget(card, idx // 4, idx % 4)
+            self.finishSummaryCards[title] = value_lbl
+        self.finishSummaryBody.layout().addLayout(finish_card_grid)
+
+        self.finishReviewJobDetails = self._make_finish_summary_table(
+            "Job Details",
+            ["Field", "Value"],
+        )
+        self.finishReviewCounters = self._make_finish_summary_table(
+            "Production Counters",
+            ["Counter", "Value"],
+        )
+        self.finishReviewRejects = self._make_finish_summary_table(
+            "Reject Details",
+            ["Reject", "Qty"],
+        )
+        self.finishReviewDowntime = self._make_finish_summary_table(
+            "Downtime / Approval",
+            ["Field", "Value"],
+        )
+        self.finishReviewParts = self._make_finish_summary_table(
+            "Product Parts Used",
+            ["SKU", "Name", "Qty/Unit", "Scanned", "Requested", "Remaining"],
+        )
+        self.finishReviewRaw = self._make_finish_summary_table(
+            "Raw Materials",
+            ["Material", "Qty", "Index", "Total", "Lot", "PO", "Scanned At"],
+        )
+        self.finishReviewPack = self._make_finish_summary_table(
+            "Pack Scan History",
+            ["Index", "Product", "Qty", "Lot", "Operator", "Scanned At"],
+        )
         self.finishSuccessRow = QWidget()
         self.finishSuccessRow.setObjectName("FinishSuccessRow")
         self.finishSuccessRow.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -3940,7 +4319,9 @@ QWidget#ClientUIRoot {{
         self.finishSuccessRow.hide()
         self.finishOverlay.layout().addWidget(self.finishTitle)
         self.finishOverlay.layout().addWidget(self.finishStatus)
+        self.finishOverlay.layout().addWidget(self.finishReviewHint)
         self.finishOverlay.layout().addWidget(self.finishProgressBar, 0, Qt.AlignmentFlag.AlignCenter)
+        self.finishOverlay.layout().addWidget(self.finishSummaryScroll)
         self.finishOverlay.layout().addWidget(self.finishSuccessRow, 0, Qt.AlignmentFlag.AlignCenter)
         self.finishOverlay.setStyleSheet(
             "QFrame#ProductionOverlay {"
@@ -3966,10 +4347,16 @@ QWidget#ClientUIRoot {{
         self._finish_post_action = ""
         self._supervisor_validation_pending = False
         self._supervisor_validation_failed_value = ""
+        self._fulfilled_notice_job_code = ""
+        self._fulfilled_notice_active = False
+        self._fulfilled_notice_timer = QTimer(self)
+        self._fulfilled_notice_timer.setSingleShot(True)
+        self._fulfilled_notice_timer.timeout.connect(self._clear_fulfilled_notice)
         self._operator_shift_flash_active = False
         self._operator_shift_flash_timer = QTimer(self)
         self._operator_shift_flash_timer.setSingleShot(True)
         self._operator_shift_flash_timer.timeout.connect(self._hide_operator_shift_overlay)
+        self._pending_shift_review_payload: Optional[Dict[str, Any]] = None
 
         # Settings overlay with category navigation (Graphics / Display).
         self.settingsOverlay = QFrame(self)
@@ -5679,37 +6066,60 @@ QWidget#ClientUIRoot {{
         self._finish_anim_timer.start()
 
     def _show_operator_shift_overlay(self, shift_payload: Dict[str, Any]):
-        name = self._safe_text(shift_payload.get("operator_name"), "-")
-        code = self._safe_text(shift_payload.get("operator_id"), "-")
-        summary = (
-            f"Operator: {name} ({code})\n"
-            f"Pack: {int(shift_payload.get('pack_count') or 0)} | "
-            f"Good: {int(shift_payload.get('good_total') or 0)} | "
-            f"Butal: {int(shift_payload.get('butal_total') or 0)} | "
-            f"Reject: {int(shift_payload.get('reject_total') or 0)} | "
-            f"Total Good: {int(shift_payload.get('total_good') or 0)}"
-        )
+        self._pending_shift_review_payload = dict(shift_payload or {})
         self._operator_shift_flash_active = True
         self._position_finish_overlay()
         self._set_background_blur(True)
-        self.finishTitle.setText("OPERATOR SHIFT SAVED")
-        self.finishStatus.setText(summary)
+        self.finishTitle.setText("FINISH SHIFT REVIEW")
+        self.finishStatus.setText("Supervisor review required before the next operator starts.")
+        self.finishReviewHint.show()
         self.finishProgressBar.hide()
+        self.finishSummaryScroll.show()
+        self._populate_finish_shift_summary(self._pending_shift_review_payload)
         self.finishSuccessRow.hide()
         self.finishOverlay.show()
         self.finishOverlay.raise_()
-        self._operator_shift_flash_timer.start(5000)
 
     def _hide_operator_shift_overlay(self):
         if not self._operator_shift_flash_active:
             return
         self._operator_shift_flash_active = False
+        self._pending_shift_review_payload = None
         self.finishTitle.setText("FINISHING JOB")
         self.finishStatus.setText("Processing...")
+        self.finishReviewHint.hide()
         self.finishProgressBar.show()
+        self.finishSummaryScroll.hide()
         self.finishOverlay.hide()
         if not self._should_keep_background_blur():
             self._set_background_blur(False)
+
+    def _approve_pending_shift_review(self, reviewer: Dict[str, Any], reviewer_badge: str):
+        shift_payload = dict(self._pending_shift_review_payload or {})
+        if not shift_payload:
+            return
+        remarks = f"Approved on client finish-shift review by {self._safe_text(reviewer.get('name'))}"
+        local_ok = self._approve_local_finished_shift(shift_payload, reviewer, remarks)
+        server_ok = self._approve_server_finished_shift(shift_payload, reviewer_badge, remarks)
+        self._pending_shift_review_payload = shift_payload
+        self._populate_finish_shift_summary(shift_payload)
+        self.finishTitle.setText("FINISH SHIFT APPROVED")
+        self.finishReviewHint.setText(
+            "Approved. Shift saved in Finished Shifts."
+            if server_ok else
+            "Approved locally. Server sync will refresh on next connection."
+        )
+        self.finishStatus.setText(
+            f"{self._safe_text(reviewer.get('name'))} approved this shift."
+            if local_ok else
+            "Approval could not be written locally."
+        )
+        if not local_ok:
+            self._show_invalid_overlay("Unable to update local finished shift approval.")
+            return
+        self.status.setText(f"Shift approved by {self._safe_text(reviewer.get('name'))}. Scan JOB QR.")
+        self._clear_shift_session_keep_machine()
+        QTimer.singleShot(2200, self._hide_operator_shift_overlay)
 
     def _set_reject_review_blur(self, enabled: bool):
         if enabled:
@@ -6172,11 +6582,11 @@ QWidget#ClientUIRoot {{
         self.lblActivityCavities.setText(f"Cavities: {self._safe_text(cavity_count, '-')}")
         self.lblActivitySticker.setText(f"Sticker Label: {self._safe_text(job_details.get('sticker_label'), '-')}")
 
-        self.lblPack.setText(str(s.pack_count))
-        self.lblGood.setText(str(s.good_total))
-        self.lblButal.setText(str(s.butal_total))
-        self.lblReject.setText(str(s.reject_total))
-        self.lblTotalGood.setText(str(s.good_total + s.butal_total))
+        self.lblPack.set_value(s.pack_count)
+        self.lblGood.set_value(s.good_total)
+        self.lblButal.set_value(s.butal_total)
+        self.lblReject.set_value(s.reject_total)
+        self.lblTotalGood.set_value(s.good_total + s.butal_total)
         self.rightCycleCount.setText(f"Confirmed by: {s.cycle_time_confirmed_by or '-'}")
         act_cycle_current = self._parse_cycle_seconds(s.cycle_time_current)
         act_cycle_shift_avg = self._compute_current_shift_avg_cycle_seconds()
@@ -6269,6 +6679,7 @@ QWidget#ClientUIRoot {{
         self._refresh_job_details()
         self._refresh_downtime_panel()
         self._refresh_linkage_panel()
+        self._maybe_show_fulfilled_notice()
 
     def _session_is_running(self) -> bool:
         s = self.state
@@ -6290,7 +6701,7 @@ QWidget#ClientUIRoot {{
                 " font-weight: 800;"
                 " background: #b9fbcf;"
                 " border: 1px solid #4ade80;"
-                " border-radius: 16px;"
+                " border-radius: 12px;"
                 " padding: 8px 12px;"
                 "}"
             )
@@ -6304,7 +6715,7 @@ QWidget#ClientUIRoot {{
                 "                             stop:0 rgba(251,146,60,245),"
                 "                             stop:1 rgba(234,88,12,248));"
                 " border: 1px solid #fb923c;"
-                " border-radius: 16px;"
+                " border-radius: 12px;"
                 " padding: 8px 12px;"
                 "}"
             )
@@ -6394,6 +6805,14 @@ QWidget#ClientUIRoot {{
             if v is not None and v > 0:
                 requested_part_qty = v
                 break
+        part_qty_per_unit = None
+        for part in part_rows:
+            v = _to_float((part or {}).get("part_qty_per_unit"))
+            if v is not None and v > 0:
+                part_qty_per_unit = v
+                break
+        if part_qty_per_unit is None:
+            part_qty_per_unit = TEMP_PART_QTY_PER_UNIT
 
         n1, n2, n3 = recent_unique[0], recent_unique[1], recent_unique[2]
         self.rightRawSacks.setText(f"Raw Mat 1: {n1}    Sacks: {int(scans_by_name.get(n1, 0) or 0)}")
@@ -6741,6 +7160,44 @@ QWidget#ClientUIRoot {{
     def _save_finished_job_local(self, payload: Dict[str, Any]):
         return _insert_finished_job_sql(payload)
 
+    def _load_local_job_records(self, job_code: str) -> List[Dict[str, Any]]:
+        code = str(job_code or "").strip()
+        if not code:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for row in _load_finished_jobs_sql():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("job_code") or "").strip() != code:
+                continue
+            rows.append(row)
+        return rows
+
+    def _local_shift_partial_rows(self, job_code: str, *, approved_only: bool = False) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for row in self._load_local_job_records(job_code):
+            if str(row.get("record_type") or "").strip().upper() != RECORD_TYPE_SHIFT_PARTIAL:
+                continue
+            status = str(row.get("review_status") or "").strip().upper()
+            if approved_only and status != REVIEW_STATUS_APPROVED:
+                continue
+            rows.append(row)
+        return rows
+
+    def _local_shift_partial_total(self, job_code: str, *, approved_only: bool = False) -> int:
+        total = 0
+        for row in self._local_shift_partial_rows(job_code, approved_only=approved_only):
+            total += int(round(self._parse_number(row.get("partial_qty", row.get("total_good", 0)))))
+        return max(0, total)
+
+    def _current_shift_good_total(self) -> int:
+        s = self.state
+        if not s.operator_shift_started_at:
+            return 0
+        good_delta = max(0, int(s.good_total or 0) - int(s.operator_shift_baseline_good_total or 0))
+        butal_delta = max(0, int(s.butal_total or 0) - int(s.operator_shift_baseline_butal_total or 0))
+        return max(0, good_delta + butal_delta)
+
     def _start_operator_shift_tracking(self):
         s = self.state
         if not (s.machine_code and s.job_code and s.operator_id):
@@ -6798,12 +7255,15 @@ QWidget#ClientUIRoot {{
             )
         shift_qty_per_shift = self._qty_per_shift_from_cycle(shift_avg_cycle_seconds, cavity_count)
         return {
+            "record_type": RECORD_TYPE_SHIFT_PARTIAL,
             "shift_index": int(s.operator_shift_index or (len(s.operator_shift_logs or []) + 1)),
             "reason": str(reason or "SHIFT_CHANGE"),
             "started_at_utc": started_at_utc,
             "ended_at_utc": ended_at_utc,
+            "finished_at_utc": ended_at_utc,
             "machine_code": s.machine_code,
             "machine_name": _machine_display_name(s.machine_code, s.machine_name),
+            "client_id": CLIENT_ID,
             "job_code": s.job_code,
             "job_name": s.job_name,
             "operator_id": s.operator_id,
@@ -6813,10 +7273,12 @@ QWidget#ClientUIRoot {{
             "butal_total": butal_total,
             "reject_total": reject_total,
             "total_good": int(good_total + butal_total),
+            "partial_qty": int(good_total + butal_total),
             "reject_breakdown": reject_delta,
             "startup_reject_total": startup_reject_total,
             "raw_sacks_count": raw_sacks_count,
             "raw_material_logs": list((s.raw_material_logs or [])[raw_from:]),
+            "raw_material_scans": list(s.raw_material_scans or []),
             "product_pack_history_logs": list((s.product_pack_history_logs or [])[pack_from:]),
             "reject_review_logs": list((s.reject_review_logs or [])[review_from:]),
             "downtime_active": bool(s.downtime_active),
@@ -6828,6 +7290,9 @@ QWidget#ClientUIRoot {{
             "qty_per_shift_avg_cycle": shift_qty_per_shift,
             "maintenance_name": s.maintenance_name,
             "supervisor_name": s.supervisor_name,
+            "job_payload": payload if isinstance(payload, dict) else {},
+            "review_status": REVIEW_STATUS_PENDING,
+            "review_history": [],
         }
 
     def _finalize_current_operator_shift(self, reason: str, emit_event: bool = True) -> Optional[Dict[str, Any]]:
@@ -7148,6 +7613,7 @@ QWidget#ClientUIRoot {{
     def _build_finished_job_payload(self) -> Dict[str, Any]:
         s = self.state
         return {
+            "record_type": RECORD_TYPE_FINAL_JOB,
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
             "client_id": CLIENT_ID,
             "machine_code": s.machine_code,
@@ -7176,6 +7642,8 @@ QWidget#ClientUIRoot {{
             "maintenance_name": s.maintenance_name,
             "supervisor_name": s.supervisor_name,
             "operator_shift_logs": list(s.operator_shift_logs or []),
+            "partial_qty": int((s.good_total or 0) + (s.butal_total or 0)),
+            "review_status": REVIEW_STATUS_CLOSED,
             "linkage_enabled": bool(s.linkage_enabled),
             "linkage_job_code": s.linkage_job_code,
             "linkage_job_name": s.linkage_job_name,
@@ -7312,6 +7780,16 @@ QWidget#ClientUIRoot {{
             self.topCycleCurrent.setText(f"Act Cycle Time: {s.cycle_time_current or ''}")
         self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or ''}")
         self.rightSupervisor.setText(f"Supervisor: {s.supervisor_name or ''}")
+
+    def _clear_shift_session_keep_machine(self):
+        s = self.state
+        active_machine_code = s.machine_code
+        active_machine_name = s.machine_name
+        self._clear_full_session()
+        s.machine_code = active_machine_code
+        s.machine_name = active_machine_name
+        self._save_active_session_snapshot()
+        self.status.setText("Finish shift saved. Scan JOB QR.")
 
     def _extract_production_reason_code(self, raw: str) -> Optional[str]:
         m = re.search(r"(\d+)", str(raw).strip())
@@ -7715,11 +8193,278 @@ QWidget#ClientUIRoot {{
             except Exception:
                 return 0.0
 
+    def _make_finish_summary_table(self, title: str, headers: List[str]) -> QTableWidget:
+        section = QFrame()
+        section.setStyleSheet(
+            "QFrame { background: rgba(255,255,255,0.74); border: 1px solid rgba(148,163,184,0.50); border-radius: 14px; }"
+            "QLabel { color: #0f172a; font-size: 15px; font-weight: 900; background: transparent; border: none; }"
+            "QTableWidget { background: transparent; border: none; gridline-color: rgba(148,163,184,0.24); color: #0f172a; }"
+            "QHeaderView::section { background: rgba(226,232,240,0.96); color: #0f172a; font-weight: 900; border: none; border-bottom: 1px solid rgba(148,163,184,0.55); padding: 6px; }"
+            "QTableWidget::item { padding: 4px; border-bottom: 1px solid rgba(226,232,240,0.78); }"
+        )
+        section.setLayout(QVBoxLayout())
+        section.layout().setContentsMargins(10, 10, 10, 10)
+        section.layout().setSpacing(6)
+        title_lbl = QLabel(title)
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        table.setAlternatingRowColors(False)
+        table.setWordWrap(True)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setFixedHeight(30)
+        table.verticalHeader().setDefaultSectionSize(28)
+        table.setMinimumHeight(112)
+        table.setMaximumHeight(240)
+        section.layout().addWidget(title_lbl)
+        section.layout().addWidget(table)
+        self.finishSummaryBody.layout().addWidget(section)
+        return table
+
+    def _set_finish_summary_table_rows(self, table: Optional[QTableWidget], rows: List[List[str]]):
+        if table is None:
+            return
+        clean_rows = rows or [["-"] * max(1, table.columnCount())]
+        table.setRowCount(0)
+        for row_vals in clean_rows:
+            r = table.rowCount()
+            table.insertRow(r)
+            values = list(row_vals or [])
+            while len(values) < table.columnCount():
+                values.append("-")
+            for c in range(table.columnCount()):
+                item = QTableWidgetItem(str(values[c]))
+                if c == 0:
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
+                else:
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                table.setItem(r, c, item)
+        header_h = table.horizontalHeader().height()
+        row_h = table.verticalHeader().defaultSectionSize()
+        frame_h = table.frameWidth() * 2
+        target_h = min(280, header_h + (table.rowCount() * row_h) + frame_h + 2)
+        table.setMinimumHeight(max(84, target_h))
+        table.setMaximumHeight(max(84, target_h))
+
+    def _extract_job_payload_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        job = data_obj.get("job") if isinstance(data_obj.get("job"), dict) else {}
+        job_details = data_obj.get("job_details") if isinstance(data_obj.get("job_details"), dict) else {}
+        if not job and isinstance(payload.get("job"), dict):
+            job = payload.get("job") or {}
+        if not job_details and isinstance(payload.get("job_details"), dict):
+            job_details = payload.get("job_details") or {}
+        parts = []
+        if isinstance(data_obj.get("parts"), list):
+            parts = [r for r in data_obj.get("parts") or [] if isinstance(r, dict)]
+        elif isinstance(job_details.get("parts"), list):
+            parts = [r for r in job_details.get("parts") or [] if isinstance(r, dict)]
+        elif isinstance(job_details.get("part_ids"), list):
+            parts = [r for r in job_details.get("part_ids") or [] if isinstance(r, dict)]
+        elif isinstance(data_obj.get("part_ids"), list):
+            parts = [r for r in data_obj.get("part_ids") or [] if isinstance(r, dict)]
+        elif isinstance(payload.get("part_ids"), list):
+            parts = [r for r in payload.get("part_ids") or [] if isinstance(r, dict)]
+        return {"job": job, "job_details": job_details, "parts": parts}
+
+    def _finish_shift_row_key(self, row: Dict[str, Any]) -> str:
+        return "|".join([
+            str(row.get("record_type") or "").strip().upper(),
+            str(row.get("client_id") or "").strip(),
+            str(row.get("machine_code") or "").strip(),
+            str(row.get("job_code") or "").strip(),
+            str(row.get("operator_id") or "").strip(),
+            str(row.get("shift_index") or "").strip(),
+            str(row.get("finished_at_utc") or row.get("ended_at_utc") or "").strip(),
+        ])
+
+    def _server_finished_job_key(self, row: Dict[str, Any]) -> str:
+        return "|".join([
+            str(row.get("finished_at_utc", "")),
+            str(row.get("machine_code", "")),
+            str(row.get("job_code", "")),
+            str(row.get("operator_id", "")),
+            str(row.get("pack_count", "")),
+            str(row.get("good_total", "")),
+            str(row.get("butal_total", "")),
+            str(row.get("reject_total", "")),
+        ])
+
+    def _approve_local_finished_shift(self, shift_payload: Dict[str, Any], reviewer: Dict[str, Any], remarks: str) -> bool:
+        key = self._finish_shift_row_key(shift_payload)
+        rows = _load_finished_jobs_sql()
+        updated = False
+        now_utc = datetime.now(timezone.utc).isoformat()
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            if self._finish_shift_row_key(row) != key:
+                continue
+            row = dict(row)
+            row["approved_by"] = reviewer.get("name")
+            row["approved_by_code"] = reviewer.get("code")
+            row["approved_by_role"] = reviewer.get("role")
+            row["approved_remarks"] = remarks
+            row["approved_at_utc"] = now_utc
+            row["review_status"] = REVIEW_STATUS_APPROVED
+            history = list(row.get("review_history") or [])
+            history.append({
+                "action": "APPROVE",
+                "remarks": remarks,
+                "actor_name": reviewer.get("name"),
+                "actor_code": reviewer.get("code"),
+                "actor_role": reviewer.get("role"),
+                "timestamp_utc": now_utc,
+            })
+            row["review_history"] = history
+            rows[idx] = row
+            shift_payload.update(row)
+            updated = True
+            break
+        if not updated:
+            return False
+        return _replace_finished_jobs_sql(rows)
+
+    def _approve_server_finished_shift(self, shift_payload: Dict[str, Any], reviewer_badge: str, remarks: str):
+        try:
+            resp = requests.post(
+                f"{str(self.client_config.get('server_url', SERVER_URL)).rstrip('/')}/api/finished-jobs/review",
+                json={
+                    "job_key": self._server_finished_job_key(shift_payload),
+                    "action": "approve",
+                    "remarks": remarks,
+                    "reviewer_badge": reviewer_badge,
+                },
+                timeout=4.5,
+            )
+            return resp.ok
+        except Exception:
+            return False
+
+    def _populate_finish_shift_summary(self, shift_payload: Dict[str, Any]):
+        payload = shift_payload.get("job_payload") if isinstance(shift_payload.get("job_payload"), dict) else {}
+        ctx = self._extract_job_payload_context(payload if isinstance(payload, dict) else {})
+        job = ctx["job"]
+        job_details = ctx["job_details"]
+        part_rows = ctx["parts"]
+        raw_logs = [x for x in (shift_payload.get("raw_material_logs") or []) if isinstance(x, dict)]
+        pack_logs = [x for x in (shift_payload.get("product_pack_history_logs") or []) if isinstance(x, dict)]
+        reject_breakdown = shift_payload.get("reject_breakdown") if isinstance(shift_payload.get("reject_breakdown"), dict) else {}
+
+        start_label = self._safe_text(shift_payload.get("started_at_utc"), "-")
+        end_label = self._safe_text(shift_payload.get("finished_at_utc") or shift_payload.get("ended_at_utc"), "-")
+        self.finishSummaryCards["Machine"].setText(self._safe_text(shift_payload.get("machine_name") or shift_payload.get("machine_code")))
+        self.finishSummaryCards["Job"].setText(self._safe_text(shift_payload.get("job_name") or shift_payload.get("job_code")))
+        self.finishSummaryCards["Operator"].setText(
+            f"{self._safe_text(shift_payload.get('operator_name'))} ({self._safe_text(shift_payload.get('operator_id'))})"
+        )
+        self.finishSummaryCards["Shift Window"].setText(f"{start_label}\n{end_label}")
+        self.finishSummaryCards["Pack Count"].setText(str(int(shift_payload.get("pack_count") or 0)))
+        self.finishSummaryCards["Good"].setText(str(int(shift_payload.get("good_total") or 0)))
+        self.finishSummaryCards["Butal"].setText(str(int(shift_payload.get("butal_total") or 0)))
+        self.finishSummaryCards["Reject"].setText(str(int(shift_payload.get("reject_total") or 0)))
+        self.finishSummaryCards["Total Good"].setText(str(int(shift_payload.get("total_good") or 0)))
+        self.finishSummaryCards["Raw Sacks"].setText(str(int(shift_payload.get("raw_sacks_count") or 0)))
+        self.finishSummaryCards["Cycle Time"].setText(self._safe_text(shift_payload.get("cycle_time_current"), "-"))
+        self.finishSummaryCards["Downtime"].setText(self._format_timer_seconds(int(shift_payload.get("downtime_last_seconds") or 0)))
+
+        job_rows = [
+            ["Job Code", self._safe_text(shift_payload.get("job_code"))],
+            ["Job Name", self._safe_text(shift_payload.get("job_name"))],
+            ["Reference", self._safe_text(job.get("ref_no"))],
+            ["Product ID", self._safe_text(job_details.get("product_id") or job.get("product_id"))],
+            ["Mold", self._safe_text(job_details.get("mold") or job.get("custom_05"))],
+            ["Color", self._safe_text(job_details.get("color") or job.get("custom_06"), "N/A")],
+            ["Cavities", self._safe_text(job_details.get("no_of_cavity") or job.get("custom_11"))],
+            ["Sticker Label", self._safe_text(job_details.get("sticker_label"), "N/A")],
+            ["Std Cycle Time", self._safe_text(job_details.get("std_cycle_time"), "N/A")],
+            ["Qty/Shift", self._safe_text(job_details.get("qty_per_shift"), "N/A")],
+            ["Requested Qty", self._safe_text(job.get("approve_qty") or job.get("request_qty"))],
+        ]
+        self._set_finish_summary_table_rows(self.finishReviewJobDetails, job_rows)
+
+        counter_rows = [
+            ["Pack Count", str(int(shift_payload.get("pack_count") or 0))],
+            ["Good", str(int(shift_payload.get("good_total") or 0))],
+            ["Butal", str(int(shift_payload.get("butal_total") or 0))],
+            ["Reject", str(int(shift_payload.get("reject_total") or 0))],
+            ["Total Good", str(int(shift_payload.get("total_good") or 0))],
+            ["Startup Reject", str(int(shift_payload.get("startup_reject_total") or 0))],
+            ["Partial Qty", str(int(shift_payload.get("partial_qty") or shift_payload.get("total_good") or 0))],
+            ["Qty/Shift Avg Cycle", self._safe_text(shift_payload.get("qty_per_shift_avg_cycle"))],
+        ]
+        self._set_finish_summary_table_rows(self.finishReviewCounters, counter_rows)
+
+        reject_rows = [[str(k), str(int(v or 0))] for k, v in reject_breakdown.items() if int(v or 0) > 0]
+        self._set_finish_summary_table_rows(self.finishReviewRejects, reject_rows)
+
+        downtime_rows = [
+            ["Review Status", self._safe_text(shift_payload.get("review_status"), REVIEW_STATUS_PENDING)],
+            ["Reason Code", self._safe_text(shift_payload.get("downtime_reason_code"))],
+            ["Reason", self._safe_text(shift_payload.get("downtime_reason_text"))],
+            ["Downtime Last", self._format_timer_seconds(int(shift_payload.get("downtime_last_seconds") or 0))],
+            ["Cycle Time", self._safe_text(shift_payload.get("cycle_time_current"))],
+            ["Maintenance", self._safe_text(shift_payload.get("maintenance_name"))],
+            ["Supervisor", self._safe_text(shift_payload.get("supervisor_name"))],
+        ]
+        self._set_finish_summary_table_rows(self.finishReviewDowntime, downtime_rows)
+
+        scanned_raw_qty = sum(self._parse_number(x.get("qty")) for x in raw_logs)
+        part_table_rows: List[List[str]] = []
+        for part in part_rows:
+            request_part_qty = self._parse_number(part.get("request_part_qty"))
+            part_qty_per_unit = self._parse_number(part.get("part_qty_per_unit"))
+            if part_qty_per_unit <= 0:
+                part_qty_per_unit = TEMP_PART_QTY_PER_UNIT
+            produced_units = max(0.0, self._parse_number(shift_payload.get("good_total")) + self._parse_number(shift_payload.get("butal_total")))
+            used_raw_qty = min(scanned_raw_qty, produced_units * part_qty_per_unit) if scanned_raw_qty > 0 else 0.0
+            remaining_part_qty = max(request_part_qty - used_raw_qty, 0.0)
+            part_table_rows.append([
+                self._safe_text(part.get("sku")),
+                self._safe_text(part.get("name")),
+                f"{part_qty_per_unit:.4f}",
+                f"{used_raw_qty:.2f}".rstrip("0").rstrip("."),
+                self._safe_text(part.get("request_part_qty")),
+                f"{remaining_part_qty:.2f}".rstrip("0").rstrip("."),
+            ])
+        self._set_finish_summary_table_rows(self.finishReviewParts, part_table_rows)
+
+        raw_rows = []
+        for row in raw_logs:
+            raw_rows.append([
+                self._safe_text(row.get("material_name") or row.get("material")),
+                self._safe_text(row.get("qty"), "0"),
+                self._safe_text(row.get("index")),
+                self._safe_text(row.get("total_labels")),
+                self._safe_text(row.get("lot_number")),
+                self._safe_text(row.get("po_number")),
+                self._safe_text(row.get("scanned_at")),
+            ])
+        self._set_finish_summary_table_rows(self.finishReviewRaw, raw_rows)
+
+        pack_rows = []
+        for row in pack_logs[-20:]:
+            product_name = self._safe_text(row.get("product_name") or row.get("product_desc") or row.get("product_id"))
+            pack_rows.append([
+                self._safe_text(row.get("index")),
+                product_name,
+                self._safe_text(row.get("qty"), "0"),
+                self._safe_text(row.get("lot_number")),
+                self._safe_text(row.get("operator_name") or row.get("operator")),
+                self._safe_text(row.get("scanned_at")),
+            ])
+        self._set_finish_summary_table_rows(self.finishReviewPack, pack_rows)
+
     def _compute_job_progress_metrics(self) -> Dict[str, int]:
         payload = self.state.job_payload or {}
         data_obj = payload.get("data") if isinstance(payload, dict) else {}
         job = data_obj.get("job") if isinstance(data_obj, dict) and isinstance(data_obj.get("job"), dict) else {}
         partials = data_obj.get("partials") if isinstance(data_obj, dict) and isinstance(data_obj.get("partials"), list) else []
+        job_code = str(self.state.job_code or "").strip()
         target_qty_raw = job.get("approve_qty")
         if self._parse_number(target_qty_raw) <= 0:
             target_qty_raw = job.get("request_qty")
@@ -7729,18 +8474,43 @@ QWidget#ClientUIRoot {{
             if not isinstance(row, dict):
                 continue
             api_partial_total += int(round(self._parse_number(row.get("partial_qty"))))
-        live_shift_good = int((self.state.good_total or 0) + (self.state.butal_total or 0))
-        produced_now = max(0, api_partial_total + live_shift_good)
+        local_partial_total = self._local_shift_partial_total(job_code, approved_only=False)
+        live_shift_good = self._current_shift_good_total()
+        produced_now = max(0, api_partial_total + local_partial_total + live_shift_good)
         remaining_qty = max(target_qty - produced_now, 0)
         overrun_qty = max(produced_now - target_qty, 0)
         return {
             "target_qty": target_qty,
             "api_partial_total": api_partial_total,
+            "local_partial_total": local_partial_total,
             "live_shift_good": live_shift_good,
             "produced_now": produced_now,
             "remaining_qty": remaining_qty,
             "overrun_qty": overrun_qty,
         }
+
+    def _maybe_show_fulfilled_notice(self):
+        metrics = self._compute_job_progress_metrics()
+        job_code = str(self.state.job_code or "").strip()
+        target_qty = int(metrics.get("target_qty", 0) or 0)
+        produced_now = int(metrics.get("produced_now", 0) or 0)
+        if not job_code or target_qty <= 0 or produced_now < target_qty:
+            if self._fulfilled_notice_job_code == job_code:
+                self._fulfilled_notice_job_code = ""
+            return
+        if self._fulfilled_notice_active and self._fulfilled_notice_job_code == job_code:
+            return
+        self._fulfilled_notice_active = True
+        self._fulfilled_notice_job_code = job_code
+        self.status.setText("Job quantity request fulfilled.")
+        self._fulfilled_notice_timer.start(5000)
+
+    def _clear_fulfilled_notice(self):
+        self._fulfilled_notice_active = False
+        if str(self.state.job_code or "").strip() != self._fulfilled_notice_job_code:
+            return
+        self._fulfilled_notice_job_code = ""
+        self.status.setText("Ready: request fulfilled. You can still scan or finish the job.")
 
     def _parse_cycle_seconds(self, v: Any) -> Optional[float]:
         if v is None:
@@ -8173,12 +8943,12 @@ QWidget#ClientUIRoot {{
             "qty_per_shift": self._safe_text(job_details.get("qty_per_shift"), "N/A"),
         }
 
-        consumed_raw_qty = 0.0
+        scanned_raw_qty = 0.0
         for row in (s.raw_material_logs or []):
             if not isinstance(row, dict):
                 continue
             try:
-                consumed_raw_qty += float(row.get("qty") or 0)
+                scanned_raw_qty += float(row.get("qty") or 0)
             except Exception:
                 pass
 
@@ -8193,30 +8963,41 @@ QWidget#ClientUIRoot {{
                 r = self.jobPartsTable.rowCount()
                 self.jobPartsTable.insertRow(r)
                 request_part_qty = self._parse_number(part.get("request_part_qty"))
-                remaining_part_qty = max(request_part_qty - consumed_raw_qty, 0.0)
+                part_qty_per_unit = self._parse_number(part.get("part_qty_per_unit"))
+                if part_qty_per_unit <= 0:
+                    part_qty_per_unit = TEMP_PART_QTY_PER_UNIT
+                produced_units = max(0.0, float(s.good_total or 0) + float(s.butal_total or 0))
+                projected_used_qty = max(0.0, produced_units * max(part_qty_per_unit, 0.0))
+                used_raw_qty = min(scanned_raw_qty, projected_used_qty) if scanned_raw_qty > 0 else 0.0
+                available_raw_qty = max(scanned_raw_qty - used_raw_qty, 0.0)
+                remaining_part_qty = max(request_part_qty - used_raw_qty, 0.0)
+                request_part_display = self._safe_text(part.get("request_part_qty"), "-")
+                if request_part_qty > 0:
+                    request_part_display = f"{_fmt_number(used_raw_qty)} / {request_part_display}"
+                else:
+                    request_part_display = _fmt_number(used_raw_qty)
                 values = [
                     self._safe_text(part.get("sku"), "-"),
                     self._safe_text(part.get("name"), "-"),
-                    self._safe_text(part.get("part_qty_per_unit"), "-"),
-                    (
-                        f"{_fmt_number(consumed_raw_qty)} / {self._safe_text(part.get('request_part_qty'), '-')}"
-                    ),
+                    f"{part_qty_per_unit:.4f}",
+                    _fmt_number(available_raw_qty),
+                    request_part_display,
                     _fmt_number(remaining_part_qty),
                 ]
                 for c, val in enumerate(values):
                     item = QTableWidgetItem(val)
-                    if c in (2, 3, 4):
+                    if c in (2, 3, 4, 5):
                         item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
                     else:
                         item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
                     self.jobPartsTable.setItem(r, c, item)
             if self.jobPartsTable.rowCount() == 0:
                 self.jobPartsTable.insertRow(0)
-                for c in range(5):
+                for c in range(6):
                     item = QTableWidgetItem("-")
                     item.setTextAlignment(
                         int(Qt.AlignmentFlag.AlignCenter)
-                        if c in (2, 3, 4)
+                        if c in (2, 3, 4, 5)
                         else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
                     )
                     self.jobPartsTable.setItem(0, c, item)
@@ -8545,6 +9326,17 @@ QWidget#ClientUIRoot {{
 
     def on_scanned(self, raw: str):
         if self._operator_shift_flash_active:
+            pending_shift = dict(self._pending_shift_review_payload or {})
+            if pending_shift:
+                raw_s = str(raw).strip()
+                reviewer = self._reviewer_from_scan(raw_s)
+                if reviewer is not None and str(reviewer.get("can_supervisor", "0")) == "1":
+                    self.status.setText("Supervisor QR accepted. Approving finished shift...")
+                    self._approve_pending_shift_review(reviewer, raw_s)
+                    return
+                self.status.setText("Finished shift review is open. Scan Supervisor QR to approve.")
+                self._show_invalid_overlay("Supervisor QR is required to approve this finished shift.")
+                return
             self.status.setText("Operator shift handoff in progress. Please wait.")
             return
         if self._finish_anim_running:
@@ -9075,12 +9867,18 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Operator shift handoff failed: no active operator data.")
                 self._show_invalid_overlay("No active operator shift to save.")
                 return
-            old_operator = self._safe_text(shift_payload.get("operator_name"), "-")
-            s.operator_id = None
-            s.operator_shift_started_at = None
+            saved_shift_ok = self._save_finished_job_local(shift_payload)
+            if not saved_shift_ok:
+                self.status.setText("Finish shift save failed: active session kept for recovery.")
+                self._show_invalid_overlay("Unable to save shift partial locally.")
+                return
+            self.push_event(
+                {"type": "FINISH_SHIFT", "finished_job": shift_payload},
+                f"FINISH SHIFT {shift_payload.get('job_name') or shift_payload.get('job_code') or ''}".strip(),
+                silent=True,
+            )
             self._show_operator_shift_overlay(shift_payload)
-            self._save_active_session_snapshot()
-            self.status.setText(f"Shift data saved for {old_operator}. Scan next OPERATOR badge.")
+            self.status.setText("Finish shift saved. Waiting for Supervisor QR approval.")
             return
 
         if res.kind == "FINISH_JOB":
@@ -9180,6 +9978,7 @@ QWidget#ClientUIRoot {{
                 s.reject_breakdown[reason] = s.reject_breakdown.get(reason, 0) + 1
                 s.waiting_reject_reason = False
                 self.status.setText(f"Reject recorded: {reason}")
+                self.lblReject.add_points(1)
                 self._refresh_ui()
                 self._pulse_card(self.cardStatReject)
                 self.push_event({"type": "REJECT", "qty": 1, "reason": reason}, f"REJECT {reason} +1")
@@ -9716,6 +10515,9 @@ QWidget#ClientUIRoot {{
                 s.good_total += qty
                 self._mark_live_cycle_scan_event(units=qty if qty > 0 else 1)
                 self.status.setText(f"Pack +1 (Good +{qty})")
+                self.lblPack.add_points(1)
+                self.lblGood.add_points(qty)
+                self.lblTotalGood.add_points(qty)
                 self._refresh_ui()
                 self._pulse_card(self.cardStatPack)
                 self._pulse_card(self.cardStatGood)
@@ -9728,6 +10530,8 @@ QWidget#ClientUIRoot {{
                 s.butal_total += qty
                 self._mark_live_cycle_scan_event(units=qty if qty > 0 else 1)
                 self.status.setText(f"Butal +{qty}")
+                self.lblButal.add_points(qty)
+                self.lblTotalGood.add_points(qty)
                 self._refresh_ui()
                 self._pulse_card(self.cardStatButal)
                 self._pulse_card(self.cardStatTotalGood)
