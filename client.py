@@ -5,6 +5,7 @@ import os
 import re
 import random
 import socket
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
 import threading
 import time
@@ -85,6 +86,9 @@ REVIEW_STATUS_APPROVED = "APPROVED"
 REVIEW_STATUS_CLOSED = "CLOSED_JOB"
 TEMP_PART_QTY_PER_UNIT = 0.0848
 MACHINE_BACKGROUND_IMAGE = os.path.join(IMAGES_DIR, "bgsteel.jpg")
+AVERAGE_WEIGHT_API_HOST = os.environ.get("MACHINE_AVG_WEIGHT_HOST", "0.0.0.0").strip() or "0.0.0.0"
+AVERAGE_WEIGHT_API_PORT = int(os.environ.get("MACHINE_AVG_WEIGHT_PORT", "5000"))
+AVERAGE_WEIGHT_API_ENDPOINT = "/average-weight"
 
 
 def _load_sql_config() -> Dict[str, Any]:
@@ -908,6 +912,7 @@ def _load_client_config() -> Dict[str, Any]:
         "scanner_com_port": SCANNER_COM_PORT,
         "scanner_baudrate": SCANNER_BAUDRATE,
         "scanner_timeout": SCANNER_TIMEOUT,
+        "graphics_mode": "quality",
     }
     raw = _load_client_settings_sql()
     if isinstance(raw, dict):
@@ -925,6 +930,14 @@ def _load_client_config() -> Dict[str, Any]:
         defaults["scanner_timeout"] = float(defaults.get("scanner_timeout", SCANNER_TIMEOUT))
     except Exception:
         defaults["scanner_timeout"] = SCANNER_TIMEOUT
+    mode = str(defaults.get("graphics_mode", "quality")).strip().lower().replace(" ", "_")
+    if mode in ("fast",):
+        mode = "faster"
+    if mode in ("faster+quality", "faster_quality", "balanced"):
+        mode = "faster_quality"
+    if mode not in ("faster", "faster_quality", "quality"):
+        mode = "quality"
+    defaults["graphics_mode"] = mode
     return defaults
 
 
@@ -1150,6 +1163,9 @@ class ClientState:
     operator_shift_baseline_raw_material_logs_len: int = 0
     operator_shift_baseline_product_pack_history_logs_len: int = 0
     operator_shift_baseline_reject_review_logs_len: int = 0
+    external_average_weight_grams: Optional[float] = None
+    external_average_weight_unit: Optional[str] = None
+    external_average_weight_received_at: Optional[str] = None
 
     def __post_init__(self):
         if self.reject_breakdown is None:
@@ -1204,6 +1220,7 @@ class CounterCard(QWidget):
         self._scale = 0.0
         self._flash = 0.0
         self._floating: List[FloatingText] = []
+        self._animations_enabled = True
 
         self.setMinimumSize(128, 78)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -1273,6 +1290,11 @@ class CounterCard(QWidget):
         old_value = self._value
         self._value += delta
 
+        if not self._animations_enabled:
+            self._display_value = float(self._value)
+            self.update()
+            return
+
         self.num_anim.stop()
         self.num_anim.setStartValue(float(old_value))
         self.num_anim.setEndValue(float(self._value))
@@ -1304,6 +1326,11 @@ class CounterCard(QWidget):
         self.update()
 
     def _tick(self):
+        if not self._animations_enabled:
+            if self._floating:
+                self._floating = []
+                self.update()
+            return
         kept = []
         dt = 0.016
         for f in self._floating:
@@ -1439,6 +1466,20 @@ class CounterCard(QWidget):
             alpha = int(255 * (1.0 - t))
             painter.setPen(QColor(c["float"].red(), c["float"].green(), c["float"].blue(), alpha))
             painter.drawText(QPointF(f.x, f.y), f.text)
+
+    def set_animations_enabled(self, enabled: bool):
+        self._animations_enabled = bool(enabled)
+        if not self._animations_enabled:
+            self.num_anim.stop()
+            self.glow_anim.stop()
+            self.scale_anim.stop()
+            self.flash_anim.stop()
+            self._floating = []
+            self._glow = 0.0
+            self._scale = 0.0
+            self._flash = 0.0
+            self._display_value = float(self._value)
+        self.update()
 
 
 class ScannerFilter(QObject):
@@ -1738,6 +1779,129 @@ class FailureCross(QWidget):
                 painter.drawLine(int(c[0]), int(c[1]), int(dx), int(dy))
 
 
+class GraphicsModeToggle(QFrame):
+    modeChanged = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._modes = ["faster", "faster_quality", "quality"]
+        self._labels = {
+            "faster": "Fastest",
+            "faster_quality": "Balanced",
+            "quality": "Best Looking",
+        }
+        self._mode = "quality"
+        self.setObjectName("GraphicsModeToggle")
+        self.setFixedSize(420, 52)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet("QFrame#GraphicsModeToggle { background: transparent; border: none; }")
+        self._dot = QFrame(self)
+        self._dot.setObjectName("GraphicsModeDot")
+        self._dot.setStyleSheet(
+            "QFrame#GraphicsModeDot {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                              stop:0 rgba(240,232,212,255),"
+            "                              stop:1 rgba(190,180,160,255));"
+            " border: 1px solid rgba(60,60,55,230);"
+            " border-radius: 3px;"
+            "}"
+        )
+        self._dot.resize(14, 18)
+        self._dot_anim = QPropertyAnimation(self._dot, b"geometry", self)
+        self._dot_anim.setDuration(180)
+        self._dot_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.set_mode(self._mode, emit_signal=False, animate=False)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._move_dot(self._mode, animate=False)
+
+    def _track_rect(self) -> QRectF:
+        return QRectF(4.0, 8.0, float(self.width() - 8), 12.0)
+
+    def _dot_rect_for_mode(self, mode: str) -> QRect:
+        track = self._track_rect()
+        idx = self._modes.index(mode) if mode in self._modes else 2
+        centers = [
+            int(track.left() + 8),
+            int(track.left() + (track.width() / 2.0)),
+            int(track.right() - 8),
+        ]
+        size = self._dot.size()
+        return QRect(centers[idx] - (size.width() // 2), int(track.top() - 3), size.width(), size.height())
+
+    def _move_dot(self, mode: str, animate: bool):
+        target = self._dot_rect_for_mode(mode)
+        if animate:
+            self._dot_anim.stop()
+            self._dot_anim.setStartValue(self._dot.geometry())
+            self._dot_anim.setEndValue(target)
+            self._dot_anim.start()
+        else:
+            self._dot.setGeometry(target)
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        x = float(event.position().x())
+        w = float(self.width())
+        if x < w / 3.0:
+            mode = "faster"
+        elif x < (w * 2.0 / 3.0):
+            mode = "faster_quality"
+        else:
+            mode = "quality"
+        self.set_mode(mode, emit_signal=True)
+        event.accept()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        track = self._track_rect()
+        p.setPen(QPen(QColor(203, 213, 200, 220), 1.4))
+        p.setBrush(QColor(40, 46, 44, 70))
+        p.drawRoundedRect(track, 2.0, 2.0)
+
+        tick_y1 = track.bottom() + 1.0
+        tick_y2 = tick_y1 + 7.0
+        tick_xs = [track.left(), track.left() + (track.width() / 3.0), track.left() + ((track.width() * 2.0) / 3.0), track.right()]
+        for x in tick_xs:
+            p.drawLine(QPointF(x, tick_y1), QPointF(x, tick_y2))
+
+        font = QFont("Consolas", 9, QFont.Weight.Bold)
+        p.setFont(font)
+        for idx, mode in enumerate(self._modes):
+            left = tick_xs[idx]
+            right = tick_xs[idx + 1]
+            rect = QRectF(left - 2.0, tick_y2 + 3.0, (right - left) + 4.0, 16.0)
+            active = mode == self._mode
+            p.setPen(QColor("#f8fafc") if active else QColor(189, 194, 184))
+            if idx == 0:
+                flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            elif idx == 2:
+                flags = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            else:
+                flags = Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+            p.drawText(rect, flags, self._labels[mode])
+        p.end()
+
+    def set_mode(self, mode: str, *, emit_signal: bool = False, animate: bool = True):
+        key = str(mode or "quality").strip().lower()
+        if key not in self._modes:
+            key = "quality"
+        self._mode = key
+        self._move_dot(key, animate=animate)
+        if emit_signal:
+            self.modeChanged.emit(key)
+
+    def mode(self) -> str:
+        return self._mode
+
+
 class CircleProgressBadge(QWidget):
     def __init__(self, accent: QColor, parent=None):
         super().__init__(parent)
@@ -1751,6 +1915,7 @@ class CircleProgressBadge(QWidget):
         self._maximum = 100
         self._segment_count = 35
         self._start_angle = -90.0
+        self._animations_enabled = True
         self.setMinimumSize(98, 98)
         self.setMaximumSize(118, 118)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -1770,6 +1935,8 @@ class CircleProgressBadge(QWidget):
         self.update()
 
     def _tick(self):
+        if not self._animations_enabled:
+            return
         self._phase = (self._phase + 0.08) % (math.pi * 2.0)
         active = max(0, min(self._segment_count, round((self._demo_value / self._maximum) * self._segment_count)))
         if active > 0:
@@ -1842,6 +2009,17 @@ class CircleProgressBadge(QWidget):
         p.setPen(QColor("#f3f4f6"))
         p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, val_text)
         p.end()
+
+    def set_animations_enabled(self, enabled: bool):
+        self._animations_enabled = bool(enabled)
+        if self._animations_enabled:
+            if not self._anim.isActive():
+                self._anim.start()
+        else:
+            self._anim.stop()
+            self._phase = 0.0
+            self._comet_pos = 0.0
+        self.update()
 
 
 @dataclass
@@ -2098,6 +2276,7 @@ class HistoryAnimatedColumn(QFrame):
         self._recent_anim_running = False
         self._initialized = False
         self._current_latest_text = ""
+        self.enable_heavy_animations = True
         self._build_ui()
 
     def _build_ui(self):
@@ -2187,6 +2366,19 @@ class HistoryAnimatedColumn(QFrame):
         self._insert_recent_with_animation(self._recent_insert_queue.popleft())
 
     def _insert_recent_with_animation(self, text: str):
+        if not getattr(self, "enable_heavy_animations", True):
+            row_h = 26
+            gap = 2
+            max_rows = 10
+            incoming = self._make_recent_row(text)
+            self._recent_items.appendleft(incoming)
+            while len(self._recent_items) > max_rows:
+                w = self._recent_items.pop()
+                w.deleteLater()
+            self._reposition_recent_items()
+            self._recent_anim_running = False
+            self._process_recent_queue()
+            return
         self._recent_anim_running = True
         row_h = 26
         gap = 2
@@ -2251,6 +2443,10 @@ class HistoryAnimatedColumn(QFrame):
             widget.setGeometry(0, i * (row_h + gap), w, row_h)
 
     def _animate_latest_pulse(self):
+        if not getattr(self, "enable_heavy_animations", True):
+            self.latestCard.setGeometry(self._latest_base_rect)
+            self.latestCard.graphicsEffect().setOpacity(1.0)
+            return
         for grp in list(self._latest_anim_groups):
             try:
                 grp.stop()
@@ -2302,6 +2498,27 @@ class HistoryAnimatedColumn(QFrame):
         group.finished.connect(cleanup)
         group.start()
 
+    def set_animations_enabled(self, enabled: bool):
+        self.enable_heavy_animations = bool(enabled)
+        if self.enable_heavy_animations:
+            return
+        self._recent_anim_running = False
+        for grp in list(self._anim_groups):
+            try:
+                grp.stop()
+            except Exception:
+                pass
+        self._anim_groups.clear()
+        for grp in list(self._latest_anim_groups):
+            try:
+                grp.stop()
+            except Exception:
+                pass
+        self._latest_anim_groups.clear()
+        self.latestCard.setGeometry(self._latest_base_rect)
+        self.latestCard.graphicsEffect().setOpacity(1.0)
+        self._reposition_recent_items()
+
 
 class ClientUI(QWidget):
     UI_BASE_WIDTH = 1920
@@ -2311,6 +2528,7 @@ class ClientUI(QWidget):
 
     scan_received = pyqtSignal(str)
     scanner_status = pyqtSignal(str)
+    average_weight_received = pyqtSignal(float, str)
 
     @staticmethod
     def _load_digital_font_family() -> str:
@@ -2360,6 +2578,9 @@ class ClientUI(QWidget):
         self._product_catalog_last_refresh_attempt = 0.0
         self._action_logs: List[str] = []
         self._background_pixmap = QPixmap(MACHINE_BACKGROUND_IMAGE)
+        self._avg_weight_server: Optional[ThreadingHTTPServer] = None
+        self._avg_weight_server_thread: Optional[threading.Thread] = None
+        self._avg_weight_server_error: Optional[str] = None
 
         self.setWindowTitle("Machine Client Dashboard")
         self.setMinimumSize(0, 0)
@@ -2372,9 +2593,13 @@ QWidget#ClientUIRoot {{
 }}
 """
         )
+        self.graphics_mode = "quality"
         self.enable_check_animation = True
         self.enable_flashing_lights = True
         self.enable_pulse_effects = True
+        self.enable_heavy_animations = True
+        self.enable_background_blur = True
+        self.enable_gif_animations = True
 
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 8)
@@ -2637,11 +2862,11 @@ QWidget#ClientUIRoot {{
         self.jobPartsTable.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
         self.jobPartsTable.horizontalHeader().setFixedHeight(32)
         self.jobPartsTable.setColumnWidth(0, 220)
-        # Size table to show up to 10 visible rows without clipping.
+        # Size table to show up to 12 visible rows without clipping.
         parts_row_h = self.jobPartsTable.verticalHeader().defaultSectionSize()
         parts_header_h = self.jobPartsTable.horizontalHeader().height()
         parts_frame_h = self.jobPartsTable.frameWidth() * 2
-        parts_target_h = parts_header_h + (parts_row_h * 10) + parts_frame_h
+        parts_target_h = parts_header_h + (parts_row_h * 12) + parts_frame_h
         self.jobPartsTable.setMinimumHeight(parts_target_h)
         self.jobPartsTable.setMaximumHeight(parts_target_h)
         self.jobPartsTableShell = QFrame()
@@ -2741,8 +2966,8 @@ QWidget#ClientUIRoot {{
             " background: transparent;"
             "}"
         )
-        self.cardJobDetailsOuter.setMinimumHeight(340)
-        self.cardJobDetailsOuter.setMaximumHeight(430)
+        self.cardJobDetailsOuter.setMinimumHeight(400)
+        self.cardJobDetailsOuter.setMaximumHeight(500)
         self.cardJobDetailsOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
         # Job details panel beside Session.
@@ -3202,7 +3427,7 @@ QWidget#ClientUIRoot {{
         linkageContent = QWidget()
         linkageContent.setObjectName("LinkageMirrorContent")
         linkageContent.setLayout(QHBoxLayout())
-        linkageContent.layout().setContentsMargins(10, 10, 10, 12)
+        linkageContent.layout().setContentsMargins(10, 8, 10, 8)
         linkageContent.layout().setSpacing(14)
         linkageContent.layout().setStretch(0, 1)
         linkageContent.layout().setStretch(1, 1)
@@ -3211,23 +3436,27 @@ QWidget#ClientUIRoot {{
         linkageLeft.setObjectName("LinkageMirrorLeft")
         linkageLeft.setLayout(QVBoxLayout())
         linkageLeft.layout().setContentsMargins(0, 0, 0, 0)
-        linkageLeft.layout().setSpacing(10)
+        linkageLeft.layout().setSpacing(6)
         linkageLeft.setMinimumWidth(0)
 
         def _make_linked_job_row(title: str):
             row = QFrame()
             row.setObjectName("LinkageMirrorJobRow")
             row.setLayout(QHBoxLayout())
-            row.layout().setContentsMargins(18, 10, 18, 10)
+            row.layout().setContentsMargins(18, 7, 18, 7)
             row.layout().setSpacing(10)
-            row.setMinimumHeight(20)
+            row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            row.setMinimumHeight(30)
             key = QLabel(title)
             key.setObjectName("LinkageMirrorJobKey")
+            key.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             value = QLabel("-")
             value.setObjectName("LinkageMirrorJobVal")
+            value.setWordWrap(False)
+            value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             row.layout().addWidget(key, 1)
-            row.layout().addWidget(value, 0)
+            row.layout().addWidget(value, 2)
             return row, value
 
         row1, self.linkageMirrorJob1 = _make_linked_job_row("Linked Job 1:")
@@ -3236,7 +3465,6 @@ QWidget#ClientUIRoot {{
         linkageLeft.layout().addWidget(row1)
         linkageLeft.layout().addWidget(row2)
         linkageLeft.layout().addWidget(row3)
-        linkageLeft.layout().addStretch(1)
 
         linkageRight = QFrame()
         linkageRight.setObjectName("LinkageMirrorRight")
@@ -3577,17 +3805,17 @@ QWidget#ClientUIRoot {{
         self.productionOverlay.layout().setSpacing(12)
         self.productionOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.productionTitle = QLabel("PRODUCTION DAILY REPORT")
-        self.productionTitle.setStyleSheet("color: #111111; font-size: 24px; font-weight: 900;")
+        self.productionTitle.setStyleSheet("color: #f8fafc; font-size: 24px; font-weight: 900;")
         self.productionTitle.setFixedWidth(552)
         self.productionTitle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.productionOverlay.layout().addWidget(self.productionTitle, 0, Qt.AlignmentFlag.AlignHCenter)
         self.productionHint = QLabel("Scan reason QR code (01-15)")
-        self.productionHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.productionHint.setStyleSheet("color: #cbd5e1; font-size: 14px; font-weight: 700;")
         self.productionOverlay.layout().addWidget(self.productionHint)
         self.productionReasonList = QWidget()
         self.productionReasonList.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.productionReasonList.setLayout(QGridLayout())
-        self.productionReasonList.layout().setContentsMargins(0, 2, 0, 2)
+        self.productionReasonList.layout().setContentsMargins(14, 2, 14, 2)
         self.productionReasonList.layout().setSpacing(8)
         self.productionReasonCards: List[QFrame] = []
         self.productionReasonCodes: List[str] = []
@@ -3600,7 +3828,9 @@ QWidget#ClientUIRoot {{
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             card.setStyleSheet(
                 "QFrame#ProductionReasonCard {"
-                "background: rgba(255,255,255,0.92);"
+                "background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+                "                        stop:0 rgba(103,107,115,220),"
+                "                        stop:1 rgba(56,59,66,230));"
                 "border: 1px solid rgba(148,163,184,0.55);"
                 "border-radius: 12px;"
                 "}"
@@ -3630,14 +3860,14 @@ QWidget#ClientUIRoot {{
             codeLabel = QLabel(code, card)
             codeLabel.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             codeLabel.setContentsMargins(0, 0, 0, 0)
-            codeLabel.setStyleSheet("color: #ea580c; font-size: 32px; font-weight: 900;")
+            codeLabel.setStyleSheet("color: #f59e0b; font-size: 32px; font-weight: 900;")
             codeLabel.adjustSize()
             codeLabel.raise_()
             textLabel = QLabel(label)
             textLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
             textLabel.setWordWrap(True)
             textLabel.setContentsMargins(0, 8, 0, 0)
-            textLabel.setStyleSheet("color: #0f172a; font-size: 15px; font-weight: 800;")
+            textLabel.setStyleSheet("color: #f8fafc; font-size: 15px; font-weight: 800;")
             card.layout().addWidget(iconLabel, 0, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
             card.layout().addWidget(textLabel, 1)
             self.productionReasonList.layout().addWidget(card, idx // 5, idx % 5)
@@ -3770,26 +4000,27 @@ QWidget#ClientUIRoot {{
         self.resolveOverlay.setObjectName("ProductionOverlay")
         self.resolveOverlay.setStyleSheet(
             "QFrame#ProductionOverlay {"
-            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
-            "stop:0 rgba(251,251,251,0.99), stop:1 rgba(238,241,245,0.99));"
-            "border: 5px solid #ff8a00; border-radius: 28px; }"
+            "background: qradialgradient(cx:0.5, cy:0.12, radius:1.2, fx:0.5, fy:0.02,"
+            "stop:0 rgba(112,116,124,242), stop:0.38 rgba(70,74,82,244), stop:1 rgba(24,26,31,248));"
+            "border: 1px solid rgba(124,130,140,235); border-radius: 28px; }"
             "QFrame#ResolveInfoCard {"
-            "background: rgba(255,255,255,0.98); border: none; border-radius: 20px; }"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(103,107,115,220), stop:1 rgba(56,59,66,230));"
+            "border: 1px solid rgba(148,163,184,0.45); border-radius: 20px; }"
             "QLabel#ResolveInfoTitle { color: transparent; font-size: 1px; }"
-            "QLabel#ResolveInfoValue { color: #111111; font-size: 24px; font-weight: 500; border: none; background: transparent; }"
+            "QLabel#ResolveInfoValue { color: #f8fafc; font-size: 24px; font-weight: 500; border: none; background: transparent; }"
         )
         self.resolveOverlay.setLayout(QVBoxLayout())
         self.resolveOverlay.layout().setContentsMargins(22, 18, 22, 20)
         self.resolveOverlay.layout().setSpacing(14)
         self.resolveOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.resolveTitle = QLabel("DOWNTIME RESOLUTION")
-        self.resolveTitle.setStyleSheet("color: #111111; font-size: 24px; font-weight: 500; background: transparent; border: none;")
+        self.resolveTitle.setStyleSheet("color: #f8fafc; font-size: 24px; font-weight: 700; background: transparent; border: none;")
         self.resolveTitle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.resolveHint = QLabel("Scan cycle time digits (num_0..num_9), backspace, then confirm")
         self.resolveHint.setStyleSheet(
             "color: #ffffff; font-size: 21px; font-weight: 900;"
-            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #4b9aeb, stop:1 #3187df);"
-            "border: none; border-radius: 22px; padding: 14px 22px;"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(85,167,245,230), stop:1 rgba(48,118,193,238));"
+            "border: 1px solid rgba(191,219,254,120); border-radius: 22px; padding: 14px 22px;"
         )
         self.resolveHint.setWordWrap(True)
         self.resolveHint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3840,7 +4071,7 @@ QWidget#ClientUIRoot {{
         self.rawMatsTitle = QLabel("RAW MATERIALS SCANNED")
         self.rawMatsTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
         self.rawMatsHint = QLabel('Scan "rawmatsummary~1" (or "showrawmats") again to close')
-        self.rawMatsHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.rawMatsHint.setStyleSheet("color: #cbd5e1; font-size: 14px; font-weight: 700;")
         self.rawMatsList = QTableWidget(0, 8)
         self.rawMatsList.setHorizontalHeaderLabels(["#", "Raw Material", "Qty", "Index", "Total Labels", "Lot", "PO No.", "Timestamp"])
         self.rawMatsList.setAlternatingRowColors(True)
@@ -3861,10 +4092,17 @@ QWidget#ClientUIRoot {{
         self.rawMatsList.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.rawMatsList.setMinimumHeight(240)
         self.rawMatsList.setStyleSheet(
-            "QTableWidget { background: rgba(255,255,255,0.78); border: 1px solid rgba(148,163,184,0.45);"
-            " border-radius: 10px; gridline-color: rgba(148,163,184,0.28); }"
-            "QHeaderView::section { background: rgba(226,232,240,0.9); color: #0f172a; font-weight: 800;"
+            "QTableWidget { background: rgba(32,35,41,0.88); border: 1px solid rgba(148,163,184,0.45);"
+            " border-radius: 10px; gridline-color: rgba(148,163,184,0.28); color: #f8fafc; }"
+            "QHeaderView::section { background: rgba(88,92,101,0.92); color: #f8fafc; font-weight: 800;"
             " border: none; border-bottom: 1px solid rgba(148,163,184,0.5); padding: 6px; }"
+        )
+        self.rawMatsOverlay.setStyleSheet(
+            "QFrame#ProductionOverlay {"
+            "background: qradialgradient(cx:0.5, cy:0.12, radius:1.2, fx:0.5, fy:0.02,"
+            "stop:0 rgba(112,116,124,242), stop:0.38 rgba(70,74,82,244), stop:1 rgba(24,26,31,248));"
+            "border: 1px solid rgba(124,130,140,235); border-radius: 22px; }"
+            "QLabel { color: #f8fafc; }"
         )
         self.rawMatsOverlay.layout().addWidget(self.rawMatsTitle)
         self.rawMatsOverlay.layout().addWidget(self.rawMatsHint)
@@ -3880,33 +4118,41 @@ QWidget#ClientUIRoot {{
         self.rejectSummaryOverlay.layout().setSpacing(8)
         self.rejectSummaryOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.rejectSummaryTitle = QLabel("REJECT SUMMARY")
-        self.rejectSummaryTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
+        self.rejectSummaryTitle.setStyleSheet("color: #f8fafc; font-size: 22px; font-weight: 900;")
         self.rejectSummaryHint = QLabel('Scan "rejectsummary" again to refresh')
-        self.rejectSummaryHint.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.rejectSummaryHint.setStyleSheet("color: #cbd5e1; font-size: 14px; font-weight: 700;")
         self.rejectSummaryStamp = QLabel("Scanned at: -")
         self.rejectSummaryStamp.setObjectName("MetaValue")
         self.rejectSummaryConfirmedBy = QLabel("Confirmed by: -")
         self.rejectSummaryConfirmedBy.setObjectName("MetaValue")
         self.rejectSummaryTotals = QLabel("Reject Total: 0 | Start Up Reject: 0")
         self.rejectSummaryTotals.setObjectName("MetaValue")
-        self.rejectSummaryDetails = QTableWidget(1, len(REJECT_DETAIL_ITEMS))
-        self.rejectSummaryDetails.setHorizontalHeaderLabels([code for code, _ in REJECT_DETAIL_ITEMS])
-        self.rejectSummaryDetails.setVerticalHeaderLabels(["Qty"])
+        self.rejectSummaryDetails = QTableWidget(0, 3)
+        self.rejectSummaryDetails.setHorizontalHeaderLabels(["Reason", "Operator", "Timestamp"])
         self.rejectSummaryDetails.setAlternatingRowColors(False)
         self.rejectSummaryDetails.setWordWrap(False)
         self.rejectSummaryDetails.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.rejectSummaryDetails.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.rejectSummaryDetails.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.rejectSummaryDetails.verticalHeader().setVisible(True)
-        self.rejectSummaryDetails.verticalHeader().setDefaultSectionSize(34)
-        self.rejectSummaryDetails.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.rejectSummaryDetails.setMinimumHeight(120)
+        self.rejectSummaryDetails.verticalHeader().setVisible(False)
+        self.rejectSummaryDetails.verticalHeader().setDefaultSectionSize(32)
+        self.rejectSummaryDetails.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.rejectSummaryDetails.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.rejectSummaryDetails.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.rejectSummaryDetails.setMinimumHeight(260)
         self.rejectSummaryDetails.setStyleSheet(
-            "QTableWidget { background: rgba(255,255,255,0.84); border: 1px solid rgba(148,163,184,0.45);"
+            "QTableWidget { background: rgba(32,35,41,0.88); border: 1px solid rgba(148,163,184,0.45);"
             " border-radius: 10px; gridline-color: rgba(148,163,184,0.28); }"
-            "QHeaderView::section { background: rgba(226,232,240,0.92); color: #0f172a; font-weight: 900;"
+            "QHeaderView::section { background: rgba(88,92,101,0.92); color: #f8fafc; font-weight: 900;"
             " border: none; border-bottom: 1px solid rgba(148,163,184,0.5); padding: 6px; }"
-            "QTableWidget::item { padding: 6px; color: #0f172a; font-weight: 800; }"
+            "QTableWidget::item { padding: 6px; color: #f8fafc; font-weight: 800; }"
+        )
+        self.rejectSummaryOverlay.setStyleSheet(
+            "QFrame#ProductionOverlay {"
+            "background: qradialgradient(cx:0.5, cy:0.12, radius:1.2, fx:0.5, fy:0.02,"
+            "stop:0 rgba(112,116,124,242), stop:0.38 rgba(70,74,82,244), stop:1 rgba(24,26,31,248));"
+            "border: 1px solid rgba(124,130,140,235); border-radius: 22px; }"
+            "QLabel { color: #f8fafc; }"
         )
         self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryTitle)
         self.rejectSummaryOverlay.layout().addWidget(self.rejectSummaryHint)
@@ -4208,13 +4454,19 @@ QWidget#ClientUIRoot {{
         self.finishOverlay.layout().setSpacing(10)
         self.finishOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishTitle = QLabel("FINISHING JOB")
-        self.finishTitle.setStyleSheet("color: #0f172a; font-size: 22px; font-weight: 900;")
+        self.finishTitle.setStyleSheet("color: #f8fafc; font-size: 26px; font-weight: 900; background: transparent; border: none;")
         self.finishTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishStatus = QLabel("Processing...")
-        self.finishStatus.setStyleSheet("color: #334155; font-size: 14px; font-weight: 700;")
+        self.finishStatus.setStyleSheet("color: #dbeafe; font-size: 16px; font-weight: 800; background: transparent; border: none;")
         self.finishStatus.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.finishReviewHint = QLabel("Scan Supervisor QR to approve this finished shift.")
-        self.finishReviewHint.setStyleSheet("color: #0f766e; font-size: 13px; font-weight: 800;")
+        self.finishReviewHint = QLabel(
+            'Scan "next" / "prev" QR to move the review, then scan Supervisor QR to approve this finished shift.'
+        )
+        self.finishReviewHint.setStyleSheet(
+            "color: #ffffff; font-size: 17px; font-weight: 900;"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(85,167,245,230), stop:1 rgba(48,118,193,238));"
+            "border: 1px solid rgba(191,219,254,120); border-radius: 22px; padding: 12px 20px;"
+        )
         self.finishReviewHint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishReviewHint.setWordWrap(True)
         self.finishReviewHint.hide()
@@ -4229,11 +4481,13 @@ QWidget#ClientUIRoot {{
         self.finishSummaryScroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
             "QScrollArea > QWidget > QWidget { background: transparent; }"
-            "QScrollBar:vertical { background: rgba(15,23,42,0.10); width: 12px; margin: 2px; border-radius: 6px; }"
-            "QScrollBar::handle:vertical { background: rgba(71,85,105,0.75); min-height: 36px; border-radius: 6px; }"
+            "QScrollBar:vertical { width: 0px; background: transparent; }"
+            "QScrollBar::handle:vertical { background: transparent; min-height: 0px; }"
             "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
             "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
         )
+        self.finishSummaryScroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.finishSummaryScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.finishSummaryBody = QWidget()
         self.finishSummaryBody.setLayout(QVBoxLayout())
         self.finishSummaryBody.layout().setContentsMargins(4, 4, 4, 4)
@@ -4253,9 +4507,11 @@ QWidget#ClientUIRoot {{
         )):
             card = QFrame()
             card.setStyleSheet(
-                "QFrame { background: rgba(255,255,255,0.78); border: 1px solid rgba(148,163,184,0.55); border-radius: 12px; }"
-                "QLabel[role='title'] { color: #64748b; font-size: 11px; font-weight: 900; }"
-                "QLabel[role='value'] { color: #0f172a; font-size: 14px; font-weight: 900; }"
+                "QFrame {"
+                "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(103,107,115,220), stop:1 rgba(56,59,66,230));"
+                "border: 1px solid rgba(148,163,184,0.45); border-radius: 14px; }"
+                "QLabel[role='title'] { color: #cbd5e1; font-size: 11px; font-weight: 900; background: transparent; border: none; }"
+                "QLabel[role='value'] { color: #f8fafc; font-size: 15px; font-weight: 900; background: transparent; border: none; }"
             )
             card.setLayout(QVBoxLayout())
             card.layout().setContentsMargins(10, 8, 10, 8)
@@ -4325,16 +4581,16 @@ QWidget#ClientUIRoot {{
         self.finishOverlay.layout().addWidget(self.finishSuccessRow, 0, Qt.AlignmentFlag.AlignCenter)
         self.finishOverlay.setStyleSheet(
             "QFrame#ProductionOverlay {"
-            "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
-            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(240,253,244,0.98), stop:1 rgba(220,252,231,0.98));"
-            "border: 3px solid #16a34a; border-radius: 14px; }"
+            "background: qradialgradient(cx:0.5, cy:0.12, radius:1.2, fx:0.5, fy:0.02,"
+            "stop:0 rgba(112,116,124,242), stop:0.38 rgba(70,74,82,244), stop:1 rgba(24,26,31,248));"
+            "border: 1px solid rgba(124,130,140,235); border-radius: 28px; }"
             "QWidget#FinishSuccessRow { background: transparent; border: none; }"
             "QLabel#FinishDoneText { background: transparent; border: none; }"
             "QProgressBar {"
-            "border: 1px solid #16a34a; border-radius: 8px; background: rgba(255,255,255,0.88); min-height: 14px; }"
+            "border: 1px solid rgba(34,197,94,0.85); border-radius: 10px; background: rgba(15,23,42,0.65); min-height: 16px; }"
             "QProgressBar::chunk {"
             "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16a34a, stop:1 #22c55e);"
-            "border-radius: 7px; }"
+            "border-radius: 8px; }"
         )
         self.finishOverlay.hide()
         self.finishOverlay.raise_()
@@ -4503,6 +4759,9 @@ QWidget#ClientUIRoot {{
         self.settingsGraphicsSection.setLayout(QVBoxLayout())
         self.settingsGraphicsSection.layout().setContentsMargins(0, 0, 0, 0)
         self.settingsGraphicsSection.layout().setSpacing(8)
+        self.graphicsModeLabel = QLabel("Graphics Mode")
+        self.graphicsModeLabel.setObjectName("MetaLabel")
+        self.graphicsModeToggle = GraphicsModeToggle()
         self.chkCheckAnimation = QPushButton()
         self.chkCheckAnimation.setObjectName("SettingToggle")
         self.chkCheckAnimation.setCheckable(True)
@@ -4524,6 +4783,8 @@ QWidget#ClientUIRoot {{
         self.graphicsSectionTitle = QLabel("Graphics")
         self.graphicsSectionTitle.setObjectName("MetaLabel")
         self.settingsGraphicsSection.layout().addWidget(self.graphicsSectionTitle)
+        self.settingsGraphicsSection.layout().addWidget(self.graphicsModeLabel)
+        self.settingsGraphicsSection.layout().addWidget(self.graphicsModeToggle, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsGraphicsSection.layout().addWidget(self.chkCheckAnimation, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsGraphicsSection.layout().addWidget(self.chkFlashingLights, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsGraphicsSection.layout().addWidget(self.chkPulseEffects, 0, Qt.AlignmentFlag.AlignLeft)
@@ -4673,6 +4934,7 @@ QWidget#ClientUIRoot {{
         self.settingsBtnGraphics.clicked.connect(lambda: self._show_settings_section("graphics"))
         self.settingsBtnDisplay.clicked.connect(lambda: self._show_settings_section("display"))
         self.settingsBtnApi.clicked.connect(lambda: self._show_settings_section("api"))
+        self.graphicsModeToggle.modeChanged.connect(self._apply_graphics_settings)
         self.displayApplyBtn.clicked.connect(self._apply_display_settings)
         self.apiJobApiTestBtn.clicked.connect(self._test_job_api_settings)
         self.apiApplyBtn.clicked.connect(self._apply_api_settings)
@@ -4687,10 +4949,161 @@ QWidget#ClientUIRoot {{
         self.settingsShell.layout().addWidget(self.settingsNav, 0)
         self.settingsShell.layout().addWidget(self.settingsContent, 1)
         self.settingsOverlay.layout().addWidget(self.settingsShell)
+        self.settingsOverlay.setStyleSheet(
+            "QFrame#SettingsOverlay {"
+            " background: rgba(7,10,16,110);"
+            " border: none;"
+            "}"
+            "QFrame#SettingsShell {"
+            " background: qradialgradient(cx:0.50, cy:0.10, radius:1.25, fx:0.50, fy:0.05,"
+            "                           stop:0 rgba(112,116,124,242),"
+            "                           stop:0.38 rgba(70,74,82,244),"
+            "                           stop:1 rgba(24,26,31,248));"
+            " border: 1px solid rgba(124,130,140,235);"
+            " border-radius: 24px;"
+            "}"
+            "QFrame#SettingsNav {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(80,84,92,232),"
+            "                             stop:1 rgba(42,45,51,236));"
+            " border: none;"
+            " border-top-left-radius: 24px;"
+            " border-bottom-left-radius: 24px;"
+            " border-right: 1px solid rgba(156,163,175,85);"
+            "}"
+            "QLabel#SettingsNavTitle {"
+            " color: #f8fafc;"
+            " font-size: 18px;"
+            " font-weight: 900;"
+            " letter-spacing: 0.8px;"
+            " padding: 4px 6px 10px 6px;"
+            "}"
+            "QPushButton#SettingsNavButton {"
+            " min-height: 42px;"
+            " padding: 0 16px;"
+            " text-align: left;"
+            " color: #e5e7eb;"
+            " font-size: 16px;"
+            " font-weight: 900;"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(87,91,99,208),"
+            "                             stop:1 rgba(54,57,64,220));"
+            " border: 1px solid rgba(154,160,170,110);"
+            " border-radius: 14px;"
+            "}"
+            "QPushButton#SettingsNavButton:hover {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(103,107,115,220),"
+            "                             stop:1 rgba(62,65,72,228));"
+            "}"
+            "QPushButton#SettingsNavButton:checked {"
+            " color: #ffffff;"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(117,121,129,230),"
+            "                             stop:1 rgba(70,74,82,236));"
+            " border: 1px solid rgba(229,231,235,165);"
+            "}"
+            "QFrame#SettingsContent {"
+            " background: transparent;"
+            " border: none;"
+            "}"
+            "QLabel#SettingsContentTitle {"
+            " color: #f8fafc;"
+            " font-size: 28px;"
+            " font-weight: 900;"
+            " letter-spacing: 0.3px;"
+            "}"
+            "QPushButton#SettingsCloseX {"
+            " min-width: 44px;"
+            " max-width: 44px;"
+            " min-height: 44px;"
+            " max-height: 44px;"
+            " color: #f8fafc;"
+            " font-size: 22px;"
+            " font-weight: 900;"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(97,101,110,220),"
+            "                             stop:1 rgba(58,61,69,232));"
+            " border: 1px solid rgba(203,213,225,130);"
+            " border-radius: 14px;"
+            "}"
+            "QPushButton#SettingsCloseX:hover {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(113,117,126,228),"
+            "                             stop:1 rgba(70,74,82,236));"
+            "}"
+            "QFrame#SettingsContentDivider {"
+            " color: rgba(226,232,240,70);"
+            " background: rgba(226,232,240,70);"
+            " min-height: 1px;"
+            " max-height: 1px;"
+            " border: none;"
+            "}"
+            "QWidget#SettingsPage {"
+            " background: transparent;"
+            " border: none;"
+            "}"
+            "QLabel#MetaLabel {"
+            " color: #cbd5e1;"
+            " font-size: 14px;"
+            " font-weight: 900;"
+            " letter-spacing: 1.1px;"
+            " text-transform: uppercase;"
+            "}"
+            "QPushButton#SettingToggle {"
+            " min-height: 42px;"
+            " padding: 0 16px;"
+            " text-align: left;"
+            " color: #f8fafc;"
+            " font-size: 15px;"
+            " font-weight: 900;"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(92,96,105,214),"
+            "                             stop:1 rgba(55,58,66,224));"
+            " border: 1px solid rgba(148,163,184,130);"
+            " border-radius: 14px;"
+            "}"
+            "QPushButton#SettingToggle:disabled {"
+            " color: #f8fafc;"
+            "}"
+            "QPushButton#SettingToggle:hover {"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(108,112,121,224),"
+            "                             stop:1 rgba(63,66,74,232));"
+            "}"
+            "QLineEdit, QComboBox {"
+            " min-height: 40px;"
+            " padding: 0 12px;"
+            " color: #f8fafc;"
+            " font-size: 14px;"
+            " font-weight: 800;"
+            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            "                             stop:0 rgba(86,90,98,214),"
+            "                             stop:1 rgba(48,51,58,224));"
+            " border: 1px solid rgba(148,163,184,120);"
+            " border-radius: 12px;"
+            " selection-background-color: rgba(59,130,246,180);"
+            "}"
+            "QComboBox::drop-down {"
+            " subcontrol-origin: padding;"
+            " subcontrol-position: top right;"
+            " width: 28px;"
+            " border: none;"
+            " background: transparent;"
+            "}"
+            "QComboBox QAbstractItemView {"
+            " color: #f8fafc;"
+            " background: rgba(31,41,55,245);"
+            " border: 1px solid rgba(148,163,184,130);"
+            " selection-background-color: rgba(71,85,105,220);"
+            "}"
+        )
         self._load_api_settings_form()
+        self._load_graphics_settings_form()
         self._show_settings_section("graphics")
         self.settingsOverlay.hide()
         self.settingsOverlay.raise_()
+        self._apply_graphics_mode(self.client_config.get("graphics_mode", "quality"), persist=False)
 
         self._overlay_mode = "select"
         self._overlay_pulse_on = False
@@ -4715,10 +5128,12 @@ QWidget#ClientUIRoot {{
 
         self.scan_received.connect(self.on_scanned)
         self.scanner_status.connect(self._set_status_text)
+        self.average_weight_received.connect(self._apply_external_average_weight)
         self._setup_scanner_input()
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._save_active_session_snapshot)
+            app.aboutToQuit.connect(self._shutdown_average_weight_server)
 
         # heartbeat timer
         self.hb = QTimer(self)
@@ -4743,6 +5158,7 @@ QWidget#ClientUIRoot {{
         self.downtimeTimer = QTimer(self)
         self.downtimeTimer.timeout.connect(self._refresh_downtime_panel)
         self.downtimeTimer.start(1000)
+        self._start_average_weight_server()
 
         self.overlayPulseTimer = QTimer(self)
         self.overlayPulseTimer.timeout.connect(self._tick_overlay_pulse)
@@ -4791,6 +5207,7 @@ QWidget#ClientUIRoot {{
         self._position_finish_overlay()
         self._sync_machine_status_pulse_overlay()
         self._apply_production_timer_fonts()
+        self._refresh_linkage_panel()
 
     def _screen_ui_scale(self) -> float:
         screen = None
@@ -5033,6 +5450,11 @@ QWidget#ClientUIRoot {{
             self.rightTopSpacer.setFixedHeight(0)
 
     def _setup_invalid_overlay_media(self):
+        if not getattr(self, "enable_gif_animations", True):
+            self.invalidGifLabel.clear()
+            self.invalidGifLabel.hide()
+            self._invalid_movie = None
+            return
         gif_path = INVALID_SCAN_GIF
         if gif_path and os.path.exists(gif_path):
             movie = QMovie(gif_path)
@@ -5101,7 +5523,7 @@ QWidget#ClientUIRoot {{
         msg = str(reason or "").strip()
         self.invalidReasonLabel.setText(msg)
         self._position_invalid_overlay()
-        if self._invalid_movie is not None:
+        if self.enable_gif_animations and self._invalid_movie is not None:
             self._invalid_movie.stop()
             self._invalid_movie.setScaledSize(self._fit_movie_size(self.invalidOverlay.size()))
             self._invalid_movie.start()
@@ -5214,8 +5636,8 @@ QWidget#ClientUIRoot {{
         self.rawMatsOverlay.setGeometry(x, y, w, h)
 
     def _position_reject_summary_overlay(self):
-        w = min(720, max(460, int(self.width() * 0.52)))
-        h = min(520, max(260, int(self.height() * 0.42)))
+        w = min(980, max(720, int(self.width() * 0.72)))
+        h = min(720, max(420, int(self.height() * 0.62)))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.rejectSummaryOverlay.setGeometry(x, y, w, h)
@@ -5247,11 +5669,30 @@ QWidget#ClientUIRoot {{
         self.rejectReviewLoadingLayer.setGeometry(0, 0, w, h)
 
     def _position_finish_overlay(self):
-        w = min(560, max(380, int(self.width() * 0.45)))
-        h = min(280, max(210, int(self.height() * 0.30)))
+        w = min(1360, max(1040, int(self.width() * 0.88)))
+        h = min(940, max(700, int(self.height() * 0.88)))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.finishOverlay.setGeometry(x, y, w, h)
+
+    def _scroll_finish_shift_review(self, direction: int):
+        if not self.finishOverlay.isVisible() or not self.finishSummaryScroll.isVisible():
+            return
+        bar = self.finishSummaryScroll.verticalScrollBar()
+        if bar is None:
+            return
+        step = max(180, self.finishSummaryScroll.viewport().height() - 70)
+        target = bar.value() + (step * (1 if direction > 0 else -1))
+        target = max(bar.minimum(), min(bar.maximum(), target))
+        if target == bar.value():
+            edge = "last" if direction > 0 else "first"
+            self.status.setText(f"Finish review: already on {edge} page.")
+            return
+        bar.setValue(target)
+        page_size = max(1, step)
+        page_num = max(1, (bar.value() // page_size) + 1)
+        total_pages = max(1, (bar.maximum() // page_size) + 1)
+        self.status.setText(f"Finish review page {page_num} of {total_pages}.")
 
     def _position_settings_overlay(self):
         w = min(660, max(500, int(self.width() * 0.50)))
@@ -5369,12 +5810,40 @@ QWidget#ClientUIRoot {{
         self.rejectSummaryTotals.setText(
             f"Reject Total: {int(s.reject_total or 0)} | Start Up Reject: {int(s.startup_reject_total or 0)}"
         )
-        counts = self._normalized_reject_counts()
-        self.rejectSummaryDetails.setRowCount(1)
-        for col, (code, _label) in enumerate(REJECT_DETAIL_ITEMS):
-            item = QTableWidgetItem(str(int(counts.get(code, 0))))
-            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.rejectSummaryDetails.setItem(0, col, item)
+        logs = []
+        for row in (s.reject_review_logs or []):
+            if not isinstance(row, dict):
+                continue
+            entry_type = str(row.get("entry_type") or "").strip().upper()
+            if entry_type not in ("REJECT_SCAN", "STARTUP_REJECT_SCAN"):
+                continue
+            logs.append(row)
+        self.rejectSummaryDetails.setRowCount(0)
+        for row_idx, row in enumerate(logs):
+            self.rejectSummaryDetails.insertRow(row_idx)
+            reason_code = str(row.get("reason_code") or row.get("reason") or "").strip() or "-"
+            operator_name = str(row.get("operator_name") or row.get("operator") or "-").strip() or "-"
+            ts_raw = str(row.get("scanned_at") or row.get("timestamp") or "").strip()
+            ts_text = ts_raw or "-"
+            if ts_raw:
+                try:
+                    ts_dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                    ts_text = ts_dt.astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
+                except Exception:
+                    pass
+            values = [reason_code, operator_name, ts_text]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignCenter if col in (0, 1) else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                )
+                self.rejectSummaryDetails.setItem(row_idx, col, item)
+        if self.rejectSummaryDetails.rowCount() == 0:
+            self.rejectSummaryDetails.insertRow(0)
+            for col, value in enumerate(("-", "-", "No reject scans yet")):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter if col in (0, 1) else Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                self.rejectSummaryDetails.setItem(0, col, item)
 
     def _show_reject_summary_overlay(self):
         self._refresh_reject_summary_overlay()
@@ -5939,25 +6408,54 @@ QWidget#ClientUIRoot {{
         if not self._should_keep_background_blur():
             self._set_background_blur(False)
 
+    def _scroll_finish_summary_page(self, direction: int):
+        if not getattr(self, "finishSummaryScroll", None) or not self.finishSummaryScroll.isVisible():
+            return False
+        bar = self.finishSummaryScroll.verticalScrollBar()
+        if bar is None:
+            return False
+        page_step = max(1, int(bar.pageStep() or self.finishSummaryScroll.viewport().height() or 1))
+        current = int(bar.value() or 0)
+        maximum = int(bar.maximum() or 0)
+        if direction > 0:
+            if current >= maximum:
+                self.status.setText("Finish review: already on last page.")
+                return True
+            bar.setValue(min(maximum, current + page_step))
+        else:
+            if current <= 0:
+                self.status.setText("Finish review: already on first page.")
+                return True
+            bar.setValue(max(0, current - page_step))
+        current_after = int(bar.value() or 0)
+        total_pages = max(1, int(math.ceil((maximum + page_step) / max(1, page_step))))
+        current_page = min(total_pages, max(1, int(current_after // max(1, page_step)) + 1))
+        self.status.setText(f"Finish review page {current_page} of {total_pages}.")
+        return True
+
     def _tick_finish_anim(self):
-        self._finish_anim_value = min(100, self._finish_anim_value + 7)
-        self.finishProgressBar.setValue(self._finish_anim_value)
+        if not getattr(self, "enable_heavy_animations", True):
+            self._finish_anim_value = 100
+            self.finishProgressBar.setValue(100)
+        else:
+            self._finish_anim_value = min(100, self._finish_anim_value + 7)
+            self.finishProgressBar.setValue(self._finish_anim_value)
         if self._finish_anim_value < 100:
             return
         self._finish_anim_timer.stop()
         if self._finish_post_action and self._finish_post_action != "downtime_supervisor_saved":
             self.finishOverlay.setStyleSheet(
                 "QFrame#ProductionOverlay {"
-                "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
-                "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(254,242,242,0.98), stop:1 rgba(254,226,226,0.98));"
-                "border: 3px solid #dc2626; border-radius: 14px; }"
+                "background: qradialgradient(cx:0.5, cy:0.12, radius:1.2, fx:0.5, fy:0.02,"
+                "stop:0 rgba(102,45,45,242), stop:0.38 rgba(73,31,31,244), stop:1 rgba(28,10,10,248));"
+                "border: 1px solid rgba(248,113,113,220); border-radius: 28px; }"
                 "QWidget#FinishSuccessRow { background: transparent; border: none; }"
                 "QLabel#FinishDoneText { background: transparent; border: none; }"
                 "QProgressBar {"
-                "border: 1px solid #dc2626; border-radius: 8px; background: rgba(255,255,255,0.88); min-height: 14px; }"
+                "border: 1px solid rgba(248,113,113,0.90); border-radius: 10px; background: rgba(15,23,42,0.65); min-height: 16px; }"
                 "QProgressBar::chunk {"
                 "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ef4444, stop:1 #dc2626);"
-                "border-radius: 7px; }"
+                "border-radius: 8px; }"
             )
             self.finishStatus.setText(self._finish_post_action)
         else:
@@ -5981,7 +6479,7 @@ QWidget#ClientUIRoot {{
         self._hide_finish_overlay()
         if self._finish_pending_clear:
             self._finish_pending_clear = False
-            self._clear_full_session()
+            self._clear_shift_session_keep_machine()
             return
         if self._finish_post_action == "downtime_supervisor_saved":
             self._finish_post_action = ""
@@ -6000,16 +6498,16 @@ QWidget#ClientUIRoot {{
     def _show_downtime_supervisor_saved_overlay(self, supervisor_name: str):
         self.finishOverlay.setStyleSheet(
             "QFrame#ProductionOverlay {"
-            "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
-            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(240,253,244,0.98), stop:1 rgba(220,252,231,0.98));"
-            "border: 3px solid #16a34a; border-radius: 14px; }"
+            "background: qradialgradient(cx:0.5, cy:0.12, radius:1.2, fx:0.5, fy:0.02,"
+            "stop:0 rgba(63,94,71,242), stop:0.38 rgba(38,61,44,244), stop:1 rgba(13,24,16,248));"
+            "border: 1px solid rgba(74,222,128,220); border-radius: 28px; }"
             "QWidget#FinishSuccessRow { background: transparent; border: none; }"
             "QLabel#FinishDoneText { background: transparent; border: none; }"
             "QProgressBar {"
-            "border: 1px solid #16a34a; border-radius: 8px; background: rgba(255,255,255,0.88); min-height: 14px; }"
+            "border: 1px solid rgba(74,222,128,0.90); border-radius: 10px; background: rgba(15,23,42,0.65); min-height: 16px; }"
             "QProgressBar::chunk {"
             "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16a34a, stop:1 #22c55e);"
-            "border-radius: 7px; }"
+            "border-radius: 8px; }"
         )
         self._position_finish_overlay()
         self._set_background_blur(True)
@@ -6034,16 +6532,16 @@ QWidget#ClientUIRoot {{
     def _show_downtime_supervisor_failed_overlay(self, message: str):
         self.finishOverlay.setStyleSheet(
             "QFrame#ProductionOverlay {"
-            "background: qradialgradient(cx:0.5, cy:0.45, radius:0.9, fx:0.5, fy:0.45,"
-            "stop:0 rgba(255,255,255,0.99), stop:0.58 rgba(240,253,244,0.98), stop:1 rgba(220,252,231,0.98));"
-            "border: 3px solid #16a34a; border-radius: 14px; }"
+            "background: qradialgradient(cx:0.5, cy:0.12, radius:1.2, fx:0.5, fy:0.02,"
+            "stop:0 rgba(102,45,45,242), stop:0.38 rgba(73,31,31,244), stop:1 rgba(28,10,10,248));"
+            "border: 1px solid rgba(248,113,113,220); border-radius: 28px; }"
             "QWidget#FinishSuccessRow { background: transparent; border: none; }"
             "QLabel#FinishDoneText { background: transparent; border: none; }"
             "QProgressBar {"
-            "border: 1px solid #16a34a; border-radius: 8px; background: rgba(255,255,255,0.88); min-height: 14px; }"
+            "border: 1px solid rgba(248,113,113,0.90); border-radius: 10px; background: rgba(15,23,42,0.65); min-height: 16px; }"
             "QProgressBar::chunk {"
-            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16a34a, stop:1 #22c55e);"
-            "border-radius: 7px; }"
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ef4444, stop:1 #dc2626);"
+            "border-radius: 8px; }"
         )
         self._position_finish_overlay()
         self._set_background_blur(True)
@@ -6076,6 +6574,9 @@ QWidget#ClientUIRoot {{
         self.finishProgressBar.hide()
         self.finishSummaryScroll.show()
         self._populate_finish_shift_summary(self._pending_shift_review_payload)
+        finish_bar = self.finishSummaryScroll.verticalScrollBar()
+        if finish_bar is not None:
+            finish_bar.setValue(finish_bar.minimum())
         self.finishSuccessRow.hide()
         self.finishOverlay.show()
         self.finishOverlay.raise_()
@@ -6122,6 +6623,8 @@ QWidget#ClientUIRoot {{
         QTimer.singleShot(2200, self._hide_operator_shift_overlay)
 
     def _set_reject_review_blur(self, enabled: bool):
+        if not getattr(self, "enable_background_blur", True):
+            enabled = False
         if enabled:
             if self._reject_review_blur_effects:
                 return
@@ -6136,6 +6639,12 @@ QWidget#ClientUIRoot {{
         self._reject_review_blur_effects = []
 
     def _tick_reject_review_anim(self):
+        if not getattr(self, "enable_heavy_animations", True):
+            self._reject_review_anim_value = 100
+            self.rejectReviewLoadingBar.setValue(100)
+            self._reject_review_anim_timer.stop()
+            self._set_reject_review_blur(False)
+            return
         self._reject_review_anim_value = min(100, self._reject_review_anim_value + 8)
         self.rejectReviewLoadingBar.setValue(self._reject_review_anim_value)
         if self._reject_review_anim_value >= 100:
@@ -6155,7 +6664,12 @@ QWidget#ClientUIRoot {{
         self._overlay_shadow.setBlurRadius(18)
         self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
         if hasattr(self, "productionFixAnim") and self.productionFixAnim is not None:
-            self.productionFixAnim.ensure_running()
+            if self.enable_heavy_animations:
+                self.productionFixAnim.show()
+                self.productionFixAnim.ensure_running()
+            else:
+                self.productionFixAnim.timer.stop()
+                self.productionFixAnim.hide()
         self.productionOverlay.show()
         self.productionOverlay.raise_()
         self._position_marquee()
@@ -6180,6 +6694,8 @@ QWidget#ClientUIRoot {{
             self._set_background_blur(False)
 
     def _set_background_blur(self, enabled: bool):
+        if not getattr(self, "enable_background_blur", True):
+            enabled = False
         if enabled:
             self._blur_left = QGraphicsBlurEffect(self.leftWrap)
             self._blur_left.setBlurRadius(3.2)
@@ -6198,6 +6714,8 @@ QWidget#ClientUIRoot {{
         if mode == "select":
             self.productionTitle.setText("PRODUCTION DAILY REPORT")
             self.productionHint.setText("Scan reason QR code (01-15)")
+            self.productionTitle.setStyleSheet("color: #f8fafc; font-size: 24px; font-weight: 900;")
+            self.productionHint.setStyleSheet("color: #cbd5e1; font-size: 14px; font-weight: 700;")
             self.productionHint.show()
             self.productionReasonList.show()
             self.productionLiveReason.hide()
@@ -6216,8 +6734,12 @@ QWidget#ClientUIRoot {{
         self.productionActionBanner.show()
         self.productionTimerPanelWrap.show()
         self.productionRepairZone.show()
-        self.productionFixAnim.show()
-        self.productionFixAnim.ensure_running()
+        if self.enable_heavy_animations:
+            self.productionFixAnim.show()
+            self.productionFixAnim.ensure_running()
+        else:
+            self.productionFixAnim.timer.stop()
+            self.productionFixAnim.hide()
         self.productionMarqueeWrap.hide()
         self._marquee_x = self.productionMarqueeWrap.width()
         self._position_marquee()
@@ -6226,25 +6748,25 @@ QWidget#ClientUIRoot {{
     def _apply_overlay_base_style(self):
         self.productionOverlay.setStyleSheet(
             "QFrame#ProductionOverlay {"
-            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
-            "stop:0 rgba(244,244,244,0.99), stop:1 rgba(233,233,233,0.99));"
-            "border: 4px solid #fb8c00; border-radius: 20px; }"
+            "background: qradialgradient(cx:0.5, cy:0.12, radius:1.2, fx:0.5, fy:0.02,"
+            "stop:0 rgba(112,116,124,242), stop:0.38 rgba(70,74,82,244), stop:1 rgba(24,26,31,248));"
+            "border: 1px solid rgba(124,130,140,235); border-radius: 20px; }"
         )
 
     def _apply_downtime_active_widget_styles(self):
         self.productionTitle.setStyleSheet(
-            "color: #111111; font-size: 26px; font-weight: 900; letter-spacing: 0.2px; background: transparent; border: none;"
+            "color: #f8fafc; font-size: 26px; font-weight: 900; letter-spacing: 0.2px; background: transparent; border: none;"
         )
         self.productionLiveReason.setStyleSheet(
-            "color: #111111; font-size: 15px; font-weight: 900;"
-            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #fbfbfb);"
-            "border: 2px solid #2196f3; border-radius: 11px;"
+            "color: #f8fafc; font-size: 15px; font-weight: 900;"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(103,107,115,220), stop:1 rgba(56,59,66,230));"
+            "border: 1px solid rgba(96,165,250,0.7); border-radius: 11px;"
             "padding: 8px 12px;"
         )
         self.productionMaintenanceLine.setStyleSheet(
-            "color: #111111; font-size: 15px; font-weight: 900;"
-            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #fafafa);"
-            "border: 1px solid rgba(0,0,0,0.10); border-radius: 11px;"
+            "color: #f8fafc; font-size: 15px; font-weight: 900;"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(103,107,115,220), stop:1 rgba(56,59,66,230));"
+            "border: 1px solid rgba(148,163,184,0.45); border-radius: 11px;"
             "padding: 8px 12px;"
         )
         self.productionActionBanner.setStyleSheet(
@@ -6305,9 +6827,12 @@ QWidget#ClientUIRoot {{
             )
         if not self.productionOverlay.isVisible() or self._overlay_mode != "active":
             return
-        self._tick_marquee()
+        if self.enable_heavy_animations:
+            self._tick_marquee()
 
     def _tick_marquee(self):
+        if not getattr(self, "enable_heavy_animations", True):
+            return
         if self._overlay_mode != "active" or not self.productionMarqueeWrap.isVisible():
             return
         text_w = self.productionMarqueeText.sizeHint().width()
@@ -6722,17 +7247,26 @@ QWidget#ClientUIRoot {{
         self.machineAnim.setStyleSheet(css)
 
     def _tick_motion(self):
-        is_active = self._session_is_running() or bool(self.state.machine_code)
-        status_text = "ACTIVE" if is_active else "IDLE"
+        has_machine = bool(self.state.machine_code)
+        is_running = self._session_is_running()
+        if is_running:
+            status_text = "ACTIVE"
+            mode = "active"
+        elif has_machine:
+            status_text = "NO JOB RUNNING"
+            mode = "idle"
+        else:
+            status_text = "IDLE"
+            mode = "idle"
         self.machineAnim.setText(f"Machine Status: {status_text}")
-        mode = "active" if is_active else "idle"
         if self.machineAnim.property("mode") != mode:
             self.machineAnim.setProperty("mode", mode)
             self.machineAnim.setProperty("pulse", "0")
         self._apply_machine_anim_style(mode)
         self._sync_machine_status_pulse_overlay()
-        self.machinePulseOverlay.set_mode(is_active)
+        self.machinePulseOverlay.set_mode(is_running)
         self.machinePulseOverlay.advance(self.enable_pulse_effects, dt=0.06)
+        self._update_product_parts_weight_indicator()
 
     def _refresh_downtime_panel(self):
         s = self.state
@@ -6776,43 +7310,14 @@ QWidget#ClientUIRoot {{
                     return None
 
         requested_part_qty = 0.0
-        payload = s.job_payload if isinstance(s.job_payload, dict) else {}
-        job = self._extract_job_record()
-        data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-        job_details = {}
-        if isinstance(job.get("job_details"), dict):
-            job_details = job.get("job_details") or {}
-        elif isinstance(payload.get("job_details"), dict):
-            job_details = payload.get("job_details") or {}
-        elif isinstance(data_obj.get("job_details"), dict):
-            job_details = data_obj.get("job_details") or {}
-        part_rows: List[Dict[str, Any]] = []
-        # Keep source priority aligned with the job details table logic.
-        if isinstance(data_obj.get("parts"), list):
-            part_rows = [r for r in data_obj.get("parts") or [] if isinstance(r, dict)]
-        elif isinstance(job_details.get("parts"), list):
-            part_rows = [r for r in job_details.get("parts") or [] if isinstance(r, dict)]
-        elif isinstance(job_details.get("part_ids"), list):
-            part_rows = [r for r in job_details.get("part_ids") or [] if isinstance(r, dict)]
-        elif isinstance(job_details.get("part_ids"), dict):
-            part_rows = [job_details.get("part_ids") or {}]
-        elif isinstance(data_obj.get("part_ids"), list):
-            part_rows = [r for r in data_obj.get("part_ids") or [] if isinstance(r, dict)]
-        elif isinstance(payload.get("part_ids"), list):
-            part_rows = [r for r in payload.get("part_ids") or [] if isinstance(r, dict)]
+        part_rows = self._job_part_rows()
         for part in part_rows:
             v = _to_float((part or {}).get("request_part_qty"))
             if v is not None and v > 0:
                 requested_part_qty = v
                 break
-        part_qty_per_unit = None
-        for part in part_rows:
-            v = _to_float((part or {}).get("part_qty_per_unit"))
-            if v is not None and v > 0:
-                part_qty_per_unit = v
-                break
-        if part_qty_per_unit is None:
-            part_qty_per_unit = TEMP_PART_QTY_PER_UNIT
+        part_qty_info = self._resolve_part_qty_per_unit(part_rows[0] if part_rows else None)
+        part_qty_per_unit = float(part_qty_info.get("value") or TEMP_PART_QTY_PER_UNIT)
 
         n1, n2, n3 = recent_unique[0], recent_unique[1], recent_unique[2]
         self.rightRawSacks.setText(f"Raw Mat 1: {n1}    Sacks: {int(scans_by_name.get(n1, 0) or 0)}")
@@ -6835,6 +7340,7 @@ QWidget#ClientUIRoot {{
             if idx < len(self.rawPreviewRings):
                 self.rawPreviewRings[idx].set_value_text(str(int(round(qty_val))))
                 self.rawPreviewRings[idx].set_progress(progress)
+        self._update_product_parts_weight_indicator()
 
         if s.downtime_reason_code and s.downtime_reason_text:
             self.rightDowntimeReason.setText(f"Reason {s.downtime_reason_code}: {s.downtime_reason_text}")
@@ -7042,6 +7548,28 @@ QWidget#ClientUIRoot {{
         if widget is not None:
             widget.setText(str(value or "00:00:00"))
 
+    def _set_linkage_job_label_text(self, widget: Optional[QLabel], value: str):
+        if widget is None:
+            return
+        text = str(value or "-")
+        widget.setText(text)
+        base_font = widget.font()
+        family = base_font.family()
+        weight = base_font.weight()
+        avail_w = max(1, widget.contentsRect().width() or widget.width() or 1)
+        best_px = 10
+        for px in range(16, 9, -1):
+            font = QFont(family)
+            font.setPixelSize(px)
+            font.setWeight(weight)
+            metrics = QFontMetrics(font)
+            if metrics.horizontalAdvance(text) <= avail_w:
+                best_px = px
+                break
+        fitted = QFont(base_font)
+        fitted.setPixelSize(best_px)
+        widget.setFont(fitted)
+
     def _refresh_linkage_panel(self):
         s = self.state
         if getattr(self, "linkageMirrorOuter", None) is None:
@@ -7053,13 +7581,14 @@ QWidget#ClientUIRoot {{
         ]
         while len(linked_names) < 3:
             linked_names.append("-")
-        self.linkageMirrorJob1.setText(linked_names[0])
-        self.linkageMirrorJob2.setText(linked_names[1])
-        self.linkageMirrorJob3.setText(linked_names[2])
-        self.linkageMirrorPack.setText(str(s.pack_count))
-        self.linkageMirrorGood.setText(str(s.good_total))
-        self.linkageMirrorButal.setText(str(s.butal_total))
-        self.linkageMirrorTotalGood.setText(str(s.good_total + s.butal_total))
+        self._set_linkage_job_label_text(self.linkageMirrorJob1, linked_names[0])
+        self._set_linkage_job_label_text(self.linkageMirrorJob2, linked_names[1])
+        self._set_linkage_job_label_text(self.linkageMirrorJob3, linked_names[2])
+        has_linked_jobs = bool(linked_rows)
+        self.linkageMirrorPack.setText(str(s.pack_count) if has_linked_jobs else "0")
+        self.linkageMirrorGood.setText(str(s.good_total) if has_linked_jobs else "0")
+        self.linkageMirrorButal.setText(str(s.butal_total) if has_linked_jobs else "0")
+        self.linkageMirrorTotalGood.setText(str(s.good_total + s.butal_total) if has_linked_jobs else "0")
         progress = self._compute_job_progress_metrics()
         self.linkageMirrorProduced.setText(f"{progress['produced_now']} / {progress['target_qty']}")
         self.linkageMirrorRemaining.setText(str(progress["remaining_qty"]))
@@ -7400,6 +7929,9 @@ QWidget#ClientUIRoot {{
             "operator_shift_baseline_raw_material_logs_len": int(s.operator_shift_baseline_raw_material_logs_len or 0),
             "operator_shift_baseline_product_pack_history_logs_len": int(s.operator_shift_baseline_product_pack_history_logs_len or 0),
             "operator_shift_baseline_reject_review_logs_len": int(s.operator_shift_baseline_reject_review_logs_len or 0),
+            "external_average_weight_grams": s.external_average_weight_grams,
+            "external_average_weight_unit": s.external_average_weight_unit,
+            "external_average_weight_received_at": s.external_average_weight_received_at,
         }
 
     def _save_active_session_snapshot(self):
@@ -7554,6 +8086,10 @@ QWidget#ClientUIRoot {{
         s.operator_shift_baseline_raw_material_logs_len = int(snap.get("operator_shift_baseline_raw_material_logs_len") or 0)
         s.operator_shift_baseline_product_pack_history_logs_len = int(snap.get("operator_shift_baseline_product_pack_history_logs_len") or 0)
         s.operator_shift_baseline_reject_review_logs_len = int(snap.get("operator_shift_baseline_reject_review_logs_len") or 0)
+        avg_weight = snap.get("external_average_weight_grams")
+        s.external_average_weight_grams = float(avg_weight) if avg_weight is not None else None
+        s.external_average_weight_unit = snap.get("external_average_weight_unit")
+        s.external_average_weight_received_at = snap.get("external_average_weight_received_at")
         for key in ("pack", "raw", "action"):
             setattr(self, f"_history_init_{key}", False)
             setattr(self, f"_history_last_{key}", "")
@@ -7649,6 +8185,9 @@ QWidget#ClientUIRoot {{
             "linkage_job_name": s.linkage_job_name,
             "linkage_job_payload": s.linkage_job_payload or {},
             "linkage_jobs": list(s.linkage_jobs or []),
+            "external_average_weight_grams": s.external_average_weight_grams,
+            "external_average_weight_unit": s.external_average_weight_unit,
+            "external_average_weight_received_at": s.external_average_weight_received_at,
             "linkage_mirror": {
                 "pack_count": int(s.pack_count or 0),
                 "good_total": int(s.good_total or 0),
@@ -7762,6 +8301,7 @@ QWidget#ClientUIRoot {{
         s.operator_shift_baseline_raw_material_logs_len = 0
         s.operator_shift_baseline_product_pack_history_logs_len = 0
         s.operator_shift_baseline_reject_review_logs_len = 0
+        self._clear_external_average_weight()
         self._reset_live_cycle_tracking()
         self._reset_downtime_resolution_state()
         self._hide_resolve_overlay()
@@ -7789,7 +8329,23 @@ QWidget#ClientUIRoot {{
         s.machine_code = active_machine_code
         s.machine_name = active_machine_name
         self._save_active_session_snapshot()
+        self._broadcast_machine_no_job_running()
         self.status.setText("Finish shift saved. Scan JOB QR.")
+
+    def _broadcast_machine_no_job_running(self):
+        s = self.state
+        if not s.machine_code:
+            return
+        snapshot = self._state_to_active_snapshot()
+        self.push_event(
+            {
+                "type": "MACHINE_STATUS",
+                "status": "NO_JOB_RUNNING",
+                "session_snapshot": snapshot,
+            },
+            "MACHINE STATUS NO JOB RUNNING",
+            silent=True,
+        )
 
     def _extract_production_reason_code(self, raw: str) -> Optional[str]:
         m = re.search(r"(\d+)", str(raw).strip())
@@ -7932,7 +8488,7 @@ QWidget#ClientUIRoot {{
             hdr.set_flash_columns(
                 [self._reject_detail_col_by_code.get(code) for code in self._reject_detail_active_codes]
             )
-            hdr.set_flash_on(bool(getattr(self, "_reject_detail_flash_on", False)))
+            hdr.set_flash_on(bool(self.enable_flashing_lights and getattr(self, "_reject_detail_flash_on", False)))
 
     def _tick_reject_detail_flash(self):
         self._reject_detail_flash_on = not self._reject_detail_flash_on
@@ -7968,6 +8524,90 @@ QWidget#ClientUIRoot {{
             self._overlay_shadow.setColor(Qt.GlobalColor.transparent)
             self._apply_overlay_base_style()
         self._apply_machine_anim_style(str(self.machineAnim.property("mode") or "idle"))
+
+    @staticmethod
+    def _normalize_graphics_mode(mode: Any) -> str:
+        key = str(mode or "quality").strip().lower().replace(" ", "_")
+        if key in ("fast",):
+            key = "faster"
+        if key in ("faster+quality", "faster_quality", "balanced"):
+            key = "faster_quality"
+        if key not in ("faster", "faster_quality", "quality"):
+            key = "quality"
+        return key
+
+    @staticmethod
+    def _graphics_mode_label(mode: str) -> str:
+        return {
+            "faster": "Faster",
+            "faster_quality": "Faster + Quality",
+            "quality": "Quality",
+        }.get(str(mode or "quality"), "Quality")
+
+    def _load_graphics_settings_form(self):
+        mode = self._normalize_graphics_mode(self.client_config.get("graphics_mode", "quality"))
+        self.graphicsModeToggle.set_mode(mode, emit_signal=False, animate=False)
+
+    def _apply_graphics_mode(self, mode: Any, persist: bool = True):
+        mode_key = self._normalize_graphics_mode(mode)
+        self.graphics_mode = mode_key
+        self.enable_check_animation = mode_key == "quality"
+        self.enable_flashing_lights = mode_key in ("faster_quality", "quality")
+        self.enable_pulse_effects = mode_key in ("faster_quality", "quality")
+        self.enable_heavy_animations = mode_key == "quality"
+        self.enable_background_blur = mode_key == "quality"
+        self.enable_gif_animations = mode_key == "quality"
+
+        self.chkCheckAnimation.blockSignals(True)
+        self.chkFlashingLights.blockSignals(True)
+        self.chkPulseEffects.blockSignals(True)
+        self.chkCheckAnimation.setChecked(self.enable_check_animation)
+        self.chkFlashingLights.setChecked(self.enable_flashing_lights)
+        self.chkPulseEffects.setChecked(self.enable_pulse_effects)
+        self.chkCheckAnimation.blockSignals(False)
+        self.chkFlashingLights.blockSignals(False)
+        self.chkPulseEffects.blockSignals(False)
+        self._set_toggle_button_text(self.chkCheckAnimation, "Check animation", self.enable_check_animation)
+        self._set_toggle_button_text(self.chkFlashingLights, "Flashing lights", self.enable_flashing_lights)
+        self._set_toggle_button_text(self.chkPulseEffects, "Pulse / moving effects", self.enable_pulse_effects)
+        self.chkCheckAnimation.setEnabled(False)
+        self.chkFlashingLights.setEnabled(False)
+        self.chkPulseEffects.setEnabled(False)
+
+        self.graphicsModeToggle.set_mode(mode_key, emit_signal=False, animate=False)
+
+        if not self.enable_background_blur:
+            self._set_background_blur(False)
+            self._set_reject_review_blur(False)
+        if hasattr(self, "productionFixAnim") and self.productionFixAnim is not None:
+            if self.enable_heavy_animations:
+                self.productionFixAnim.show()
+                self.productionFixAnim.ensure_running()
+            else:
+                self.productionFixAnim.timer.stop()
+                self.productionFixAnim.hide()
+        if self.enable_gif_animations and self._invalid_movie is None:
+            self._setup_invalid_overlay_media()
+        if self._invalid_movie is not None and not self.enable_gif_animations:
+            self._invalid_movie.stop()
+        self.invalidGifLabel.setVisible(bool(self.enable_gif_animations and self.invalidOverlay.isVisible() and self._invalid_movie is not None))
+        for widget in self.findChildren(CounterCard):
+            widget.set_animations_enabled(self.enable_heavy_animations)
+        for widget in self.findChildren(CircleProgressBadge):
+            widget.set_animations_enabled(self.enable_heavy_animations)
+        for widget in self.findChildren(HistoryAnimatedColumn):
+            widget.set_animations_enabled(self.enable_heavy_animations)
+        self._apply_machine_anim_style(str(self.machineAnim.property("mode") or "idle"))
+        self._sync_reject_detail_header_flash()
+
+        if persist:
+            self.client_config["graphics_mode"] = mode_key
+            _save_client_config(self.client_config)
+
+    def _apply_graphics_settings(self, mode: Optional[str] = None):
+        selected = mode if mode is not None else self.graphicsModeToggle.mode()
+        self._apply_graphics_mode(selected, persist=True)
+        self.status.setText(f"Graphics mode applied: {self._graphics_mode_label(self.graphics_mode)}")
 
     def _show_settings_section(self, section: str):
         is_graphics = section == "graphics"
@@ -8193,14 +8833,202 @@ QWidget#ClientUIRoot {{
             except Exception:
                 return 0.0
 
+    def _clear_external_average_weight(self):
+        s = self.state
+        s.external_average_weight_grams = None
+        s.external_average_weight_unit = None
+        s.external_average_weight_received_at = None
+
+    def _job_part_rows(self, payload: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        base_payload = payload if isinstance(payload, dict) else (self.state.job_payload or {})
+        job = self._extract_job_record()
+        data_obj = base_payload.get("data") if isinstance(base_payload.get("data"), dict) else {}
+        job_details = {}
+        if isinstance(job.get("job_details"), dict):
+            job_details = job.get("job_details") or {}
+        elif isinstance(base_payload.get("job_details"), dict):
+            job_details = base_payload.get("job_details") or {}
+        elif isinstance(data_obj.get("job_details"), dict):
+            job_details = data_obj.get("job_details") or {}
+        if isinstance(data_obj.get("parts"), list):
+            return [r for r in data_obj.get("parts") or [] if isinstance(r, dict)]
+        if isinstance(job_details.get("parts"), list):
+            return [r for r in job_details.get("parts") or [] if isinstance(r, dict)]
+        if isinstance(job_details.get("part_ids"), list):
+            return [r for r in job_details.get("part_ids") or [] if isinstance(r, dict)]
+        if isinstance(job_details.get("part_ids"), dict):
+            return [job_details.get("part_ids") or {}]
+        if isinstance(data_obj.get("part_ids"), list):
+            return [r for r in data_obj.get("part_ids") or [] if isinstance(r, dict)]
+        if isinstance(base_payload.get("part_ids"), list):
+            return [r for r in base_payload.get("part_ids") or [] if isinstance(r, dict)]
+        return []
+
+    def _resolve_part_qty_per_unit(self, part: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        s = self.state
+        ext_weight = s.external_average_weight_grams
+        ext_unit = str(s.external_average_weight_unit or "g").strip() or "g"
+        if ext_weight is not None and ext_weight > 0:
+            return {
+                "value": float(ext_weight),
+                "source": "app",
+                "unit": ext_unit,
+                "label": f"App ({float(ext_weight):.4f} {ext_unit})",
+            }
+        if isinstance(part, dict):
+            part_qty = self._parse_number(part.get("part_qty_per_unit"))
+            if part_qty > 0:
+                return {
+                    "value": part_qty,
+                    "source": "job_api",
+                    "unit": "g",
+                    "label": f"Job API ({part_qty:.4f} g)",
+                }
+        for row in self._job_part_rows():
+            part_qty = self._parse_number((row or {}).get("part_qty_per_unit"))
+            if part_qty > 0:
+                return {
+                    "value": part_qty,
+                    "source": "job_api",
+                    "unit": "g",
+                    "label": f"Job API ({part_qty:.4f} g)",
+                }
+        return {
+            "value": TEMP_PART_QTY_PER_UNIT,
+            "source": "standard",
+            "unit": "g",
+            "label": f"Standard ({TEMP_PART_QTY_PER_UNIT:.4f} g)",
+        }
+
+    def _update_product_parts_weight_indicator(self):
+        if not hasattr(self, "jobPartsTable") or self.jobPartsTable is None:
+            return
+        info = self._resolve_part_qty_per_unit()
+        row_count = int(self.jobPartsTable.rowCount() or 0)
+        has_job = bool(str(self.state.job_code or "").strip())
+        if row_count <= 0:
+            return
+        phase = (math.sin(time.time() * 5.2) + 1.0) * 0.5
+        for row in range(row_count):
+            item = self.jobPartsTable.item(row, 2)
+            if item is None:
+                continue
+            txt = str(item.text() or "").strip()
+            if not has_job or txt in ("", "-"):
+                item.setBackground(QBrush(Qt.GlobalColor.transparent))
+                item.setForeground(QBrush(QColor(239, 240, 242, 226)))
+                continue
+            if info.get("source") == "app":
+                item.setBackground(QBrush(QColor(34, 197, 94, 185)))
+                item.setForeground(QBrush(QColor("#ecfdf5")))
+            else:
+                flash_alpha = int(90 + (95 * phase))
+                item.setBackground(QBrush(QColor(248, 113, 113, flash_alpha)))
+                item.setForeground(QBrush(QColor("#fff7ed")))
+
+    def _apply_external_average_weight(self, average_grams: float, unit: str):
+        grams = float(average_grams or 0.0)
+        normalized_unit = str(unit or "g").strip() or "g"
+        if grams <= 0:
+            return
+        s = self.state
+        s.external_average_weight_grams = grams
+        s.external_average_weight_unit = normalized_unit
+        s.external_average_weight_received_at = datetime.now(timezone.utc).isoformat()
+        self.status.setText(f"Average weight received from app: {grams:.4f} {normalized_unit}")
+        self._refresh_ui()
+        if s.machine_code:
+            self._save_active_session_snapshot()
+        self.push_event(
+            {"type": "AVERAGE_WEIGHT_RECEIVED", "average_grams": grams, "unit": normalized_unit},
+            f"AVERAGE WEIGHT {grams:.4f} {normalized_unit}",
+        )
+
+    def _start_average_weight_server(self):
+        if self._avg_weight_server is not None:
+            return
+
+        ui = self
+
+        class AverageWeightHandler(BaseHTTPRequestHandler):
+            def _send_json(self, status: int, payload: Dict[str, Any]):
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, format: str, *args):
+                return
+
+            def do_POST(self):
+                if self.path.rstrip("/") != AVERAGE_WEIGHT_API_ENDPOINT:
+                    self._send_json(404, {"success": False, "message": "Not found"})
+                    return
+                try:
+                    content_length = int(self.headers.get("Content-Length", "0") or 0)
+                except Exception:
+                    content_length = 0
+                body = self.rfile.read(max(0, content_length))
+                try:
+                    payload = json.loads(body.decode("utf-8") if body else "{}")
+                except Exception:
+                    self._send_json(400, {"success": False, "message": "Invalid JSON"})
+                    return
+                if not isinstance(payload, dict):
+                    self._send_json(400, {"success": False, "message": "JSON body must be an object"})
+                    return
+                try:
+                    average_grams = float(payload.get("average_grams"))
+                except Exception:
+                    self._send_json(400, {"success": False, "message": "average_grams must be numeric"})
+                    return
+                unit = str(payload.get("unit") or "").strip() or "g"
+                if average_grams <= 0:
+                    self._send_json(400, {"success": False, "message": "average_grams must be greater than zero"})
+                    return
+                ui.average_weight_received.emit(average_grams, unit)
+                self._send_json(200, {"success": True, "message": "Average weight received"})
+
+        try:
+            server = ThreadingHTTPServer((AVERAGE_WEIGHT_API_HOST, AVERAGE_WEIGHT_API_PORT), AverageWeightHandler)
+            server.daemon_threads = True
+            self._avg_weight_server = server
+            self._avg_weight_server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            self._avg_weight_server_thread.start()
+            self._avg_weight_server_error = None
+            print(f"[AverageWeightAPI] Listening on http://{AVERAGE_WEIGHT_API_HOST}:{AVERAGE_WEIGHT_API_PORT}{AVERAGE_WEIGHT_API_ENDPOINT}")
+        except Exception as e:
+            self._avg_weight_server = None
+            self._avg_weight_server_thread = None
+            self._avg_weight_server_error = str(e)
+            print(f"[AverageWeightAPI] Failed to start: {e}")
+
+    def _shutdown_average_weight_server(self):
+        server = self._avg_weight_server
+        self._avg_weight_server = None
+        if server is None:
+            return
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+        try:
+            server.server_close()
+        except Exception:
+            pass
+
     def _make_finish_summary_table(self, title: str, headers: List[str]) -> QTableWidget:
         section = QFrame()
         section.setStyleSheet(
-            "QFrame { background: rgba(255,255,255,0.74); border: 1px solid rgba(148,163,184,0.50); border-radius: 14px; }"
-            "QLabel { color: #0f172a; font-size: 15px; font-weight: 900; background: transparent; border: none; }"
-            "QTableWidget { background: transparent; border: none; gridline-color: rgba(148,163,184,0.24); color: #0f172a; }"
-            "QHeaderView::section { background: rgba(226,232,240,0.96); color: #0f172a; font-weight: 900; border: none; border-bottom: 1px solid rgba(148,163,184,0.55); padding: 6px; }"
-            "QTableWidget::item { padding: 4px; border-bottom: 1px solid rgba(226,232,240,0.78); }"
+            "QFrame {"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(103,107,115,220), stop:1 rgba(56,59,66,230));"
+            "border: 1px solid rgba(148,163,184,0.45); border-radius: 18px; }"
+            "QLabel { color: #f8fafc; font-size: 16px; font-weight: 900; background: transparent; border: none; }"
+            "QTableWidget { background: rgba(15,23,42,0.32); border: none; gridline-color: rgba(148,163,184,0.18); color: #f8fafc; }"
+            "QHeaderView::section { background: rgba(71,85,105,0.96); color: #f8fafc; font-weight: 900; border: none; border-bottom: 1px solid rgba(148,163,184,0.35); padding: 7px; }"
+            "QTableWidget::item { padding: 5px; border-bottom: 1px solid rgba(148,163,184,0.20); }"
         )
         section.setLayout(QVBoxLayout())
         section.layout().setContentsMargins(10, 10, 10, 10)
@@ -8218,8 +9046,8 @@ QWidget#ClientUIRoot {{
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         table.horizontalHeader().setFixedHeight(30)
         table.verticalHeader().setDefaultSectionSize(28)
-        table.setMinimumHeight(112)
-        table.setMaximumHeight(240)
+        table.setMinimumHeight(132)
+        table.setMaximumHeight(340)
         section.layout().addWidget(title_lbl)
         section.layout().addWidget(table)
         self.finishSummaryBody.layout().addWidget(section)
@@ -8246,9 +9074,9 @@ QWidget#ClientUIRoot {{
         header_h = table.horizontalHeader().height()
         row_h = table.verticalHeader().defaultSectionSize()
         frame_h = table.frameWidth() * 2
-        target_h = min(280, header_h + (table.rowCount() * row_h) + frame_h + 2)
-        table.setMinimumHeight(max(84, target_h))
-        table.setMaximumHeight(max(84, target_h))
+        target_h = min(340, header_h + (table.rowCount() * row_h) + frame_h + 2)
+        table.setMinimumHeight(max(96, target_h))
+        table.setMaximumHeight(max(96, target_h))
 
     def _extract_job_payload_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -8415,11 +9243,15 @@ QWidget#ClientUIRoot {{
 
         scanned_raw_qty = sum(self._parse_number(x.get("qty")) for x in raw_logs)
         part_table_rows: List[List[str]] = []
+        shift_external_avg_weight = shift_payload.get("external_average_weight_grams")
         for part in part_rows:
             request_part_qty = self._parse_number(part.get("request_part_qty"))
-            part_qty_per_unit = self._parse_number(part.get("part_qty_per_unit"))
-            if part_qty_per_unit <= 0:
-                part_qty_per_unit = TEMP_PART_QTY_PER_UNIT
+            if shift_external_avg_weight is not None and self._parse_number(shift_external_avg_weight) > 0:
+                part_qty_per_unit = self._parse_number(shift_external_avg_weight)
+            else:
+                part_qty_per_unit = self._parse_number(part.get("part_qty_per_unit"))
+                if part_qty_per_unit <= 0:
+                    part_qty_per_unit = TEMP_PART_QTY_PER_UNIT
             produced_units = max(0.0, self._parse_number(shift_payload.get("good_total")) + self._parse_number(shift_payload.get("butal_total")))
             used_raw_qty = min(scanned_raw_qty, produced_units * part_qty_per_unit) if scanned_raw_qty > 0 else 0.0
             remaining_part_qty = max(request_part_qty - used_raw_qty, 0.0)
@@ -8963,9 +9795,8 @@ QWidget#ClientUIRoot {{
                 r = self.jobPartsTable.rowCount()
                 self.jobPartsTable.insertRow(r)
                 request_part_qty = self._parse_number(part.get("request_part_qty"))
-                part_qty_per_unit = self._parse_number(part.get("part_qty_per_unit"))
-                if part_qty_per_unit <= 0:
-                    part_qty_per_unit = TEMP_PART_QTY_PER_UNIT
+                part_qty_info = self._resolve_part_qty_per_unit(part)
+                part_qty_per_unit = float(part_qty_info.get("value") or TEMP_PART_QTY_PER_UNIT)
                 produced_units = max(0.0, float(s.good_total or 0) + float(s.butal_total or 0))
                 projected_used_qty = max(0.0, produced_units * max(part_qty_per_unit, 0.0))
                 used_raw_qty = min(scanned_raw_qty, projected_used_qty) if scanned_raw_qty > 0 else 0.0
@@ -9001,6 +9832,7 @@ QWidget#ClientUIRoot {{
                         else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
                     )
                     self.jobPartsTable.setItem(0, c, item)
+            self._update_product_parts_weight_indicator()
 
         # Cycle monitor values are computed live in _refresh_ui from:
         # - Act cycle time entered/confirmed by operator
@@ -9531,6 +10363,10 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Pack history: already on first page.")
             return
 
+        if self.finishOverlay.isVisible() and self.finishSummaryScroll.isVisible() and raw_l in ("next", "prev", "previous", "preview"):
+            self._scroll_finish_shift_review(1 if raw_l == "next" else -1)
+            return
+
         if raw_l == "prodhistory~1":
             if self.productHistoryOverlay.isVisible():
                 self._hide_product_history_overlay()
@@ -9974,8 +10810,17 @@ QWidget#ClientUIRoot {{
             if res.kind == "REJECT_REASON":
                 reason = res.value
                 s.reject_total += 1
-                self._mark_live_cycle_scan_event()
                 s.reject_breakdown[reason] = s.reject_breakdown.get(reason, 0) + 1
+                s.reject_review_logs.append(
+                    {
+                        "entry_type": "REJECT_SCAN",
+                        "reason_code": reason,
+                        "reason_text": REJECT_REASON_MAP.get(reason, reason),
+                        "operator": str(s.operator_id or "").strip() or "-",
+                        "operator_name": self._operator_display_name(s.operator_id),
+                        "scanned_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
                 s.waiting_reject_reason = False
                 self.status.setText(f"Reject recorded: {reason}")
                 self.lblReject.add_points(1)
@@ -9985,7 +10830,16 @@ QWidget#ClientUIRoot {{
                 return
             if res.kind == "STARTUP_REJECT":
                 s.startup_reject_total += 1
-                self._mark_live_cycle_scan_event()
+                s.reject_review_logs.append(
+                    {
+                        "entry_type": "STARTUP_REJECT_SCAN",
+                        "reason_code": "SUR",
+                        "reason_text": "Start Up Reject",
+                        "operator": str(s.operator_id or "").strip() or "-",
+                        "operator_name": self._operator_display_name(s.operator_id),
+                        "scanned_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
                 s.waiting_reject_reason = False
                 self.status.setText("Start Up Reject recorded.")
                 self._refresh_ui()
@@ -10001,7 +10855,6 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay(msg)
                 return
             s.startup_reject_total += 1
-            self._mark_live_cycle_scan_event()
             self.status.setText("Start Up Reject recorded.")
             self._refresh_ui()
             self.push_event({"type": "STARTUP_REJECT", "qty": 1}, "STARTUP REJECT +1")
@@ -10089,6 +10942,7 @@ QWidget#ClientUIRoot {{
             s.operator_shift_baseline_raw_material_logs_len = 0
             s.operator_shift_baseline_product_pack_history_logs_len = 0
             s.operator_shift_baseline_reject_review_logs_len = 0
+            self._clear_external_average_weight()
             self._reset_downtime_resolution_state()
             self._hide_resolve_overlay()
             self._hide_production_overlay()
@@ -10296,6 +11150,7 @@ QWidget#ClientUIRoot {{
             s.operator_shift_baseline_raw_material_logs_len = 0
             s.operator_shift_baseline_product_pack_history_logs_len = 0
             s.operator_shift_baseline_reject_review_logs_len = 0
+            self._clear_external_average_weight()
             self._reset_downtime_resolution_state()
             self._hide_resolve_overlay()
             self._hide_production_overlay()
@@ -10528,7 +11383,6 @@ QWidget#ClientUIRoot {{
             if res.kind == "BUTAL":
                 qty = int(res.qty or 0)
                 s.butal_total += qty
-                self._mark_live_cycle_scan_event(units=qty if qty > 0 else 1)
                 self.status.setText(f"Butal +{qty}")
                 self.lblButal.add_points(qty)
                 self.lblTotalGood.add_points(qty)
