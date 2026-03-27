@@ -61,7 +61,6 @@ PROFILE_REPRINT_ADMIN_PASSWORD = "0t1docmtl$tm"
 QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.1.149:5000").strip().rstrip("/")
 RAW_QR_O_SEGMENT = "O000000000240000010237800000000000"
 RAW_QR_REMARK = "V2"
-TEMP_PART_QTY_PER_UNIT = 0.0848
 WIDTH_P = 11
 WIDTH_Q = 11
 WIDTH_I = 11
@@ -826,8 +825,12 @@ class MachineSession:
     downtime_started_at: Optional[float] = None
     downtime_last_seconds: Optional[int] = None
     downtime_active: bool = False
+    downtime_wait_started_at: Optional[float] = None
+    downtime_wait_last_seconds: Optional[int] = None
     cycle_time_current: Optional[str] = None
     live_cycle_avg_seconds: Optional[float] = None
+    maintenance_name: Optional[str] = None
+    supervisor_name: Optional[str] = None
     job_payload: Dict[str, Any] = None
     linkage_enabled: bool = False
     linkage_jobs: List[Dict[str, Any]] = None
@@ -875,8 +878,12 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         downtime_started_at=raw.get("downtime_started_at"),
         downtime_last_seconds=raw.get("downtime_last_seconds"),
         downtime_active=bool(raw.get("downtime_active", False)),
+        downtime_wait_started_at=raw.get("downtime_wait_started_at"),
+        downtime_wait_last_seconds=raw.get("downtime_wait_last_seconds"),
         cycle_time_current=raw.get("cycle_time_current"),
         live_cycle_avg_seconds=raw.get("live_cycle_avg_seconds"),
+        maintenance_name=raw.get("maintenance_name"),
+        supervisor_name=raw.get("supervisor_name"),
         job_payload=dict(raw.get("job_payload") or {}),
         linkage_enabled=bool(raw.get("linkage_enabled", False)),
         linkage_jobs=list(raw.get("linkage_jobs") or []),
@@ -1630,7 +1637,7 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
     part_row = _extract_primary_part_row(payload)
     part_qty_per_unit = _parse_number_like(part_row.get("part_qty_per_unit"))
     if part_qty_per_unit <= 0:
-        part_qty_per_unit = TEMP_PART_QTY_PER_UNIT
+        part_qty_per_unit = 0.0
     total_good = max(0.0, _parse_number_like(row.get("total_good", 0)))
     raw_logs = row.get("raw_material_logs") if isinstance(row.get("raw_material_logs"), list) else []
     pack_logs = row.get("product_pack_history_logs") if isinstance(row.get("product_pack_history_logs"), list) else []
@@ -2433,6 +2440,11 @@ async def broadcast_state():
         "type": "STATE",
         "active_ttl_seconds": ACTIVE_TTL_SECONDS,
         "sessions": [s.to_dict() for s in SESSIONS.values()],
+        "daily_roles": get_today_role_assignments(),
+        "maintenance_profiles": [
+            dict(p) for p in PROFILES
+            if isinstance(p, dict) and _normalize_company_role(p.get("company_role") or p.get("role") or "") == "Maintenance"
+        ],
         "job_queue": _build_job_queue_rows(),
         "machine_status_overrides": MACHINE_STATUS_OVERRIDES,
         "machine_status_archive": MACHINE_STATUS_ARCHIVE,
@@ -2522,6 +2534,51 @@ DASHBOARD_HTML = """
     .data-table th, .data-table td { padding: 10px 12px; border-bottom: 1px solid #edf2f7; text-align: left; font-size: 0.86rem; vertical-align: top; }
     .data-table th { background: #f8fafc; color: #334155; font-weight: 700; position: sticky; top: 0; z-index: 1; }
     .data-table tr:hover td { background: #f8fbff; }
+    .maintenance-shell { position:relative; overflow:hidden; background:linear-gradient(180deg, rgba(255,255,255,.98), rgba(246,248,252,.98)); border:1px solid #d8e2ef; border-radius:18px; padding:12px 12px 8px; }
+    .maintenance-shell::before { content:""; position:absolute; inset:0; pointer-events:none; opacity:.22; background:linear-gradient(135deg, transparent 0 83%, rgba(148,163,184,.18) 83% 84%, transparent 84% 100%), radial-gradient(circle at 90% 16%, rgba(148,163,184,.28) 0 2px, transparent 2.5px), radial-gradient(circle at 84% 28%, rgba(148,163,184,.22) 0 3px, transparent 3.5px), radial-gradient(circle at 93% 36%, rgba(148,163,184,.18) 0 2px, transparent 2.5px); }
+    .maintenance-topbar { position:relative; z-index:1; display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+    .maintenance-topbar h3 { margin:0; font-size:1.02rem; line-height:1.1; }
+    .maintenance-date { font-size:.83rem; color:#334155; white-space:nowrap; text-align:right; }
+    .maintenance-summary { position:relative; z-index:1; display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:12px; margin-top:12px; }
+    .maintenance-metric { display:flex; align-items:center; gap:12px; min-height:86px; border:1px solid #cdd8e7; border-radius:12px; padding:14px 16px; box-shadow: inset 0 1px 0 rgba(255,255,255,.7); }
+    .maintenance-metric.blue { background:linear-gradient(180deg, #e7f1fb, #dbeafe); }
+    .maintenance-metric.green { background:linear-gradient(180deg, #e8f8eb, #dcfce7); }
+    .maintenance-metric.amber { background:linear-gradient(180deg, #fff4e5, #ffedd5); }
+    .maintenance-metric.red { background:linear-gradient(180deg, #feeaea, #fee2e2); }
+    .maintenance-metric .icon { width:34px; height:34px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:700; background:rgba(255,255,255,.5); color:#1e293b; flex:0 0 auto; }
+    .maintenance-metric .k { font-size:.9rem; color:#0f172a; font-weight:700; }
+    .maintenance-metric .v { font-size:1.95rem; line-height:1; font-weight:800; color:#0f172a; margin-top:2px; }
+    .maintenance-metric .s { font-size:.83rem; color:#334155; margin-top:2px; }
+    .maintenance-live-grid { position:relative; z-index:1; display:grid; grid-template-columns: 1fr; gap:10px; margin-top:12px; }
+    .maintenance-section-title { margin:0; font-size:1rem; line-height:1.1; }
+    .maintenance-list { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:12px; }
+    .maintenance-person { display:grid; grid-template-columns: 96px minmax(0, 1.2fr) minmax(160px, .9fr); border:1px solid #d5deea; border-radius:12px; background:rgba(255,255,255,.94); overflow:hidden; box-shadow:0 8px 18px rgba(15,23,42,.06); }
+    .maintenance-person.busy { border-color:#ecc896; }
+    .maintenance-avatar-wrap { padding:10px; display:flex; align-items:center; justify-content:center; border-right:1px solid #e5ecf4; background:linear-gradient(180deg, #f8fafc, #eef2f7); }
+    .maintenance-avatar { width:78px; height:78px; border-radius:10px; background:radial-gradient(circle at 50% 34%, #cbd5e1 0 11px, transparent 12px), radial-gradient(circle at 50% 74%, #cbd5e1 0 24px, transparent 25px), linear-gradient(180deg, #f8fafc, #e2e8f0); border:1px solid #cbd5e1; box-shadow: inset 0 1px 0 rgba(255,255,255,.7); }
+    .maintenance-person-main { padding:10px 12px; min-width:0; }
+    .maintenance-person-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+    .maintenance-person .title { font-weight:800; color:#0f172a; font-size:1rem; }
+    .maintenance-person .meta { color:#111827; font-size:.85rem; line-height:1.3; }
+    .maintenance-person .submeta { color:#334155; font-size:.83rem; margin-top:6px; line-height:1.35; }
+    .maintenance-badge { display:inline-flex; align-items:center; justify-content:center; min-width:86px; padding:4px 10px; border-radius:999px; font-size:.67rem; font-weight:800; letter-spacing:.03em; text-transform:uppercase; }
+    .maintenance-badge.available { background:#dcfce7; color:#166534; }
+    .maintenance-badge.busy { background:#ffedd5; color:#9a3412; }
+    .maintenance-badge.waiting { background:#fee2e2; color:#b91c1c; }
+    .maintenance-machine-grid { display:grid; grid-template-columns: 1fr; gap:6px; margin-top:8px; }
+    .maintenance-machine { display:grid; grid-template-columns:minmax(0, 1fr) auto; align-items:center; gap:8px; padding:6px 10px; border:1px solid #d7dee8; border-radius:9px; background:#f8fafc; }
+    .maintenance-machine.busy { background:#fff7ed; border-color:#fed7aa; }
+    .maintenance-machine.waiting { background:#f8fafc; }
+    .maintenance-machine-title { font-size:.84rem; color:#111827; }
+    .maintenance-machine-time { font-size:.82rem; color:#111827; white-space:nowrap; }
+    .maintenance-stats { padding:10px 12px; border-left:1px solid #e5ecf4; }
+    .maintenance-stats-title { font-size:.9rem; font-weight:700; color:#0f172a; margin-bottom:8px; }
+    .maintenance-stat-line { display:flex; align-items:center; gap:8px; font-size:.84rem; color:#111827; margin-bottom:7px; }
+    .maintenance-stat-icon { width:18px; text-align:center; color:#0f172a; font-size:.92rem; }
+    .maintenance-performance-panel { margin-top:10px; border-top:1px solid #dbe4f0; padding-top:10px; position:relative; z-index:1; }
+    .maintenance-performance-title { margin:0; font-size:1rem; line-height:1.1; }
+    .maintenance-performance-wrap { margin-top:10px; border:1px solid #dbe4f0; border-radius:0 0 12px 12px; overflow:auto; background:rgba(255,255,255,.92); }
+    .maintenance-performance-wrap .data-table { min-width:760px; }
     .table-actions { display: flex; gap: 8px; }
     .mini-btn { border: 1px solid #cbd5e1; background: #fff; color: #1f2937; border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; cursor: pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .mini-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 12px rgba(15,23,42,0.08); }
@@ -2922,7 +2979,7 @@ DASHBOARD_HTML = """
     @media (max-width: 1400px) { .grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
     @media (max-width: 1100px) { .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
     @media (max-width: 1100px) { .diagnostics { grid-template-columns: 48px 48px 48px 48px repeat(2, minmax(180px, 1fr)); } }
-    @media (max-width: 768px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .finished-wrap { grid-template-columns: 1fr; } .finished-grid { grid-template-columns: 1fr; } .overlay-row { grid-template-columns: 1fr; } .main-tab-content { padding: 0 12px 12px; } .main-tabs { padding: 12px; } .diagnostics { padding: 8px 10px; grid-template-columns: 48px 48px 48px 48px 1fr; gap: 6px; } .machine-detail-grid { grid-template-columns: 1fr; } .overlay-card { width: calc(100vw - 18px); border-radius: 16px; } .review-edge-arrow.left { left: 8px; } .review-edge-arrow.right { right: 8px; } #overlayReviewStep, .review-form-card { width: 100%; } .people-role-row { grid-template-columns: 1fr; } .operator-directory-row { grid-template-columns: 1fr; gap:6px; padding:10px 12px; } .operator-directory-row.header { display:none; } .operator-directory-label { display:block; } .operator-detail-grid { grid-template-columns:1fr; } }
+    @media (max-width: 768px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .finished-wrap { grid-template-columns: 1fr; } .finished-grid { grid-template-columns: 1fr; } .overlay-row { grid-template-columns: 1fr; } .main-tab-content { padding: 0 12px 12px; } .main-tabs { padding: 12px; } .diagnostics { padding: 8px 10px; grid-template-columns: 48px 48px 48px 48px 1fr; gap: 6px; } .machine-detail-grid { grid-template-columns: 1fr; } .overlay-card { width: calc(100vw - 18px); border-radius: 16px; } .review-edge-arrow.left { left: 8px; } .review-edge-arrow.right { right: 8px; } #overlayReviewStep, .review-form-card { width: 100%; } .people-role-row { grid-template-columns: 1fr; } .operator-directory-row { grid-template-columns: 1fr; gap:6px; padding:10px 12px; } .operator-directory-row.header { display:none; } .operator-directory-label { display:block; } .operator-detail-grid { grid-template-columns:1fr; } .maintenance-topbar { flex-direction:column; } .maintenance-date { text-align:left; white-space:normal; } .maintenance-summary { grid-template-columns:1fr; } .maintenance-list { grid-template-columns:1fr; } .maintenance-person { grid-template-columns:1fr; } .maintenance-avatar-wrap { border-right:none; border-bottom:1px solid #e5ecf4; } .maintenance-stats { border-left:none; border-top:1px solid #e5ecf4; } }
   </style>
 </head>
 <body>
@@ -2952,6 +3009,7 @@ DASHBOARD_HTML = """
     <button class="main-tab-button" data-target="finishedJobsTab">Finished Jobs</button>
     <button class="main-tab-button" data-target="archivedJobsTab">Archived Jobs</button>
     <button class="main-tab-button" data-target="machineArchiveTab">Machine Archive</button>
+    <button class="main-tab-button" data-target="maintenanceTab">Maintenance</button>
     <button class="main-tab-button" data-target="pdrTab">PDR Reports</button>
   </div>
 
@@ -3011,6 +3069,31 @@ DASHBOARD_HTML = """
       <h3>Downtime Archive</h3>
       <div class="muted">Downtime summaries collected from finished/archived job records (read-only).</div>
       <div id="downtimeArchiveTableWrap" class="table-wrap"></div>
+    </div>
+  </div>
+
+  <div id="maintenanceTab" class="main-tab-content">
+    <div class="maintenance-shell">
+      <div class="maintenance-topbar">
+        <div>
+          <h3>Maintenance Overview</h3>
+          <div class="muted">Live maintenance availability from today&apos;s roles and active machine downtime, plus repair speed from stored downtime records.</div>
+        </div>
+        <div id="maintenanceCurrentDate" class="maintenance-date">Accurate current date: -</div>
+      </div>
+      <div id="maintenanceSummary" class="maintenance-summary"></div>
+      <div class="maintenance-live-grid">
+        <div>
+          <h3 class="maintenance-section-title">Active Maintenance Team</h3>
+          <div class="muted">Live maintenance availability from Maintenance People.</div>
+          <div id="maintenancePeopleList" class="maintenance-list"></div>
+        </div>
+      </div>
+      <div class="maintenance-performance-panel">
+        <h3 class="maintenance-performance-title">Performance Analytics</h3>
+        <div class="muted">Average repair speed computed from downtime records with saved maintenance names.</div>
+        <div id="maintenancePerformanceTableWrap" class="maintenance-performance-wrap"></div>
+      </div>
     </div>
   </div>
 
@@ -3405,6 +3488,10 @@ DASHBOARD_HTML = """
   const archivedJobsTableWrap = document.getElementById("archivedJobsTableWrap");
   const machineStatusArchiveTableWrap = document.getElementById("machineStatusArchiveTableWrap");
   const downtimeArchiveTableWrap = document.getElementById("downtimeArchiveTableWrap");
+  const maintenanceSummary = document.getElementById("maintenanceSummary");
+  const maintenancePeopleList = document.getElementById("maintenancePeopleList");
+  const maintenancePerformanceTableWrap = document.getElementById("maintenancePerformanceTableWrap");
+  const maintenanceCurrentDate = document.getElementById("maintenanceCurrentDate");
   const approvePrintOverlay = document.getElementById("approvePrintOverlay");
   const overlayCloseBtn = document.getElementById("overlayCloseBtn");
   const overlayCancelBtn = document.getElementById("overlayCancelBtn");
@@ -3502,6 +3589,7 @@ DASHBOARD_HTML = """
   let finishedShiftState = [];
   let archivedJobsState = [];
   let machineStatusArchiveState = [];
+  let maintenanceCardIndexByKey = {};
   let finishedJobsInteractionLock = false;
   let pendingFinishedJobsRows = null;
   let productItems = [];
@@ -4645,6 +4733,7 @@ DASHBOARD_HTML = """
         job_code: String(r.job_code || "").trim(),
         job_name: String(r.job_name || "").trim(),
         operator_id: String(r.operator_id || "").trim(),
+        maintenance_name: String(r.maintenance_name || "").trim(),
         reason_code: reasonCode,
         reason_text: reasonText,
         duration_seconds: Number.isFinite(sec) ? Math.max(0, Math.floor(sec)) : null,
@@ -4698,6 +4787,235 @@ DASHBOARD_HTML = """
         </tbody>
       </table>
     `;
+  }
+
+  function maintenancePeopleFromState(state){
+    const byBadge = new Map();
+    const profiles = Array.isArray(state?.maintenance_profiles) ? state.maintenance_profiles : [];
+    profiles.forEach((row) => {
+      const badge = String(row?.id_number || "").trim();
+      if(!badge) return;
+      byBadge.set(badge, {
+        badge,
+        name: String(row?.name || badge).trim() || badge,
+        source: "profile",
+      });
+    });
+    const dailyRoles = (state?.daily_roles && typeof state.daily_roles === "object") ? state.daily_roles : {};
+    for(const [badge, row] of Object.entries(dailyRoles)){
+      const rights = String(row?.rights || "").trim().toLowerCase();
+      const companyRole = String(row?.company_role || "").trim().toLowerCase();
+      if(rights !== "maintenance" && companyRole !== "maintenance") continue;
+      const existing = byBadge.get(badge) || {};
+      byBadge.set(badge, {
+        badge,
+        name: String(row?.name || existing.name || badge).trim() || badge,
+        source: existing.source ? "profile+daily" : "daily",
+      });
+    }
+    return Array.from(byBadge.values()).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  }
+
+  function maintenanceMachineDurationSeconds(session){
+    const active = Boolean(session?.downtime_active);
+    const startDowntime = Number(session?.downtime_started_at || 0);
+    const startWait = Number(session?.downtime_wait_started_at || 0);
+    if(active && startDowntime > 0){
+      return Math.max(0, Math.floor((Date.now() / 1000) - startDowntime));
+    }
+    if(active){
+      return Math.max(0, Math.floor(Number(session?.downtime_last_seconds || 0)));
+    }
+    if(startWait > 0){
+      return Math.max(0, Math.floor((Date.now() / 1000) - startWait));
+    }
+    return Math.max(0, Math.floor(Number(session?.downtime_wait_last_seconds || 0)));
+  }
+
+  function renderMaintenanceMachineCard(s){
+    const machineName = s.machine_name || MACHINE_NAME_MAP[s.machine_code] || s.machine_code || "-";
+    const active = Boolean(s.downtime_active);
+    const duration = maintenanceMachineDurationSeconds(s);
+    return `
+      <div class="maintenance-machine ${active ? "busy" : "waiting"}">
+        <div class="maintenance-machine-title">${esc(machineName)}: ${esc(active ? (s.downtime_reason_text || "Fixing") : "Waiting")}</div>
+        <div class="maintenance-machine-time">${esc(fmtDowntimeSeconds(duration))}</div>
+      </div>
+    `;
+  }
+
+  function maintenanceDateLabel(iso){
+    const date = iso ? new Date(iso) : new Date();
+    if(Number.isNaN(date.getTime())) return "Accurate current date: -";
+    return "Accurate current date: " + date.toLocaleString("en-US", {
+      weekday: "short",
+      month: "short",
+      day: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+  }
+
+  function buildMaintenancePerfMap(state){
+    const allRows = buildDowntimeArchiveRows(state?.finished_jobs || [], state?.archived_jobs || []);
+    const perfMap = new Map();
+    allRows.forEach((row) => {
+      const maintenanceName = String(row.maintenance_name || "").trim();
+      if(!maintenanceName || !Number.isFinite(Number(row.duration_seconds))) return;
+      const stat = perfMap.get(maintenanceName) || { name: maintenanceName, count: 0, total: 0, fastest: null, latest_utc: "" };
+      const sec = Math.max(0, Math.floor(Number(row.duration_seconds || 0)));
+      stat.count += 1;
+      stat.total += sec;
+      stat.fastest = stat.fastest === null ? sec : Math.min(stat.fastest, sec);
+      if(String(row.at_utc || "").trim() > String(stat.latest_utc || "").trim()) stat.latest_utc = String(row.at_utc || "").trim();
+      perfMap.set(maintenanceName, stat);
+    });
+    return perfMap;
+  }
+
+  function activeMaintenanceMachineRows(sessions){
+    return (Array.isArray(sessions) ? sessions : []).filter((s) => {
+      if(!s || typeof s !== "object") return false;
+      const hasDowntime = Boolean(s.downtime_active);
+      const hasWait = Number(s.downtime_wait_started_at || 0) > 0 || Number(s.downtime_wait_last_seconds || 0) > 0;
+      const hasReason = String(s.downtime_reason_code || s.downtime_reason_text || "").trim() !== "";
+      return hasReason && (hasDowntime || hasWait);
+    });
+  }
+
+  function renderMaintenanceTab(state){
+    const sessions = Array.isArray(state?.sessions) ? state.sessions : [];
+    const maintenancePeople = maintenancePeopleFromState(state);
+    const activeMachines = activeMaintenanceMachineRows(sessions);
+    const perfMap = buildMaintenancePerfMap(state);
+    const assignments = new Map();
+    activeMachines.forEach((s) => {
+      const name = String(s.maintenance_name || "").trim();
+      if(!name) return;
+      const rows = assignments.get(name) || [];
+      rows.push(s);
+      assignments.set(name, rows);
+    });
+    const busyCount = assignments.size;
+    const availableCount = Math.max(0, maintenancePeople.length - busyCount);
+    const waitingCount = activeMachines.filter(s => !String(s.maintenance_name || "").trim()).length;
+    const activeFixCount = activeMachines.filter(s => Boolean(s.downtime_active)).length;
+    if(maintenanceCurrentDate){
+      maintenanceCurrentDate.textContent = maintenanceDateLabel(state?.server_time_utc || "");
+    }
+
+    if(maintenanceSummary){
+      maintenanceSummary.innerHTML = `
+        <div class="maintenance-metric blue"><div class="icon"></div><div><div class="k">Maintenance Today</div><div class="v">${esc(maintenancePeople.length)}</div><div class="s">Maintenance today&apos;s roles.</div></div></div>
+        <div class="maintenance-metric green"><div class="icon"></div><div><div class="k">Available Team</div><div class="v">${esc(availableCount)}</div><div class="s">Metric card for available team.</div></div></div>
+        <div class="maintenance-metric amber"><div class="icon"></div><div><div class="k">Active Repairs</div><div class="v">${esc(activeFixCount)}</div><div class="s">Active repairs in motion.</div></div></div>
+        <div class="maintenance-metric red"><div class="icon"></div><div><div class="k">Machines Waiting</div><div class="v">${esc(waitingCount)}</div><div class="s">Machines waiting assigned.</div></div></div>
+      `;
+    }
+
+    if(maintenancePeopleList){
+      if(!maintenancePeople.length){
+        maintenancePeopleList.innerHTML = '<div class="placeholder">No maintenance profiles yet.</div>';
+      } else {
+        const unassigned = activeMachines.filter(s => !String(s.maintenance_name || "").trim());
+        maintenancePeopleList.innerHTML = maintenancePeople.map((person) => {
+          const jobs = assignments.get(person.name) || [];
+          const busy = jobs.length > 0;
+          const perf = perfMap.get(person.name) || { count: 0, total: 0, fastest: null };
+          const avgRepair = perf.count ? fmtDowntimeSeconds(Math.round(perf.total / Math.max(1, perf.count))) : "00:00:00";
+          const waitFreq = perf.count ? `${Math.round((jobs.length / Math.max(1, perf.count)) * 100)}%` : "0%";
+          const avgWait = jobs.length ? fmtDowntimeSeconds(Math.round(jobs.reduce((sum, row) => sum + maintenanceMachineDurationSeconds(row), 0) / jobs.length)) : "00:00:00";
+          return `
+            <div class="maintenance-person ${busy ? "busy" : "available"}">
+              <div class="maintenance-avatar-wrap">
+                <div class="maintenance-avatar" aria-hidden="true"></div>
+              </div>
+              <div class="maintenance-person-main">
+                <div class="maintenance-person-head">
+                  <div>
+                    <div class="title">${esc(person.name)}</div>
+                    <div class="meta">Badge: ${esc(person.badge || "-")}</div>
+                  </div>
+                  <span class="maintenance-badge ${busy ? "busy" : "available"}">${busy ? "Fixing" : "Available"}</span>
+                </div>
+                <div class="submeta">${jobs.length ? `${jobs.length} active machine assignment${jobs.length > 1 ? "s" : ""}.` : "No active machines."}<br>${jobs.length ? "Ready to continue assigned work." : "Ready for new call."}</div>
+                <div class="maintenance-machine-grid">
+                  ${jobs.length ? jobs.map(renderMaintenanceMachineCard).join("") : '<div class="submeta">No active machines.</div>'}
+                </div>
+              </div>
+              <div class="maintenance-stats">
+                <div class="maintenance-stats-title">Lifetime Stats</div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">◷</span><span>Avg. Repair: ${esc(avgRepair)}</span></div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">⟳</span><span>Wait Freq: ${esc(waitFreq)}</span></div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">◷</span><span>Avg. Wait: ${esc(avgWait)}</span></div>
+              </div>
+            </div>
+          `;
+        }).join("") + (
+          unassigned.length ? `
+            <div class="maintenance-person">
+              <div class="maintenance-avatar-wrap">
+                <div class="maintenance-avatar" aria-hidden="true"></div>
+              </div>
+              <div class="maintenance-person-main">
+                <div class="maintenance-person-head">
+                  <div>
+                    <div class="title">Unassigned Maintenance Calls</div>
+                    <div class="meta">Badge: -</div>
+                  </div>
+                  <span class="maintenance-badge waiting">Waiting</span>
+                </div>
+                <div class="submeta">Machines waiting for maintenance assignment.</div>
+                <div class="maintenance-machine-grid">
+                  ${unassigned.map(renderMaintenanceMachineCard).join("")}
+                </div>
+              </div>
+              <div class="maintenance-stats">
+                <div class="maintenance-stats-title">Queue Stats</div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">◷</span><span>Waiting jobs: ${esc(unassigned.length)}</span></div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">⚙</span><span>Active repairs: ${esc(activeFixCount)}</span></div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">△</span><span>Needs assignment now.</span></div>
+              </div>
+            </div>
+          ` : ""
+        );
+      }
+    }
+
+    if(maintenancePerformanceTableWrap){
+      const perfRows = Array.from(perfMap.values()).sort((a, b) => (a.total / Math.max(1, a.count)) - (b.total / Math.max(1, b.count)));
+      if(!perfRows.length){
+        maintenancePerformanceTableWrap.innerHTML = '<div class="placeholder">No downtime records with maintenance names yet.</div>';
+      } else {
+        maintenancePerformanceTableWrap.innerHTML = `
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Maintenance</th>
+                <th>Resolved Downtimes</th>
+                <th>Average Repair Time</th>
+                <th>Fastest Repair</th>
+                <th>Last Recorded</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${perfRows.map((row) => `
+                <tr>
+                  <td>${esc(row.name)}</td>
+                  <td>${esc(row.count)}</td>
+                  <td>${esc(fmtDowntimeSeconds(Math.round(row.total / Math.max(1, row.count))))}</td>
+                  <td>${esc(fmtDowntimeSeconds(row.fastest))}</td>
+                  <td>${esc(fmtDateLocal(row.latest_utc || ""))}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        `;
+      }
+    }
   }
 
   function queueStatusBadge(status){
@@ -4989,6 +5307,7 @@ DASHBOARD_HTML = """
     renderArchivedJobs(state.archived_jobs || []);
     renderMachineStatusArchive(machineStatusArchiveState);
     renderDowntimeArchive(state.finished_jobs || [], state.archived_jobs || []);
+    renderMaintenanceTab(state || {});
   }
 
   // tab handling
@@ -6153,12 +6472,16 @@ async def api_event(req: Request):
             sess.downtime_started_at = snap.get("downtime_started_at", sess.downtime_started_at)
             sess.downtime_last_seconds = snap.get("downtime_last_seconds", sess.downtime_last_seconds)
             sess.downtime_active = bool(snap.get("downtime_active", sess.downtime_active))
+            sess.downtime_wait_started_at = snap.get("downtime_wait_started_at", sess.downtime_wait_started_at)
+            sess.downtime_wait_last_seconds = snap.get("downtime_wait_last_seconds", sess.downtime_wait_last_seconds)
             sess.cycle_time_current = snap.get("cycle_time_current", sess.cycle_time_current)
             live_avg = snap.get("live_cycle_avg_seconds", sess.live_cycle_avg_seconds)
             try:
                 sess.live_cycle_avg_seconds = float(live_avg) if live_avg is not None else sess.live_cycle_avg_seconds
             except Exception:
                 pass
+            sess.maintenance_name = snap.get("maintenance_name", sess.maintenance_name)
+            sess.supervisor_name = snap.get("supervisor_name", sess.supervisor_name)
             if isinstance(snap.get("job_payload"), dict):
                 sess.job_payload = dict(snap.get("job_payload") or {})
             sess.linkage_enabled = bool(snap.get("linkage_enabled", sess.linkage_enabled))
