@@ -46,11 +46,18 @@
   const lastMessageEl = document.getElementById("last-message");
   const machineCountEl = document.getElementById("machine-count");
   const machineGrid = document.getElementById("machineGrid");
+  const jobQueueSummary = document.getElementById("jobQueueSummary");
+  const jobQueueTableWrap = document.getElementById("jobQueueTableWrap");
+  const finishedShiftQueueList = document.getElementById("finishedShiftQueueList");
+  const finishedShiftJobProgress = document.getElementById("finishedShiftJobProgress");
   const finishedJobsList = document.getElementById("finishedJobsList");
   const archivedJobsTableWrap = document.getElementById("archivedJobsTableWrap");
-  const operatorShiftSummaryWrap = document.getElementById("operatorShiftSummaryWrap");
   const machineStatusArchiveTableWrap = document.getElementById("machineStatusArchiveTableWrap");
   const downtimeArchiveTableWrap = document.getElementById("downtimeArchiveTableWrap");
+  const maintenanceSummary = document.getElementById("maintenanceSummary");
+  const maintenancePeopleList = document.getElementById("maintenancePeopleList");
+  const maintenancePerformanceTableWrap = document.getElementById("maintenancePerformanceTableWrap");
+  const maintenanceCurrentDate = document.getElementById("maintenanceCurrentDate");
   const approvePrintOverlay = document.getElementById("approvePrintOverlay");
   const overlayCloseBtn = document.getElementById("overlayCloseBtn");
   const overlayCancelBtn = document.getElementById("overlayCancelBtn");
@@ -88,9 +95,9 @@
   const overlayBackToReviewBtn = document.getElementById("overlayBackToReviewBtn");
   const overlayReviewStep = document.getElementById("overlayReviewStep");
   const overlayQrStep = document.getElementById("overlayQrStep");
-  const overlayReviewSlideStatus = document.getElementById("overlayReviewSlideStatus");
   const overlayReviewPrevBtn = document.getElementById("overlayReviewPrevBtn");
   const overlayReviewNextBtn = document.getElementById("overlayReviewNextBtn");
+  const overlayReviewSlideStatus = document.getElementById("overlayReviewSlideStatus");
   const reviewSubslide1 = document.getElementById("reviewSubslide1");
   const reviewSubslide2 = document.getElementById("reviewSubslide2");
   const reviewSubslide3 = document.getElementById("reviewSubslide3");
@@ -103,6 +110,7 @@
   const overlayIndex = document.getElementById("overlayIndex");
   const overlayTotal = document.getElementById("overlayTotal");
   const overlayLotNumber = document.getElementById("overlayLotNumber");
+  const overlayPoNumberRow = overlayPoNumber ? overlayPoNumber.closest(".overlay-row") : null;
   const machineDetailOverlay = document.getElementById("machineDetailOverlay");
   const machineDetailSettingsBtn = document.getElementById("machineDetailSettingsBtn");
   const machineDetailCloseBtn = document.getElementById("machineDetailCloseBtn");
@@ -147,9 +155,10 @@
   let operatorDirectoryState = [];
   const machineCardEls = new Map();
   let finishedJobsState = [];
+  let finishedShiftState = [];
   let archivedJobsState = [];
   let machineStatusArchiveState = [];
-  let operatorShiftSummaryState = [];
+  let maintenanceCardIndexByKey = {};
   let finishedJobsInteractionLock = false;
   let pendingFinishedJobsRows = null;
   let productItems = [];
@@ -165,9 +174,15 @@
     index: "",
     total: "",
     lotNumber: "",
+    stageLabel: "",
+    stageKind: "",
+    plan: [],
+    planIndex: 0,
+    printRequests: [],
   };
   let overlayReviewSavedApproved = false;
   let reviewSlideIndex = 0;
+  let overlayReviewMode = "job";
   let serverSettingsState = { theme: "Default", qrgen_base_url: "" };
   let dailyRolesState = {};
   let settingsProfilesState = [];
@@ -299,6 +314,7 @@
           ${detailItem("Good", Number(session.good_total || 0))}
           ${detailItem("Butal", Number(session.butal_total || 0))}
           ${detailItem("Reject", Number(session.reject_total || 0))}
+          ${detailItem("No Shot", Number(session.no_shot_total || 0))}
           ${detailItem("Total Good", totalGood)}
           ${detailItem("Start Up Reject", Number(session.startup_reject_total || 0))}
           ${detailItem("Raw Sacks Count", Number(session.raw_sacks_count || 0))}
@@ -812,9 +828,9 @@
     overlayReviewStep.style.display = isReview ? "" : "none";
     overlayQrStep.style.display = isReview ? "none" : "";
     overlayReviewSubmitBtn.style.display = isReview ? "" : "none";
-    overlayReviewContinueBtn.style.display = isReview ? "" : "none";
+    overlayReviewContinueBtn.style.display = (isReview && overlayReviewMode !== "shift") ? "" : "none";
     overlayBackToReviewBtn.style.display = isReview ? "none" : "";
-    overlayGenerateBtn.style.display = isReview ? "none" : "";
+    overlayGenerateBtn.style.display = "none";
     overlayRequestBtn.style.display = isReview ? "none" : "";
     syncReviewSubslides();
   }
@@ -826,17 +842,13 @@
     slides.forEach((el, idx) => {
       if(el) el.classList.toggle("active", idx === reviewSlideIndex);
     });
+    if(overlayReviewPrevBtn) overlayReviewPrevBtn.disabled = reviewSlideIndex <= 0;
+    if(overlayReviewNextBtn) overlayReviewNextBtn.disabled = reviewSlideIndex >= (total - 1);
     if(overlayReviewSlideStatus){
-      const labels = ["Job Summary", "Raw Mats / Cycle", "Downtime / Team", "Approval"];
+      const labels = overlayReviewMode === "shift"
+        ? ["Shift Summary", "Materials / Job API", "Downtime / Team", "Review / Edit"]
+        : ["Job Summary", "Raw Mats / Cycle", "Downtime / Team", "Approval"];
       overlayReviewSlideStatus.textContent = `Slide ${reviewSlideIndex + 1} / ${total} - ${labels[reviewSlideIndex] || ""}`;
-    }
-    if(overlayReviewPrevBtn){
-      overlayReviewPrevBtn.disabled = reviewSlideIndex <= 0;
-      overlayReviewPrevBtn.style.display = overlayReviewStep.style.display === "none" ? "none" : "";
-    }
-    if(overlayReviewNextBtn){
-      overlayReviewNextBtn.disabled = reviewSlideIndex >= total - 1;
-      overlayReviewNextBtn.style.display = overlayReviewStep.style.display === "none" ? "none" : "";
     }
   }
 
@@ -848,6 +860,7 @@
       `Good: ${row.good_total ?? 0}`,
       `Butal: ${row.butal_total ?? 0}`,
       `Reject: ${row.reject_total ?? 0}`,
+      `No Shot: ${row.no_shot_total ?? 0}`,
       `Total Good: ${row.total_good ?? ((Number(row.good_total||0)+Number(row.butal_total||0)))}`,
     ].join("\\n");
   }
@@ -864,6 +877,7 @@
     editGoodTotal.value = String(row?.good_total ?? 0);
     editButalTotal.value = String(row?.butal_total ?? 0);
     editRejectTotal.value = String(row?.reject_total ?? 0);
+    if(typeof editNoShotTotal !== "undefined" && editNoShotTotal) editNoShotTotal.value = String(row?.no_shot_total ?? 0);
     editTotalGood.value = String(row?.total_good ?? (Number(row?.good_total||0)+Number(row?.butal_total||0)));
     editRejectBreakdown.value = JSON.stringify((row && row.reject_breakdown) || {}, null, 2);
   }
@@ -880,6 +894,171 @@
     return `<ul class="review-line-list">${lines.map(x => `<li>${esc(x)}</li>`).join("")}</ul>`;
   }
 
+  function safeJsonPretty(value){
+    try {
+      return JSON.stringify(value ?? {}, null, 2);
+    } catch {
+      return String(value ?? "");
+    }
+  }
+
+  function renderPreformattedHtml(text, emptyLabel = "No data."){
+    const raw = String(text || "").trim();
+    if(!raw) return `<div class="machine-detail-empty">${esc(emptyLabel)}</div>`;
+    return `<pre class="review-pre">${esc(raw)}</pre>`;
+  }
+
+  function renderKeyValueTableHtml(obj, emptyLabel = "No data."){
+    const entries = Object.entries((obj && typeof obj === "object") ? obj : {}).filter(([_, v]) => v !== undefined);
+    if(!entries.length) return `<div class="machine-detail-empty">${esc(emptyLabel)}</div>`;
+    return `
+      <table class="review-kv-table">
+        <tbody>
+          ${entries.map(([key, value]) => `
+            <tr>
+              <td class="review-kv-key">${esc(String(key).replace(/_/g, " "))}</td>
+              <td class="review-kv-value">${esc(typeof value === "string" ? value : String(value))}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function renderShiftGroupedPanelHtml(panel, emptyLabel = "No data."){
+    const groups = Array.isArray(panel) ? panel : [];
+    if(!groups.length) return `<div class="machine-detail-empty">${esc(emptyLabel)}</div>`;
+    return `
+      <div class="review-group-list">
+        ${groups.map(group => {
+          const title = String(group?.title || "").trim() || "Section";
+          const kind = String(group?.kind || "json").trim();
+          const content = group?.content;
+          let bodyHtml = "";
+          if(kind === "table"){
+            bodyHtml = renderKeyValueTableHtml(content, emptyLabel);
+          } else if(kind === "lines"){
+            const text = Array.isArray(content) ? content.join("\n") : String(content || "");
+            bodyHtml = renderBulletListHtml(text, emptyLabel);
+          } else {
+            const raw = safeJsonPretty(content);
+            bodyHtml = `<pre class="review-json-block">${esc(raw)}</pre>`;
+          }
+          return `
+            <div class="review-group-card">
+              <div class="review-group-head">${esc(title)}</div>
+              <div class="review-group-body">${bodyHtml}</div>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    `;
+  }
+
+  function buildShiftPreviewPanels(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const payload = (item.job_payload && typeof item.job_payload === "object") ? item.job_payload : {};
+    const data = (payload.data && typeof payload.data === "object") ? payload.data : {};
+    const job = (data.job && typeof data.job === "object") ? data.job : {};
+    const jobDetails = (data.job_details && typeof data.job_details === "object") ? data.job_details : {};
+    const partials = Array.isArray(data.partials) ? data.partials : [];
+    const productParts = Array.isArray(data.product_parts) ? data.product_parts : [];
+    const rawLogs = Array.isArray(item.raw_material_logs) ? item.raw_material_logs : [];
+    const rawScans = Array.isArray(item.raw_material_scans) ? item.raw_material_scans : [];
+    const packHistory = Array.isArray(item.product_pack_history_logs) ? item.product_pack_history_logs : [];
+    const rejectReviews = Array.isArray(item.reject_review_logs) ? item.reject_review_logs : [];
+    const summary = {
+      record_type: item.record_type || "SHIFT_PARTIAL",
+      review_status: item.review_status || "-",
+      reason: item.reason || "-",
+      machine_code: item.machine_code || "-",
+      machine_name: item.machine_name || item.machine_code || "-",
+      job_code: item.job_code || "-",
+      job_name: item.job_name || "-",
+      operator_id: item.operator_id || "-",
+      operator_name: displayNameForId(item.operator_id || item.operator_name || "-"),
+      shift_index: item.shift_index ?? "-",
+      started_at_utc: item.started_at_utc || "-",
+      ended_at_utc: item.ended_at_utc || item.finished_at_utc || "-",
+      pack_count: item.pack_count ?? 0,
+      good_total: item.good_total ?? 0,
+      butal_total: item.butal_total ?? 0,
+      reject_total: item.reject_total ?? 0,
+      no_shot_total: item.no_shot_total ?? 0,
+      startup_reject_total: item.startup_reject_total ?? 0,
+      total_good: item.total_good ?? item.partial_qty ?? 0,
+      partial_qty: item.partial_qty ?? item.total_good ?? 0,
+      raw_sacks_count: item.raw_sacks_count ?? 0,
+      cycle_time_current: item.cycle_time_current || "-",
+      cycle_time_shift_avg_seconds: item.cycle_time_shift_avg_seconds ?? "-",
+      qty_per_shift_avg_cycle: item.qty_per_shift_avg_cycle ?? "-",
+      downtime_reason_code: item.downtime_reason_code || "-",
+      downtime_reason_text: item.downtime_reason_text || "-",
+      downtime_last_seconds: item.downtime_last_seconds ?? 0,
+      maintenance_name: item.maintenance_name || "-",
+      supervisor_name: item.supervisor_name || "-",
+      linkage_enabled: !!item.linkage_enabled,
+      linkage_job_code: item.linkage_job_code || "-",
+      linkage_job_name: item.linkage_job_name || "-",
+      raw_material_logs_count: rawLogs.length,
+      raw_material_scans_count: rawScans.length,
+      product_pack_history_count: packHistory.length,
+      reject_review_logs_count: rejectReviews.length,
+      partials_count: partials.length,
+      product_parts_count: productParts.length,
+    };
+    return {
+      summary: [
+        { title: "Shift Summary", kind: "table", content: summary },
+      ],
+      rejects: [
+        { title: "Reject Breakdown", kind: "json", content: item.reject_breakdown || {} },
+        { title: "Reject Review Logs", kind: "json", content: rejectReviews },
+      ],
+      rawConsumption: [
+        { title: "Raw Material Consumption", kind: "lines", content: rawLogs.map((x, idx) => rawMaterialLine(x, idx)) },
+        { title: "Raw Material Scans", kind: "lines", content: rawScans.map((x, idx) => `${idx + 1}. ${String(x || "-")}`) },
+        { title: "Product Pack History", kind: "json", content: packHistory },
+      ],
+      rawCycle: [
+        { title: "Job API Job", kind: "json", content: job },
+        { title: "Job API Job Details", kind: "json", content: jobDetails },
+        { title: "Job API Product Parts", kind: "json", content: productParts },
+        { title: "Job API Partials", kind: "json", content: partials },
+      ],
+      downtime: [
+        {
+          title: "Downtime",
+          kind: "table",
+          content: {
+            downtime_reason_code: item.downtime_reason_code || "-",
+            downtime_reason_text: item.downtime_reason_text || "-",
+            downtime_last_seconds: item.downtime_last_seconds ?? 0,
+            downtime_active: !!item.downtime_active,
+            maintenance_name: item.maintenance_name || "-",
+            supervisor_name: item.supervisor_name || "-",
+          },
+        },
+      ],
+      people: [
+        {
+          title: "People",
+          kind: "table",
+          content: {
+            operator_name: displayNameForId(item.operator_id || item.operator_name || "-"),
+            operator_id: item.operator_id || "-",
+            maintenance_name: item.maintenance_name || "-",
+            supervisor_name: item.supervisor_name || "-",
+            qc_name: qcFromFinishedJob(item),
+            no_shot_total: item.no_shot_total ?? 0,
+            startup_reject_total: item.startup_reject_total ?? 0,
+          },
+        },
+        { title: "Full Job API Payload", kind: "json", content: payload },
+      ],
+    };
+  }
+
   function renderSummaryMetricsHtml(row){
     const r = row || {};
     const totalGood = Number(r.total_good ?? ((Number(r.good_total||0) + Number(r.butal_total||0))));
@@ -892,13 +1071,202 @@
       <span>Butal: ${esc(r.butal_total ?? 0)}</span>
       <span class="dot">•</span>
       <span>Reject: <span class="reject-emph">${esc(r.reject_total ?? 0)}</span></span>
+      <span>No Shot: <span class="reject-emph">${esc(r.no_shot_total ?? 0)}</span></span>
       <span class="dot">•</span>
       <span>Total Good: ${esc(totalGood)}</span>
     `;
   }
 
-  function renderFinishedJobs(rows){
+  function isShiftPartialRecord(row){
+    return String(row?.record_type || "").toUpperCase() === "SHIFT_PARTIAL";
+  }
+
+  function isApprovedShiftRecord(row){
+    return isShiftPartialRecord(row) && String(row?.review_status || "").toUpperCase() === "APPROVED";
+  }
+
+  function renderFinishedShiftQueue(rows){
     const items = Array.isArray(rows) ? rows : [];
+    if(!finishedShiftQueueList) return;
+    if(!items.length){
+      finishedShiftQueueList.innerHTML = '<div class="placeholder">No finished shifts yet.</div>';
+      return;
+    }
+    const sorted = [...items].reverse();
+    finishedShiftQueueList.innerHTML = sorted.map((r, idx) => {
+      const machineCode = String(r.machine_code || "").trim();
+      const machineName = r.machine_name || MACHINE_NAME_MAP[machineCode] || machineCode || "-";
+      const rawLogs = Array.isArray(r.raw_material_logs) ? r.raw_material_logs : [];
+      const rawText = rawLogs.length
+        ? rawLogs.map((x, rowIdx) => rawMaterialLine(x, rowIdx)).join("\\n")
+        : "No raw materials scanned.";
+      return `
+        <div class="finished-item">
+          <div class="finished-head">
+            <h4>${esc(r.job_name || r.job_code || "Shift")} - ${esc(machineName)}</h4>
+            <span class="finished-badge">${esc(r.review_status || "PENDING")}</span>
+          </div>
+          <div class="finished-grid">
+            <div><strong>Shift End:</strong> ${esc(fmtDateLocal(r.finished_at_utc || r.ended_at_utc || ""))}</div>
+            <div><strong>Operator:</strong> ${esc(displayNameForId(r.operator_id || "-"))}</div>
+            <div><strong>Pack:</strong> ${esc(r.pack_count ?? 0)}</div>
+            <div><strong>Total Good:</strong> ${esc(r.total_good ?? r.partial_qty ?? 0)}</div>
+            <div><strong>Reject:</strong> ${esc(r.reject_total ?? 0)}</div>
+            <div><strong>Downtime:</strong> ${esc(fmtDowntimeSeconds(r.downtime_last_seconds))}</div>
+          </div>
+          <div class="raw-list">${esc(rawText)}</div>
+          <div class="finished-actions">
+            <button class="approve-print-btn shift-review-btn" data-row-index="${idx}" type="button">Review Shift</button>
+          </div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  function renderFinishedShiftJobProgress(rows){
+    const approved = (Array.isArray(rows) ? rows : []).filter(isApprovedShiftRecord);
+    if(!finishedShiftJobProgress) return;
+    if(!approved.length){
+      finishedShiftJobProgress.innerHTML = '<div class="placeholder">No approved shift partials yet.</div>';
+      return;
+    }
+    const grouped = new Map();
+    approved.forEach(row => {
+      const key = String(row.job_code || row.job_name || "").trim() || "UNKNOWN";
+      if(!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push(row);
+    });
+    const cards = Array.from(grouped.entries()).map(([key, list]) => {
+      const first = list[0] || {};
+      const approvedQty = list.reduce((sum, row) => sum + Number(row.partial_qty || row.total_good || 0), 0);
+      const apiPartials = Array.isArray(first?.job_payload?.data?.partials) ? first.job_payload.data.partials : [];
+      const apiPartialQty = apiPartials.reduce((sum, row) => sum + Number(row?.partial_qty || 0), 0);
+      const targetQty = Number(first?.job_payload?.data?.job?.approve_qty || first?.job_payload?.data?.job?.request_qty || 0);
+      const producedQty = approvedQty + apiPartialQty;
+      const remainingQty = Math.max(0, targetQty - producedQty);
+      const lines = list
+        .slice()
+        .sort((a, b) => String(a.finished_at_utc || a.ended_at_utc || "").localeCompare(String(b.finished_at_utc || b.ended_at_utc || "")))
+        .map((row, idx) => `${idx + 1}. ${fmtDateLocal(row.finished_at_utc || row.ended_at_utc || "")} | Qty ${row.partial_qty || row.total_good || 0} | Reject ${row.reject_total || 0} | No Shot ${row.no_shot_total || 0} | Downtime ${fmtDowntimeSeconds(row.downtime_last_seconds)}`);
+      return `
+        <div class="finished-item">
+          <div class="finished-head">
+            <h4>${esc(first.job_name || first.job_code || key)}</h4>
+            <span class="finished-badge">APPROVED PARTIALS</span>
+          </div>
+          <div class="finished-grid">
+            <div><strong>Job Code:</strong> ${esc(first.job_code || key)}</div>
+            <div><strong>Approved Shifts:</strong> ${esc(list.length)}</div>
+            <div><strong>API Partials:</strong> ${esc(apiPartialQty)}</div>
+            <div><strong>Approved Shift Qty:</strong> ${esc(approvedQty)}</div>
+            <div><strong>Produced:</strong> ${esc(producedQty)}</div>
+            <div><strong>Remaining:</strong> ${esc(remainingQty)}</div>
+          </div>
+          <div class="raw-list">${esc(lines.join("\\n"))}</div>
+        </div>
+      `;
+    });
+    finishedShiftJobProgress.innerHTML = cards.join("");
+  }
+
+  function applyGeneratedQrPlanEntry(entry){
+    const item = entry && typeof entry === "object" ? entry : {};
+    const poRequired = Boolean(item.po_required);
+    const stagePo = String(item.po_number || "").trim();
+    const payloadText = (poRequired && !stagePo) ? "" : String(item.qr_payload || item.payload || "").trim();
+    const parsed = item.parsed && typeof item.parsed === "object" ? item.parsed : {};
+    if(overlayQrStageLabel) overlayQrStageLabel.value = String(item.stage_label || "2 / 2 - QR Print");
+    overlayQrPayload.value = payloadText || (poRequired ? "PO Number required for Butal QR. Enter PO Number, then Generate QR Payload." : "");
+    overlayQty.value = parsed.qty || item.qty || "";
+    overlayIndex.value = parsed.index || item.index || "";
+    overlayTotal.value = parsed.total || item.total || "";
+    overlayLotNumber.value = parsed.lot_number || item.lot_number || "";
+    generatedQrState.payload = overlayQrPayload.value || "";
+    generatedQrState.qty = overlayQty.value || "";
+    generatedQrState.index = overlayIndex.value || "";
+    generatedQrState.total = overlayTotal.value || "";
+    generatedQrState.lotNumber = overlayLotNumber.value || "";
+    generatedQrState.stageLabel = String(item.stage_label || "");
+    generatedQrState.stageKind = String(item.stage_kind || "");
+    if(overlayPoNumberRow){
+      overlayPoNumberRow.style.display = poRequired ? "" : "none";
+    }
+    if(overlayPoNumber){
+      overlayPoNumber.value = stagePo;
+      overlayPoNumber.placeholder = poRequired ? "Enter PO Number..." : "Not required for raw excess";
+    }
+    if(overlayProductSelect){
+      const sku = String(item.product_sku || "").trim();
+      const name = String(item.product_name || "").trim();
+      overlayProductSelect.value = (sku && name) ? `${sku} - ${name}` : (name || sku || overlayProductSelect.value || "");
+    }
+  }
+
+  async function refreshQrStagePayload(){
+    if(!overlayReviewSavedApproved){
+      overlayQrPayload.value = "Review approval is required before generating QR.";
+      return;
+    }
+    const productId = resolveProductIdFromText(overlayProductSelect.value || "");
+    const poNumber = (overlayPoNumber.value || "").trim();
+    const needsPo = generatedQrState.stageKind === "BUTAL";
+    if(needsPo && !poNumber){
+      overlayQrPayload.value = "Enter PO Number for Butal.";
+      return;
+    }
+    const resp = await fetch("/api/raw-material-qr", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        product_id: productId,
+        po_number: poNumber,
+        finished_job: activeJobRow || {},
+        stage_index: generatedQrState.plan && generatedQrState.plan.length ? generatedQrState.planIndex : 0,
+      }),
+    });
+    const out = await resp.json();
+    const plan = Array.isArray(out.qr_plan) ? out.qr_plan : [];
+    const payloadText = out.qr_payload || out.error || "Failed to generate.";
+    const existingRequests = Array.isArray(generatedQrState.printRequests) ? generatedQrState.printRequests : [];
+    generatedQrState = {
+      jobKey: jobKeyOf(activeJobRow),
+      payload: payloadText,
+      qty: "",
+      index: "",
+      total: "",
+      lotNumber: "",
+      stageLabel: String(out.stage_label || ""),
+      stageKind: "",
+      plan: plan,
+      planIndex: Number(out.selected_stage_index || 0),
+      printRequests: existingRequests,
+    };
+    if(plan.length){
+      applyGeneratedQrPlanEntry(plan[generatedQrState.planIndex] || plan[0]);
+    } else {
+      overlayQrPayload.value = payloadText;
+      const parsed = out.parsed || {};
+      overlayQty.value = parsed.qty || "";
+      overlayIndex.value = parsed.index || "";
+      overlayTotal.value = parsed.total || "";
+      overlayLotNumber.value = parsed.lot_number || "";
+      if(overlayQrStageLabel) overlayQrStageLabel.value = String(out.stage_label || "1 / 1 - QR Print");
+      generatedQrState.qty = overlayQty.value || "";
+      generatedQrState.index = overlayIndex.value || "";
+      generatedQrState.total = overlayTotal.value || "";
+      generatedQrState.lotNumber = overlayLotNumber.value || "";
+      generatedQrState.stageKind = "DEFAULT";
+    }
+  }
+
+  function renderFinishedJobs(rows){
+    const allItems = Array.isArray(rows) ? rows : [];
+    const shiftItems = allItems.filter(isShiftPartialRecord);
+    const finalItems = allItems.filter(r => !isShiftPartialRecord(r));
+    finishedShiftState = shiftItems;
+    renderFinishedShiftQueue(shiftItems);
+    renderFinishedShiftJobProgress(shiftItems);
+    const items = finalItems;
     if(finishedJobsInteractionLock){
       pendingFinishedJobsRows = items;
       finishedJobsState = items;
@@ -915,9 +1283,13 @@
       const machineCode = String(r.machine_code || "").trim();
       const machineName = (r.machine_name || MACHINE_NAME_MAP[machineCode] || machineCode || "-");
       const rawLogs = Array.isArray(r.raw_material_logs) ? r.raw_material_logs : [];
+      const relatedApprovedShifts = shiftItems.filter(x => isApprovedShiftRecord(x) && String(x.job_code || "") === String(r.job_code || ""));
       const rawText = rawLogs.length
         ? rawLogs.map((x, idx) => rawMaterialLine(x, idx)).join("\\n")
         : "No raw materials scanned.";
+      const partialSummaryText = relatedApprovedShifts.length
+        ? relatedApprovedShifts.map((x, rowIdx) => `${rowIdx + 1}. ${fmtDateLocal(x.finished_at_utc || x.ended_at_utc || "")} | Qty ${x.partial_qty || x.total_good || 0} | Reject ${x.reject_total || 0} | No Shot ${x.no_shot_total || 0} | Downtime ${fmtDowntimeSeconds(x.downtime_last_seconds)}`).join("\\n")
+        : "No approved shift partials linked to this job yet.";
       const linkageRole = String(r.linkage_role || "").toUpperCase();
       const linkageTotal = Number(r.linkage_group_total_jobs || 0);
       const linkageBadge = linkageRole ? `<span class="linkage-pill">${esc(linkageRole)}${linkageTotal ? ` (${linkageTotal})` : ""}</span>` : "";
@@ -935,11 +1307,15 @@
             <div><strong>Good:</strong> ${esc(r.good_total ?? 0)}</div>
             <div><strong>Butal:</strong> ${esc(r.butal_total ?? 0)}</div>
             <div><strong>Reject:</strong> ${esc(r.reject_total ?? 0)}</div>
+            <div><strong>No Shot:</strong> ${esc(r.no_shot_total ?? 0)}</div>
             <div><strong>Total Good:</strong> ${esc(r.total_good ?? 0)}</div>
             <div><strong>Startup Reject:</strong> ${esc(r.startup_reject_total ?? 0)}</div>
             <div><strong>Raw Sacks:</strong> ${esc(r.raw_sacks_count ?? 0)}</div>
+            <div><strong>Approved Shifts:</strong> ${esc(relatedApprovedShifts.length)}</div>
+            <div><strong>Approved Shift Qty:</strong> ${esc(relatedApprovedShifts.reduce((sum, x) => sum + Number(x.partial_qty || x.total_good || 0), 0))}</div>
           </div>
           <div class="raw-list">${esc(rawText)}</div>
+          <div class="raw-list">${esc(partialSummaryText)}</div>
           ${linkageNote ? `<div class="finished-linkage-note"><strong>Link Info:</strong> ${esc(linkageNote)}</div>` : ""}
           <div class="finished-actions">
             <button class="approve-print-btn" data-row-index="${idx}" type="button">Approve and Print QR</button>
@@ -961,6 +1337,7 @@
       good_total: row.good_total || 0,
       butal_total: row.butal_total || 0,
       reject_total: row.reject_total || 0,
+      no_shot_total: row.no_shot_total || 0,
       reject_breakdown: row.reject_breakdown || {},
       raw_sacks_count: row.raw_sacks_count || 0,
       raw_material_scans: row.raw_material_scans || [],
@@ -1022,92 +1399,6 @@
                 <td>${esc(r.review_status || "ARCHIVED")}</td>
                 <td>${esc(actor)}${actorRole ? `<br><span class="muted">${esc(actorRole)}</span>` : ""}</td>
                 <td><div class="table-actions"><button class="mini-btn primary archived-view-btn" data-row-index="${idx}" type="button">View</button></div></td>
-              </tr>
-            `;
-          }).join("")}
-        </tbody>
-      </table>
-    `;
-  }
-
-  function renderOperatorShiftSummary(rows){
-    const items = Array.isArray(rows) ? rows : [];
-    operatorShiftSummaryState = items;
-    if(!operatorShiftSummaryWrap) return;
-    if(!items.length){
-      operatorShiftSummaryWrap.innerHTML = '<div class="placeholder">No operator shift summaries saved yet.</div>';
-      return;
-    }
-    const grouped = new Map();
-    for(const row of items){
-      const dateKey = String(row.date_key || "-").trim() || "-";
-      const jobCode = String(row.job_code || "").trim();
-      const machineCode = String(row.machine_code || "").trim();
-      const groupKey = `${dateKey}||${jobCode}||${machineCode}`;
-      if(!grouped.has(groupKey)){
-        grouped.set(groupKey, {
-          date_key: dateKey,
-          job_code: jobCode,
-          job_name: String(row.job_name || "").trim(),
-          machine_code: machineCode,
-          machine_name: String(row.machine_name || "").trim(),
-          rows: [],
-          pack_count: 0,
-          good_total: 0,
-          butal_total: 0,
-          reject_total: 0,
-          total_good: 0,
-        });
-      }
-      const bucket = grouped.get(groupKey);
-      bucket.rows.push(row);
-      bucket.pack_count += Number(row.pack_count || 0);
-      bucket.good_total += Number(row.good_total || 0);
-      bucket.butal_total += Number(row.butal_total || 0);
-      bucket.reject_total += Number(row.reject_total || 0);
-      bucket.total_good += Number(row.total_good || 0);
-    }
-    const sorted = Array.from(grouped.values()).sort((a, b) => {
-      if(a.date_key !== b.date_key) return String(b.date_key).localeCompare(String(a.date_key));
-      return String(b.job_code || "").localeCompare(String(a.job_code || ""));
-    });
-    operatorShiftSummaryWrap.innerHTML = `
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Date</th>
-            <th>Machine</th>
-            <th>Job</th>
-            <th>Operators</th>
-            <th>Pack</th>
-            <th>Good</th>
-            <th>Butal</th>
-            <th>Reject</th>
-            <th>Total Good</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${sorted.map(group => {
-            const operatorLines = group.rows
-              .slice()
-              .sort((a, b) => String(a.started_at_utc || "").localeCompare(String(b.started_at_utc || "")))
-              .map(row => {
-                const name = row.operator_name || displayNameForId(row.operator_id || "-");
-                const timeSpan = `${fmtDateLocal(row.started_at_utc || "")} -> ${fmtDateLocal(row.ended_at_utc || "")}`;
-                return `${esc(name)}<br><span class="muted">${esc(timeSpan)}</span><br><span class="muted">Pack ${esc(row.pack_count || 0)} | Good ${esc(row.good_total || 0)} | Reject ${esc(row.reject_total || 0)}</span>`;
-              })
-              .join("<hr style=\"border:none;border-top:1px solid #e5e7eb;margin:8px 0;\">");
-            return `
-              <tr>
-                <td>${esc(group.date_key)}</td>
-                <td>${esc(group.machine_name || group.machine_code || "-")}<br><span class="muted">${esc(group.machine_code || "-")}</span></td>
-                <td>${esc(group.job_name || group.job_code || "-")}<br><span class="muted">${esc(group.job_code || "-")}</span></td>
-                <td>${operatorLines || "-"}</td>
-                <td>${esc(group.pack_count)}</td>
-                <td>${esc(group.good_total)}</td>
-                <td>${esc(group.butal_total)}</td>
-                <td>${esc(group.reject_total)}</td>
-                <td>${esc(group.total_good)}</td>
               </tr>
             `;
           }).join("")}
@@ -1201,6 +1492,7 @@
         job_code: String(r.job_code || "").trim(),
         job_name: String(r.job_name || "").trim(),
         operator_id: String(r.operator_id || "").trim(),
+        maintenance_name: String(r.maintenance_name || "").trim(),
         reason_code: reasonCode,
         reason_text: reasonText,
         duration_seconds: Number.isFinite(sec) ? Math.max(0, Math.floor(sec)) : null,
@@ -1256,6 +1548,322 @@
     `;
   }
 
+  function maintenancePeopleFromState(state){
+    const byBadge = new Map();
+    const profiles = Array.isArray(state?.maintenance_profiles) ? state.maintenance_profiles : [];
+    profiles.forEach((row) => {
+      const badge = String(row?.id_number || "").trim();
+      if(!badge) return;
+      byBadge.set(badge, {
+        badge,
+        name: String(row?.name || badge).trim() || badge,
+        source: "profile",
+      });
+    });
+    const dailyRoles = (state?.daily_roles && typeof state.daily_roles === "object") ? state.daily_roles : {};
+    for(const [badge, row] of Object.entries(dailyRoles)){
+      const rights = String(row?.rights || "").trim().toLowerCase();
+      const companyRole = String(row?.company_role || "").trim().toLowerCase();
+      if(rights !== "maintenance" && companyRole !== "maintenance") continue;
+      const existing = byBadge.get(badge) || {};
+      byBadge.set(badge, {
+        badge,
+        name: String(row?.name || existing.name || badge).trim() || badge,
+        source: existing.source ? "profile+daily" : "daily",
+      });
+    }
+    return Array.from(byBadge.values()).sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  }
+
+  function maintenanceMachineDurationSeconds(session){
+    const active = Boolean(session?.downtime_active);
+    const startDowntime = Number(session?.downtime_started_at || 0);
+    const startWait = Number(session?.downtime_wait_started_at || 0);
+    if(active && startDowntime > 0){
+      return Math.max(0, Math.floor((Date.now() / 1000) - startDowntime));
+    }
+    if(active){
+      return Math.max(0, Math.floor(Number(session?.downtime_last_seconds || 0)));
+    }
+    if(startWait > 0){
+      return Math.max(0, Math.floor((Date.now() / 1000) - startWait));
+    }
+    return Math.max(0, Math.floor(Number(session?.downtime_wait_last_seconds || 0)));
+  }
+
+  function renderMaintenanceMachineCard(s){
+    const machineName = s.machine_name || MACHINE_NAME_MAP[s.machine_code] || s.machine_code || "-";
+    const active = Boolean(s.downtime_active);
+    const duration = maintenanceMachineDurationSeconds(s);
+    return `
+      <div class="maintenance-machine ${active ? "busy" : "waiting"}">
+        <div class="maintenance-machine-title">${esc(machineName)}: ${esc(active ? (s.downtime_reason_text || "Fixing") : "Waiting")}</div>
+        <div class="maintenance-machine-time">${esc(fmtDowntimeSeconds(duration))}</div>
+      </div>
+    `;
+  }
+
+  function maintenanceDateLabel(iso){
+    const date = iso ? new Date(iso) : new Date();
+    if(Number.isNaN(date.getTime())) return "Accurate current date: -";
+    return "Accurate current date: " + date.toLocaleString("en-US", {
+      weekday: "short",
+      month: "short",
+      day: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+  }
+
+  function buildMaintenancePerfMap(state){
+    const allRows = buildDowntimeArchiveRows(state?.finished_jobs || [], state?.archived_jobs || []);
+    const perfMap = new Map();
+    allRows.forEach((row) => {
+      const maintenanceName = String(row.maintenance_name || "").trim();
+      if(!maintenanceName || !Number.isFinite(Number(row.duration_seconds))) return;
+      const stat = perfMap.get(maintenanceName) || { name: maintenanceName, count: 0, total: 0, fastest: null, latest_utc: "" };
+      const sec = Math.max(0, Math.floor(Number(row.duration_seconds || 0)));
+      stat.count += 1;
+      stat.total += sec;
+      stat.fastest = stat.fastest === null ? sec : Math.min(stat.fastest, sec);
+      if(String(row.at_utc || "").trim() > String(stat.latest_utc || "").trim()) stat.latest_utc = String(row.at_utc || "").trim();
+      perfMap.set(maintenanceName, stat);
+    });
+    return perfMap;
+  }
+
+  function activeMaintenanceMachineRows(sessions){
+    return (Array.isArray(sessions) ? sessions : []).filter((s) => {
+      if(!s || typeof s !== "object") return false;
+      const hasDowntime = Boolean(s.downtime_active);
+      const hasWait = Number(s.downtime_wait_started_at || 0) > 0 || Number(s.downtime_wait_last_seconds || 0) > 0;
+      const hasReason = String(s.downtime_reason_code || s.downtime_reason_text || "").trim() !== "";
+      return hasReason && (hasDowntime || hasWait);
+    });
+  }
+
+  function renderMaintenanceTab(state){
+    const sessions = Array.isArray(state?.sessions) ? state.sessions : [];
+    const maintenancePeople = maintenancePeopleFromState(state);
+    const activeMachines = activeMaintenanceMachineRows(sessions);
+    const perfMap = buildMaintenancePerfMap(state);
+    const assignments = new Map();
+    activeMachines.forEach((s) => {
+      const name = String(s.maintenance_name || "").trim();
+      if(!name) return;
+      const rows = assignments.get(name) || [];
+      rows.push(s);
+      assignments.set(name, rows);
+    });
+    const busyCount = assignments.size;
+    const availableCount = Math.max(0, maintenancePeople.length - busyCount);
+    const waitingCount = activeMachines.filter(s => !String(s.maintenance_name || "").trim()).length;
+    const activeFixCount = activeMachines.filter(s => Boolean(s.downtime_active)).length;
+    if(maintenanceCurrentDate){
+      maintenanceCurrentDate.textContent = maintenanceDateLabel(state?.server_time_utc || "");
+    }
+
+    if(maintenanceSummary){
+      maintenanceSummary.innerHTML = `
+        <div class="maintenance-metric blue"><div class="icon"></div><div><div class="k">Maintenance Today</div><div class="v">${esc(maintenancePeople.length)}</div><div class="s">Maintenance today&apos;s roles.</div></div></div>
+        <div class="maintenance-metric green"><div class="icon"></div><div><div class="k">Available Team</div><div class="v">${esc(availableCount)}</div><div class="s">Metric card for available team.</div></div></div>
+        <div class="maintenance-metric amber"><div class="icon"></div><div><div class="k">Active Repairs</div><div class="v">${esc(activeFixCount)}</div><div class="s">Active repairs in motion.</div></div></div>
+        <div class="maintenance-metric red"><div class="icon"></div><div><div class="k">Machines Waiting</div><div class="v">${esc(waitingCount)}</div><div class="s">Machines waiting assigned.</div></div></div>
+      `;
+    }
+
+    if(maintenancePeopleList){
+      if(!maintenancePeople.length){
+        maintenancePeopleList.innerHTML = '<div class="placeholder">No maintenance profiles yet.</div>';
+      } else {
+        const unassigned = activeMachines.filter(s => !String(s.maintenance_name || "").trim());
+        maintenancePeopleList.innerHTML = maintenancePeople.map((person) => {
+          const jobs = assignments.get(person.name) || [];
+          const busy = jobs.length > 0;
+          const perf = perfMap.get(person.name) || { count: 0, total: 0, fastest: null };
+          const avgRepair = perf.count ? fmtDowntimeSeconds(Math.round(perf.total / Math.max(1, perf.count))) : "00:00:00";
+          const waitFreq = perf.count ? `${Math.round((jobs.length / Math.max(1, perf.count)) * 100)}%` : "0%";
+          const avgWait = jobs.length ? fmtDowntimeSeconds(Math.round(jobs.reduce((sum, row) => sum + maintenanceMachineDurationSeconds(row), 0) / jobs.length)) : "00:00:00";
+          return `
+            <div class="maintenance-person ${busy ? "busy" : "available"}">
+              <div class="maintenance-avatar-wrap">
+                <div class="maintenance-avatar" aria-hidden="true"></div>
+              </div>
+              <div class="maintenance-person-main">
+                <div class="maintenance-person-head">
+                  <div>
+                    <div class="title">${esc(person.name)}</div>
+                    <div class="meta">Badge: ${esc(person.badge || "-")}</div>
+                  </div>
+                  <span class="maintenance-badge ${busy ? "busy" : "available"}">${busy ? "Fixing" : "Available"}</span>
+                </div>
+                <div class="submeta">${jobs.length ? `${jobs.length} active machine assignment${jobs.length > 1 ? "s" : ""}.` : "No active machines."}<br>${jobs.length ? "Ready to continue assigned work." : "Ready for new call."}</div>
+                <div class="maintenance-machine-grid">
+                  ${jobs.length ? jobs.map(renderMaintenanceMachineCard).join("") : '<div class="submeta">No active machines.</div>'}
+                </div>
+              </div>
+              <div class="maintenance-stats">
+                <div class="maintenance-stats-title">Lifetime Stats</div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">◷</span><span>Avg. Repair: ${esc(avgRepair)}</span></div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">⟳</span><span>Wait Freq: ${esc(waitFreq)}</span></div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">◷</span><span>Avg. Wait: ${esc(avgWait)}</span></div>
+              </div>
+            </div>
+          `;
+        }).join("") + (
+          unassigned.length ? `
+            <div class="maintenance-person">
+              <div class="maintenance-avatar-wrap">
+                <div class="maintenance-avatar" aria-hidden="true"></div>
+              </div>
+              <div class="maintenance-person-main">
+                <div class="maintenance-person-head">
+                  <div>
+                    <div class="title">Unassigned Maintenance Calls</div>
+                    <div class="meta">Badge: -</div>
+                  </div>
+                  <span class="maintenance-badge waiting">Waiting</span>
+                </div>
+                <div class="submeta">Machines waiting for maintenance assignment.</div>
+                <div class="maintenance-machine-grid">
+                  ${unassigned.map(renderMaintenanceMachineCard).join("")}
+                </div>
+              </div>
+              <div class="maintenance-stats">
+                <div class="maintenance-stats-title">Queue Stats</div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">◷</span><span>Waiting jobs: ${esc(unassigned.length)}</span></div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">⚙</span><span>Active repairs: ${esc(activeFixCount)}</span></div>
+                <div class="maintenance-stat-line"><span class="maintenance-stat-icon">△</span><span>Needs assignment now.</span></div>
+              </div>
+            </div>
+          ` : ""
+        );
+      }
+    }
+
+    if(maintenancePerformanceTableWrap){
+      const perfRows = Array.from(perfMap.values()).sort((a, b) => (a.total / Math.max(1, a.count)) - (b.total / Math.max(1, b.count)));
+      if(!perfRows.length){
+        maintenancePerformanceTableWrap.innerHTML = '<div class="placeholder">No downtime records with maintenance names yet.</div>';
+      } else {
+        maintenancePerformanceTableWrap.innerHTML = `
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Maintenance</th>
+                <th>Resolved Downtimes</th>
+                <th>Average Repair Time</th>
+                <th>Fastest Repair</th>
+                <th>Last Recorded</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${perfRows.map((row) => `
+                <tr>
+                  <td>${esc(row.name)}</td>
+                  <td>${esc(row.count)}</td>
+                  <td>${esc(fmtDowntimeSeconds(Math.round(row.total / Math.max(1, row.count))))}</td>
+                  <td>${esc(fmtDowntimeSeconds(row.fastest))}</td>
+                  <td>${esc(fmtDateLocal(row.latest_utc || ""))}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        `;
+      }
+    }
+  }
+
+  function queueStatusBadge(status){
+    const raw = String(status || "").trim();
+    const css = raw.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "running";
+    return `<span class="queue-status-badge ${esc(css)}">${esc(raw || "RUNNING")}</span>`;
+  }
+
+  function renderJobQueue(rows){
+    if(!jobQueueTableWrap) return;
+    const list = Array.isArray(rows) ? rows : [];
+    const runningRows = list.filter(r => {
+      const status = String(r?.status || "").trim();
+      return status !== "DONE" && status !== "DISCONNECTED";
+    });
+    const disconnectedRows = list.filter(r => String(r?.status || "").trim() === "DISCONNECTED");
+    const remainingTotal = runningRows.reduce((sum, r) => sum + Number(r?.remaining_qty || 0), 0);
+
+    if(jobQueueSummary){
+      jobQueueSummary.innerHTML = `
+        <div class="job-queue-metric"><div class="k">Active Jobs</div><div class="v">${esc(list.length)}</div></div>
+        <div class="job-queue-metric"><div class="k">Running Jobs</div><div class="v">${esc(runningRows.length)}</div></div>
+        <div class="job-queue-metric"><div class="k">Disconnected</div><div class="v">${esc(disconnectedRows.length)}</div></div>
+        <div class="job-queue-metric"><div class="k">Remaining Qty</div><div class="v">${esc(remainingTotal)}</div></div>
+      `;
+    }
+
+    if(!list.length){
+      jobQueueTableWrap.innerHTML = '<div class="placeholder">No active jobs in queue yet.</div>';
+      return;
+    }
+
+    jobQueueTableWrap.innerHTML = `
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Machine</th>
+            <th>Job</th>
+            <th>Operator</th>
+            <th>Started</th>
+            <th>Status</th>
+            <th>Produced</th>
+            <th>Target</th>
+            <th>Remaining</th>
+            <th>Time Remaining</th>
+            <th>Ends</th>
+            <th>Act Cycle ETA</th>
+            <th>Pack Cycle ETA</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${list.map((row) => {
+            const actCycleText = row?.act_cycle_seconds ? `${Number(row.act_cycle_seconds).toFixed(2)} sec | ${row?.act_qty_per_shift ?? "-"} / shift` : "-";
+            const packCycleText = row?.live_cycle_seconds ? `${Number(row.live_cycle_seconds).toFixed(2)} sec | ${row?.live_qty_per_shift ?? "-"} / shift` : "-";
+            const noTarget = Number(row?.target_qty || 0) <= 0;
+            const isDisconnected = !Boolean(row?.is_connected);
+            const startText = row?.job_started_at ? fmtDateLocal(row.job_started_at) : "-";
+            const actEtaDate = row?.expected_finish_act_utc ? fmtDateLocal(row.expected_finish_act_utc) : "";
+            const actEtaLeft = row?.expected_finish_act_utc ? `${fmtDowntimeSeconds(row?.remaining_seconds_act)} left${isDisconnected ? " (frozen)" : ""}` : (noTarget ? "No target qty" : (actCycleText === "-" ? "No act cycle time" : "Target reached"));
+            const packEtaDate = row?.expected_finish_pack_utc ? fmtDateLocal(row.expected_finish_pack_utc) : "";
+            const packEtaLeft = row?.expected_finish_pack_utc ? `${fmtDowntimeSeconds(row?.remaining_seconds_pack)} left${isDisconnected ? " (frozen)" : ""}` : (noTarget ? "No target qty" : (packCycleText === "-" ? "No pack cycle time" : "Target reached"));
+            const preferredRemaining = row?.remaining_seconds_pack ?? row?.remaining_seconds_act ?? null;
+            const preferredEnd = row?.expected_finish_pack_utc || row?.expected_finish_act_utc || "";
+            const remainingText = preferredRemaining != null
+              ? `${fmtDowntimeSeconds(preferredRemaining)}${isDisconnected ? " (frozen)" : ""}`
+              : (noTarget ? "No target qty" : "Target reached");
+            const endText = preferredEnd ? fmtDateLocal(preferredEnd) : (noTarget ? "No target qty" : "Target reached");
+            return `
+              <tr>
+                <td>${esc(row?.machine_name || row?.machine_code || "-")}<br><span class="muted">${esc(row?.machine_code || "-")}</span></td>
+                <td>${esc(row?.job_name || row?.job_code || "-")}<br><span class="muted">${esc(row?.job_code || "-")}</span></td>
+                <td>${esc(displayNameForId(row?.operator_id || "-"))}${row?.last_seen_utc ? `<br><span class="muted">Last seen ${esc(fmtDateLocal(row.last_seen_utc))}</span>` : ""}</td>
+                <td>${esc(startText)}</td>
+                <td>${queueStatusBadge(row?.status || "RUNNING")}</td>
+                <td>${esc(row?.produced_now ?? 0)}<br><span class="muted">Pack ${esc(row?.pack_count ?? 0)}</span></td>
+                <td>${esc(row?.target_qty ?? 0)}<br><span class="muted">Cavity ${esc(row?.cavity_count ?? 1)}</span></td>
+                <td>${esc(row?.remaining_qty ?? 0)}${Number(row?.overrun_qty || 0) > 0 ? `<br><span class="muted">Over ${esc(row?.overrun_qty || 0)}</span>` : ""}</td>
+                <td>${esc(remainingText)}</td>
+                <td>${esc(endText)}</td>
+                <td>${actEtaDate ? `${esc(actEtaDate)}<br>` : ""}<span class="muted">${esc(actEtaLeft)}</span><br><span class="muted">${esc(actCycleText)}</span></td>
+                <td>${packEtaDate ? `${esc(packEtaDate)}<br>` : ""}<span class="muted">${esc(packEtaLeft)}</span><br><span class="muted">${esc(packCycleText)}</span></td>
+              </tr>
+            `;
+          }).join("")}
+        </tbody>
+      </table>
+    `;
+  }
+
   function setFinishedJobsInteractionLock(locked){
     finishedJobsInteractionLock = Boolean(locked);
     if(!finishedJobsInteractionLock && pendingFinishedJobsRows){
@@ -1288,6 +1896,9 @@
   function openApprovePrintOverlay(job){
     activeJobRow = job || null;
     overlayReviewSavedApproved = false;
+    overlayReviewMode = isShiftPartialRecord(activeJobRow) ? "shift" : "job";
+    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = overlayReviewMode === "shift" ? "Save Changes" : "Save Review";
+    if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = overlayReviewMode === "shift" ? "none" : "";
     const title = activeJobRow
       ? `${activeJobRow.job_name || activeJobRow.job_code || "Finished Job"} | ${activeJobRow.machine_name || activeJobRow.machine_code || "-"}`
       : "Finished Job";
@@ -1295,58 +1906,78 @@
     overlayJobInfo.value = title;
     if(overlayReviewJobInfo) overlayReviewJobInfo.value = title;
     if(overlayReviewJobInfoDisplay) overlayReviewJobInfoDisplay.textContent = title;
-    if(overlayReviewSummary) overlayReviewSummary.value = reviewSummaryText(activeJobRow);
-    if(overlayReviewRejects) overlayReviewRejects.value = reviewRejectsText(activeJobRow);
-    if(overlayReviewSummaryDisplay) overlayReviewSummaryDisplay.innerHTML = renderSummaryMetricsHtml(activeJobRow);
-    if(overlayReviewRejectsDisplay) overlayReviewRejectsDisplay.innerHTML = renderBulletListHtml(reviewRejectsText(activeJobRow), "No reject details recorded.");
+    const shiftPanels = overlayReviewMode === "shift" ? buildShiftPreviewPanels(activeJobRow) : null;
+    if(overlayReviewSummary) overlayReviewSummary.value = shiftPanels ? shiftPanels.summary : reviewSummaryText(activeJobRow);
+    if(overlayReviewRejects) overlayReviewRejects.value = shiftPanels ? shiftPanels.rejects : reviewRejectsText(activeJobRow);
+    if(overlayReviewSummaryDisplay) overlayReviewSummaryDisplay.innerHTML = shiftPanels
+      ? renderShiftGroupedPanelHtml(shiftPanels.summary, "No shift summary.")
+      : renderSummaryMetricsHtml(activeJobRow);
+    if(overlayReviewRejectsDisplay) overlayReviewRejectsDisplay.innerHTML = shiftPanels
+      ? renderShiftGroupedPanelHtml(shiftPanels.rejects, "No reject details recorded.")
+      : renderBulletListHtml(reviewRejectsText(activeJobRow), "No reject details recorded.");
     const rawLogs = Array.isArray(activeJobRow?.raw_material_logs) ? activeJobRow.raw_material_logs : [];
-    if(overlayRawConsumption) overlayRawConsumption.value = rawLogs.length
-      ? rawLogs.map((x, i) => rawMaterialLine(x, i)).join("\\n")
-      : "No raw material consumption records.";
-    if(overlayRawConsumptionDisplay) overlayRawConsumptionDisplay.innerHTML = renderBulletListHtml(overlayRawConsumption?.value || "", "No raw material consumption records.");
-    if(overlayRawCycleSummary) overlayRawCycleSummary.value = [
-      `Raw Materials / Sacks Count: ${activeJobRow?.raw_sacks_count ?? 0}`,
-      `Cycle Count (Pack): ${activeJobRow?.pack_count ?? 0}`,
-      `Cycle Time: ${activeJobRow?.cycle_time_current || "-"}`,
-    ].join("\\n");
-    if(overlayRawCycleSummaryDisplay) overlayRawCycleSummaryDisplay.innerHTML = renderBulletListHtml(overlayRawCycleSummary?.value || "");
-    if(overlayDowntimeSummary) overlayDowntimeSummary.value = [
-      `Reason: ${activeJobRow?.downtime_reason_code || "-"} ${activeJobRow?.downtime_reason_text || ""}`.trim(),
-      `Downtime: ${fmtDowntimeSeconds(activeJobRow?.downtime_last_seconds)}`,
-    ].join("\\n");
-    if(overlayDowntimeSummaryDisplay) overlayDowntimeSummaryDisplay.innerHTML = renderBulletListHtml(overlayDowntimeSummary?.value || "");
-    if(overlayPeopleSummary) overlayPeopleSummary.value = [
-      `Maintenance: ${activeJobRow?.maintenance_name || "-"}`,
-      `Supervisor: ${activeJobRow?.supervisor_name || "-"}`,
-      `QC: ${qcFromFinishedJob(activeJobRow)}`,
-      `Start Up Reject: ${activeJobRow?.startup_reject_total ?? 0}`,
-    ].join("\\n");
-    if(overlayPeopleSummaryDisplay) overlayPeopleSummaryDisplay.innerHTML = renderBulletListHtml(overlayPeopleSummary?.value || "");
+    if(overlayRawConsumption) overlayRawConsumption.value = shiftPanels
+      ? shiftPanels.rawConsumption
+      : (rawLogs.length
+        ? rawLogs.map((x, i) => rawMaterialLine(x, i)).join("\\n")
+        : "No raw material consumption records.");
+    if(overlayRawConsumptionDisplay) overlayRawConsumptionDisplay.innerHTML = shiftPanels
+      ? renderShiftGroupedPanelHtml(shiftPanels.rawConsumption, "No raw material consumption records.")
+      : renderBulletListHtml(overlayRawConsumption?.value || "", "No raw material consumption records.");
+    if(overlayRawCycleSummary) overlayRawCycleSummary.value = shiftPanels
+      ? shiftPanels.rawCycle
+      : [
+        `Raw Materials / Sacks Count: ${activeJobRow?.raw_sacks_count ?? 0}`,
+        `Cycle Count (Pack): ${activeJobRow?.pack_count ?? 0}`,
+        `Cycle Time: ${activeJobRow?.cycle_time_current || "-"}`,
+      ].join("\\n");
+    if(overlayRawCycleSummaryDisplay) overlayRawCycleSummaryDisplay.innerHTML = shiftPanels
+      ? renderShiftGroupedPanelHtml(shiftPanels.rawCycle, "No raw/cycle data.")
+      : renderBulletListHtml(overlayRawCycleSummary?.value || "");
+    if(overlayDowntimeSummary) overlayDowntimeSummary.value = shiftPanels
+      ? shiftPanels.downtime
+      : [
+        `Reason: ${activeJobRow?.downtime_reason_code || "-"} ${activeJobRow?.downtime_reason_text || ""}`.trim(),
+        `Downtime: ${fmtDowntimeSeconds(activeJobRow?.downtime_last_seconds)}`,
+      ].join("\\n");
+    if(overlayDowntimeSummaryDisplay) overlayDowntimeSummaryDisplay.innerHTML = shiftPanels
+      ? renderShiftGroupedPanelHtml(shiftPanels.downtime, "No downtime data.")
+      : renderBulletListHtml(overlayDowntimeSummary?.value || "");
+    if(overlayPeopleSummary) overlayPeopleSummary.value = shiftPanels
+      ? shiftPanels.people
+      : [
+        `Maintenance: ${activeJobRow?.maintenance_name || "-"}`,
+        `Supervisor: ${activeJobRow?.supervisor_name || "-"}`,
+        `QC: ${qcFromFinishedJob(activeJobRow)}`,
+        `Start Up Reject: ${activeJobRow?.startup_reject_total ?? 0}`,
+        `No Shot: ${activeJobRow?.no_shot_total ?? 0}`,
+      ].join("\\n");
+    if(overlayPeopleSummaryDisplay) overlayPeopleSummaryDisplay.innerHTML = shiftPanels
+      ? renderShiftGroupedPanelHtml(shiftPanels.people, "No team data.")
+      : renderBulletListHtml(overlayPeopleSummary?.value || "");
     if(overlayReviewerBadge) overlayReviewerBadge.value = "";
     if(overlayReviewerScanInput){
       overlayReviewerScanInput.value = "";
       overlayReviewerScanInput.style.display = "none";
     }
     if(overlayReviewRemarks) overlayReviewRemarks.value = "";
-    if(overlayReviewAction) overlayReviewAction.value = "approve";
-    if(overlayDisapproveFields) overlayDisapproveFields.style.display = "none";
     fillDisapproveFields(activeJobRow);
     reviewSlideIndex = 0;
     syncReviewSubslides();
     setOverlayStep("review");
-    if(generatedQrState.jobKey === key){
-      overlayQrPayload.value = generatedQrState.payload || "";
-      overlayQty.value = generatedQrState.qty || "";
-      overlayIndex.value = generatedQrState.index || "";
-      overlayTotal.value = generatedQrState.total || "";
-      overlayLotNumber.value = generatedQrState.lotNumber || "";
-    } else {
-      generatedQrState = { jobKey: key, payload: "", qty: "", index: "", total: "", lotNumber: "" };
-      overlayQrPayload.value = "";
-      overlayQty.value = "";
-      overlayIndex.value = "";
-      overlayTotal.value = "";
-      overlayLotNumber.value = "";
+    generatedQrState = { jobKey: key, payload: "", qty: "", index: "", total: "", lotNumber: "", stageLabel: "", stageKind: "", plan: [], planIndex: 0, printRequests: [] };
+    overlayQrPayload.value = "";
+    overlayQty.value = "";
+    overlayIndex.value = "";
+    overlayTotal.value = "";
+    overlayLotNumber.value = "";
+    if(overlayQrStageLabel) overlayQrStageLabel.value = "2 / 2 - QR Print";
+    if(overlayPoNumber){
+      overlayPoNumber.value = "";
+      overlayPoNumber.placeholder = "Enter PO Number...";
+    }
+    if(overlayPoNumberRow){
+      overlayPoNumberRow.style.display = "none";
     }
     approvePrintOverlay.classList.add("active");
     if(productItems.length){
@@ -1358,6 +1989,7 @@
     approvePrintOverlay.classList.remove("active");
     activeJobRow = null;
     overlayReviewSavedApproved = false;
+    overlayReviewMode = "job";
     reviewSlideIndex = 0;
     syncReviewSubslides();
     setOverlayStep("review");
@@ -1383,6 +2015,7 @@
       <p>Good: <strong>${esc(s.good_total)}</strong></p>
       <p>Butal: <strong>${esc(s.butal_total)}</strong></p>
       <p>Reject: <strong>${esc(s.reject_total)}</strong></p>
+      <p>No Shot: <strong>${esc(s.no_shot_total || 0)}</strong></p>
       <p>Total: <strong>${esc(total)}</strong></p>
       <p class="muted">Last Seen: ${esc(seenLabel)}</p>
       <p class="muted">Last Event: ${esc(s.last_event || "-")}</p>
@@ -1409,7 +2042,6 @@
     latestState = state || { sessions: [] };
     machineStatusOverridesState = (state && state.machine_status_overrides && typeof state.machine_status_overrides === "object") ? state.machine_status_overrides : {};
     machineStatusArchiveState = (state && Array.isArray(state.machine_status_archive)) ? state.machine_status_archive : [];
-    operatorShiftSummaryState = (state && Array.isArray(state.operator_shift_summaries)) ? state.operator_shift_summaries : [];
     timeEl.textContent = "Server UTC: " + (state.server_time_utc || "-");
     const sessions = state.sessions || [];
     const activeTtlSeconds = Number(state.active_ttl_seconds || 30);
@@ -1433,6 +2065,7 @@
         good_total: 0,
         butal_total: 0,
         reject_total: 0,
+        no_shot_total: 0,
         last_event: "No data yet",
         last_seen_utc: "",
       };
@@ -1452,11 +2085,12 @@
       if(card && card.parentNode) card.parentNode.removeChild(card);
       machineCardEls.delete(code);
     }
+    renderJobQueue(state.job_queue || []);
     renderFinishedJobs(state.finished_jobs || []);
     renderArchivedJobs(state.archived_jobs || []);
-    renderOperatorShiftSummary(operatorShiftSummaryState);
     renderMachineStatusArchive(machineStatusArchiveState);
     renderDowntimeArchive(state.finished_jobs || [], state.archived_jobs || []);
+    renderMaintenanceTab(state || {});
   }
 
   // tab handling
@@ -1467,6 +2101,17 @@
       document.querySelectorAll(".main-tab-content").forEach(c => c.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById(target)?.classList.add("active");
+    });
+  });
+  document.querySelectorAll(".sub-tab-button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const host = btn.closest(".panel");
+      if(!host) return;
+      const target = btn.getAttribute("data-target");
+      host.querySelectorAll(".sub-tab-button").forEach(b => b.classList.remove("active"));
+      host.querySelectorAll(".sub-tab-content").forEach(c => c.classList.remove("active"));
+      btn.classList.add("active");
+      host.querySelector(`#${target}`)?.classList.add("active");
     });
   });
 
@@ -1596,6 +2241,19 @@
     }
     setTimeout(() => setFinishedJobsInteractionLock(false), 0);
   });
+  finishedShiftQueueList?.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest(".shift-review-btn");
+    if(!btn) return;
+    const idx = Number(btn.getAttribute("data-row-index"));
+    if(Number.isNaN(idx) || idx < 0) return;
+    const sorted = [...(finishedShiftState || [])].reverse();
+    const row = sorted[idx];
+    if(!row) return;
+    openApprovePrintOverlay(row);
+    setOverlayStep("review");
+    if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = "none";
+    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = "Save Changes";
+  });
   finishedJobsList.addEventListener("mouseover", (ev) => {
     if(ev.target.closest(".approve-print-btn")) setFinishedJobsInteractionLock(true);
   });
@@ -1622,29 +2280,6 @@
 
   overlayCloseBtn.addEventListener("click", closeApprovePrintOverlay);
   overlayCancelBtn.addEventListener("click", closeApprovePrintOverlay);
-  if(overlayReviewAction){
-    overlayReviewAction.addEventListener("change", () => {
-      if(overlayDisapproveFields){
-        overlayDisapproveFields.style.display = overlayReviewAction.value === "disapprove" ? "" : "none";
-      }
-      if(overlayReviewAction.value === "disapprove" && reviewSlideIndex < 3){
-        reviewSlideIndex = 3;
-        syncReviewSubslides();
-      }
-    });
-  }
-  if(overlayReviewPrevBtn){
-    overlayReviewPrevBtn.addEventListener("click", () => {
-      reviewSlideIndex = Math.max(0, reviewSlideIndex - 1);
-      syncReviewSubslides();
-    });
-  }
-  if(overlayReviewNextBtn){
-    overlayReviewNextBtn.addEventListener("click", () => {
-      reviewSlideIndex = Math.min(3, reviewSlideIndex + 1);
-      syncReviewSubslides();
-    });
-  }
   if(overlayOpenScanFieldBtn && overlayReviewerScanInput){
     overlayOpenScanFieldBtn.addEventListener("click", () => {
       openQrScanCaptureOverlay();
@@ -1668,6 +2303,14 @@
     });
   }
   if(overlayBackToReviewBtn) overlayBackToReviewBtn.addEventListener("click", () => setOverlayStep("review"));
+  if(overlayReviewPrevBtn) overlayReviewPrevBtn.addEventListener("click", () => {
+    reviewSlideIndex = Math.max(0, Number(reviewSlideIndex || 0) - 1);
+    syncReviewSubslides();
+  });
+  if(overlayReviewNextBtn) overlayReviewNextBtn.addEventListener("click", () => {
+    reviewSlideIndex = Math.min(3, Number(reviewSlideIndex || 0) + 1);
+    syncReviewSubslides();
+  });
   machineDetailCloseBtn.addEventListener("click", closeMachineDetail);
   machineDetailSettingsBtn?.addEventListener("click", () => {
     if(!machineDetailStatusPanel) return;
@@ -1750,6 +2393,16 @@
   overlayProductSelect.addEventListener("input", () => {
     renderProductSuggestions(overlayProductSelect.value || "");
   });
+  overlayPoNumber?.addEventListener("input", () => {
+    if(generatedQrState.stageKind === "BUTAL"){
+      const po = (overlayPoNumber.value || "").trim();
+      if(!po){
+        overlayQrPayload.value = "Enter PO Number for Butal.";
+        return;
+      }
+      refreshQrStagePayload().catch(() => {});
+    }
+  });
 
   overlayProductSelect.addEventListener("keydown", (ev) => {
     if(!overlayProductSuggest.classList.contains("active")){
@@ -1801,45 +2454,7 @@
   });
 
   overlayGenerateBtn.addEventListener("click", async () => {
-    if(!overlayReviewSavedApproved){
-      overlayQrPayload.value = "Review approval is required before generating QR.";
-      return;
-    }
-    const productId = resolveProductIdFromText(overlayProductSelect.value || "");
-    if(!productId){
-      overlayQrPayload.value = "Select a product first.";
-      return;
-    }
-    const poNumber = (overlayPoNumber.value || "").trim();
-    if(!poNumber){
-      overlayQrPayload.value = "Provide PO Number first.";
-      return;
-    }
-    const resp = await fetch("/api/raw-material-qr", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        product_id: productId,
-        po_number: poNumber,
-        finished_job: activeJobRow || {},
-      }),
-    });
-    const out = await resp.json();
-    const payloadText = out.qr_payload || out.error || "Failed to generate.";
-    overlayQrPayload.value = payloadText;
-    const parsed = out.parsed || {};
-    overlayQty.value = parsed.qty || "";
-    overlayIndex.value = parsed.index || "";
-    overlayTotal.value = parsed.total || "";
-    overlayLotNumber.value = parsed.lot_number || "";
-    generatedQrState = {
-      jobKey: jobKeyOf(activeJobRow),
-      payload: payloadText,
-      qty: overlayQty.value || "",
-      index: overlayIndex.value || "",
-      total: overlayTotal.value || "",
-      lotNumber: overlayLotNumber.value || "",
-    };
+    await refreshQrStagePayload();
   });
 
   overlayRequestBtn.addEventListener("click", async () => {
@@ -1856,8 +2471,11 @@
     const total = (overlayTotal.value || "").trim();
     const poNumber = (overlayPoNumber.value || "").trim();
     const lotNumber = (overlayLotNumber.value || "").trim();
-    if(!quantity || !total || !poNumber || !lotNumber){
-      overlayQrPayload.value = "Generate QR first so Quantity/Total/Lot/PO are complete.";
+    const stageNeedsPo = generatedQrState.stageKind === "BUTAL";
+    if(!quantity || !total || !lotNumber || (stageNeedsPo && !poNumber)){
+      overlayQrPayload.value = stageNeedsPo
+        ? "Generate QR first so Quantity/Total/Lot/PO are complete."
+        : "Generate QR first so Quantity/Total/Lot are complete.";
       return;
     }
 
@@ -1870,6 +2488,7 @@
       product_desc: (activeJobRow && (activeJobRow.job_name || activeJobRow.job_code)) || "",
       requested_at_ph: "",
       lot_number: lotNumber,
+      qr_stage_label: generatedQrState.stageLabel || "",
     };
 
     const resp = await fetch("/api/qrgen/pending-request", {
@@ -1879,7 +2498,19 @@
     });
     const out = await resp.json();
     if(out.ok){
-      overlayQrPayload.value = `${overlayQrPayload.value}\n\nPrint request sent.`;
+      generatedQrState.printRequests = [...(generatedQrState.printRequests || []), requestPayload];
+      const hasNext = Array.isArray(generatedQrState.plan) && generatedQrState.planIndex < (generatedQrState.plan.length - 1);
+      if(hasNext){
+        generatedQrState.planIndex += 1;
+        applyGeneratedQrPlanEntry(generatedQrState.plan[generatedQrState.planIndex]);
+        if(generatedQrState.stageKind === "BUTAL"){
+          overlayQrPayload.value = "Enter PO Number for Butal.";
+        } else {
+          overlayQrPayload.value = `${overlayQrPayload.value}\n\nPrint request sent. Next QR stage loaded.`;
+        }
+        return;
+      }
+      overlayQrPayload.value = `${overlayQrPayload.value}\n\nPrint request sent. Shift finished.`;
       try {
         const archiveResp = await fetch("/api/finished-jobs/archive", {
           method: "POST",
@@ -1888,6 +2519,7 @@
             job_key: jobKeyOf(activeJobRow),
             qr_payload: overlayQrPayload.value || "",
             print_payload: requestPayload,
+            print_payloads: generatedQrState.printRequests || [],
           }),
         });
         const archiveOut = await archiveResp.json();
@@ -1904,7 +2536,10 @@
         overlayQrPayload.value = `${overlayQrPayload.value}\nArchive warning: ${e}`;
       }
     } else {
-      overlayQrPayload.value = out.error || "Print request failed.";
+      const apiMsg = out?.target_base_url
+        ? `QR generator API is not available. ${out.error || "Request failed."}`
+        : (out.error || "Print request failed.");
+      overlayQrPayload.value = apiMsg;
     }
   });
 
@@ -1912,7 +2547,9 @@
     if(!activeJobRow) return;
     const reviewerBadge = (overlayReviewerBadge.value || "").trim();
     const remarks = (overlayReviewRemarks.value || "").trim();
-    const action = actionMode === "continue" ? "approve" : (overlayReviewAction.value || "approve");
+    const action = overlayReviewMode === "shift"
+      ? "update"
+      : (actionMode === "continue" ? "approve" : "disapprove");
     if(!reviewerBadge){
       overlayReviewRemarks.value = remarks;
       alert("Reviewer QR / badge is required.");
@@ -1922,24 +2559,21 @@
       alert("Remarks are required.");
       return;
     }
-    let changes = {};
-    if(action === "disapprove"){
-      let rejectBreakdown = {};
-      try {
-        rejectBreakdown = JSON.parse((editRejectBreakdown.value || "{}").trim() || "{}");
-      } catch {
-        alert("Reject Details JSON is invalid.");
-        return;
-      }
-      changes = {
-        pack_count: Number(editPackCount.value || 0),
-        good_total: Number(editGoodTotal.value || 0),
-        butal_total: Number(editButalTotal.value || 0),
-        reject_total: Number(editRejectTotal.value || 0),
-        total_good: Number(editTotalGood.value || 0),
-        reject_breakdown: rejectBreakdown,
-      };
+    let rejectBreakdown = {};
+    try {
+      rejectBreakdown = JSON.parse((editRejectBreakdown.value || "{}").trim() || "{}");
+    } catch {
+      alert("Reject Details JSON is invalid.");
+      return;
     }
+    const changes = {
+      pack_count: Number(editPackCount.value || 0),
+      good_total: Number(editGoodTotal.value || 0),
+      butal_total: Number(editButalTotal.value || 0),
+      reject_total: Number(editRejectTotal.value || 0),
+      total_good: Number(editTotalGood.value || 0),
+      reject_breakdown: rejectBreakdown,
+    };
     const resp = await fetch("/api/finished-jobs/review", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1959,10 +2593,15 @@
     activeJobRow = out.item || activeJobRow;
     overlayReviewJobInfo.value = `${activeJobRow.job_name || activeJobRow.job_code || "Finished Job"} | ${activeJobRow.machine_name || activeJobRow.machine_code || "-"}`;
     if(overlayReviewJobInfoDisplay) overlayReviewJobInfoDisplay.textContent = overlayReviewJobInfo.value;
-    overlayReviewSummary.value = reviewSummaryText(activeJobRow) + `\\n\\nStatus: ${activeJobRow.review_status || "-"}`;
-    overlayReviewRejects.value = reviewRejectsText(activeJobRow);
-    if(overlayReviewSummaryDisplay) overlayReviewSummaryDisplay.innerHTML = renderSummaryMetricsHtml(activeJobRow);
-    if(overlayReviewRejectsDisplay) overlayReviewRejectsDisplay.innerHTML = renderBulletListHtml(overlayReviewRejects.value || "", "No reject details recorded.");
+    const shiftPanels = overlayReviewMode === "shift" ? buildShiftPreviewPanels(activeJobRow) : null;
+    overlayReviewSummary.value = shiftPanels ? safeJsonPretty(shiftPanels.summary) : reviewSummaryText(activeJobRow) + `\\n\\nStatus: ${activeJobRow.review_status || "-"}`;
+    overlayReviewRejects.value = shiftPanels ? safeJsonPretty(shiftPanels.rejects) : reviewRejectsText(activeJobRow);
+    if(overlayReviewSummaryDisplay) overlayReviewSummaryDisplay.innerHTML = shiftPanels
+      ? renderShiftGroupedPanelHtml(shiftPanels.summary, "No shift summary.")
+      : renderSummaryMetricsHtml(activeJobRow);
+    if(overlayReviewRejectsDisplay) overlayReviewRejectsDisplay.innerHTML = shiftPanels
+      ? renderShiftGroupedPanelHtml(shiftPanels.rejects, "No reject details recorded.")
+      : renderBulletListHtml(overlayReviewRejects.value || "", "No reject details recorded.");
     fillDisapproveFields(activeJobRow);
     if(Array.isArray(latestState.finished_jobs)){
       const k = jobKeyOf(activeJobRow);
@@ -1972,10 +2611,20 @@
     if(actionMode === "continue"){
       overlayReviewSavedApproved = true;
       setOverlayStep("qr");
+      generatedQrState = { jobKey: jobKeyOf(activeJobRow), payload: "", qty: "", index: "", total: "", lotNumber: "", stageLabel: "", stageKind: "", plan: [], planIndex: 0, printRequests: [] };
+      if(overlayPoNumber){
+        overlayPoNumber.value = "";
+      }
+      if(overlayPoNumberRow){
+        overlayPoNumberRow.style.display = "none";
+      }
+      setTimeout(() => { refreshQrStagePayload().catch(() => {}); }, 0);
     } else {
       overlayReviewSavedApproved = action === "approve";
       if(action === "approve"){
         alert("Approved and saved. You can now continue to QR.");
+      } else if(action === "update"){
+        alert("Shift review changes saved.");
       } else {
         alert("Disapproved changes saved. Review again and approve to continue to QR.");
       }

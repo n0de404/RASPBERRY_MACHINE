@@ -135,6 +135,22 @@ QLabel#RightMonitorValueAccent {
                                 stop:1 rgba(60,63,70,236));
     border: 1px solid #858992;
 }
+QLabel#RightMonitorValue[warn="1"][flash="1"] {
+    color: #fff1f2;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(239,68,68,245),
+                                stop:0.55 rgba(185,28,28,238),
+                                stop:1 rgba(127,29,29,236));
+    border: 1px solid #b91c1c;
+}
+QLabel#RightMonitorValue[warn="1"] {
+    color: #fff1f2;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(239,68,68,245),
+                                stop:0.55 rgba(185,28,28,238),
+                                stop:1 rgba(127,29,29,236));
+    border: 1px solid #b91c1c;
+}
 QLabel#ProductionLiveReason {
     color: #0f172a;
     font-size: 16px;
@@ -272,6 +288,22 @@ QLabel#MetaValue {
     border: 1px solid #777c86;
     border-radius: 14px;
     padding: 10px 12px;
+}
+QLabel#MetaValue[warn="1"][flash="1"] {
+    color: #fff1f2;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(239,68,68,245),
+                                stop:0.55 rgba(185,28,28,238),
+                                stop:1 rgba(127,29,29,236));
+    border: 1px solid #b91c1c;
+}
+QLabel#MetaValue[warn="1"] {
+    color: #fff1f2;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(239,68,68,245),
+                                stop:0.55 rgba(185,28,28,238),
+                                stop:1 rgba(127,29,29,236));
+    border: 1px solid #b91c1c;
 }
 QLabel#RejectDetailItem {
     color: #6b7280;

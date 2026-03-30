@@ -11,9 +11,10 @@ from typing import Optional, Dict, Any
 MACHINE_MAP: Dict[str, str] = {
     "M00001": "IMM 301",
     "M00002": "IMM 302",
-    "M00004": "IMM 303",
-    "M00005": "IMM 304",
-    "M00006": "IMM 305",
+    "M00003": "IMM 303",
+    "M00004": "IMM 304",
+    "M00005": "IMM 305",
+    "M00006": "IMM 306",
     "M00007": "IMM 307",
     "M00008": "IMM 308",
     "M00009": "IMM 309",
@@ -40,6 +41,21 @@ REJECT_REASON_MAP: Dict[str, str] = {
     "CO03": "CONTAMINATION",
     "CR04": "CRACK/BRITTLE",
     "DI05": "DISCOLORATION",
+    "EM06": "EJECTOR MARK",
+    "FL07": "FLASHES",
+    "F08": "FLOW MARK/ WRINKLE",
+    "FM08": "FLOW MARK/ WRINKLE",
+    "NO": "NO SHOT",
+    "OC09": "OVER-CUT",
+    "SC10": "SCRATCH",
+    "SS11": "SHORT SHOT",
+    "SI12": "SILICONE MARK",
+    "SK13": "SILVER STREAK",
+    "ST14": "STUCK",
+    "VO15": "VOID",
+    "WA": "WARP",
+    "WM": "WATER MARK",
+    "WL": "WELD LINE",
 }
 
 OPERATOR_MAP: Dict[str, str] = {
@@ -195,7 +211,12 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
 
     # Reject reason code
     if s in REJECT_REASON_MAP:
-        return ScanResult(kind="REJECT_REASON", raw=raw, value=REJECT_REASON_MAP[s])
+        return ScanResult(
+            kind="REJECT_REASON",
+            raw=raw,
+            value=s,
+            meta={"reason_text": REJECT_REASON_MAP[s]},
+        )
     if s_l == "sur":
         return ScanResult(kind="STARTUP_REJECT", raw=raw, value="Start Up Reject", qty=1)
 

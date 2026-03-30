@@ -1,5 +1,5 @@
 {
-  "server_url": "http://192.168.1.178:8000",
+  "server_url": "http://192.168.1.213:8000",
   "client_id": "philtop-it-001",
   "scanner_mode": "auto",
   "scanner_com_port": "Com2",
