@@ -1,0 +1,63 @@
+# -*- mode: python ; coding: utf-8 -*-
+
+from pathlib import Path
+
+
+project_dir = Path.cwd()
+datas = [
+    (str(project_dir / "Animations"), "Animations"),
+    (str(project_dir / "Assets"), "Assets"),
+    (str(project_dir / "Database"), "Database"),
+    (str(project_dir / "Images"), "Images"),
+    (str(project_dir / "PDR_Icon"), "PDR_Icon"),
+    (str(project_dir / "digital-7.ttf"), "."),
+    (str(project_dir / "bgsteel.jpg"), "."),
+]
+
+hiddenimports = [
+    "PyQt6",
+    "PyQt6.QtCore",
+    "PyQt6.QtGui",
+    "PyQt6.QtWidgets",
+    "requests",
+    "pymysql",
+    "pymysql.cursors",
+    "serial",
+]
+
+
+a = Analysis(
+    ["client.py"],
+    pathex=[str(project_dir)],
+    binaries=[],
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name="RaspberryMachineClient",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)

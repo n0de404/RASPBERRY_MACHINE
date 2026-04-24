@@ -93,6 +93,8 @@ FINISHED_JOBS_FILE = os.path.join(DATABASE_DIR, "finished_jobs.json")
 FINISH_SHIFT_FILE = os.path.join(DATABASE_DIR, "finish_shift.json")
 SQL_CONFIG_FILE = os.path.join(DATABASE_DIR, "sql_config.json")
 APP_LOGS_FILE = os.path.join(DATABASE_DIR, "app_logs.json")
+CLIENT_SETTINGS_FILE = os.path.join(DATABASE_DIR, "client_settings.json")
+DAILY_ROLE_ASSIGNMENTS_FILE = os.path.join(DATABASE_DIR, "daily_role_assignments.json")
 APP_LOG_MAX_ROWS = 5000
 APP_LOG_TABLE_MAX_ROWS = 400
 RECORD_TYPE_SHIFT_PARTIAL = "SHIFT_PARTIAL"
@@ -1330,12 +1332,6 @@ def _migrate_app_logs_json_to_sql() -> bool:
     return ok
 
 
-_ensure_sql_schema()
-_migrate_active_sessions_json_to_sql()
-_migrate_finish_shift_json_to_sql()
-_migrate_app_logs_json_to_sql()
-
-
 def _load_client_config() -> Dict[str, Any]:
     defaults = {
         "server_url": SERVER_URL,
@@ -1346,9 +1342,14 @@ def _load_client_config() -> Dict[str, Any]:
         "scanner_timeout": SCANNER_TIMEOUT,
         "graphics_mode": _default_graphics_mode(),
     }
-    raw = _load_client_settings_sql()
-    if isinstance(raw, dict):
-        defaults.update(raw)
+    try:
+        if os.path.exists(CLIENT_SETTINGS_FILE):
+            with open(CLIENT_SETTINGS_FILE, "r", encoding="utf-8-sig") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                defaults.update(raw)
+    except Exception:
+        pass
 
     # Allow runtime environment overrides to take priority over persisted settings.
     env_overrides = {
@@ -1450,7 +1451,12 @@ def _save_job_api_config(cfg: Dict[str, Any]):
 
 
 def _save_client_config(cfg: Dict[str, Any]):
-    _save_client_settings_sql(cfg)
+    try:
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        with open(CLIENT_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def _machine_display_name(machine_code: Optional[str], machine_name: Optional[str] = None) -> str:
@@ -3167,8 +3173,7 @@ class ClientUI(QWidget):
         self._product_catalog_last_refresh_attempt = 0.0
         self._product_catalog_refresh_inflight = False
         self._action_logs: List[str] = []
-        sql_app_logs = _load_app_logs_sql()
-        self._app_logs: List[Dict[str, Any]] = sql_app_logs if sql_app_logs else _load_app_logs_json()
+        self._app_logs: List[Dict[str, Any]] = _load_app_logs_json()
         self._app_logs_dirty = True
         self._avg_weight_server: Optional[ThreadingHTTPServer] = None
         self._avg_weight_server_thread: Optional[threading.Thread] = None
@@ -7154,23 +7159,39 @@ QWidget#ClientUIRoot {{
                     out_profiles = resp_profiles.json()
                     items = out_profiles.get("items") if isinstance(out_profiles, dict) else None
                     if isinstance(items, list):
-                        ok = _save_profiles_sql(items) or ok
+                        os.makedirs(DATABASE_DIR, exist_ok=True)
+                        with open(USER_QR_PROFILES_FILE, "w", encoding="utf-8") as f:
+                            json.dump(items, f, ensure_ascii=False, indent=2)
+                        ok = True
 
-                # Daily roles cache is SQL-backed as {date: items}.
+                # Daily roles cache stays local on the client.
                 resp_roles = requests.get(f"{server_url}/api/daily-roles", headers=headers, timeout=2.5)
                 if resp_roles.status_code == 200:
                     out_roles = resp_roles.json()
                     if isinstance(out_roles, dict):
                         date_key = str(out_roles.get("date") or "").strip()
                         items = out_roles.get("items")
+                        local_daily: Dict[str, Any] = {}
+                        try:
+                            if os.path.exists(DAILY_ROLE_ASSIGNMENTS_FILE):
+                                with open(DAILY_ROLE_ASSIGNMENTS_FILE, "r", encoding="utf-8-sig") as f:
+                                    loaded_daily = json.load(f)
+                                if isinstance(loaded_daily, dict):
+                                    local_daily = loaded_daily
+                        except Exception:
+                            local_daily = {}
                         if date_key and isinstance(items, dict):
-                            local_daily = _load_daily_role_assignments_sql()
                             local_daily[date_key] = items
-                            ok = _save_daily_role_assignments_sql(local_daily) or ok
+                            os.makedirs(DATABASE_DIR, exist_ok=True)
+                            with open(DAILY_ROLE_ASSIGNMENTS_FILE, "w", encoding="utf-8") as f:
+                                json.dump(local_daily, f, ensure_ascii=False, indent=2)
+                            ok = True
                         elif isinstance(items, dict):
-                            local_daily = _load_daily_role_assignments_sql()
                             local_daily[datetime.now().date().isoformat()] = items
-                            ok = _save_daily_role_assignments_sql(local_daily) or ok
+                            os.makedirs(DATABASE_DIR, exist_ok=True)
+                            with open(DAILY_ROLE_ASSIGNMENTS_FILE, "w", encoding="utf-8") as f:
+                                json.dump(local_daily, f, ensure_ascii=False, indent=2)
+                            ok = True
 
             except Exception:
                 ok = False
@@ -7214,8 +7235,16 @@ QWidget#ClientUIRoot {{
             caps.add("qc")
             display_name = display_name or QC_BADGES[code]
 
-        # Profile-based role from SQL-backed profile cache.
-        profiles = _load_profiles_sql()
+        # Profile-based role from local JSON cache synced from the server.
+        profiles: List[Dict[str, Any]] = []
+        try:
+            if os.path.exists(USER_QR_PROFILES_FILE):
+                with open(USER_QR_PROFILES_FILE, "r", encoding="utf-8-sig") as f:
+                    loaded_profiles = json.load(f)
+                if isinstance(loaded_profiles, list):
+                    profiles = [row for row in loaded_profiles if isinstance(row, dict)]
+        except Exception:
+            profiles = []
         for row in profiles:
             if not isinstance(row, dict):
                 continue
@@ -7226,7 +7255,15 @@ QWidget#ClientUIRoot {{
             break
 
         # Daily assignments can grant temporary rights (including both).
-        daily_map = _load_daily_role_assignments_sql()
+        daily_map: Dict[str, Any] = {}
+        try:
+            if os.path.exists(DAILY_ROLE_ASSIGNMENTS_FILE):
+                with open(DAILY_ROLE_ASSIGNMENTS_FILE, "r", encoding="utf-8-sig") as f:
+                    loaded_daily = json.load(f)
+                if isinstance(loaded_daily, dict):
+                    daily_map = loaded_daily
+        except Exception:
+            daily_map = {}
         if isinstance(daily_map, dict):
             today_key = datetime.now().date().isoformat()
             today_rows = daily_map.get(today_key)
@@ -8727,21 +8764,17 @@ QWidget#ClientUIRoot {{
         payload = _normalized_finished_job_row(payload)
         if str(payload.get("record_type") or "").strip().upper() == RECORD_TYPE_SHIFT_PARTIAL:
             saved_json = _append_finish_shift_json(payload)
-            saved_sql = _replace_finish_shift_sql(_load_finish_shift_json()) if saved_json else False
         else:
             saved_json = _append_finished_job_json(payload)
-            saved_sql = _insert_finished_job_sql(payload)
-        return bool(saved_sql or saved_json)
+        return bool(saved_json)
 
     def _load_local_job_records(self, job_code: str) -> List[Dict[str, Any]]:
         code = str(job_code or "").strip()
         if not code:
             return []
         rows: List[Dict[str, Any]] = []
-        sql_rows = list(_load_finish_shift_sql()) + list(_load_finished_jobs_sql())
         json_rows = list(_load_finish_shift_json()) + list(_load_finished_jobs_json())
-        source_rows = sql_rows if sql_rows else json_rows
-        for row in source_rows:
+        for row in json_rows:
             if not isinstance(row, dict):
                 continue
             if str(row.get("job_code") or "").strip() != code:
@@ -9079,10 +9112,6 @@ QWidget#ClientUIRoot {{
         snap = rows.get(code)
         if isinstance(snap, dict):
             return snap
-        rows = _load_active_sessions_sql()
-        snap = rows.get(code)
-        if isinstance(snap, dict):
-            return snap
         return None
 
     def _clear_active_session_snapshot(self, machine_code: Optional[str]):
@@ -9090,39 +9119,13 @@ QWidget#ClientUIRoot {{
         if not code:
             return
         _delete_active_session_json(code)
-        _delete_active_session_sql(code)
         self._last_active_session_snapshot_serialized = ""
 
     def _sync_active_session_snapshots_to_sql(self):
-        self._trigger_active_session_sql_sync(force=True)
+        return
 
     def _trigger_active_session_sql_sync(self, force: bool = False):
-        now_ts = time.time()
-        if not force and (now_ts - float(self._active_session_sql_sync_last_attempt or 0.0)) < ACTIVE_SESSION_SQL_SYNC_MIN_INTERVAL_SECONDS:
-            return
-        with self._active_session_sql_sync_lock:
-            if self._active_session_sql_sync_inflight:
-                return
-            self._active_session_sql_sync_inflight = True
-            self._active_session_sql_sync_last_attempt = now_ts
-
-        def _run():
-            ok = False
-            try:
-                ok = _sync_active_sessions_json_to_sql()
-            except Exception as e:
-                print(f"[SQL] Active session sync error: {e}")
-            finally:
-                with self._active_session_sql_sync_lock:
-                    self._active_session_sql_sync_inflight = False
-                    if ok:
-                        self._active_session_sql_sync_last_ok = time.time()
-            if ok:
-                print("[SQL] Active session snapshot sync: SQL OK")
-            else:
-                print("[SQL] Active session snapshot sync: SQL pending, local JSON retained")
-
-        threading.Thread(target=_run, daemon=True).start()
+        return
 
     def _restore_state_from_snapshot(self, snap: Dict[str, Any]):
         s = self.state
@@ -10592,11 +10595,7 @@ QWidget#ClientUIRoot {{
 
     def _approve_local_finished_shift(self, shift_payload: Dict[str, Any], reviewer: Dict[str, Any], remarks: str) -> bool:
         key = self._finish_shift_row_key(shift_payload)
-        rows = _load_finish_shift_sql()
-        use_json = False
-        if not rows:
-            rows = _load_finish_shift_json()
-            use_json = True
+        rows = _load_finish_shift_json()
         updated = False
         now_utc = datetime.now(timezone.utc).isoformat()
         for idx, row in enumerate(rows):
@@ -10627,9 +10626,7 @@ QWidget#ClientUIRoot {{
             break
         if not updated:
             return False
-        if use_json:
-            return _save_finish_shift_json(rows)
-        return _replace_finish_shift_sql(rows)
+        return _save_finish_shift_json(rows)
 
     def _approve_server_finished_shift(self, shift_payload: Dict[str, Any], reviewer_badge: str, remarks: str):
         try:
@@ -13861,8 +13858,6 @@ QWidget#ClientUIRoot {{
                 rows_snapshot = item.get("rows") if isinstance(item.get("rows"), list) else list(getattr(self, "_app_logs", []) or [])
                 row = item.get("row") if isinstance(item.get("row"), dict) else None
                 _save_app_logs_json(rows_snapshot)
-                if row is not None:
-                    _insert_app_log_sql(row)
             except Exception:
                 pass
             finally:
