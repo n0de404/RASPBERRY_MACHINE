@@ -196,6 +196,8 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_TRIGGER", raw=raw, value="Production daily report mode")
     if s_l in ("productiondailyreport~2", "pdr_done", "pdrdone"):
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_RESOLVE", raw=raw, value="Production daily report resolve")
+    if s.isdigit() and 1 <= int(s) <= 15:
+        return ScanResult(kind="PRODUCTION_DAILY_REPORT_REASON", raw=raw, value=f"{int(s):02d}")
     if s_l in ("finishjob", "finishjob~1", "jobfinish"):
         return ScanResult(kind="FINISH_JOB", raw=raw, value="Finish current job session")
     if s_l == "joblinkage~1":

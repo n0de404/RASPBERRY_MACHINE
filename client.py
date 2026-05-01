@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import random
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
@@ -13,11 +12,8 @@ import math
 import queue
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Set
-from PyQt6.QtWidgets import QLabel  # (already at top of file)
-from PyQt6.QtCore import Qt
-
 import requests
 
 try:
@@ -34,16 +30,16 @@ from PyQt6.QtCore import (
     QSequentialAnimationGroup,
 )
 from PyQt6.QtGui import (
-    QMovie, QPixmap, QColor, QPainter, QPen, QFont, QFontDatabase, QFontMetrics, QConicalGradient, QBrush,
+    QMovie, QPixmap, QColor, QPainter, QPen, QFont, QFontDatabase, QFontMetrics, QBrush,
     QLinearGradient, QRadialGradient, QPainterPath,
 )
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy,
     QGraphicsDropShadowEffect, QGraphicsBlurEffect, QGraphicsOpacityEffect, QProgressBar, QPushButton, QComboBox, QScrollArea, QStackedWidget,
-    QLineEdit, QInputDialog, QTableWidget, QTableWidgetItem, QHeaderView, QStyleOptionHeader
+    QLineEdit, QInputDialog, QTableWidget, QTableWidgetItem, QHeaderView
 )
 
-from mappings import parse_scan, ScanResult, MACHINE_MAP, JOB_MAP, REJECT_REASON_MAP
+from mappings import parse_scan, ScanResult, MACHINE_MAP, REJECT_REASON_MAP
 from ui_theme import APP_STYLESHEET
 
 try:
@@ -93,6 +89,8 @@ FINISHED_JOBS_FILE = os.path.join(DATABASE_DIR, "finished_jobs.json")
 FINISH_SHIFT_FILE = os.path.join(DATABASE_DIR, "finish_shift.json")
 SQL_CONFIG_FILE = os.path.join(DATABASE_DIR, "sql_config.json")
 APP_LOGS_FILE = os.path.join(DATABASE_DIR, "app_logs.json")
+CLIENT_SETTINGS_FILE = os.path.join(DATABASE_DIR, "client_settings.json")
+DAILY_ROLE_ASSIGNMENTS_FILE = os.path.join(DATABASE_DIR, "daily_role_assignments.json")
 APP_LOG_MAX_ROWS = 5000
 APP_LOG_TABLE_MAX_ROWS = 400
 RECORD_TYPE_SHIFT_PARTIAL = "SHIFT_PARTIAL"
@@ -133,7 +131,7 @@ def _default_graphics_mode() -> str:
     except Exception:
         machine = str(os.environ.get("PROCESSOR_ARCHITECTURE", "") or "").strip().lower()
     if sys.platform.startswith("linux") and machine and any(token in machine for token in ("arm", "aarch64")):
-        return "faster_quality"
+        return "faster"
     return "quality"
 
 
@@ -320,390 +318,6 @@ def _sql_conn():
         return None
 
 
-def _ensure_sql_schema() -> bool:
-    conn = _sql_conn()
-    if conn is None:
-        return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS `user_qr_profiles` (
-                  `id` BIGINT NOT NULL AUTO_INCREMENT,
-                  `id_number` VARCHAR(100) NOT NULL,
-                  `name` VARCHAR(255) NULL,
-                  `role` VARCHAR(100) NULL,
-                  `created_at_utc` VARCHAR(50) NULL,
-                  `print_count` INT NOT NULL DEFAULT 0,
-                  `last_printed_at_utc` VARCHAR(50) NULL,
-                  `raw_json` JSON NOT NULL,
-                  PRIMARY KEY (`id`),
-                  UNIQUE KEY `uq_user_qr_profiles_id_number` (`id_number`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS `finish_shift` (
-                  `id` BIGINT NOT NULL AUTO_INCREMENT,
-                  `record_type` VARCHAR(50) NULL,
-                  `reason` VARCHAR(100) NULL,
-                  `shift_index` INT NULL,
-                  `started_at_utc` VARCHAR(50) NULL,
-                  `ended_at_utc` VARCHAR(50) NULL,
-                  `finished_at_utc` VARCHAR(50) NULL,
-                  `client_id` VARCHAR(100) NULL,
-                  `machine_code` VARCHAR(50) NULL,
-                  `machine_name` VARCHAR(255) NULL,
-                  `job_code` VARCHAR(100) NULL,
-                  `job_name` VARCHAR(255) NULL,
-                  `operator_id` VARCHAR(255) NULL,
-                  `operator_name` VARCHAR(255) NULL,
-                  `pack_count` INT NOT NULL DEFAULT 0,
-                  `good_total` INT NOT NULL DEFAULT 0,
-                  `butal_total` INT NOT NULL DEFAULT 0,
-                  `reject_total` INT NOT NULL DEFAULT 0,
-                  `total_good` INT NOT NULL DEFAULT 0,
-                  `partial_qty` INT NOT NULL DEFAULT 0,
-                  `startup_reject_total` INT NOT NULL DEFAULT 0,
-                  `no_shot_total` INT NOT NULL DEFAULT 0,
-                  `raw_sacks_count` INT NOT NULL DEFAULT 0,
-                  `downtime_last_seconds` INT NULL,
-                  `downtime_reason_code` VARCHAR(50) NULL,
-                  `downtime_reason_text` TEXT NULL,
-                  `cycle_time_current` VARCHAR(100) NULL,
-                  `machine_counter_start` INT NULL,
-                  `machine_counter_end` INT NULL,
-                  `machine_counter_app_delta` INT NULL,
-                  `machine_counter_app_end` INT NULL,
-                  `machine_counter_difference` INT NULL,
-                  `cycle_time_shift_avg_seconds` DOUBLE NULL,
-                  `qty_per_shift_avg_cycle` INT NULL,
-                  `maintenance_name` VARCHAR(255) NULL,
-                  `supervisor_name` VARCHAR(255) NULL,
-                  `approved_by` VARCHAR(255) NULL,
-                  `approved_by_code` VARCHAR(100) NULL,
-                  `approved_by_role` VARCHAR(100) NULL,
-                  `approved_remarks` TEXT NULL,
-                  `approved_at_utc` VARCHAR(50) NULL,
-                  `review_status` VARCHAR(100) NULL,
-                  `linkage_enabled` TINYINT NOT NULL DEFAULT 0,
-                  `linkage_job_code` VARCHAR(100) NULL,
-                  `linkage_job_name` VARCHAR(255) NULL,
-                  `linkage_role` VARCHAR(50) NULL,
-                  `linkage_group_total_jobs` INT NULL,
-                  `linkage_main_job_code` VARCHAR(100) NULL,
-                  `linkage_main_job_name` VARCHAR(255) NULL,
-                  `linkage_note` TEXT NULL,
-                  `reject_breakdown` JSON NOT NULL,
-                  `raw_material_scans` JSON NOT NULL,
-                  `raw_material_logs` JSON NOT NULL,
-                  `job_payload` JSON NOT NULL,
-                  `reject_review_logs` JSON NOT NULL,
-                  `linkage_job_payload` JSON NULL,
-                  `linkage_jobs` JSON NULL,
-                  `linkage_mirror` JSON NULL,
-                  `review_history` JSON NULL,
-                  `raw_json` JSON NOT NULL,
-                  PRIMARY KEY (`id`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS `finished_jobs` (
-                  `id` BIGINT NOT NULL AUTO_INCREMENT,
-                  `record_type` VARCHAR(50) NULL,
-                  `reason` VARCHAR(100) NULL,
-                  `shift_index` INT NULL,
-                  `started_at_utc` VARCHAR(50) NULL,
-                  `ended_at_utc` VARCHAR(50) NULL,
-                  `finished_at_utc` VARCHAR(50) NULL,
-                  `client_id` VARCHAR(100) NULL,
-                  `machine_code` VARCHAR(50) NULL,
-                  `machine_name` VARCHAR(255) NULL,
-                  `job_code` VARCHAR(100) NULL,
-                  `job_name` VARCHAR(255) NULL,
-                  `operator_id` VARCHAR(255) NULL,
-                  `operator_name` VARCHAR(255) NULL,
-                  `pack_count` INT NOT NULL DEFAULT 0,
-                  `good_total` INT NOT NULL DEFAULT 0,
-                  `butal_total` INT NOT NULL DEFAULT 0,
-                  `reject_total` INT NOT NULL DEFAULT 0,
-                  `total_good` INT NOT NULL DEFAULT 0,
-                  `partial_qty` INT NOT NULL DEFAULT 0,
-                  `startup_reject_total` INT NOT NULL DEFAULT 0,
-                  `no_shot_total` INT NOT NULL DEFAULT 0,
-                  `raw_sacks_count` INT NOT NULL DEFAULT 0,
-                  `downtime_last_seconds` INT NULL,
-                  `downtime_reason_code` VARCHAR(50) NULL,
-                  `downtime_reason_text` TEXT NULL,
-                  `cycle_time_current` VARCHAR(100) NULL,
-                  `machine_counter_start` INT NULL,
-                  `machine_counter_end` INT NULL,
-                  `machine_counter_app_delta` INT NULL,
-                  `machine_counter_app_end` INT NULL,
-                  `machine_counter_difference` INT NULL,
-                  `cycle_time_shift_avg_seconds` DOUBLE NULL,
-                  `qty_per_shift_avg_cycle` INT NULL,
-                  `maintenance_name` VARCHAR(255) NULL,
-                  `supervisor_name` VARCHAR(255) NULL,
-                  `approved_by` VARCHAR(255) NULL,
-                  `approved_by_code` VARCHAR(100) NULL,
-                  `approved_by_role` VARCHAR(100) NULL,
-                  `approved_remarks` TEXT NULL,
-                  `approved_at_utc` VARCHAR(50) NULL,
-                  `review_status` VARCHAR(100) NULL,
-                  `linkage_enabled` TINYINT NOT NULL DEFAULT 0,
-                  `linkage_job_code` VARCHAR(100) NULL,
-                  `linkage_job_name` VARCHAR(255) NULL,
-                  `linkage_role` VARCHAR(50) NULL,
-                  `linkage_group_total_jobs` INT NULL,
-                  `linkage_main_job_code` VARCHAR(100) NULL,
-                  `linkage_main_job_name` VARCHAR(255) NULL,
-                  `linkage_note` TEXT NULL,
-                  `reject_breakdown` JSON NOT NULL,
-                  `raw_material_scans` JSON NOT NULL,
-                  `raw_material_logs` JSON NOT NULL,
-                  `job_payload` JSON NOT NULL,
-                  `reject_review_logs` JSON NOT NULL,
-                  `linkage_job_payload` JSON NULL,
-                  `linkage_jobs` JSON NULL,
-                  `linkage_mirror` JSON NULL,
-                  `review_history` JSON NULL,
-                  `raw_json` JSON NOT NULL,
-                  PRIMARY KEY (`id`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """
-            )
-            for stmt in (
-                "ALTER TABLE `finished_jobs` ADD COLUMN `record_type` VARCHAR(50) NULL AFTER `id`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `reason` VARCHAR(100) NULL AFTER `record_type`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `shift_index` INT NULL AFTER `reason`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `started_at_utc` VARCHAR(50) NULL AFTER `shift_index`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `ended_at_utc` VARCHAR(50) NULL AFTER `started_at_utc`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `operator_name` VARCHAR(255) NULL AFTER `operator_id`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `partial_qty` INT NOT NULL DEFAULT 0 AFTER `total_good`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `no_shot_total` INT NOT NULL DEFAULT 0 AFTER `startup_reject_total`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `machine_counter_start` INT NULL AFTER `cycle_time_current`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `machine_counter_end` INT NULL AFTER `machine_counter_start`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `machine_counter_app_delta` INT NULL AFTER `machine_counter_end`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `machine_counter_app_end` INT NULL AFTER `machine_counter_app_delta`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `machine_counter_difference` INT NULL AFTER `machine_counter_app_end`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `cycle_time_shift_avg_seconds` DOUBLE NULL AFTER `machine_counter_difference`",
-                "ALTER TABLE `finished_jobs` ADD COLUMN `qty_per_shift_avg_cycle` INT NULL AFTER `cycle_time_shift_avg_seconds`",
-            ):
-                try:
-                    cur.execute(stmt)
-                except Exception:
-                    pass
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS `daily_role_assignments` (
-                  `id` BIGINT NOT NULL AUTO_INCREMENT,
-                  `assignment_date` VARCHAR(20) NOT NULL,
-                  `badge_id` VARCHAR(100) NOT NULL,
-                  `name` VARCHAR(255) NULL,
-                  `rights` VARCHAR(50) NULL,
-                  `company_role` VARCHAR(100) NULL,
-                  `extra_privilege` VARCHAR(50) NULL,
-                  `updated_at_utc` VARCHAR(50) NULL,
-                  `raw_json` JSON NOT NULL,
-                  PRIMARY KEY (`id`),
-                  UNIQUE KEY `uq_daily_role_assignments_date_badge` (`assignment_date`, `badge_id`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS `active_machine_sessions` (
-                  `id` BIGINT NOT NULL AUTO_INCREMENT,
-                  `machine_code` VARCHAR(50) NOT NULL,
-                  `saved_at_utc` VARCHAR(50) NULL,
-                  `machine_name` VARCHAR(255) NULL,
-                  `job_code` VARCHAR(100) NULL,
-                  `job_name` VARCHAR(255) NULL,
-                  `operator_id` VARCHAR(255) NULL,
-                  `raw_json` JSON NOT NULL,
-                  PRIMARY KEY (`id`),
-                  UNIQUE KEY `uq_active_machine_sessions_machine_code` (`machine_code`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS `client_settings` (
-                  `id` BIGINT NOT NULL AUTO_INCREMENT,
-                  `server_url` VARCHAR(500) NULL,
-                  `client_id` VARCHAR(100) NULL,
-                  `scanner_mode` VARCHAR(50) NULL,
-                  `scanner_com_port` VARCHAR(100) NULL,
-                  `scanner_baudrate` INT NOT NULL DEFAULT 9600,
-                  `scanner_timeout` DOUBLE NOT NULL DEFAULT 1.0,
-                  `raw_json` JSON NOT NULL,
-                  PRIMARY KEY (`id`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS `app_logs` (
-                  `id` BIGINT NOT NULL AUTO_INCREMENT,
-                  `timestamp_utc` VARCHAR(50) NULL,
-                  `source` VARCHAR(100) NULL,
-                  `actor` VARCHAR(255) NULL,
-                  `message` TEXT NULL,
-                  `raw_json` JSON NOT NULL,
-                  PRIMARY KEY (`id`),
-                  KEY `idx_app_logs_timestamp` (`timestamp_utc`),
-                  KEY `idx_app_logs_source` (`source`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """
-            )
-        conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        conn.close()
-
-
-def _load_profiles_sql() -> List[Dict[str, Any]]:
-    conn = _sql_conn()
-    if conn is None:
-        return []
-    try:
-        items: List[Dict[str, Any]] = []
-        with conn.cursor() as cur:
-            cur.execute("SELECT `raw_json` FROM `user_qr_profiles` ORDER BY `id` ASC")
-            for row in cur.fetchall() or []:
-                raw = row.get("raw_json")
-                if isinstance(raw, dict):
-                    items.append(raw)
-                elif isinstance(raw, str):
-                    try:
-                        parsed = json.loads(raw)
-                    except Exception:
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        items.append(parsed)
-        return items
-    except Exception:
-        return []
-    finally:
-        conn.close()
-
-
-def _save_profiles_sql(rows: List[Dict[str, Any]]) -> bool:
-    conn = _sql_conn()
-    if conn is None:
-        return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM `user_qr_profiles`")
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                cur.execute(
-                    """
-                    INSERT INTO `user_qr_profiles`
-                    (`id_number`,`name`,`role`,`created_at_utc`,`print_count`,`last_printed_at_utc`,`raw_json`)
-                    VALUES (%s,%s,%s,%s,%s,%s,CAST(%s AS JSON))
-                    """,
-                    (
-                        row.get("id_number"),
-                        row.get("name"),
-                        row.get("role"),
-                        row.get("created_at_utc"),
-                        int(row.get("print_count", 0) or 0),
-                        row.get("last_printed_at_utc"),
-                        json.dumps(row, ensure_ascii=False),
-                    ),
-                )
-        conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        conn.close()
-
-
-def _load_daily_role_assignments_sql() -> Dict[str, Any]:
-    conn = _sql_conn()
-    if conn is None:
-        return {}
-    try:
-        out: Dict[str, Any] = {}
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT `assignment_date`, `badge_id`, `raw_json` FROM `daily_role_assignments` ORDER BY `assignment_date` ASC, `badge_id` ASC"
-            )
-            for row in cur.fetchall() or []:
-                assignment_date = str(row.get("assignment_date") or "").strip()
-                badge_id = str(row.get("badge_id") or "").strip()
-                raw = row.get("raw_json")
-                item = raw if isinstance(raw, dict) else None
-                if item is None and isinstance(raw, str):
-                    try:
-                        parsed = json.loads(raw)
-                    except Exception:
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        item = parsed
-                if not assignment_date or not badge_id or not isinstance(item, dict):
-                    continue
-                date_rows = out.get(assignment_date)
-                if not isinstance(date_rows, dict):
-                    date_rows = {}
-                    out[assignment_date] = date_rows
-                date_rows[badge_id] = item
-        return out
-    except Exception:
-        return {}
-    finally:
-        conn.close()
-
-
-def _save_daily_role_assignments_sql(rows: Dict[str, Any]) -> bool:
-    conn = _sql_conn()
-    if conn is None:
-        return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM `daily_role_assignments`")
-            for assignment_date, items in (rows or {}).items():
-                date_key = str(assignment_date or "").strip()
-                if not date_key or not isinstance(items, dict):
-                    continue
-                for badge_id, raw_row in items.items():
-                    badge_key = str(badge_id or "").strip()
-                    if not badge_key or not isinstance(raw_row, dict):
-                        continue
-                    cur.execute(
-                        """
-                        INSERT INTO `daily_role_assignments`
-                        (`assignment_date`,`badge_id`,`name`,`rights`,`company_role`,`extra_privilege`,`updated_at_utc`,`raw_json`)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,CAST(%s AS JSON))
-                        """,
-                        (
-                            date_key,
-                            badge_key,
-                            raw_row.get("name"),
-                            raw_row.get("rights"),
-                            raw_row.get("company_role"),
-                            raw_row.get("extra_privilege"),
-                            raw_row.get("updated_at_utc"),
-                            json.dumps(raw_row, ensure_ascii=False),
-                        ),
-                    )
-        conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        conn.close()
-
-
 def _load_active_sessions_sql() -> Dict[str, Any]:
     conn = _sql_conn()
     if conn is None:
@@ -790,21 +404,6 @@ def _delete_active_session_json(machine_code: Optional[str]) -> bool:
         rows.pop(code, None)
         return _save_active_sessions_json(rows)
     return True
-
-
-def _sync_active_sessions_json_to_sql() -> bool:
-    rows = _load_active_sessions_json()
-    ok = True
-    for machine_code, row in rows.items():
-        if not isinstance(row, dict):
-            continue
-        payload = dict(row)
-        payload["machine_code"] = str(payload.get("machine_code") or machine_code or "").strip()
-        if not payload["machine_code"]:
-            ok = False
-            continue
-        ok = _upsert_active_session_sql(payload) and ok
-    return ok
 
 
 def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
@@ -1006,107 +605,6 @@ def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
         conn.close()
 
 
-def _delete_active_session_sql(machine_code: Optional[str]) -> bool:
-    code = str(machine_code or "").strip()
-    if not code:
-        return False
-    conn = _sql_conn()
-    if conn is None:
-        return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM `active_machine_sessions` WHERE `machine_code`=%s", (code,))
-        conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        conn.close()
-
-
-def _load_client_settings_sql() -> Dict[str, Any]:
-    conn = _sql_conn()
-    if conn is None:
-        return {}
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT `raw_json` FROM `client_settings` ORDER BY `id` DESC LIMIT 1")
-            row = cur.fetchone() or {}
-        raw = row.get("raw_json")
-        if isinstance(raw, dict):
-            return raw
-        if isinstance(raw, str):
-            try:
-                parsed = json.loads(raw)
-            except Exception:
-                parsed = None
-            if isinstance(parsed, dict):
-                return parsed
-        return {}
-    except Exception:
-        return {}
-    finally:
-        conn.close()
-
-
-def _save_client_settings_sql(row: Dict[str, Any]) -> bool:
-    conn = _sql_conn()
-    if conn is None:
-        return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM `client_settings`")
-            cur.execute(
-                """
-                INSERT INTO `client_settings`
-                (`server_url`,`client_id`,`scanner_mode`,`scanner_com_port`,`scanner_baudrate`,`scanner_timeout`,`raw_json`)
-                VALUES (%s,%s,%s,%s,%s,%s,CAST(%s AS JSON))
-                """,
-                (
-                    row.get("server_url"),
-                    row.get("client_id"),
-                    row.get("scanner_mode"),
-                    row.get("scanner_com_port"),
-                    int(row.get("scanner_baudrate", SCANNER_BAUDRATE) or SCANNER_BAUDRATE),
-                    float(row.get("scanner_timeout", SCANNER_TIMEOUT) or SCANNER_TIMEOUT),
-                    json.dumps(row, ensure_ascii=False),
-                ),
-            )
-        conn.commit()
-        return True
-    except Exception:
-        return False
-    finally:
-        conn.close()
-
-
-def _migrate_active_sessions_json_to_sql() -> bool:
-    legacy_path = ACTIVE_MACHINE_SESSIONS_FILE
-    if not os.path.exists(legacy_path):
-        return True
-    sql_rows = _load_active_sessions_sql()
-    if sql_rows:
-        return True
-    try:
-        with open(legacy_path, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-    except Exception:
-        return False
-    if not isinstance(loaded, dict):
-        return False
-    ok = True
-    for machine_code, row in loaded.items():
-        if not isinstance(row, dict):
-            continue
-        payload = dict(row)
-        payload["machine_code"] = str(payload.get("machine_code") or machine_code or "").strip()
-        if not payload["machine_code"]:
-            ok = False
-            continue
-        ok = _upsert_active_session_sql(payload) and ok
-    return ok
-
-
 def _insert_finished_job_sql(row: Dict[str, Any]) -> bool:
     row = _normalized_finished_job_row(row)
     table_name = "finish_shift" if str(row.get("record_type") or "").strip().upper() == RECORD_TYPE_SHIFT_PARTIAL else "finished_jobs"
@@ -1159,30 +657,6 @@ def _insert_finished_job_sql(row: Dict[str, Any]) -> bool:
         conn.close()
 
 
-def _load_finished_jobs_sql() -> List[Dict[str, Any]]:
-    conn = _sql_conn()
-    if conn is None:
-        return []
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT `raw_json` FROM `finished_jobs` ORDER BY `id` ASC")
-            rows = cur.fetchall() or []
-        out: List[Dict[str, Any]] = []
-        for row in rows:
-            raw = row.get("raw_json") if isinstance(row, dict) else None
-            try:
-                item = json.loads(raw) if isinstance(raw, str) else raw
-            except Exception:
-                item = None
-            if isinstance(item, dict):
-                out.append(item)
-        return out
-    except Exception:
-        return []
-    finally:
-        conn.close()
-
-
 def _load_finish_shift_sql() -> List[Dict[str, Any]]:
     conn = _sql_conn()
     if conn is None:
@@ -1207,26 +681,6 @@ def _load_finish_shift_sql() -> List[Dict[str, Any]]:
         conn.close()
 
 
-def _replace_finished_jobs_sql(rows: List[Dict[str, Any]]) -> bool:
-    conn = _sql_conn()
-    if conn is None:
-        return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM `finished_jobs`")
-        conn.commit()
-        ok = True
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            ok = _insert_finished_job_sql(row) and ok
-        return ok
-    except Exception:
-        return False
-    finally:
-        conn.close()
-
-
 def _replace_finish_shift_sql(rows: List[Dict[str, Any]]) -> bool:
     conn = _sql_conn()
     if conn is None:
@@ -1246,16 +700,6 @@ def _replace_finish_shift_sql(rows: List[Dict[str, Any]]) -> bool:
         return False
     finally:
         conn.close()
-
-
-def _migrate_finish_shift_json_to_sql() -> bool:
-    sql_rows = _load_finish_shift_sql()
-    if sql_rows:
-        return True
-    json_rows = _load_finish_shift_json()
-    if not json_rows:
-        return True
-    return _replace_finish_shift_sql(json_rows)
 
 
 def _load_app_logs_sql() -> List[Dict[str, Any]]:
@@ -1315,27 +759,6 @@ def _insert_app_log_sql(row: Dict[str, Any]) -> bool:
         conn.close()
 
 
-def _migrate_app_logs_json_to_sql() -> bool:
-    sql_rows = _load_app_logs_sql()
-    if sql_rows:
-        return True
-    json_rows = _load_app_logs_json()
-    if not json_rows:
-        return True
-    ok = True
-    for row in json_rows:
-        if not isinstance(row, dict):
-            continue
-        ok = _insert_app_log_sql(row) and ok
-    return ok
-
-
-_ensure_sql_schema()
-_migrate_active_sessions_json_to_sql()
-_migrate_finish_shift_json_to_sql()
-_migrate_app_logs_json_to_sql()
-
-
 def _load_client_config() -> Dict[str, Any]:
     defaults = {
         "server_url": SERVER_URL,
@@ -1346,9 +769,14 @@ def _load_client_config() -> Dict[str, Any]:
         "scanner_timeout": SCANNER_TIMEOUT,
         "graphics_mode": _default_graphics_mode(),
     }
-    raw = _load_client_settings_sql()
-    if isinstance(raw, dict):
-        defaults.update(raw)
+    try:
+        if os.path.exists(CLIENT_SETTINGS_FILE):
+            with open(CLIENT_SETTINGS_FILE, "r", encoding="utf-8-sig") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                defaults.update(raw)
+    except Exception:
+        pass
 
     # Allow runtime environment overrides to take priority over persisted settings.
     env_overrides = {
@@ -1450,7 +878,12 @@ def _save_job_api_config(cfg: Dict[str, Any]):
 
 
 def _save_client_config(cfg: Dict[str, Any]):
-    _save_client_settings_sql(cfg)
+    try:
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        with open(CLIENT_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def _machine_display_name(machine_code: Optional[str], machine_name: Optional[str] = None) -> str:
@@ -1564,6 +997,11 @@ class ClientState:
     job_payload: Dict[str, Any] = None
     downtime_reason_code: Optional[str] = None
     downtime_reason_text: Optional[str] = None
+    pdr_operator_reason_code: Optional[str] = None
+    pdr_operator_reason_text: Optional[str] = None
+    waiting_pdr_maintenance_reason: bool = False
+    pdr_reason_segments: List[Dict[str, Any]] = None
+    pdr_current_segment_start_seconds: Optional[int] = None
     downtime_started_at: Optional[float] = None
     downtime_last_seconds: Optional[int] = None
     downtime_active: bool = False
@@ -1660,6 +1098,8 @@ class ClientState:
             self.reject_review_logs = []
         if self.production_adjustment_logs is None:
             self.production_adjustment_logs = []
+        if self.pdr_reason_segments is None:
+            self.pdr_reason_segments = []
         if self.linkage_job_payload is None:
             self.linkage_job_payload = {}
         if self.linkage_jobs is None:
@@ -3128,13 +2568,11 @@ class ClientUI(QWidget):
         self._identity_sync_inflight = False
         self._identity_sync_last_attempt = 0.0
         self._identity_sync_last_ok = 0.0
-        self._active_session_sql_sync_lock = threading.Lock()
-        self._active_session_sql_sync_inflight = False
-        self._active_session_sql_sync_last_attempt = 0.0
-        self._active_session_sql_sync_last_ok = 0.0
         self._last_active_session_snapshot_serialized = ""
         self._active_session_snapshot_deferred_pending = False
         self._ui_refresh_pending = False
+        self._job_parts_table_refresh_key = ""
+        self._raw_mats_overlay_refresh_key = ""
         self._animation_burst_until = 0.0
         self._marquee_frame_skip = False
         self._event_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max(16, SERVER_EVENT_QUEUE_MAXSIZE))
@@ -3167,8 +2605,7 @@ class ClientUI(QWidget):
         self._product_catalog_last_refresh_attempt = 0.0
         self._product_catalog_refresh_inflight = False
         self._action_logs: List[str] = []
-        sql_app_logs = _load_app_logs_sql()
-        self._app_logs: List[Dict[str, Any]] = sql_app_logs if sql_app_logs else _load_app_logs_json()
+        self._app_logs: List[Dict[str, Any]] = _load_app_logs_json()
         self._app_logs_dirty = True
         self._avg_weight_server: Optional[ThreadingHTTPServer] = None
         self._avg_weight_server_thread: Optional[threading.Thread] = None
@@ -3179,7 +2616,7 @@ class ClientUI(QWidget):
         self.setObjectName("ClientUIRoot")
         self.setStyleSheet(
             APP_STYLESHEET
-            + f"""
+            + """
 QWidget#ClientUIRoot {{
     background: transparent;
 }}
@@ -5345,6 +4782,8 @@ QWidget#ClientUIRoot {{
         self._operator_shift_flash_timer.setSingleShot(True)
         self._operator_shift_flash_timer.timeout.connect(self._hide_operator_shift_overlay)
         self._pending_shift_review_payload: Optional[Dict[str, Any]] = None
+        self._pending_final_review_payload: Optional[Dict[str, Any]] = None
+        self._pending_final_review_linked_payloads: List[Dict[str, Any]] = []
         self._app_log_ready = False
         self._app_log_filter = AppInteractionLogFilter(self)
 
@@ -5935,11 +5374,6 @@ QWidget#ClientUIRoot {{
         self.hb = QTimer(self)
         self.hb.timeout.connect(self.send_heartbeat)
         self.hb.start(max(1000, HEARTBEAT_INTERVAL_MS))
-
-        self.activeSessionSqlSyncTimer = QTimer(self)
-        self.activeSessionSqlSyncTimer.timeout.connect(self._sync_active_session_snapshots_to_sql)
-        self.activeSessionSqlSyncTimer.start(180000)
-        QTimer.singleShot(2000, self._sync_active_session_snapshots_to_sql)
 
         self.activeSessionAutosaveTimer = QTimer(self)
         self.activeSessionAutosaveTimer.timeout.connect(self._autosave_active_session_snapshot)
@@ -6549,9 +5983,16 @@ QWidget#ClientUIRoot {{
     def _refresh_raw_mats_overlay(self):
         logs = self.state.raw_material_logs or []
         table = self.rawMatsList
-        table.setRowCount(0)
         valid_rows: List[Dict[str, Any]] = [x for x in logs if isinstance(x, dict)]
-        active_rows: List[Dict[str, Any]] = [x for x in valid_rows if not bool((x or {}).get("voided"))]
+        try:
+            refresh_key = json.dumps(valid_rows, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            refresh_key = str(valid_rows)
+        if refresh_key == self._raw_mats_overlay_refresh_key:
+            return
+        self._raw_mats_overlay_refresh_key = refresh_key
+
+        table.setRowCount(0)
         if not valid_rows:
             table.setRowCount(1)
             empty_item = QTableWidgetItem("No raw materials scanned yet.")
@@ -6691,7 +6132,6 @@ QWidget#ClientUIRoot {{
             self.rejectSummaryProduct.setItem(row_idx, 1, QTableWidgetItem(str(value)))
         std_cycle = self._safe_text(job_details.get("std_cycle_time"), "-")
         active_cycle = self._safe_text(s.cycle_time_current or "-", "-")
-        input_cycle = str(s.cycle_time_new_input or "").strip()
         self.rejectSummaryCycleStd.setText(f"Std Cycle Time: {std_cycle}")
         self.rejectSummaryCycleCurrent.setText(f"Current Cycle Time: {active_cycle}")
         self.rejectSummaryCycleInput.setText(self._format_supervisor_cycle_input_text())
@@ -7154,23 +6594,39 @@ QWidget#ClientUIRoot {{
                     out_profiles = resp_profiles.json()
                     items = out_profiles.get("items") if isinstance(out_profiles, dict) else None
                     if isinstance(items, list):
-                        ok = _save_profiles_sql(items) or ok
+                        os.makedirs(DATABASE_DIR, exist_ok=True)
+                        with open(USER_QR_PROFILES_FILE, "w", encoding="utf-8") as f:
+                            json.dump(items, f, ensure_ascii=False, indent=2)
+                        ok = True
 
-                # Daily roles cache is SQL-backed as {date: items}.
+                # Daily roles cache stays local on the client.
                 resp_roles = requests.get(f"{server_url}/api/daily-roles", headers=headers, timeout=2.5)
                 if resp_roles.status_code == 200:
                     out_roles = resp_roles.json()
                     if isinstance(out_roles, dict):
                         date_key = str(out_roles.get("date") or "").strip()
                         items = out_roles.get("items")
+                        local_daily: Dict[str, Any] = {}
+                        try:
+                            if os.path.exists(DAILY_ROLE_ASSIGNMENTS_FILE):
+                                with open(DAILY_ROLE_ASSIGNMENTS_FILE, "r", encoding="utf-8-sig") as f:
+                                    loaded_daily = json.load(f)
+                                if isinstance(loaded_daily, dict):
+                                    local_daily = loaded_daily
+                        except Exception:
+                            local_daily = {}
                         if date_key and isinstance(items, dict):
-                            local_daily = _load_daily_role_assignments_sql()
                             local_daily[date_key] = items
-                            ok = _save_daily_role_assignments_sql(local_daily) or ok
+                            os.makedirs(DATABASE_DIR, exist_ok=True)
+                            with open(DAILY_ROLE_ASSIGNMENTS_FILE, "w", encoding="utf-8") as f:
+                                json.dump(local_daily, f, ensure_ascii=False, indent=2)
+                            ok = True
                         elif isinstance(items, dict):
-                            local_daily = _load_daily_role_assignments_sql()
                             local_daily[datetime.now().date().isoformat()] = items
-                            ok = _save_daily_role_assignments_sql(local_daily) or ok
+                            os.makedirs(DATABASE_DIR, exist_ok=True)
+                            with open(DAILY_ROLE_ASSIGNMENTS_FILE, "w", encoding="utf-8") as f:
+                                json.dump(local_daily, f, ensure_ascii=False, indent=2)
+                            ok = True
 
             except Exception:
                 ok = False
@@ -7214,8 +6670,16 @@ QWidget#ClientUIRoot {{
             caps.add("qc")
             display_name = display_name or QC_BADGES[code]
 
-        # Profile-based role from SQL-backed profile cache.
-        profiles = _load_profiles_sql()
+        # Profile-based role from local JSON cache synced from the server.
+        profiles: List[Dict[str, Any]] = []
+        try:
+            if os.path.exists(USER_QR_PROFILES_FILE):
+                with open(USER_QR_PROFILES_FILE, "r", encoding="utf-8-sig") as f:
+                    loaded_profiles = json.load(f)
+                if isinstance(loaded_profiles, list):
+                    profiles = [row for row in loaded_profiles if isinstance(row, dict)]
+        except Exception:
+            profiles = []
         for row in profiles:
             if not isinstance(row, dict):
                 continue
@@ -7226,7 +6690,15 @@ QWidget#ClientUIRoot {{
             break
 
         # Daily assignments can grant temporary rights (including both).
-        daily_map = _load_daily_role_assignments_sql()
+        daily_map: Dict[str, Any] = {}
+        try:
+            if os.path.exists(DAILY_ROLE_ASSIGNMENTS_FILE):
+                with open(DAILY_ROLE_ASSIGNMENTS_FILE, "r", encoding="utf-8-sig") as f:
+                    loaded_daily = json.load(f)
+                if isinstance(loaded_daily, dict):
+                    daily_map = loaded_daily
+        except Exception:
+            daily_map = {}
         if isinstance(daily_map, dict):
             today_key = datetime.now().date().isoformat()
             today_rows = daily_map.get(today_key)
@@ -7538,6 +7010,51 @@ QWidget#ClientUIRoot {{
         if not self._should_keep_background_blur():
             self._set_background_blur(False)
 
+    def _show_final_job_review_overlay(self, finished_payload: Dict[str, Any], linked_payloads: Optional[List[Dict[str, Any]]] = None):
+        self._pending_final_review_payload = dict(finished_payload or {})
+        self._pending_final_review_linked_payloads = [
+            dict(row) for row in (linked_payloads or []) if isinstance(row, dict)
+        ]
+        self._position_finish_overlay()
+        self._set_background_blur(True)
+        self.finishTitle.setText("FINISH JOB SUMMARY")
+        self.finishStatus.setText("Review the summary. Scan NEXT / PREV to change page, then scan CONFIRM to finish.")
+        self.finishReviewHint.setText(
+            'Scan "next" / "prev" QR to move the review, then scan "confirm" QR to close this job.'
+        )
+        self.finishReviewHint.show()
+        self.finishReviewPageInfo.show()
+        self.finishProgressBar.hide()
+        self.finishSummaryScroll.show()
+        self._finish_review_page_index = 0
+        self._populate_finish_shift_summary(self._pending_final_review_payload)
+        self.finishSummaryStack.setCurrentIndex(0)
+        self._set_finish_review_page_info()
+        self.finishSuccessRow.hide()
+        self.finishOverlay.show()
+        self.finishOverlay.raise_()
+
+    def _hide_final_job_review_overlay(self):
+        self._pending_final_review_payload = None
+        self._pending_final_review_linked_payloads = []
+        self.finishTitle.setText("FINISHING JOB")
+        self.finishStatus.setText("Processing...")
+        self.finishReviewHint.hide()
+        self.finishReviewPageInfo.hide()
+        self.finishProgressBar.show()
+        self.finishSummaryScroll.hide()
+        self.finishOverlay.hide()
+        if not self._should_keep_background_blur():
+            self._set_background_blur(False)
+
+    def _confirm_pending_final_job_review(self):
+        if not self._pending_final_review_payload:
+            return
+        self.status.setText("Job finished. Session cleared.")
+        self._finish_pending_clear = False
+        self._clear_shift_session_keep_machine()
+        self._hide_final_job_review_overlay()
+
     def _approve_pending_shift_review(self, reviewer: Dict[str, Any], reviewer_badge: str):
         shift_payload = dict(self._pending_shift_review_payload or {})
         if not shift_payload:
@@ -7743,9 +7260,11 @@ QWidget#ClientUIRoot {{
         self._apply_widget_shadow(self.productionMaintenanceLine, 16, 2, QColor(0, 0, 0, 42))
         self.productionActionBanner.setGraphicsEffect(None)
 
-    @staticmethod
-    def _apply_widget_shadow(widget: Optional[QWidget], blur: int, offset_y: int, color: QColor):
+    def _apply_widget_shadow(self, widget: Optional[QWidget], blur: int, offset_y: int, color: QColor):
         if widget is None:
+            return
+        if not getattr(self, "enable_heavy_animations", True):
+            widget.setGraphicsEffect(None)
             return
         shadow = QGraphicsDropShadowEffect(widget)
         shadow.setBlurRadius(float(blur))
@@ -8113,6 +7632,7 @@ QWidget#ClientUIRoot {{
                 or str(s.downtime_reason_text or "").strip()
                 or s.waiting_production_report_reason
                 or s.waiting_downtime_start_maintenance
+                or s.waiting_pdr_maintenance_reason
                 or s.waiting_downtime_end_maintenance
                 or s.waiting_maintenance_qr
                 or s.waiting_supervisor_qr
@@ -8206,6 +7726,8 @@ QWidget#ClientUIRoot {{
                 self._set_banner_text("Downtime resolve: Scan numkeys to input new cycle time")
         elif s.waiting_downtime_start_maintenance:
             self._set_banner_text("PDR waiting: scan Maintenance QR to start downtime")
+        elif s.waiting_pdr_maintenance_reason:
+            self._set_banner_text("PDR validation: scan reason QR (01-15)")
         elif s.waiting_downtime_end_maintenance:
             self._set_banner_text('Downtime active: scan "pdr_done" when repair is done')
         elif s.waiting_maintenance_qr:
@@ -8227,6 +7749,7 @@ QWidget#ClientUIRoot {{
         show_pdr_select = bool(s.waiting_production_report_reason)
         show_pdr_active = bool(
             s.waiting_downtime_start_maintenance
+            or s.waiting_pdr_maintenance_reason
             or s.waiting_downtime_end_maintenance
             or s.downtime_active
             or s.downtime_started_at
@@ -8307,9 +7830,13 @@ QWidget#ClientUIRoot {{
             self.machineAnim.setProperty("mode", mode)
             self.machineAnim.setProperty("pulse", "0")
             self._sync_machine_status_pulse_overlay()
-        self._apply_machine_anim_style(mode)
-        self.machinePulseOverlay.set_mode(is_running)
-        self.machinePulseOverlay.advance(self.enable_pulse_effects, dt=0.06)
+        if self.enable_flashing_lights or self.enable_pulse_effects:
+            self._apply_machine_anim_style(mode)
+            self.machinePulseOverlay.set_mode(is_running)
+            self.machinePulseOverlay.advance(self.enable_pulse_effects, dt=0.06)
+        else:
+            self.machineAnim.setProperty("pulse", "0")
+            self.machinePulseOverlay.set_mode(False)
         now_ts = time.time()
         refresh_interval = 0.35 if self.enable_flashing_lights else 1.0
         if (now_ts - self._last_parts_indicator_refresh) >= refresh_interval:
@@ -8364,8 +7891,6 @@ QWidget#ClientUIRoot {{
             if v is not None and v > 0:
                 requested_part_qty = v
                 break
-        part_qty_info = self._resolve_part_qty_per_unit(part_rows[0] if part_rows else None)
-        part_qty_per_unit = float(part_qty_info.get("value") or 0.0)
 
         n1, n2, n3 = recent_unique[0], recent_unique[1], recent_unique[2]
         self.rightRawSacks.setText(f"Raw Mat 1: {n1}    Sacks: {int(scans_by_name.get(n1, 0) or 0)}")
@@ -8400,6 +7925,8 @@ QWidget#ClientUIRoot {{
             self.productionLiveReason.setText("REASON: -")
         if s.waiting_downtime_start_maintenance:
             action_text = "SCAN MAINTENANCE QR\nTO START DOWNTIME"
+        elif s.waiting_pdr_maintenance_reason:
+            action_text = "SCAN VALID REASON\n01-15"
         elif s.waiting_downtime_end_maintenance:
             action_text = "SCAN PDR DONE QR WHEN\nREPAIR IS DONE"
         elif s.waiting_cycle_time_input:
@@ -8727,21 +8254,17 @@ QWidget#ClientUIRoot {{
         payload = _normalized_finished_job_row(payload)
         if str(payload.get("record_type") or "").strip().upper() == RECORD_TYPE_SHIFT_PARTIAL:
             saved_json = _append_finish_shift_json(payload)
-            saved_sql = _replace_finish_shift_sql(_load_finish_shift_json()) if saved_json else False
         else:
             saved_json = _append_finished_job_json(payload)
-            saved_sql = _insert_finished_job_sql(payload)
-        return bool(saved_sql or saved_json)
+        return bool(saved_json)
 
     def _load_local_job_records(self, job_code: str) -> List[Dict[str, Any]]:
         code = str(job_code or "").strip()
         if not code:
             return []
         rows: List[Dict[str, Any]] = []
-        sql_rows = list(_load_finish_shift_sql()) + list(_load_finished_jobs_sql())
         json_rows = list(_load_finish_shift_json()) + list(_load_finished_jobs_json())
-        source_rows = sql_rows if sql_rows else json_rows
-        for row in source_rows:
+        for row in json_rows:
             if not isinstance(row, dict):
                 continue
             if str(row.get("job_code") or "").strip() != code:
@@ -8889,6 +8412,9 @@ QWidget#ClientUIRoot {{
             "downtime_active": bool(s.downtime_active),
             "downtime_reason_code": s.downtime_reason_code,
             "downtime_reason_text": s.downtime_reason_text,
+            "pdr_operator_reason_code": s.pdr_operator_reason_code,
+            "pdr_operator_reason_text": s.pdr_operator_reason_text,
+            "pdr_reason_segments": list(s.pdr_reason_segments or []),
             "downtime_last_seconds": s.downtime_last_seconds,
             "cycle_time_current": s.cycle_time_current,
             "cycle_time_shift_avg_seconds": shift_avg_cycle_seconds,
@@ -8946,6 +8472,11 @@ QWidget#ClientUIRoot {{
             "downtime_started_at": s.downtime_started_at,
             "downtime_last_seconds": s.downtime_last_seconds,
             "downtime_active": bool(s.downtime_active),
+            "pdr_operator_reason_code": s.pdr_operator_reason_code,
+            "pdr_operator_reason_text": s.pdr_operator_reason_text,
+            "waiting_pdr_maintenance_reason": bool(s.waiting_pdr_maintenance_reason),
+            "pdr_reason_segments": list(s.pdr_reason_segments or []),
+            "pdr_current_segment_start_seconds": s.pdr_current_segment_start_seconds,
             "downtime_wait_started_at": s.downtime_wait_started_at,
             "downtime_wait_last_seconds": s.downtime_wait_last_seconds,
             "waiting_downtime_start_maintenance": bool(s.waiting_downtime_start_maintenance),
@@ -9079,10 +8610,6 @@ QWidget#ClientUIRoot {{
         snap = rows.get(code)
         if isinstance(snap, dict):
             return snap
-        rows = _load_active_sessions_sql()
-        snap = rows.get(code)
-        if isinstance(snap, dict):
-            return snap
         return None
 
     def _clear_active_session_snapshot(self, machine_code: Optional[str]):
@@ -9090,39 +8617,13 @@ QWidget#ClientUIRoot {{
         if not code:
             return
         _delete_active_session_json(code)
-        _delete_active_session_sql(code)
         self._last_active_session_snapshot_serialized = ""
 
     def _sync_active_session_snapshots_to_sql(self):
-        self._trigger_active_session_sql_sync(force=True)
+        return
 
     def _trigger_active_session_sql_sync(self, force: bool = False):
-        now_ts = time.time()
-        if not force and (now_ts - float(self._active_session_sql_sync_last_attempt or 0.0)) < ACTIVE_SESSION_SQL_SYNC_MIN_INTERVAL_SECONDS:
-            return
-        with self._active_session_sql_sync_lock:
-            if self._active_session_sql_sync_inflight:
-                return
-            self._active_session_sql_sync_inflight = True
-            self._active_session_sql_sync_last_attempt = now_ts
-
-        def _run():
-            ok = False
-            try:
-                ok = _sync_active_sessions_json_to_sql()
-            except Exception as e:
-                print(f"[SQL] Active session sync error: {e}")
-            finally:
-                with self._active_session_sql_sync_lock:
-                    self._active_session_sql_sync_inflight = False
-                    if ok:
-                        self._active_session_sql_sync_last_ok = time.time()
-            if ok:
-                print("[SQL] Active session snapshot sync: SQL OK")
-            else:
-                print("[SQL] Active session snapshot sync: SQL pending, local JSON retained")
-
-        threading.Thread(target=_run, daemon=True).start()
+        return
 
     def _restore_state_from_snapshot(self, snap: Dict[str, Any]):
         s = self.state
@@ -9153,6 +8654,11 @@ QWidget#ClientUIRoot {{
         s.downtime_started_at = snap.get("downtime_started_at")
         s.downtime_last_seconds = snap.get("downtime_last_seconds")
         s.downtime_active = bool(snap.get("downtime_active"))
+        s.pdr_operator_reason_code = snap.get("pdr_operator_reason_code")
+        s.pdr_operator_reason_text = snap.get("pdr_operator_reason_text")
+        s.waiting_pdr_maintenance_reason = bool(snap.get("waiting_pdr_maintenance_reason"))
+        s.pdr_reason_segments = list(snap.get("pdr_reason_segments") or [])
+        s.pdr_current_segment_start_seconds = snap.get("pdr_current_segment_start_seconds")
         s.downtime_wait_started_at = snap.get("downtime_wait_started_at")
         s.downtime_wait_last_seconds = snap.get("downtime_wait_last_seconds")
         s.waiting_downtime_start_maintenance = bool(snap.get("waiting_downtime_start_maintenance"))
@@ -9338,6 +8844,9 @@ QWidget#ClientUIRoot {{
             "downtime_wait_last_seconds": s.downtime_wait_last_seconds,
             "downtime_reason_code": s.downtime_reason_code,
             "downtime_reason_text": s.downtime_reason_text,
+            "pdr_operator_reason_code": s.pdr_operator_reason_code,
+            "pdr_operator_reason_text": s.pdr_operator_reason_text,
+            "pdr_reason_segments": list(s.pdr_reason_segments or []),
             "cycle_time_current": s.cycle_time_current,
             "machine_counter_start": self._parse_int_value(s.machine_counter_shift_start),
             "machine_counter_end": self._parse_int_value(s.machine_counter_current),
@@ -9436,6 +8945,11 @@ QWidget#ClientUIRoot {{
         s.job_payload = {}
         s.downtime_reason_code = None
         s.downtime_reason_text = None
+        s.pdr_operator_reason_code = None
+        s.pdr_operator_reason_text = None
+        s.waiting_pdr_maintenance_reason = False
+        s.pdr_reason_segments = []
+        s.pdr_current_segment_start_seconds = None
         s.downtime_started_at = None
         s.downtime_last_seconds = None
         s.downtime_active = False
@@ -9553,7 +9067,13 @@ QWidget#ClientUIRoot {{
         )
 
     def _extract_production_reason_code(self, raw: str) -> Optional[str]:
-        reject_code = str(raw or "").strip().upper()
+        raw_code = str(raw or "").strip()
+        if raw_code.isdigit():
+            idx = int(raw_code)
+            if 1 <= idx <= len(PRODUCTION_DAILY_REPORT_ITEMS):
+                return f"{idx:02d}"
+            return None
+        reject_code = raw_code.upper()
         if reject_code not in REJECT_REASON_MAP:
             return None
         m = re.search(r"(\d{2})\s*$", reject_code)
@@ -9566,6 +9086,41 @@ QWidget#ClientUIRoot {{
         if idx < 1 or idx > len(PRODUCTION_DAILY_REPORT_ITEMS):
             return None
         return f"{idx:02d}"
+
+    def _production_reason_text(self, code: str) -> Optional[str]:
+        reason_map = {k: v for k, v in PRODUCTION_DAILY_REPORT_ITEMS}
+        return reason_map.get(str(code or "").strip().zfill(2))
+
+    def _pdr_elapsed_seconds(self) -> int:
+        s = self.state
+        if s.downtime_started_at:
+            return max(0, int(time.time() - s.downtime_started_at))
+        return int(s.downtime_last_seconds or s.maintenance_downtime_seconds or 0)
+
+    def _close_pdr_reason_segment(self, ended_by: str) -> Optional[Dict[str, Any]]:
+        s = self.state
+        code = str(s.downtime_reason_code or "").strip()
+        reason = str(s.downtime_reason_text or "").strip()
+        if not code:
+            return None
+        end_seconds = self._pdr_elapsed_seconds()
+        start_seconds = s.pdr_current_segment_start_seconds
+        if start_seconds is None:
+            start_seconds = 0
+        row = {
+            "reason_code": code,
+            "reason": reason,
+            "started_at_seconds": int(start_seconds),
+            "ended_at_seconds": int(end_seconds),
+            "duration_seconds": max(0, int(end_seconds) - int(start_seconds)),
+            "ended_by": ended_by,
+            "closed_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        rows = list(s.pdr_reason_segments or [])
+        rows.append(row)
+        s.pdr_reason_segments = rows
+        s.pdr_current_segment_start_seconds = int(end_seconds)
+        return row
 
     def _operator_code_only(self, operator_text: Optional[str]) -> str:
         if not operator_text:
@@ -9814,8 +9369,8 @@ QWidget#ClientUIRoot {{
         self.graphics_mode = mode_key
         # Keep scan/void confirmation animation active even in faster modes.
         self.enable_check_animation = True
-        self.enable_flashing_lights = mode_key in ("faster_quality", "quality")
-        self.enable_pulse_effects = mode_key in ("faster_quality", "quality")
+        self.enable_flashing_lights = mode_key == "quality"
+        self.enable_pulse_effects = mode_key == "quality"
         self.enable_heavy_animations = mode_key == "quality"
         self.enable_background_blur = mode_key == "quality"
         self.enable_gif_animations = mode_key == "quality"
@@ -9853,6 +9408,46 @@ QWidget#ClientUIRoot {{
         if self._invalid_movie is not None and not self.enable_gif_animations:
             self._invalid_movie.stop()
         self.invalidGifLabel.setVisible(bool(self.enable_gif_animations and self.invalidOverlay.isVisible() and self._invalid_movie is not None))
+        if not self.enable_heavy_animations:
+            self.invalidGifLabel.setGraphicsEffect(None)
+            for attr_name in (
+                "productHistoryOverlay",
+                "productHistoryOrderNote",
+                "resolveOldCard",
+                "resolveNewCard",
+                "productionWaitingPanel",
+                "productionDowntimePanel",
+                "productionLiveReason",
+                "productionMaintenanceLine",
+            ):
+                widget = getattr(self, attr_name, None)
+                if widget is not None:
+                    widget.setGraphicsEffect(None)
+            for widget in getattr(self, "productionReasonCards", []) or []:
+                try:
+                    widget.setGraphicsEffect(None)
+                except Exception:
+                    pass
+        else:
+            self._apply_widget_shadow(getattr(self, "resolveOldCard", None), 26, 8, QColor(15, 23, 42, 55))
+            self._apply_widget_shadow(getattr(self, "resolveNewCard", None), 26, 8, QColor(15, 23, 42, 55))
+            self._apply_widget_shadow(getattr(self, "productionWaitingPanel", None), 12, 2, QColor(0, 0, 0, 62))
+            self._apply_widget_shadow(getattr(self, "productionDowntimePanel", None), 12, 2, QColor(0, 0, 0, 62))
+            self._apply_widget_shadow(getattr(self, "productionLiveReason", None), 16, 2, QColor(0, 0, 0, 45))
+            self._apply_widget_shadow(getattr(self, "productionMaintenanceLine", None), 16, 2, QColor(0, 0, 0, 42))
+            if getattr(self, "_product_history_shadow", None) is not None and getattr(self, "productHistoryOverlay", None) is not None:
+                self.productHistoryOverlay.setGraphicsEffect(self._product_history_shadow)
+            if getattr(self, "_product_history_order_note_shadow", None) is not None and getattr(self, "productHistoryOrderNote", None) is not None:
+                self.productHistoryOrderNote.setGraphicsEffect(self._product_history_order_note_shadow)
+            for widget in getattr(self, "productionReasonCards", []) or []:
+                try:
+                    card_shadow = QGraphicsDropShadowEffect(widget)
+                    card_shadow.setBlurRadius(16)
+                    card_shadow.setOffset(0, 3)
+                    card_shadow.setColor(QColor(15, 23, 42, 45))
+                    widget.setGraphicsEffect(card_shadow)
+                except Exception:
+                    pass
         for widget in self.findChildren(CounterCard):
             widget.set_animations_enabled(self.enable_heavy_animations)
         for widget in self.findChildren(CircleProgressBadge):
@@ -10592,11 +10187,7 @@ QWidget#ClientUIRoot {{
 
     def _approve_local_finished_shift(self, shift_payload: Dict[str, Any], reviewer: Dict[str, Any], remarks: str) -> bool:
         key = self._finish_shift_row_key(shift_payload)
-        rows = _load_finish_shift_sql()
-        use_json = False
-        if not rows:
-            rows = _load_finish_shift_json()
-            use_json = True
+        rows = _load_finish_shift_json()
         updated = False
         now_utc = datetime.now(timezone.utc).isoformat()
         for idx, row in enumerate(rows):
@@ -10627,9 +10218,7 @@ QWidget#ClientUIRoot {{
             break
         if not updated:
             return False
-        if use_json:
-            return _save_finish_shift_json(rows)
-        return _replace_finish_shift_sql(rows)
+        return _save_finish_shift_json(rows)
 
     def _approve_server_finished_shift(self, shift_payload: Dict[str, Any], reviewer_badge: str, remarks: str):
         try:
@@ -11293,7 +10882,6 @@ QWidget#ClientUIRoot {{
             return None
 
     def _refresh_job_details(self):
-        job = self._extract_job_record()
         payload = self.state.job_payload or {}
         s = self.state
         job_details = {}
@@ -11325,18 +10913,21 @@ QWidget#ClientUIRoot {{
         _stored_machine_tons = self._safe_text(job_details.get("machine_tons"), "")
         _ = (_stored_machine_num, _stored_special_instructions, _stored_machine_tons)
 
-        fields = {
-            "job_ref": self._safe_text(job.get("ref_no") or self.state.job_name),
-            "product_id": self._safe_text(job_details.get("product_id") or job.get("product_id")),
-            "mold": self._safe_text(job_details.get("mold") or job.get("custom_05")),
-            "color": self._safe_text(job_details.get("color") or job.get("custom_06"), "N/A"),
-            "cavities": self._safe_text(job_details.get("no_of_cavity") or job.get("custom_11")),
-            "sticker_label": self._safe_text(job_details.get("sticker_label"), "N/A"),
-            "std_cycle_time": self._safe_text(job_details.get("std_cycle_time"), "N/A"),
-            "qty_per_shift": self._safe_text(job_details.get("qty_per_shift"), "N/A"),
-        }
-
         raw_logs = [x for x in (s.raw_material_logs or []) if isinstance(x, dict)]
+        try:
+            table_refresh_key = json.dumps(
+                {
+                    "parts": part_rows,
+                    "raw_logs": raw_logs,
+                    "good_total": int(s.good_total or 0),
+                    "butal_total": int(s.butal_total or 0),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            table_refresh_key = str((part_rows, raw_logs, s.good_total, s.butal_total))
 
         def _fmt_number(v: float) -> str:
             if abs(v - int(v)) < 1e-9:
@@ -11344,49 +10935,51 @@ QWidget#ClientUIRoot {{
             return f"{v:.2f}".rstrip("0").rstrip(".")
 
         if hasattr(self, "jobPartsTable") and self.jobPartsTable is not None:
-            self.jobPartsTable.setRowCount(0)
-            for part in part_rows:
-                r = self.jobPartsTable.rowCount()
-                self.jobPartsTable.insertRow(r)
-                request_part_qty = self._parse_number(part.get("request_part_qty"))
-                part_qty_info = self._resolve_part_qty_per_unit(part)
-                part_qty_per_unit = float(part_qty_info.get("value") or 0.0)
-                scanned_raw_qty = self._raw_qty_for_part(raw_logs, part, total_part_count=len(part_rows))
-                produced_units = max(0.0, float(s.good_total or 0) + float(s.butal_total or 0))
-                projected_used_qty = max(0.0, produced_units * max(part_qty_per_unit, 0.0))
-                used_raw_qty = min(scanned_raw_qty, projected_used_qty) if scanned_raw_qty > 0 else 0.0
-                available_raw_qty = max(scanned_raw_qty - used_raw_qty, 0.0)
-                remaining_part_qty = max(request_part_qty - used_raw_qty, 0.0)
-                request_part_display = self._safe_text(part.get("request_part_qty"), "-")
-                if request_part_qty > 0:
-                    request_part_display = f"{_fmt_number(used_raw_qty)} / {request_part_display}"
-                else:
-                    request_part_display = _fmt_number(used_raw_qty)
-                values = [
-                    self._safe_text(part.get("sku"), "-"),
-                    self._safe_text(part.get("name"), "-"),
-                    self._format_part_qty_per_unit_display(part_qty_per_unit),
-                    _fmt_number(available_raw_qty),
-                    request_part_display,
-                    _fmt_number(remaining_part_qty),
-                ]
-                for c, val in enumerate(values):
-                    item = QTableWidgetItem(val)
-                    if c in (2, 3, 4, 5):
-                        item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            if table_refresh_key != self._job_parts_table_refresh_key:
+                self._job_parts_table_refresh_key = table_refresh_key
+                self.jobPartsTable.setRowCount(0)
+                for part in part_rows:
+                    r = self.jobPartsTable.rowCount()
+                    self.jobPartsTable.insertRow(r)
+                    request_part_qty = self._parse_number(part.get("request_part_qty"))
+                    part_qty_info = self._resolve_part_qty_per_unit(part)
+                    part_qty_per_unit = float(part_qty_info.get("value") or 0.0)
+                    scanned_raw_qty = self._raw_qty_for_part(raw_logs, part, total_part_count=len(part_rows))
+                    produced_units = max(0.0, float(s.good_total or 0) + float(s.butal_total or 0))
+                    projected_used_qty = max(0.0, produced_units * max(part_qty_per_unit, 0.0))
+                    used_raw_qty = min(scanned_raw_qty, projected_used_qty) if scanned_raw_qty > 0 else 0.0
+                    available_raw_qty = max(scanned_raw_qty - used_raw_qty, 0.0)
+                    remaining_part_qty = max(request_part_qty - used_raw_qty, 0.0)
+                    request_part_display = self._safe_text(part.get("request_part_qty"), "-")
+                    if request_part_qty > 0:
+                        request_part_display = f"{_fmt_number(used_raw_qty)} / {request_part_display}"
                     else:
-                        item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
-                    self.jobPartsTable.setItem(r, c, item)
-            if self.jobPartsTable.rowCount() == 0:
-                self.jobPartsTable.insertRow(0)
-                for c in range(6):
-                    item = QTableWidgetItem("-")
-                    item.setTextAlignment(
-                        int(Qt.AlignmentFlag.AlignCenter)
-                        if c in (2, 3, 4, 5)
-                        else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                    )
-                    self.jobPartsTable.setItem(0, c, item)
+                        request_part_display = _fmt_number(used_raw_qty)
+                    values = [
+                        self._safe_text(part.get("sku"), "-"),
+                        self._safe_text(part.get("name"), "-"),
+                        self._format_part_qty_per_unit_display(part_qty_per_unit),
+                        _fmt_number(available_raw_qty),
+                        request_part_display,
+                        _fmt_number(remaining_part_qty),
+                    ]
+                    for c, val in enumerate(values):
+                        item = QTableWidgetItem(val)
+                        if c in (2, 3, 4, 5):
+                            item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                        else:
+                            item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
+                        self.jobPartsTable.setItem(r, c, item)
+                if self.jobPartsTable.rowCount() == 0:
+                    self.jobPartsTable.insertRow(0)
+                    for c in range(6):
+                        item = QTableWidgetItem("-")
+                        item.setTextAlignment(
+                            int(Qt.AlignmentFlag.AlignCenter)
+                            if c in (2, 3, 4, 5)
+                            else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                        )
+                        self.jobPartsTable.setItem(0, c, item)
             self._update_product_parts_weight_indicator()
 
         # Cycle monitor values are computed live in _refresh_ui from:
@@ -11936,6 +11529,9 @@ QWidget#ClientUIRoot {{
             return "Production daily report mode enabled"
         if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
             return "Production daily report resolve"
+        if res.kind == "PRODUCTION_DAILY_REPORT_REASON":
+            reason = self._production_reason_text(str(res.value or ""))
+            return f"PDR reason: {res.value} - {reason or ''}".strip()
         if res.kind == "JOB_STUB":
             return res.value
         return "Scan received"
@@ -12165,8 +11761,6 @@ QWidget#ClientUIRoot {{
     def _setup_scanner_input(self):
         mode = str(self.client_config.get("scanner_mode", SCANNER_MODE)).strip().lower()
         scanner_port = str(self.client_config.get("scanner_com_port", SCANNER_COM_PORT)).strip() or SCANNER_COM_PORT
-        scanner_baudrate = int(self.client_config.get("scanner_baudrate", SCANNER_BAUDRATE))
-        scanner_timeout = max(SCANNER_MIN_TIMEOUT_SECONDS, float(self.client_config.get("scanner_timeout", SCANNER_TIMEOUT)))
         if mode not in ("auto", "keyboard", "serial"):
             mode = "auto"
 
@@ -12226,6 +11820,7 @@ QWidget#ClientUIRoot {{
             and not s.waiting_initial_cycle_time_input
             and not s.waiting_production_report_reason
             and not s.waiting_downtime_start_maintenance
+            and not s.waiting_pdr_maintenance_reason
             and not s.waiting_downtime_end_maintenance
             and not s.waiting_cycle_time_input
             and not s.waiting_maintenance_qr
@@ -12255,6 +11850,18 @@ QWidget#ClientUIRoot {{
 
     def on_scanned(self, raw: str):
         self._mark_animation_burst()
+        if self._pending_final_review_payload:
+            raw_s = str(raw).strip()
+            raw_l = raw_s.lower()
+            if raw_l in ("next", "prev", "previous", "preview"):
+                self._scroll_finish_shift_review(1 if raw_l == "next" else -1)
+                return
+            if raw_l == "confirm":
+                self._confirm_pending_final_job_review()
+                return
+            self.status.setText('Finish job summary is open. Scan "next", "prev", or "confirm".')
+            self._show_invalid_overlay('Scan "next" / "prev" to review pages, then scan "confirm" to close the finished job.')
+            return
         if self._operator_shift_flash_active:
             pending_shift = dict(self._pending_shift_review_payload or {})
             if pending_shift:
@@ -12346,6 +11953,7 @@ QWidget#ClientUIRoot {{
             in_downtime_flow = (
                 s.waiting_production_report_reason
                 or s.waiting_downtime_start_maintenance
+                or s.waiting_pdr_maintenance_reason
                 or s.waiting_downtime_end_maintenance
                 or s.waiting_cycle_time_input
                 or s.waiting_maintenance_qr
@@ -12576,7 +12184,7 @@ QWidget#ClientUIRoot {{
             if self.can_accept_production_scans() or s.waiting_reject_reason:
                 if self._append_reject_multiplier_digit(raw_l[-1]):
                     self.status.setText(
-                        f"Reject multiplier set: x{self._reject_multiplier_value()}. Scan SUR or NO, or backspace to edit."
+                        f"Multiplier set: x{self._reject_multiplier_value()}. Scan SUR, NO, BUTAL, or backspace to edit."
                     )
                     self._refresh_ui()
                     self._save_active_session_snapshot()
@@ -12585,7 +12193,7 @@ QWidget#ClientUIRoot {{
             self._trim_reject_multiplier()
             if str(s.reject_multiplier_input or "").strip():
                 self.status.setText(
-                    f"Reject multiplier set: x{self._reject_multiplier_value()}. Scan SUR or NO, or backspace to edit."
+                    f"Multiplier set: x{self._reject_multiplier_value()}. Scan SUR, NO, BUTAL, or backspace to edit."
                 )
             else:
                 self.status.setText("Reject multiplier cleared.")
@@ -12623,6 +12231,7 @@ QWidget#ClientUIRoot {{
             material_name = str((meta.get("material_name") if isinstance(meta, dict) else None) or res_pre.value or "Raw Material").strip()
             material_product_id = material_code
             material_sku = self._lookup_product_sku(material_product_id) if material_product_id else ""
+            raw_job_code = self._normalize_job_code(meta.get("job_code")) if meta.get("job_code") else None
             s.raw_material_scans.append(material_name)
             s.raw_material_logs.append(
                 {
@@ -12637,7 +12246,7 @@ QWidget#ClientUIRoot {{
                     "lot_number": str(meta.get("lot_number") or "") if isinstance(meta, dict) else None,
                     "po_number": str(meta.get("po_number") or "") if isinstance(meta, dict) else None,
                     "unique_key": unique_key or None,
-                    "raw_job_code": self._normalize_job_code(meta.get("job_code")) if meta.get("job_code") else None,
+                    "raw_job_code": raw_job_code,
                     "scanned_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -12663,18 +12272,49 @@ QWidget#ClientUIRoot {{
             auth = self._authorized_person_from_scan(raw_s)
             if auth and str(auth.get("can_maintenance", "0")) == "1":
                 s.maintenance_name = str(auth.get("name") or raw_s)
-                if s.downtime_wait_started_at:
-                    s.downtime_wait_last_seconds = max(0, int(time.time() - s.downtime_wait_started_at))
-                s.downtime_wait_started_at = None
                 s.waiting_downtime_start_maintenance = False
-                s.downtime_started_at = time.time()
-                s.downtime_active = True
-                s.waiting_downtime_end_maintenance = True
-                self.status.setText('Maintenance acknowledged. Downtime timer started. Scan "pdr_done" when downtime is done.')
+                s.waiting_pdr_maintenance_reason = True
+                self.status.setText("Maintenance acknowledged. Scan valid PDR reason QR (01-15) to start downtime.")
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 return
             self.status.setText("Waiting mode: scan valid Maintenance QR to start downtime.")
+            return
+
+        # PDR validation step: maintenance confirms the reason that starts downtime.
+        if s.waiting_pdr_maintenance_reason:
+            code = self._extract_production_reason_code(raw_s)
+            reason = self._production_reason_text(code) if code else None
+            if not code or not reason:
+                self.status.setText("PDR validation: scan valid reason QR (01-15).")
+                return
+            if s.downtime_active and s.downtime_started_at:
+                s.waiting_pdr_maintenance_reason = False
+                s.downtime_reason_code = code
+                s.downtime_reason_text = reason
+                if s.pdr_current_segment_start_seconds is None:
+                    s.pdr_current_segment_start_seconds = self._pdr_elapsed_seconds()
+                s.waiting_downtime_end_maintenance = True
+                self.status.setText(f"Next PDR reason started: {code} - {reason}. Downtime timer continues.")
+                self._refresh_ui()
+                self._save_active_session_snapshot()
+                return
+            if s.downtime_wait_started_at:
+                s.downtime_wait_last_seconds = max(0, int(time.time() - s.downtime_wait_started_at))
+            s.downtime_wait_started_at = None
+            s.waiting_pdr_maintenance_reason = False
+            s.downtime_reason_code = code
+            s.downtime_reason_text = reason
+            s.downtime_started_at = time.time()
+            s.downtime_last_seconds = None
+            s.maintenance_downtime_seconds = None
+            s.pdr_reason_segments = []
+            s.pdr_current_segment_start_seconds = 0
+            s.downtime_active = True
+            s.waiting_downtime_end_maintenance = True
+            self.status.setText(f"PDR reason validated: {code} - {reason}. Downtime timer started. Scan \"pdr_done\" when done.")
+            self._refresh_ui()
+            self._save_active_session_snapshot()
             return
 
         # Downtime running step: wait for pdr_done to begin resolution flow.
@@ -12719,11 +12359,41 @@ QWidget#ClientUIRoot {{
                     s.supervisor_downtime_confirmation_seconds = max(
                         0, int(time.time() - s.supervisor_downtime_confirmation_started_at)
                     )
+                if s.downtime_started_at:
+                    s.maintenance_downtime_seconds = max(0, int(time.time() - s.downtime_started_at))
+                    s.downtime_last_seconds = s.maintenance_downtime_seconds
+                elif s.maintenance_downtime_seconds is not None:
+                    s.downtime_last_seconds = int(s.maintenance_downtime_seconds)
+                s.downtime_started_at = None
+                s.downtime_active = False
+                s.waiting_downtime_end_maintenance = False
                 s.waiting_supervisor_qr = False
-                s.waiting_maintenance_qr = True
                 self.resolveNewCycle.setText(f"Confirmed by: {s.cycle_time_confirmed_by or ''}")
                 self._supervisor_validation_pending = True
-                self.status.setText("Supervisor QR logged. Validating...")
+                self._reset_downtime_resolution_state()
+                self._hide_resolve_overlay()
+                self._hide_production_overlay()
+                self.status.setText("Supervisor QR logged. Downtime resolved.")
+                self.push_event(
+                    {
+                        "type": "PRODUCTION_DAILY_REPORT_RESOLVED",
+                        "operator_reason_code": s.pdr_operator_reason_code,
+                        "operator_reason": s.pdr_operator_reason_text,
+                        "reason_code": s.downtime_reason_code,
+                        "reason": s.downtime_reason_text,
+                        "reason_segments": list(s.pdr_reason_segments or []),
+                        "cycle_time": s.cycle_time_current,
+                        "waiting_seconds": int(s.downtime_wait_last_seconds or 0),
+                        "downtime_seconds": int(s.downtime_last_seconds or 0),
+                        "maintenance_downtime_seconds": int(s.maintenance_downtime_seconds or 0),
+                        "supervisor_downtime_confirmation_seconds": int(s.supervisor_downtime_confirmation_seconds or 0),
+                        "maintenance": s.maintenance_name,
+                        "supervisor": s.supervisor_name,
+                    },
+                    "PRODUCTION DAILY REPORT RESOLVED",
+                )
+                self._save_active_session_snapshot()
+                self._refresh_ui()
                 QTimer.singleShot(1000, lambda name=s.supervisor_name: self._show_downtime_supervisor_saved_overlay(name))
                 return
             scanned_name = str((auth or {}).get("name") or raw_s or "").strip()
@@ -12734,7 +12404,7 @@ QWidget#ClientUIRoot {{
             QTimer.singleShot(1000, lambda: self._show_downtime_supervisor_failed_overlay("This is not supervisor QR"))
             return
 
-        # Resolution step 3: Maintenance stops downtime, then operator can proceed
+        # Resolution step 3: Maintenance stops downtime, then cycle time can be confirmed.
         if s.waiting_maintenance_qr:
             auth = self._authorized_person_from_scan(raw_s)
             if auth and str(auth.get("can_maintenance", "0")) == "1":
@@ -12744,14 +12414,15 @@ QWidget#ClientUIRoot {{
                     s.downtime_last_seconds = s.maintenance_downtime_seconds
                 s.downtime_started_at = None
                 s.waiting_maintenance_qr = False
-                s.operator_downtime_confirmation_started_at = time.time()
-                s.waiting_operator_downtime_confirm = True
+                self._begin_downtime_resolution()
+                self.status.setText("Maintenance QR logged. Input cycle time, confirm, then scan Supervisor QR.")
                 self._refresh_ui()
+                self._save_active_session_snapshot()
                 return
             self.status.setText("Scan valid Maintenance QR.")
             return
 
-        # Resolution step 4: Operator confirmation
+        # Legacy resolution step 4: Operator confirmation
         if s.waiting_operator_downtime_confirm:
             op_auth = self._operator_from_scan(raw_s)
             if op_auth:
@@ -12834,6 +12505,7 @@ QWidget#ClientUIRoot {{
             return
         if not (
             res.kind == "STARTUP_REJECT"
+            or res.kind == "BUTAL"
             or (res.kind == "REJECT_REASON" and str(res.value or "").strip().upper() == "NO")
         ):
             self._consume_reject_multiplier_if_inapplicable(raw_l)
@@ -12854,16 +12526,21 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Production Daily Report: unknown reason code.")
                 return
             s.waiting_production_report_reason = False
-            s.downtime_reason_code = code
-            s.downtime_reason_text = reason
+            s.pdr_operator_reason_code = code
+            s.pdr_operator_reason_text = reason
+            s.downtime_reason_code = None
+            s.downtime_reason_text = None
             s.downtime_wait_started_at = time.time()
             s.downtime_wait_last_seconds = None
             s.waiting_downtime_start_maintenance = True
+            s.waiting_pdr_maintenance_reason = False
             s.waiting_downtime_end_maintenance = False
             s.downtime_started_at = None
             s.downtime_resolution_started_at = None
             s.downtime_active = False
             s.maintenance_downtime_seconds = None
+            s.pdr_reason_segments = []
+            s.pdr_current_segment_start_seconds = None
             s.supervisor_downtime_confirmation_started_at = None
             s.supervisor_downtime_confirmation_seconds = None
             s.operator_downtime_confirmation_started_at = None
@@ -12872,10 +12549,10 @@ QWidget#ClientUIRoot {{
             s.supervisor_name = None
             self._set_production_overlay_mode("active")
             self._show_production_overlay()
-            self.status.setText(f"Production Daily Report reason set: {code} - {reason}. Waiting for maintenance scan.")
+            self.status.setText(f"Operator PDR reason set: {code} - {reason}. Waiting for maintenance scan.")
             self._refresh_ui()
             self.push_event(
-                {"type": "PRODUCTION_DAILY_REPORT", "reason_code": code, "reason": reason, "mode": "WAITING_FOR_MAINTENANCE"},
+                {"type": "PRODUCTION_DAILY_REPORT", "operator_reason_code": code, "operator_reason": reason, "mode": "WAITING_FOR_MAINTENANCE"},
                 f"PRODUCTION DAILY REPORT {code} {reason}",
             )
             return
@@ -12965,6 +12642,7 @@ QWidget#ClientUIRoot {{
                 s.waiting_reject_reason
                 or s.waiting_production_report_reason
                 or s.waiting_downtime_start_maintenance
+                or s.waiting_pdr_maintenance_reason
                 or s.waiting_downtime_end_maintenance
                 or s.waiting_cycle_time_input
                 or s.waiting_maintenance_qr
@@ -12990,6 +12668,7 @@ QWidget#ClientUIRoot {{
                 s.waiting_reject_reason
                 or s.waiting_production_report_reason
                 or s.waiting_downtime_start_maintenance
+                or s.waiting_pdr_maintenance_reason
                 or s.waiting_downtime_end_maintenance
                 or s.waiting_cycle_time_input
                 or s.waiting_maintenance_qr
@@ -13029,9 +12708,9 @@ QWidget#ClientUIRoot {{
                     f"FINISH LINKED JOB {lp.get('job_name') or lp.get('job_code') or ''}".strip(),
                     silent=True,
                 )
-            self.status.setText("Finishing job...")
-            self._finish_pending_clear = True
-            self._show_finish_overlay()
+            self.status.setText('Finish job summary opened. Scan "next" / "prev" / "confirm".')
+            self._finish_pending_clear = False
+            self._show_final_job_review_overlay(finished_payload, linked_finished_payloads)
             return
 
         if res.kind == "JOB_LINKAGE_TRIGGER":
@@ -13044,6 +12723,7 @@ QWidget#ClientUIRoot {{
                 s.waiting_reject_reason
                 or s.waiting_production_report_reason
                 or s.waiting_downtime_start_maintenance
+                or s.waiting_pdr_maintenance_reason
                 or s.waiting_downtime_end_maintenance
                 or s.downtime_active
             ):
@@ -13066,9 +12746,21 @@ QWidget#ClientUIRoot {{
             if not s.waiting_downtime_end_maintenance:
                 self.status.setText("Downtime resolution is already in progress.")
                 return
+            self._close_pdr_reason_segment("pdr_done")
+            if str(s.downtime_reason_code or "").strip().zfill(2) == "07":
+                s.waiting_downtime_end_maintenance = False
+                s.waiting_pdr_maintenance_reason = True
+                s.downtime_reason_code = None
+                s.downtime_reason_text = None
+                self.status.setText("Mold Change PDR done. Scan next valid PDR reason QR (01-15). Downtime timer continues.")
+                self._refresh_ui()
+                self._save_active_session_snapshot()
+                return
             s.waiting_downtime_end_maintenance = False
-            self._begin_downtime_resolution()
-            self.status.setText("Downtime done. Scan Maintenance QR, then input cycle time, confirm, Supervisor QR, and Operator QR.")
+            s.waiting_maintenance_qr = True
+            self.status.setText("Downtime done. Scan Maintenance QR to stop downtime timer.")
+            self._refresh_ui()
+            self._save_active_session_snapshot()
             return
 
         if s.waiting_reject_reason:
@@ -13231,6 +12923,11 @@ QWidget#ClientUIRoot {{
             s.job_payload = {}
             s.downtime_reason_code = None
             s.downtime_reason_text = None
+            s.pdr_operator_reason_code = None
+            s.pdr_operator_reason_text = None
+            s.waiting_pdr_maintenance_reason = False
+            s.pdr_reason_segments = []
+            s.pdr_current_segment_start_seconds = None
             s.downtime_started_at = None
             s.downtime_last_seconds = None
             s.downtime_active = False
@@ -13458,6 +13155,11 @@ QWidget#ClientUIRoot {{
             s.reject_summary_last_scanned_at = None
             s.downtime_reason_code = None
             s.downtime_reason_text = None
+            s.pdr_operator_reason_code = None
+            s.pdr_operator_reason_text = None
+            s.waiting_pdr_maintenance_reason = False
+            s.pdr_reason_segments = []
+            s.pdr_current_segment_start_seconds = None
             s.downtime_started_at = None
             s.downtime_last_seconds = None
             s.downtime_active = False
@@ -13773,19 +13475,24 @@ QWidget#ClientUIRoot {{
                 return
 
             if res.kind == "BUTAL":
-                qty = int(res.qty or 0)
+                base_qty = int(res.qty or 0)
+                multiplier = self._reject_multiplier_value()
+                qty = base_qty * multiplier
                 s.butal_total += qty
                 s.butal_scan_logs.append(
                     {
                         "raw_scan": raw_s,
                         "qty": qty,
+                        "base_qty": base_qty,
+                        "multiplier": multiplier,
                         "scanned_at": datetime.now(timezone.utc).isoformat(),
                         "operator": str(s.operator_id or "").strip() or "-",
                         "operator_name": self._operator_display_name(s.operator_id),
                         "voided": False,
                     }
                 )
-                self.status.setText(f"Butal +{qty}")
+                self._clear_reject_multiplier()
+                self.status.setText(f"Butal +{qty}" if multiplier <= 1 else f"Butal +{qty} (x{multiplier})")
                 self.lblButal.add_points(qty)
                 self.lblTotalGood.add_points(qty)
                 self._refresh_ui()
@@ -13859,10 +13566,7 @@ QWidget#ClientUIRoot {{
                 continue
             try:
                 rows_snapshot = item.get("rows") if isinstance(item.get("rows"), list) else list(getattr(self, "_app_logs", []) or [])
-                row = item.get("row") if isinstance(item.get("row"), dict) else None
                 _save_app_logs_json(rows_snapshot)
-                if row is not None:
-                    _insert_app_log_sql(row)
             except Exception:
                 pass
             finally:
@@ -13879,7 +13583,7 @@ QWidget#ClientUIRoot {{
                 return
             except queue.Full:
                 try:
-                    dropped = self._app_log_queue.get_nowait()
+                    self._app_log_queue.get_nowait()
                 except queue.Empty:
                     return
                 else:

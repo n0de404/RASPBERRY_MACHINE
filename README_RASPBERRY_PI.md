@@ -119,7 +119,7 @@ Default launcher values:
 - `MACHINE_SERVER_URL=http://127.0.0.1:8000`
 - `MACHINE_SCANNER_MODE=auto`
 - `MACHINE_SCANNER_COM_PORT=/dev/ttyACM0`
-- `MACHINE_DEFAULT_GRAPHICS_MODE=faster_quality`
+- `MACHINE_DEFAULT_GRAPHICS_MODE=faster`
 
 If your scanner appears on a different port, check with:
 

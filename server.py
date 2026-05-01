@@ -999,6 +999,78 @@ def load_active_sessions_seed() -> Dict[str, MachineSession]:
     return out
 
 
+def _save_active_sessions_json(rows: Dict[str, MachineSession]) -> bool:
+    try:
+        payload: Dict[str, Any] = {}
+        for machine_code, sess in (rows or {}).items():
+            if isinstance(sess, MachineSession):
+                payload[str(machine_code or sess.machine_code).strip()] = sess.to_dict()
+        ACTIVE_MACHINE_SESSIONS_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO `active_machine_sessions` (`machine_code`, `saved_at_utc`, `raw_json`)
+                VALUES (%s, %s, CAST(%s AS JSON))
+                ON DUPLICATE KEY UPDATE
+                  `saved_at_utc`=VALUES(`saved_at_utc`),
+                  `raw_json`=VALUES(`raw_json`)
+                """,
+                (
+                    str(row.get("machine_code") or "").strip(),
+                    row.get("saved_at_utc") or utc_now().isoformat(),
+                    json.dumps(row, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _delete_active_session_sql(machine_code: str) -> bool:
+    code = str(machine_code or "").strip()
+    if not code:
+        return False
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM `active_machine_sessions` WHERE `machine_code`=%s", (code,))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _persist_active_sessions_state() -> None:
+    _save_active_sessions_json(SESSIONS)
+    for sess in SESSIONS.values():
+        _upsert_active_session_sql(sess.to_dict())
+
+
+def _remove_persisted_active_session(machine_code: str) -> None:
+    _delete_active_session_sql(machine_code)
+    _save_active_sessions_json(SESSIONS)
+
+
 SESSIONS: Dict[str, MachineSession] = load_active_sessions_seed()  # key = machine_code
 WS_CLIENTS: List[WebSocket] = []
 STATE_TICK_TASK: Optional[asyncio.Task] = None
@@ -6497,7 +6569,6 @@ def api_profiles_operators():
 
 @APP.post("/api/profiles")
 async def api_profiles_create(req: Request):
-    global PROFILES
     data = await req.json()
     name = str(data.get("name", "")).strip()
     id_number = str(data.get("id_number", "")).strip()
@@ -6537,7 +6608,6 @@ async def api_profile_qr_preview(req: Request):
 
 @APP.post("/api/profiles/authorize-print")
 async def api_profiles_authorize_print(req: Request):
-    global PROFILES
     data = await req.json()
     id_number = str(data.get("id_number", "")).strip()
     admin_password = str(data.get("admin_password", "") or "")
@@ -6563,7 +6633,6 @@ async def api_profiles_authorize_print(req: Request):
 
 @APP.post("/api/profiles/delete")
 async def api_profiles_delete(req: Request):
-    global PROFILES
     data = await req.json()
     id_number = str(data.get("id_number", "")).strip()
     admin_password = str(data.get("admin_password", "") or "")
@@ -6590,7 +6659,6 @@ async def api_profiles_authorize_open(req: Request):
 
 @APP.post("/api/machines/status")
 async def api_machine_status_set(req: Request):
-    global MACHINE_STATUS_OVERRIDES, MACHINE_STATUS_ARCHIVE
     data = await req.json()
     machine_code = str(data.get("machine_code", "")).strip()
     status = str(data.get("status", "")).strip()
@@ -6735,6 +6803,7 @@ async def api_event(req: Request):
             save_finished_jobs(FINISHED_JOBS)
         if machine_code in SESSIONS:
             del SESSIONS[machine_code]
+            _remove_persisted_active_session(machine_code)
     elif ev_type == "JOB_LINKAGE_SET":
         sess.linkage_enabled = True
         linked_code = str(ev.get("linked_job_code", "")).strip()
@@ -6792,6 +6861,7 @@ async def api_event(req: Request):
                 sess.linkage_jobs = list(snap.get("linkage_jobs") or [])
             if isinstance(snap.get("operator_shift_logs"), list):
                 sess.operator_shift_logs = list(snap.get("operator_shift_logs") or [])
+            _persist_active_sessions_state()
     elif ev_type == "PACK":
         qty = int(ev.get("qty", 0) or 0)
         sess.pack_total += qty
@@ -6807,6 +6877,9 @@ async def api_event(req: Request):
             sess.reject_total += qty
         if reason:
             sess.reject_breakdown[reason] = sess.reject_breakdown.get(reason, 0) + qty
+
+    if ev_type not in ("SESSION_SYNC", "HEARTBEAT", "FINISH_JOB"):
+        _persist_active_sessions_state()
 
     await broadcast_state()
     return {"ok": True}
@@ -6889,7 +6962,6 @@ async def api_server_settings_save(req: Request):
 
 @APP.post("/api/finished-jobs/review")
 async def api_finished_jobs_review(req: Request):
-    global FINISHED_JOBS
     data = await req.json()
     job_key = str(data.get("job_key", "")).strip()
     action = str(data.get("action", "")).strip().lower()  # approve | disapprove | update
@@ -7002,7 +7074,6 @@ async def api_finished_jobs_review(req: Request):
 
 @APP.post("/api/finished-jobs/archive")
 async def api_finished_jobs_archive(req: Request):
-    global FINISHED_JOBS, ARCHIVED_JOBS
     data = await req.json()
     job_key = str(data.get("job_key", "")).strip()
     print_payload = data.get("print_payload") if isinstance(data.get("print_payload"), dict) else {}

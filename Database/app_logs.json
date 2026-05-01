@@ -16822,5 +16822,335 @@
     "source": "APP",
     "actor": "-",
     "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-04-24T01:55:00.357597+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-04-24T06:45:55.351715+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-04-24T08:38:25.257218+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-04-25T01:56:23.603022+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:16:57.977124+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:21:47.937272+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:21:53.738166+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:26.837820+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:28.184152+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00003"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:28.192799+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Machine set: IMM 303"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:31.210539+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:34.226353+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:45.221493+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: O000000000240000010538000000000000"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:46.554822+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "GET https://sbk-ptii.net/philtop/IMS/v1/jobs/105380 -> HTTP 200 (try 1/3)"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:46.556331+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "GET body unauthorized; refreshing bearer token"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:46.556331+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "LOGIN preparing https://sbk-ptii.net/philtop/IMS/v1/auth/login (user=svcapiroleprod, ttl=604800)"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:46.861925+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "LOGIN POST https://sbk-ptii.net/philtop/IMS/v1/auth/login -> HTTP 200"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:46.867377+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "LOGIN OK (bearer token received)"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:47.350672+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "GET https://sbk-ptii.net/philtop/IMS/v1/jobs/105380 -> HTTP 200 (try 2/3)"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:47.351242+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "GET OK: job 105380"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:47.351242+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Job set (API): 3-26-0328-2"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:47.428373+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:50.394118+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:52.419582+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:44:53.408085+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:47:58.661963+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:47:58.661963+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:01.173507+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:01.174506+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:03.344924+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Dropdown changed: Monitor / Window Size -> Fullscreen"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:05.039000+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Dropdown changed: Monitor / Window Size -> 1024x600"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:07.243874+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Dropdown changed: Monitor / Window Size -> 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:08.657200+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Display applied: Raspberry Pi OS / 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:08.657200+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:25.233853+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:25.234491+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:26.651224+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 102394"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:48:26.655692+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:51:04.310825+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 25-00446"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:51:04.313825+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:51:46.737643+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 25-00446"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:51:46.739645+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:51:57.327098+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 102394"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:51:57.331407+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:52:32.388875+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 102394"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:52:32.388875+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:52:34.556318+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 102394"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:52:34.556318+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:52:50.929729+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 25-00446"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:52:50.929729+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:52:52.162834+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 25-00446"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:52:52.162834+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:52:53.096805+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 25-00446"
+  },
+  {
+    "timestamp_utc": "2026-04-25T08:52:53.096805+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-04-27T00:29:05.922984+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
   }
 ]
