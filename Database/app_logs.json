@@ -17152,5 +17152,2237 @@
     "source": "APP",
     "actor": "-",
     "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:49:51.173874+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:52:38.415187+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:52:38.421716+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:52:40.576037+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:52:40.576037+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:52:44.097984+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Dropdown changed: Monitor / Window Size -> 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:52:44.599610+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Display applied: Raspberry Pi OS / 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:52:44.599610+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:53:06.497256+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:53:06.497256+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:53:12.097843+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: \u001b \u001b \u001b \u001b operatorshift~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:53:12.097843+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:57:37.031184+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 26-00123"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:57:37.031184+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:57:48.822084+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:57:48.829586+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Machine set: IMM 304"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:57:51.848722+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:57:54.864691+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:58:01.119492+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: O000000000240000010538000000000000"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:58:02.519655+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "GET https://sbk-ptii.net/philtop/IMS/v1/jobs/105380 -> HTTP 200 (try 1/3)"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:58:02.519655+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "GET OK: job 105380"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:58:02.526554+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Job set (API): 3-26-0328-2"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:58:02.605382+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:58:05.565232+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:58:05.894505+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 26-00123"
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:58:05.896505+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:58:07.597960+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T06:58:08.581671+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:35:47.361586+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:35:49.205334+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:35:49.205334+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Recovered last state for IMM 304. Scan operator QR first."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:35:49.275289+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:35:52.235376+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:35:54.269376+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:35:55.251110+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:00.536061+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:00.536061+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:02.125242+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:02.125242+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:04.395130+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Dropdown changed: Monitor / Window Size -> 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:04.918467+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Display applied: Raspberry Pi OS / 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:04.918467+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:07.815707+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:07.815707+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:12.249316+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 26-00123"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:12.270634+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:49.495207+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 87936"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:36:49.510344+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Unknown or invalid QR."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:00.940224+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 25-00446"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:00.963778+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Operator set: 25-00446 - ROLAND RECLA. Enter cycle time now."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:01.027984+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:03.997421+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:06.031371+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:31.826246+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:41.398454+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:41.411844+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Cycle time saved. Input machine counter next."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:41.485299+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:45.582389+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:46.498987+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:51.212572+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:51.228145+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Machine counter saved. Production can continue."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:51.304310+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:37:56.318982+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:07.610641+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: operatorshift~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:07.612660+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Input machine counter before finish preview."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:16.373260+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: operatorshift!"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:16.381761+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Shift end machine counter: scan numpad digits, backspace, confirm."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:20.349712+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: operatorshift"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:20.361485+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Shift end machine counter: scan numpad digits, backspace, confirm."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:33.882557+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:39.638075+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:39.671619+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish shift saved. Waiting for Supervisor QR approval."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:43.497633+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:45.188353+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:45.188353+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:48.001593+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Dropdown changed: Monitor / Window Size -> Fullscreen"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:48.791629+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Display applied: Raspberry Pi OS / Fullscreen"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:48.791629+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:50.101496+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:41:50.101496+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:42:31.254371+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:42:31.254371+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:42:32.438369+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: api"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:42:32.439370+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings API Config [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:42:39.845063+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Input updated: Server URL = http://192.168.1.213:8000"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:43:12.926721+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Input updated: Job API Base URL = https://sbk-ptii.net/philtop/IMS/v1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:43:13.027847+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:43:13.028847+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:56:22.526789+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:30.072843+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:30.074843+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 304 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:30.136118+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:33.111180+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:35.126662+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:36.118958+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:36.257824+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:36.257824+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:38.603641+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: logs"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:38.609800+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings App Logs [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:39.102794+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: api"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.216686+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings API Config [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.290705+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.290705+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.332998+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: api"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.332998+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings API Config [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.370607+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.370607+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.408254+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.409255+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.436970+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: graphics"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.436970+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Graphics [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.476496+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:45.476496+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:51.556841+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Dropdown changed: Monitor / Window Size -> 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:52.306290+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Display applied: Raspberry Pi OS / 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:52.306290+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:54.989084+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:58:54.989084+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:59:11.646056+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: operatorshift~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:59:11.648064+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Input machine counter before finish preview."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:59:18.596430+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:59:24.602815+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:59:24.639614+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish shift saved. Waiting for Supervisor QR approval."
+  },
+  {
+    "timestamp_utc": "2026-05-02T07:59:28.752244+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:04:50.957150+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:04:55.550235+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:04:55.570346+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 304 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:04:55.637383+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:04:58.582435+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:00.633118+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:01.600862+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:04.724891+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:04.724891+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:06.510152+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:06.510152+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:09.057186+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Dropdown changed: Monitor / Window Size -> 1024x600"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:09.571026+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Display applied: Raspberry Pi OS / 1024x600"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:09.571026+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:21.445040+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:21.446040+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:32.499132+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: operatorshift~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:32.500326+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Input machine counter before finish preview."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:38.582463+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:45.092158+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:45.130153+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish shift saved. Waiting for Supervisor QR approval."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:05:48.117808+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:39.342173+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:43.022537+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:43.031042+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 304 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:43.091016+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:46.066558+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:46.710449+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:46.710449+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:48.079992+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:48.579899+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:48.579899+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:49.084166+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:50.054933+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Dropdown changed: Monitor / Window Size -> 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:51.700428+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Dropdown changed: Monitor / Window Size -> 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:52.182894+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Display applied: Raspberry Pi OS / 1920x1080"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:52.182894+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:55.131403+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:09:55.132406+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:10:08.620276+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: operatorshift~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:10:08.620276+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Input machine counter before finish preview."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:10:14.720100+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:10:14.740219+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Machine Counter is empty. Scan digits first."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:10:19.549003+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:10:22.690111+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:10:22.730893+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish shift saved. Waiting for Supervisor QR approval."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:10:25.716000+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:19.240219+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:23.205893+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:23.205893+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:24.033648+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: api"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:24.033648+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings API Config [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:24.414033+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:24.414033+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:28.030286+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Dropdown changed: Monitor / Window Size -> 1280x720"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:28.714874+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Display applied: Raspberry Pi OS / 1280x720"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:28.715874+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:32.935726+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:32.936831+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:44.431320+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: operatorshift~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:44.432778+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Scan machine QR first."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:51.953016+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:51.963525+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 304 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:52.026083+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:55.000682+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:55.188416+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: operatorshift~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:55.198136+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Input machine counter before finish preview."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:57.032027+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:14:58.015059+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:15:01.008137+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:15:06.218342+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:15:06.258215+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish shift saved. Waiting for Supervisor QR approval."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:15:10.316495+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:21.178337+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:22.588438+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:22.588438+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:24.888399+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: logs"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:24.900739+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings App Logs [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:25.388568+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:31.499945+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:31.549539+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:31.549539+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:31.568728+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: graphics"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:31.568728+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Graphics [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:31.614692+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:31.614692+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:35.566278+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Dropdown changed: Monitor / Window Size -> 1280x720"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:38.288110+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Dropdown changed: Monitor / Window Size -> 1366x768"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:38.838312+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Display applied: Raspberry Pi OS / 1366x768"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:38.838312+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:43.274730+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:17:43.274730+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:05.961266+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:05.971772+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 304 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:06.052073+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:09.015372+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:11.064910+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:12.020857+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:20.383422+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: operatorshift~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:20.383422+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Input machine counter before finish preview."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:27.020653+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:32.688459+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:32.742594+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish shift saved. Waiting for Supervisor QR approval."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:18:37.233547+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:24.078628+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:28.040887+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:28.041906+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:29.428033+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:29.428033+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:32.000698+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Dropdown changed: Monitor / Window Size -> 1600x900"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:32.693754+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Display applied: Raspberry Pi OS / 1600x900"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:32.693754+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:36.116403+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:36.116403+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:56.053510+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:56.066668+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 304 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:56.138857+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:27:59.101979+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:28:00.893551+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: operatorshift~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:28:00.893551+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Input machine counter before finish preview."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:28:01.126856+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:28:02.116670+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:28:05.383677+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:28:09.358666+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:28:09.403517+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish shift saved. Waiting for Supervisor QR approval."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:28:15.167485+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:29:54.140669+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:29:54.140669+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:29:55.455634+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Display applied: Raspberry Pi OS / 1600x900"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:29:55.455634+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:30:04.704693+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:30:04.704693+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:30:09.685880+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish review page 2 of 3."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:30:11.329355+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish review page 3 of 3."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:33:02.206526+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish review page 2 of 3."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:33:05.876702+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish review page 1 of 3."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:36:45.484460+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish review page 2 of 3."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:36:55.805912+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish review page 3 of 3."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:45.594142+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:51.766844+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:51.775756+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 304 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:51.840462+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:54.815904+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:56.835128+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:57.835926+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:57.890837+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:57.890837+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:58.921802+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:39:58.921802+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:02.324355+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Dropdown changed: Monitor / Window Size -> 1600x900"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:03.005850+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Display applied: Raspberry Pi OS / 1600x900"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:03.005850+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:10.155763+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:10.155763+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:25.174516+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: operatorshift~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:25.177026+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Input machine counter before finish preview."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:30.957027+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:33.525910+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:33.567159+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish shift saved. Waiting for Supervisor QR approval."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:36.666707+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:57.050026+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish review page 2 of 3."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:40:58.483409+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Finish review page 3 of 3."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:44:34.551891+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:44:43.130419+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:44:43.134548+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 304 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:44:43.198112+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:44:46.188161+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:44:48.215275+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:44:49.201843+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:47:47.601907+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:47:47.601907+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:47:49.553963+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:47:49.553963+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:47:52.184509+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Dropdown changed: Monitor / Window Size -> 1366x768"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:47:52.759912+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Display applied: Raspberry Pi OS / 1366x768"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:47:52.759912+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:47:58.007973+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:47:58.008973+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:48:08.457947+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: productiondailyreport~1"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:48:08.460952+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Production Daily Report mode enabled. Scan reason QR now (01-15)."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:48:08.522091+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:48:11.496964+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:48:13.532953+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:48:58.352933+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: FL07"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:48:58.352933+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Operator PDR reason set: 07 - Mold Change. Waiting for maintenance scan."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:48:58.419325+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:01.398995+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:03.416013+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:47.853492+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 200001"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:47.880785+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:56.480971+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 200001"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:56.500821+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:57.511270+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 200001"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:57.523235+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:57.993079+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 200001"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:58.007126+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:58.184598+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 200001"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:58.202907+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:58.508977+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 200001"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:58.520605+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:58.852984+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 200001"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:49:58.863039+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:22.623119+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:22.650305+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:25.242941+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:25.262929+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:29.384685+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:29.400598+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:29.873343+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:29.884647+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:30.087866+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:30.099074+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:30.573132+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:30.588702+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:30.763148+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:30.772990+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:30.932190+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:30.943202+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:31.087935+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:31.098981+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:31.282966+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:31.294202+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:31.451111+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:31.463109+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:31.634394+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:31.643141+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:48.646259+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:48.662969+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:49.178929+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:50:49.187872+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Waiting mode: scan valid Maintenance QR to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:53:43.797683+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:53:46.330683+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:53:46.331696+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:53:47.753352+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: display"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:53:47.753352+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Display [ON]"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:53:50.480095+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Dropdown changed: Monitor / Window Size -> 1600x900"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:53:51.034055+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Display applied: Raspberry Pi OS / 1600x900"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:53:51.034055+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply Display Settings"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:54:02.474622+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:54:02.475622+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:54:17.094209+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00004"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:54:17.103105+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 304 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:54:17.171142+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:54:19.960228+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:54:19.973378+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Maintenance acknowledged. Scan valid PDR reason QR (01-15) to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:54:20.148156+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:54:22.172995+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-02T08:54:23.160057+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
   }
 ]

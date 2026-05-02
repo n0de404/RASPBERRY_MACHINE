@@ -318,6 +318,35 @@ def _sql_conn():
         return None
 
 
+def _load_user_qr_profiles_sql() -> List[Dict[str, Any]]:
+    conn = _sql_conn()
+    if conn is None:
+        return []
+    try:
+        out: List[Dict[str, Any]] = []
+        with conn.cursor() as cur:
+            cur.execute("SELECT `raw_json` FROM `user_qr_profiles` ORDER BY `id` ASC")
+            for row in cur.fetchall() or []:
+                raw = row.get("raw_json") if isinstance(row, dict) else None
+                item = raw if isinstance(raw, dict) else None
+                if item is None and isinstance(raw, str):
+                    try:
+                        item = json.loads(raw)
+                    except Exception:
+                        item = None
+                if isinstance(item, dict):
+                    out.append(item)
+        return out
+    except Exception as e:
+        print(f"[SQL] Failed to load user QR profiles: {e}")
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _load_active_sessions_sql() -> Dict[str, Any]:
     conn = _sql_conn()
     if conn is None:
@@ -1002,6 +1031,7 @@ class ClientState:
     waiting_pdr_maintenance_reason: bool = False
     pdr_reason_segments: List[Dict[str, Any]] = None
     pdr_current_segment_start_seconds: Optional[int] = None
+    pdr_followup_reasons_remaining: int = 0
     downtime_started_at: Optional[float] = None
     downtime_last_seconds: Optional[int] = None
     downtime_active: bool = False
@@ -4589,14 +4619,14 @@ QWidget#ClientUIRoot {{
         self.finishOverlay = QFrame(self)
         self.finishOverlay.setObjectName("ProductionOverlay")
         self.finishOverlay.setLayout(QVBoxLayout())
-        self.finishOverlay.layout().setContentsMargins(12, 10, 12, 10)
-        self.finishOverlay.layout().setSpacing(6)
+        self.finishOverlay.layout().setContentsMargins(10, 8, 10, 8)
+        self.finishOverlay.layout().setSpacing(5)
         self.finishOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishTitle = QLabel("FINISHING JOB")
-        self.finishTitle.setStyleSheet("color: #f8fafc; font-size: 22px; font-weight: 900; background: transparent; border: none;")
+        self.finishTitle.setStyleSheet("color: #f8fafc; font-size: 20px; font-weight: 900; background: transparent; border: none;")
         self.finishTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishStatus = QLabel("Processing...")
-        self.finishStatus.setStyleSheet("color: #dbeafe; font-size: 13px; font-weight: 800; background: transparent; border: none;")
+        self.finishStatus.setStyleSheet("color: #dbeafe; font-size: 12px; font-weight: 800; background: transparent; border: none;")
         self.finishStatus.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishReviewHint = QLabel(
             'Scan "next" / "prev" QR to move the review, then scan Supervisor QR to approve this finished shift.'
@@ -4604,7 +4634,7 @@ QWidget#ClientUIRoot {{
         self.finishReviewHint.setStyleSheet(
             "color: #ffffff; font-size: 14px; font-weight: 900;"
             "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(85,167,245,230), stop:1 rgba(48,118,193,238));"
-            "border: 1px solid rgba(191,219,254,120); border-radius: 18px; padding: 8px 14px;"
+            "border: 1px solid rgba(191,219,254,120); border-radius: 14px; padding: 6px 12px;"
         )
         self.finishReviewHint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishReviewHint.setWordWrap(True)
@@ -4614,26 +4644,19 @@ QWidget#ClientUIRoot {{
         self.finishProgressBar.setValue(0)
         self.finishProgressBar.setTextVisible(False)
         self.finishProgressBar.setFixedWidth(300)
-        self.finishSummaryScroll = QScrollArea()
-        self.finishSummaryScroll.setWidgetResizable(True)
+        self.finishSummaryScroll = QFrame()
         self.finishSummaryScroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.finishSummaryScroll.setStyleSheet(
-            "QScrollArea { background: transparent; border: none; }"
-            "QScrollArea > QWidget > QWidget { background: transparent; }"
-            "QScrollBar:vertical { width: 0px; background: transparent; }"
-            "QScrollBar::handle:vertical { background: transparent; min-height: 0px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }"
-            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }"
-        )
-        self.finishSummaryScroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.finishSummaryScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.finishSummaryScroll.setStyleSheet("QFrame { background: transparent; border: none; }")
+        self.finishSummaryScroll.setLayout(QVBoxLayout())
+        self.finishSummaryScroll.layout().setContentsMargins(0, 0, 0, 0)
+        self.finishSummaryScroll.layout().setSpacing(0)
         self.finishSummaryBody = QWidget()
         self.finishSummaryBody.setLayout(QVBoxLayout())
         self.finishSummaryBody.layout().setContentsMargins(2, 2, 2, 2)
         self.finishSummaryBody.layout().setSpacing(6)
         self.finishSummaryStack = QStackedWidget()
         self.finishSummaryStack.setStyleSheet("background: transparent; border: none;")
-        self.finishSummaryScroll.setWidget(self.finishSummaryBody)
+        self.finishSummaryScroll.layout().addWidget(self.finishSummaryBody)
         self.finishSummaryBody.layout().addWidget(self.finishSummaryStack)
         self.finishSummaryScroll.hide()
         self._finish_review_total_pages = 1
@@ -4655,7 +4678,7 @@ QWidget#ClientUIRoot {{
             "border: 1px solid rgba(148,163,184,0.38); border-radius: 14px; }"
         )
         self.finishSummaryOverviewSection.setLayout(finish_card_grid)
-        self.finishSummaryOverviewSection.layout().setContentsMargins(8, 8, 8, 8)
+        self.finishSummaryOverviewSection.layout().setContentsMargins(7, 7, 7, 7)
         for idx, title in enumerate((
             "Machine", "Job", "Operator", "Shift Window",
             "Pack Count", "Good", "Butal", "Reject",
@@ -4668,10 +4691,10 @@ QWidget#ClientUIRoot {{
                 "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(103,107,115,220), stop:1 rgba(56,59,66,230));"
                 "border: 1px solid rgba(148,163,184,0.32); border-radius: 12px; }"
                 "QLabel[role='title'] { color: #cbd5e1; font-size: 10px; font-weight: 900; background: transparent; border: none; }"
-                "QLabel[role='value'] { color: #f8fafc; font-size: 13px; font-weight: 900; background: transparent; border: none; }"
+                "QLabel[role='value'] { color: #f8fafc; font-size: 14px; font-weight: 900; background: transparent; border: none; }"
             )
             card.setLayout(QVBoxLayout())
-            card.layout().setContentsMargins(8, 6, 8, 6)
+            card.layout().setContentsMargins(9, 6, 9, 6)
             card.layout().setSpacing(1)
             title_lbl = QLabel(title)
             title_lbl.setProperty("role", "title")
@@ -4719,8 +4742,21 @@ QWidget#ClientUIRoot {{
         self.finishReviewPageTwo.setLayout(QVBoxLayout())
         self.finishReviewPageTwo.layout().setContentsMargins(0, 0, 0, 0)
         self.finishReviewPageTwo.layout().setSpacing(6)
+        self.finishReviewPageThree = QWidget()
+        self.finishReviewPageThree.setLayout(QVBoxLayout())
+        self.finishReviewPageThree.layout().setContentsMargins(0, 0, 0, 0)
+        self.finishReviewPageThree.layout().setSpacing(6)
+        self.finishReviewPageFour = QWidget()
+        self.finishReviewPageFour.setLayout(QVBoxLayout())
+        self.finishReviewPageFour.layout().setContentsMargins(0, 0, 0, 0)
+        self.finishReviewPageFour.layout().setSpacing(6)
+        for page in (self.finishReviewPageOne, self.finishReviewPageTwo, self.finishReviewPageThree, self.finishReviewPageFour):
+            page.setAutoFillBackground(True)
+            page.setStyleSheet("background: rgba(37,42,50,245); border: none;")
         self.finishSummaryStack.addWidget(self.finishReviewPageOne)
         self.finishSummaryStack.addWidget(self.finishReviewPageTwo)
+        self.finishSummaryStack.addWidget(self.finishReviewPageThree)
+        self.finishSummaryStack.addWidget(self.finishReviewPageFour)
         self._build_finish_review_pages()
         self._rebuild_finish_review_pages(include_second_page=True)
         self.finishSuccessRow = QWidget()
@@ -5900,8 +5936,8 @@ QWidget#ClientUIRoot {{
         self.rejectReviewLoadingLayer.setGeometry(0, 0, w, h)
 
     def _position_finish_overlay(self):
-        w = min(1280, max(1020, int(self.width() * 0.84)))
-        h = min(920, max(760, int(self.height() * 0.84)))
+        w = min(1120, max(880, int(self.width() * 0.74)))
+        h = min(760, max(620, int(self.height() * 0.72)))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.finishOverlay.setGeometry(x, y, w, h)
@@ -5914,8 +5950,11 @@ QWidget#ClientUIRoot {{
     def _build_finish_review_pages(self):
         self.finishReviewPageOne.layout().setSpacing(6)
         self.finishReviewPageTwo.layout().setSpacing(6)
+        self.finishReviewPageThree.layout().setSpacing(6)
+        self.finishReviewPageFour.layout().setSpacing(6)
         self.finishReviewPageOne.layout().addWidget(self.finishSummaryOverviewSection)
         page_one_grid_host = QWidget()
+        page_one_grid_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         page_one_grid = QGridLayout()
         page_one_grid.setContentsMargins(0, 0, 0, 0)
         page_one_grid.setHorizontalSpacing(6)
@@ -5925,26 +5964,44 @@ QWidget#ClientUIRoot {{
             page_one_grid.addWidget(self.finishReviewJobDetails._finish_section, 0, 0)
         if getattr(self.finishReviewCounters, "_finish_section", None) is not None:
             page_one_grid.addWidget(self.finishReviewCounters._finish_section, 0, 1)
-        if getattr(self.finishReviewPartialPayload, "_finish_section", None) is not None:
-            page_one_grid.addWidget(self.finishReviewPartialPayload._finish_section, 0, 2)
-        if getattr(self.finishReviewDowntime, "_finish_section", None) is not None:
-            page_one_grid.addWidget(self.finishReviewDowntime._finish_section, 1, 0)
-        if getattr(self.finishReviewRejects, "_finish_section", None) is not None:
-            page_one_grid.addWidget(self.finishReviewRejects._finish_section, 1, 1)
+        page_one_grid.setColumnStretch(0, 1)
+        page_one_grid.setColumnStretch(1, 1)
+        page_one_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.finishReviewPageOne.layout().addWidget(page_one_grid_host)
+        page_two_grid_host = QWidget()
+        page_two_grid_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        page_two_grid = QGridLayout()
+        page_two_grid.setContentsMargins(0, 0, 0, 0)
+        page_two_grid.setHorizontalSpacing(6)
+        page_two_grid.setVerticalSpacing(6)
+        page_two_grid_host.setLayout(page_two_grid)
+        if getattr(self.finishReviewDowntime, "_finish_section", None) is not None:
+            page_two_grid.addWidget(self.finishReviewDowntime._finish_section, 0, 0)
+        if getattr(self.finishReviewRejects, "_finish_section", None) is not None:
+            page_two_grid.addWidget(self.finishReviewRejects._finish_section, 0, 1)
+        page_two_grid.setColumnStretch(0, 1)
+        page_two_grid.setColumnStretch(1, 1)
+        page_two_grid.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.finishReviewPageTwo.layout().addWidget(page_two_grid_host)
+        if getattr(self.finishReviewPartialPayload, "_finish_section", None) is not None:
+            self.finishReviewPageThree.layout().addWidget(self.finishReviewPartialPayload._finish_section)
         if getattr(self.finishReviewParts, "_finish_section", None) is not None:
-            self.finishReviewPageTwo.layout().addWidget(self.finishReviewParts._finish_section)
+            self.finishReviewPageThree.layout().addWidget(self.finishReviewParts._finish_section)
+        self.finishReviewPageThree.layout().addStretch(1)
         if getattr(self.finishReviewRaw, "_finish_section", None) is not None:
-            self.finishReviewPageTwo.layout().addWidget(self.finishReviewRaw._finish_section)
+            self.finishReviewPageFour.layout().addWidget(self.finishReviewRaw._finish_section)
+        self.finishReviewPageFour.layout().addStretch(1)
 
-    def _rebuild_finish_review_pages(self, include_second_page: bool):
-        self._finish_review_total_pages = 2 if include_second_page else 1
+    def _rebuild_finish_review_pages(self, include_second_page: bool, include_third_page: bool = False, include_fourth_page: bool = False):
+        self._finish_review_total_pages = 1 + (1 if include_second_page else 0) + (1 if include_third_page else 0) + (1 if include_fourth_page else 0)
         self.finishSummaryStack.widget(1).setVisible(include_second_page)
+        self.finishSummaryStack.widget(2).setVisible(include_third_page)
+        self.finishSummaryStack.widget(3).setVisible(include_fourth_page)
         self._finish_review_page_index = min(int(getattr(self, "_finish_review_page_index", 0) or 0), self._finish_review_total_pages - 1)
         self.finishSummaryStack.setCurrentIndex(self._finish_review_page_index)
         self._set_finish_review_page_info()
 
-    def _scroll_finish_shift_review(self, direction: int):
+    def _change_finish_review_page(self, direction: int):
         if not self.finishOverlay.isVisible() or not self.finishSummaryScroll.isVisible():
             return
         total_pages = max(1, int(getattr(self, "_finish_review_total_pages", 1) or 1))
@@ -6653,8 +6710,59 @@ QWidget#ClientUIRoot {{
             caps.add("qc")
         return caps
 
+    def _clean_badge_scan_code(self, raw: str) -> str:
+        return re.sub(r"[\x00-\x1f\x7f]+", "", str(raw or "")).strip()
+
+    def _local_operator_from_history(self, code: str) -> Optional[Dict[str, str]]:
+        badge = self._clean_badge_scan_code(code)
+        if not badge:
+            return None
+
+        def _match_operator_value(value: Any, row: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, str]]:
+            text = str(value or "").strip()
+            if not text:
+                return None
+            op_code = self._operator_code_only(text)
+            if op_code != badge:
+                return None
+            name = ""
+            if isinstance(row, dict):
+                name = str(row.get("operator_name") or "").strip()
+            if not name and " - " in text:
+                name = text.split(" - ", 1)[1].strip()
+            return {"code": badge, "name": name or badge}
+
+        def _walk(node: Any) -> Optional[Dict[str, str]]:
+            if isinstance(node, dict):
+                for key in ("operator_id", "operator"):
+                    found = _match_operator_value(node.get(key), node)
+                    if found:
+                        return found
+                for value in node.values():
+                    found = _walk(value)
+                    if found:
+                        return found
+            elif isinstance(node, list):
+                for item in node:
+                    found = _walk(item)
+                    if found:
+                        return found
+            return None
+
+        for path in (ACTIVE_MACHINE_SESSIONS_FILE, FINISHED_JOBS_FILE, FINISH_SHIFT_FILE):
+            try:
+                if not os.path.exists(path):
+                    continue
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    found = _walk(json.load(f))
+                if found:
+                    return found
+            except Exception:
+                continue
+        return None
+
     def _authorized_person_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
-        code = str(raw).strip()
+        code = self._clean_badge_scan_code(raw)
         if not code:
             return None
         self._trigger_identity_cache_sync(force=False)
@@ -6680,6 +6788,15 @@ QWidget#ClientUIRoot {{
                     profiles = [row for row in loaded_profiles if isinstance(row, dict)]
         except Exception:
             profiles = []
+        if not profiles:
+            profiles = _load_user_qr_profiles_sql()
+            if profiles:
+                try:
+                    os.makedirs(DATABASE_DIR, exist_ok=True)
+                    with open(USER_QR_PROFILES_FILE, "w", encoding="utf-8") as f:
+                        json.dump(profiles, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
         for row in profiles:
             if not isinstance(row, dict):
                 continue
@@ -6717,6 +6834,12 @@ QWidget#ClientUIRoot {{
                         caps.add("qc")
                     if extra_priv == "supervisor":
                         caps.add("supervisor")
+
+        if not caps:
+            local_operator = self._local_operator_from_history(code)
+            if local_operator:
+                caps.add("operator")
+                display_name = display_name or str(local_operator.get("name") or "").strip()
 
         if not caps:
             return None
@@ -6820,31 +6943,6 @@ QWidget#ClientUIRoot {{
         self.finishOverlay.hide()
         if not self._should_keep_background_blur():
             self._set_background_blur(False)
-
-    def _scroll_finish_summary_page(self, direction: int):
-        if not getattr(self, "finishSummaryScroll", None) or not self.finishSummaryScroll.isVisible():
-            return False
-        bar = self.finishSummaryScroll.verticalScrollBar()
-        if bar is None:
-            return False
-        page_step = max(1, int(bar.pageStep() or self.finishSummaryScroll.viewport().height() or 1))
-        current = int(bar.value() or 0)
-        maximum = int(bar.maximum() or 0)
-        if direction > 0:
-            if current >= maximum:
-                self.status.setText("Finish review: already on last page.")
-                return True
-            bar.setValue(min(maximum, current + page_step))
-        else:
-            if current <= 0:
-                self.status.setText("Finish review: already on first page.")
-                return True
-            bar.setValue(max(0, current - page_step))
-        current_after = int(bar.value() or 0)
-        total_pages = max(1, int(math.ceil((maximum + page_step) / max(1, page_step))))
-        current_page = min(total_pages, max(1, int(current_after // max(1, page_step)) + 1))
-        self.status.setText(f"Finish review page {current_page} of {total_pages}.")
-        return True
 
     def _tick_finish_anim(self):
         if not getattr(self, "enable_heavy_animations", True):
@@ -8477,6 +8575,7 @@ QWidget#ClientUIRoot {{
             "waiting_pdr_maintenance_reason": bool(s.waiting_pdr_maintenance_reason),
             "pdr_reason_segments": list(s.pdr_reason_segments or []),
             "pdr_current_segment_start_seconds": s.pdr_current_segment_start_seconds,
+            "pdr_followup_reasons_remaining": int(s.pdr_followup_reasons_remaining or 0),
             "downtime_wait_started_at": s.downtime_wait_started_at,
             "downtime_wait_last_seconds": s.downtime_wait_last_seconds,
             "waiting_downtime_start_maintenance": bool(s.waiting_downtime_start_maintenance),
@@ -8659,6 +8758,7 @@ QWidget#ClientUIRoot {{
         s.waiting_pdr_maintenance_reason = bool(snap.get("waiting_pdr_maintenance_reason"))
         s.pdr_reason_segments = list(snap.get("pdr_reason_segments") or [])
         s.pdr_current_segment_start_seconds = snap.get("pdr_current_segment_start_seconds")
+        s.pdr_followup_reasons_remaining = int(snap.get("pdr_followup_reasons_remaining") or 0)
         s.downtime_wait_started_at = snap.get("downtime_wait_started_at")
         s.downtime_wait_last_seconds = snap.get("downtime_wait_last_seconds")
         s.waiting_downtime_start_maintenance = bool(snap.get("waiting_downtime_start_maintenance"))
@@ -8950,6 +9050,7 @@ QWidget#ClientUIRoot {{
         s.waiting_pdr_maintenance_reason = False
         s.pdr_reason_segments = []
         s.pdr_current_segment_start_seconds = None
+        s.pdr_followup_reasons_remaining = 0
         s.downtime_started_at = None
         s.downtime_last_seconds = None
         s.downtime_active = False
@@ -10051,95 +10152,109 @@ QWidget#ClientUIRoot {{
         except Exception:
             pass
 
-    def _make_finish_summary_table(self, title: str, headers: List[str]) -> QTableWidget:
+    def _make_finish_summary_table(self, title: str, headers: List[str]) -> QFrame:
         section = QFrame()
+        section.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         section.setStyleSheet(
             "QFrame {"
             "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(103,107,115,220), stop:1 rgba(56,59,66,230));"
             "border: 1px solid rgba(148,163,184,0.34); border-radius: 14px; }"
-            "QLabel { color: #f8fafc; font-size: 13px; font-weight: 900; background: transparent; border: none; }"
-            "QTableWidget { background: rgba(15,23,42,0.32); border: none; gridline-color: rgba(148,163,184,0.18); color: #f8fafc; }"
-            "QHeaderView::section { background: rgba(71,85,105,0.96); color: #f8fafc; font-weight: 900; border: none; border-bottom: 1px solid rgba(148,163,184,0.35); padding: 3px; }"
-            "QTableWidget::item { padding: 1px; border-bottom: 1px solid rgba(148,163,184,0.20); }"
+            "QLabel { color: #f8fafc; font-size: 14px; font-weight: 900; background: transparent; border: none; }"
         )
         section.setLayout(QVBoxLayout())
         section.layout().setContentsMargins(8, 7, 8, 7)
         section.layout().setSpacing(4)
         title_lbl = QLabel(title)
-        table = QTableWidget(0, len(headers))
-        table.setHorizontalHeaderLabels(headers)
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        table.setAlternatingRowColors(False)
-        table.setWordWrap(True)
-        table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setStretchLastSection(True)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        if len(headers) == 1 and str(headers[0]).strip().lower() == "entry":
-            table.horizontalHeader().setVisible(False)
-        else:
-            table.horizontalHeader().setFixedHeight(20)
-        table.verticalHeader().setDefaultSectionSize(19)
-        if title in ("Job Details", "Production Counters"):
-            table.setMinimumHeight(180)
-            table.setMaximumHeight(260)
-        elif title == "Partial Payload":
-            table.setMinimumHeight(300)
-            table.setMaximumHeight(420)
-        elif title == "Product Parts Used":
-            table.setMinimumHeight(260)
-            table.setMaximumHeight(420)
-        elif title == "Raw Materials":
-            table.setMinimumHeight(220)
-            table.setMaximumHeight(360)
-        else:
-            table.setMinimumHeight(120)
-            table.setMaximumHeight(220)
+        table = QFrame()
+        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        table.setStyleSheet(
+            "QFrame { background: rgba(15,23,42,0.32); border: none; border-radius: 10px; }"
+            "QLabel[role='header'] { background: rgba(71,85,105,0.96); color: #f8fafc; font-size: 11px; font-weight: 900; padding: 3px 4px; }"
+            "QLabel[role='cell'] { color: #f8fafc; font-size: 12px; font-weight: 800; padding: 2px 5px; border-bottom: 1px solid rgba(148,163,184,0.20); }"
+        )
+        rows_host = QWidget(table)
+        rows_layout = QGridLayout()
+        rows_layout.setContentsMargins(0, 0, 0, 0)
+        rows_layout.setHorizontalSpacing(0)
+        rows_layout.setVerticalSpacing(0)
+        rows_host.setLayout(rows_layout)
+        table.setLayout(QVBoxLayout())
+        table.layout().setContentsMargins(0, 0, 0, 0)
+        table.layout().setSpacing(0)
+        table.layout().addWidget(rows_host)
+        table._finish_headers = list(headers or ["Entry"])
+        table._finish_rows_host = rows_host
+        table._finish_rows_layout = rows_layout
+        table._finish_section = section
         section.layout().addWidget(title_lbl)
         section.layout().addWidget(table)
-        table._finish_section = section
+        section.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         return table
 
-    def _set_finish_summary_table_rows(self, table: Optional[QTableWidget], rows: List[List[str]]):
+    def _set_finish_summary_table_rows(self, table: Optional[QFrame], rows: List[List[str]]):
         if table is None:
             return
-        clean_rows = rows or [["-"] * max(1, table.columnCount())]
-        table.setRowCount(0)
+        layout = getattr(table, "_finish_rows_layout", None)
+        headers = list(getattr(table, "_finish_headers", ["Entry"]) or ["Entry"])
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        col_count = max(1, len(headers))
+        clean_rows = rows or [["-"] * col_count]
+        show_header = not (col_count == 1 and str(headers[0]).strip().lower() == "entry")
+        grid_row = 0
+        if show_header:
+            for c, header in enumerate(headers):
+                lbl = QLabel(str(header))
+                lbl.setProperty("role", "header")
+                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(lbl, grid_row, c)
+            grid_row += 1
         for row_vals in clean_rows:
-            r = table.rowCount()
-            table.insertRow(r)
             values = list(row_vals or [])
-            while len(values) < table.columnCount():
+            while len(values) < col_count:
                 values.append("-")
-            for c in range(table.columnCount()):
-                item = QTableWidgetItem(str(values[c]))
-                if table.columnCount() == 1 or c == 0:
-                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
+            for c in range(col_count):
+                lbl = QLabel(str(values[c]))
+                lbl.setProperty("role", "cell")
+                lbl.setWordWrap(True)
+                if col_count == 1 or c == 0:
+                    lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
                 else:
-                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
-                table.setItem(r, c, item)
-        header_h = table.horizontalHeader().height() if table.horizontalHeader().isVisible() else 0
-        row_h = table.verticalHeader().defaultSectionSize()
-        frame_h = table.frameWidth() * 2
-        if table in (self.finishReviewJobDetails, self.finishReviewCounters):
-            max_h = 260
-            min_h = 180
-        elif table is self.finishReviewPartialPayload:
-            max_h = 420
-            min_h = 300
-        elif table is self.finishReviewParts:
-            max_h = 420
-            min_h = 260
-        elif table is self.finishReviewRaw:
-            max_h = 360
-            min_h = 220
-        else:
-            max_h = 220
-            min_h = 120
-        target_h = min(max_h, header_h + (table.rowCount() * row_h) + frame_h + 2)
-        table.setMinimumHeight(max(min_h, target_h))
-        table.setMaximumHeight(max(min_h, target_h))
+                    lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(lbl, grid_row, c)
+            grid_row += 1
+        for c in range(col_count):
+            layout.setColumnStretch(c, 1)
+        row_h = 24
+        header_h = 23 if show_header else 0
+        target_h = max(30, header_h + (len(clean_rows) * row_h) + 3)
+        table.setMinimumHeight(target_h)
+        table.setMaximumHeight(target_h)
+        section = getattr(table, "_finish_section", None)
+        if section is not None:
+            title_h = 20
+            margin_h = 16
+            section_h = target_h + title_h + margin_h
+            section.setMinimumHeight(section_h)
+            section.setMaximumHeight(section_h)
+
+    def _stretch_finish_summary_table(self, table: Optional[QFrame], section_height: int):
+        if table is None:
+            return
+        section = getattr(table, "_finish_section", None)
+        if section is None:
+            return
+        section_h = max(72, int(section_height or 0))
+        table_h = max(32, section_h - 36)
+        table.setMinimumHeight(table_h)
+        table.setMaximumHeight(table_h)
+        section.setMinimumHeight(section_h)
+        section.setMaximumHeight(section_h)
 
     def _extract_job_payload_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -10298,6 +10413,8 @@ QWidget#ClientUIRoot {{
             [f"Machine Counter Diff: {self._safe_text(shift_payload.get('machine_counter_difference'), '-')}"],
         ]
         self._set_finish_summary_table_rows(self.finishReviewCounters, counter_rows)
+        self._stretch_finish_summary_table(self.finishReviewJobDetails, 310)
+        self._stretch_finish_summary_table(self.finishReviewCounters, 310)
 
         reject_rows = [[f"{str(k)}: {str(int(v or 0))}"] for k, v in reject_breakdown.items() if int(v or 0) > 0]
         self._set_finish_summary_table_rows(self.finishReviewRejects, reject_rows)
@@ -10312,6 +10429,8 @@ QWidget#ClientUIRoot {{
             [f"Supervisor: {self._safe_text(shift_payload.get('supervisor_name'))}"],
         ]
         self._set_finish_summary_table_rows(self.finishReviewDowntime, downtime_rows)
+        self._stretch_finish_summary_table(self.finishReviewDowntime, 390)
+        self._stretch_finish_summary_table(self.finishReviewRejects, 390)
 
         scanned_raw_qty = sum(self._parse_number(x.get("qty")) for x in raw_logs)
         part_table_rows: List[List[str]] = []
@@ -10361,6 +10480,8 @@ QWidget#ClientUIRoot {{
             [f"Qty/Shift Avg Cycle: {self._safe_text(shift_payload.get('qty_per_shift_avg_cycle'), '-')}"],
         ]
         self._set_finish_summary_table_rows(self.finishReviewPartialPayload, partial_payload_rows)
+        self._stretch_finish_summary_table(self.finishReviewPartialPayload, 390)
+        self._stretch_finish_summary_table(self.finishReviewParts, 110)
 
         raw_rows = []
         for row in raw_logs:
@@ -10374,9 +10495,16 @@ QWidget#ClientUIRoot {{
                 self._safe_text(row.get("scanned_at")),
             ])
         self._set_finish_summary_table_rows(self.finishReviewRaw, raw_rows)
+        self._stretch_finish_summary_table(self.finishReviewRaw, 500)
 
-        include_second_page = bool(partial_payload_rows or part_table_rows or raw_rows)
-        self._rebuild_finish_review_pages(include_second_page=include_second_page)
+        include_second_page = True
+        include_third_page = bool(partial_payload_rows or part_table_rows)
+        include_fourth_page = bool(raw_rows)
+        self._rebuild_finish_review_pages(
+            include_second_page=include_second_page,
+            include_third_page=include_third_page,
+            include_fourth_page=include_fourth_page,
+        )
 
     def _compute_job_progress_metrics(self) -> Dict[str, int]:
         payload = self.state.job_payload or {}
@@ -11854,7 +11982,7 @@ QWidget#ClientUIRoot {{
             raw_s = str(raw).strip()
             raw_l = raw_s.lower()
             if raw_l in ("next", "prev", "previous", "preview"):
-                self._scroll_finish_shift_review(1 if raw_l == "next" else -1)
+                self._change_finish_review_page(1 if raw_l == "next" else -1)
                 return
             if raw_l == "confirm":
                 self._confirm_pending_final_job_review()
@@ -11868,7 +11996,7 @@ QWidget#ClientUIRoot {{
                 raw_s = str(raw).strip()
                 raw_l = raw_s.lower()
                 if raw_l in ("next", "prev", "previous", "preview"):
-                    self._scroll_finish_shift_review(1 if raw_l == "next" else -1)
+                    self._change_finish_review_page(1 if raw_l == "next" else -1)
                     return
                 reviewer = self._reviewer_from_scan(raw_s)
                 if reviewer is not None and str(reviewer.get("can_supervisor", "0")) == "1":
@@ -12079,7 +12207,7 @@ QWidget#ClientUIRoot {{
             return
 
         if self.finishOverlay.isVisible() and self.finishSummaryScroll.isVisible() and raw_l in ("next", "prev", "previous", "preview"):
-            self._scroll_finish_shift_review(1 if raw_l == "next" else -1)
+            self._change_finish_review_page(1 if raw_l == "next" else -1)
             return
 
         if raw_l == "prodhistory~1":
@@ -12278,7 +12406,10 @@ QWidget#ClientUIRoot {{
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 return
-            self.status.setText("Waiting mode: scan valid Maintenance QR to start downtime.")
+            if auth:
+                self.status.setText(f"Waiting mode: scanned badge is {auth.get('role') or 'not Maintenance'}. Scan Maintenance QR.")
+            else:
+                self.status.setText("Waiting mode: Maintenance QR not found in profiles/cache. Check server/SQL profile role.")
             return
 
         # PDR validation step: maintenance confirms the reason that starts downtime.
@@ -12310,6 +12441,7 @@ QWidget#ClientUIRoot {{
             s.maintenance_downtime_seconds = None
             s.pdr_reason_segments = []
             s.pdr_current_segment_start_seconds = 0
+            s.pdr_followup_reasons_remaining = 2 if str(code or "").strip().zfill(2) == "07" else 0
             s.downtime_active = True
             s.waiting_downtime_end_maintenance = True
             self.status.setText(f"PDR reason validated: {code} - {reason}. Downtime timer started. Scan \"pdr_done\" when done.")
@@ -12541,6 +12673,7 @@ QWidget#ClientUIRoot {{
             s.maintenance_downtime_seconds = None
             s.pdr_reason_segments = []
             s.pdr_current_segment_start_seconds = None
+            s.pdr_followup_reasons_remaining = 0
             s.supervisor_downtime_confirmation_started_at = None
             s.supervisor_downtime_confirmation_seconds = None
             s.operator_downtime_confirmation_started_at = None
@@ -12747,12 +12880,13 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Downtime resolution is already in progress.")
                 return
             self._close_pdr_reason_segment("pdr_done")
-            if str(s.downtime_reason_code or "").strip().zfill(2) == "07":
+            if int(s.pdr_followup_reasons_remaining or 0) > 0:
+                s.pdr_followup_reasons_remaining = max(0, int(s.pdr_followup_reasons_remaining or 0) - 1)
                 s.waiting_downtime_end_maintenance = False
                 s.waiting_pdr_maintenance_reason = True
                 s.downtime_reason_code = None
                 s.downtime_reason_text = None
-                self.status.setText("Mold Change PDR done. Scan next valid PDR reason QR (01-15). Downtime timer continues.")
+                self.status.setText("Mold Change follow-up needed. Scan next valid PDR reason QR (01-15). Downtime timer continues.")
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 return
@@ -12928,6 +13062,7 @@ QWidget#ClientUIRoot {{
             s.waiting_pdr_maintenance_reason = False
             s.pdr_reason_segments = []
             s.pdr_current_segment_start_seconds = None
+            s.pdr_followup_reasons_remaining = 0
             s.downtime_started_at = None
             s.downtime_last_seconds = None
             s.downtime_active = False
@@ -13160,6 +13295,7 @@ QWidget#ClientUIRoot {{
             s.waiting_pdr_maintenance_reason = False
             s.pdr_reason_segments = []
             s.pdr_current_segment_start_seconds = None
+            s.pdr_followup_reasons_remaining = 0
             s.downtime_started_at = None
             s.downtime_last_seconds = None
             s.downtime_active = False

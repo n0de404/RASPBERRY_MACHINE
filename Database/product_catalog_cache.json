@@ -1,6 +1,6 @@
 {
-  "saved_at_utc": "2026-04-24T06:55:49.876350+00:00",
-  "count": 2846,
+  "saved_at_utc": "2026-05-02T07:02:36.289529+00:00",
+  "count": 2843,
   "items": [
     {
       "id": "15",
@@ -144,27 +144,27 @@
     },
     {
       "id": "8521",
-      "name": "30 Inches Towel Hanger (2 Pcs/Set) Blue",
+      "name": "30 Inches Towel Hanger (2 Pcs/Set)",
       "sku": "-HF-30-BLUE"
     },
     {
       "id": "8522",
-      "name": "30 Inches Towel Hanger (2 Pcs/Set) Green",
+      "name": "30 Inches Towel Hanger (2 Pcs/Set)",
       "sku": "-HF-30-GREEN"
     },
     {
       "id": "8523",
-      "name": "30 Inches Towel Hanger (2 Pcs/Set) Orange",
+      "name": "30 Inches Towel Hanger (2 Pcs/Set)",
       "sku": "-HF-30-ORANGE"
     },
     {
       "id": "8520",
-      "name": "30 Inches Towel Hanger (2 Pcs/Set) Pink",
+      "name": "30 Inches Towel Hanger (2 Pcs/Set)",
       "sku": "-HF-30-PINK"
     },
     {
       "id": "8524",
-      "name": "30 Inches Towel Hanger (2 Pcs/Set) Violet",
+      "name": "30 Inches Towel Hanger (2 Pcs/Set)",
       "sku": "-HF-30-VIOLET"
     },
     {
@@ -499,22 +499,22 @@
     },
     {
       "id": "48",
-      "name": "9 Inches Flower Pot Brown",
+      "name": "9 Inches Flower Pot",
       "sku": "2029-1-BROWN"
     },
     {
       "id": "8613",
-      "name": "9 Inches Flower Pot Green",
+      "name": "9 Inches Flower Pot",
       "sku": "2029-1-GREEN"
     },
     {
       "id": "49",
-      "name": "10 Inches Flower Pot Brown",
+      "name": "10 Inches Flower Pot",
       "sku": "2029-2-BROWN"
     },
     {
       "id": "8614",
-      "name": "10 Inches Flower Pot Green",
+      "name": "10 Inches Flower Pot",
       "sku": "2029-2-GREEN"
     },
     {
@@ -3245,12 +3245,12 @@
     {
       "id": "8434",
       "name": "8 L Waste Bin - Special Color",
-      "sku": "SC-231"
+      "sku": "SC-231-A"
     },
     {
       "id": "8408",
       "name": "13 L Waste Bin - Special Color",
-      "sku": "SC-232"
+      "sku": "SC-232-A"
     },
     {
       "id": "8690",
@@ -3396,6 +3396,11 @@
       "id": "8771",
       "name": "1.4 L  Food Keeper - Large - Special Color",
       "sku": "SC-504"
+    },
+    {
+      "id": "12514",
+      "name": "Bento Box - 3 Divisions w/ Spoon and Fork",
+      "sku": "SC-508"
     },
     {
       "id": "13168",
@@ -3953,11 +3958,6 @@
       "sku": "ST-PT-25-CM-12"
     },
     {
-      "id": "11549",
-      "name": "2335 By 72s - 2L Pitcher",
-      "sku": "ST-PT-SET-01"
-    },
-    {
       "id": "11626",
       "name": "500, 511 - Food Container Set",
       "sku": "ST-PT-SET-04"
@@ -4404,7 +4404,7 @@
     },
     {
       "id": "13494",
-      "name": "818-S, 818-M, 818-L (Carry Box Set)",
+      "name": "818-S, 818-M, 818-L (Carry Box Set) (6 sets per Case)",
       "sku": "ST-PT-SET-98"
     },
     {
@@ -5468,11 +5468,6 @@
       "sku": "VO-H-001-BLACK"
     },
     {
-      "id": "13231",
-      "name": "Goblet Crate - 25 Goblets - Special Order",
-      "sku": "VO-H-002"
-    },
-    {
       "id": "12725",
       "name": "17\" Hanger Flat  (6 Pcs/Set) - Special Order",
       "sku": "VO-HF-17"
@@ -5486,16 +5481,6 @@
       "id": "12672",
       "name": "Crate Cover (I-001 & 2178) Special Order",
       "sku": "VO-I-001-2178-C"
-    },
-    {
-      "id": "13117",
-      "name": "Multi-Purpose Crate Close Type - Special Order",
-      "sku": "VO-I-004"
-    },
-    {
-      "id": "12866",
-      "name": "Egg Tray Crate - Special Order",
-      "sku": "VO-I-005"
     },
     {
       "id": "11438",
@@ -5784,7 +5769,7 @@
     },
     {
       "id": "3349",
-      "name": "Waste Can Dome Cover - Blue",
+      "name": "Waste Can Dome Cover",
       "sku": "W-130-COVER-BLUE"
     },
     {
