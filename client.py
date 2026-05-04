@@ -2414,7 +2414,6 @@ class HistoryAnimatedColumn(QFrame):
     def _insert_recent_with_animation(self, text: str):
         if not getattr(self, "enable_heavy_animations", True):
             row_h = 26
-            gap = 2
             max_rows = 10
             incoming = self._make_recent_row(text)
             self._recent_items.appendleft(incoming)
@@ -2491,7 +2490,9 @@ class HistoryAnimatedColumn(QFrame):
     def _animate_latest_pulse(self):
         if not getattr(self, "enable_heavy_animations", True):
             self.latestCard.setGeometry(self._latest_base_rect)
-            self.latestCard.graphicsEffect().setOpacity(1.0)
+            effect = self.latestCard.graphicsEffect()
+            if effect is not None:
+                effect.setOpacity(1.0)
             return
         for grp in list(self._latest_anim_groups):
             try:
@@ -2613,6 +2614,10 @@ class ClientUI(QWidget):
         self._app_log_worker_stop = threading.Event()
         self._app_log_worker_thread = threading.Thread(target=self._app_log_persist_loop, daemon=True)
         self._app_log_worker_thread.start()
+        self._active_session_file_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=256)
+        self._active_session_file_worker_stop = threading.Event()
+        self._active_session_file_worker_thread = threading.Thread(target=self._active_session_file_persist_loop, daemon=True)
+        self._active_session_file_worker_thread.start()
         self._serial_stop = threading.Event()
         self._serial_thread: Optional[threading.Thread] = None
         self._motion_index = 0
@@ -8269,6 +8274,17 @@ QWidget#ClientUIRoot {{
         self.linkageMirrorOuter.setVisible(True)
         self._refresh_history_panel()
 
+    def _schedule_history_panel_refresh(self):
+        if bool(getattr(self, "_history_refresh_scheduled", False)):
+            return
+        self._history_refresh_scheduled = True
+
+        def _run():
+            self._history_refresh_scheduled = False
+            self._refresh_history_panel()
+
+        QTimer.singleShot(0, _run)
+
     def _refresh_history_panel(self):
         if not all(
             hasattr(self, name)
@@ -8676,7 +8692,7 @@ QWidget#ClientUIRoot {{
             serialized = ""
         if not force and serialized and serialized == self._last_active_session_snapshot_serialized:
             return
-        _upsert_active_session_json(snapshot)
+        self._enqueue_active_session_file_persist({"op": "upsert", "snapshot": snapshot})
         if serialized:
             self._last_active_session_snapshot_serialized = serialized
         self._trigger_active_session_sql_sync(force=False)
@@ -8715,7 +8731,7 @@ QWidget#ClientUIRoot {{
         code = str(machine_code or "").strip()
         if not code:
             return
-        _delete_active_session_json(code)
+        self._enqueue_active_session_file_persist({"op": "delete", "machine_code": code})
         self._last_active_session_snapshot_serialized = ""
 
     def _sync_active_session_snapshots_to_sql(self):
@@ -9174,6 +9190,11 @@ QWidget#ClientUIRoot {{
             if 1 <= idx <= len(PRODUCTION_DAILY_REPORT_ITEMS):
                 return f"{idx:02d}"
             return None
+        normalized_reason = re.sub(r"[^A-Z0-9]+", "", raw_code.upper())
+        if normalized_reason:
+            for code, label in PRODUCTION_DAILY_REPORT_ITEMS:
+                if normalized_reason == re.sub(r"[^A-Z0-9]+", "", str(label or "").upper()):
+                    return code
         reject_code = raw_code.upper()
         if reject_code not in REJECT_REASON_MAP:
             return None
@@ -9472,9 +9493,9 @@ QWidget#ClientUIRoot {{
         self.enable_check_animation = True
         self.enable_flashing_lights = mode_key == "quality"
         self.enable_pulse_effects = mode_key == "quality"
-        self.enable_heavy_animations = mode_key == "quality"
+        self.enable_heavy_animations = False
         self.enable_background_blur = mode_key == "quality"
-        self.enable_gif_animations = mode_key == "quality"
+        self.enable_gif_animations = True
 
         self.chkCheckAnimation.blockSignals(True)
         self.chkFlashingLights.blockSignals(True)
@@ -11672,7 +11693,7 @@ QWidget#ClientUIRoot {{
         rows = list(getattr(self, "_action_logs", []) or [])
         rows.append(f"{stamp}  {t}")
         self._action_logs = rows[-20:]
-        self._refresh_history_panel()
+        self._schedule_history_panel_refresh()
 
     def _current_app_log_actor(self) -> str:
         s = getattr(self, "state", None)
@@ -13725,6 +13746,43 @@ QWidget#ClientUIRoot {{
                 else:
                     self._app_log_queue.task_done()
 
+    def _active_session_file_persist_loop(self):
+        while not self._active_session_file_worker_stop.is_set() or not self._active_session_file_queue.empty():
+            try:
+                item = self._active_session_file_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                op = str(item.get("op") or "").strip().lower()
+                if op == "upsert":
+                    snapshot = item.get("snapshot")
+                    if isinstance(snapshot, dict):
+                        _upsert_active_session_json(snapshot)
+                elif op == "delete":
+                    _delete_active_session_json(item.get("machine_code"))
+            except Exception:
+                pass
+            finally:
+                self._active_session_file_queue.task_done()
+
+    def _enqueue_active_session_file_persist(self, item: Dict[str, Any]):
+        payload = dict(item or {})
+        if self._active_session_file_worker_stop.is_set():
+            op = str(payload.get("op") or "").strip().lower()
+            if op == "upsert" and isinstance(payload.get("snapshot"), dict):
+                _upsert_active_session_json(payload["snapshot"])
+            elif op == "delete":
+                _delete_active_session_json(payload.get("machine_code"))
+            return
+        try:
+            self._active_session_file_queue.put_nowait(payload)
+        except Exception:
+            op = str(payload.get("op") or "").strip().lower()
+            if op == "upsert" and isinstance(payload.get("snapshot"), dict):
+                _upsert_active_session_json(payload["snapshot"])
+            elif op == "delete":
+                _delete_active_session_json(payload.get("machine_code"))
+
     def push_event(self, event: Dict[str, Any], last_event: str, silent: bool = False, defer_snapshot: bool = False):
         s = self.state
         if not s.machine_code:
@@ -13747,15 +13805,18 @@ QWidget#ClientUIRoot {{
         self._enqueue_server_event(payload, silent=silent)
 
     def closeEvent(self, event):
+        self._save_active_session_snapshot()
         self._serial_stop.set()
         self._event_worker_stop.set()
         self._app_log_worker_stop.set()
+        self._active_session_file_worker_stop.set()
         self._shutdown_average_weight_server()
         if self._event_worker_thread and self._event_worker_thread.is_alive():
             self._event_worker_thread.join(timeout=1.0)
         if self._app_log_worker_thread and self._app_log_worker_thread.is_alive():
             self._app_log_worker_thread.join(timeout=1.0)
-        self._save_active_session_snapshot()
+        if self._active_session_file_worker_thread and self._active_session_file_worker_thread.is_alive():
+            self._active_session_file_worker_thread.join(timeout=1.0)
         super().closeEvent(event)
 
 

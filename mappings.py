@@ -192,9 +192,9 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="VOID_TRIGGER", raw=raw, value="Void mode")
 
     # Production daily report trigger
-    if s_l == "productiondailyreport~1":
+    if s_l in ("productiondailyreport~1", "pdr_start", "pdrstart"):
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_TRIGGER", raw=raw, value="Production daily report mode")
-    if s_l in ("productiondailyreport~2"):
+    if s_l in ("productiondailyreport~2", "pdr_done", "pdrdone"):
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_RESOLVE", raw=raw, value="Production daily report resolve")
     if s.isdigit() and 1 <= int(s) <= 15:
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_REASON", raw=raw, value=f"{int(s):02d}")

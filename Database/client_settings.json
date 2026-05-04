@@ -4,5 +4,6 @@
   "scanner_mode": "auto",
   "scanner_com_port": "Com2",
   "scanner_baudrate": 9600,
-  "scanner_timeout": 1.0
+  "scanner_timeout": 1.0,
+  "graphics_mode": "faster_quality"
 }

@@ -19384,5 +19384,167 @@
     "source": "STATUS",
     "actor": "ROLAND RECLA (Operator)",
     "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-04T01:17:51.615531+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-04T01:18:19.777679+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-04T01:35:07.487941+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:30:06.251889+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:21.292073+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:21.305768+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:23.740438+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:23.740438+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:27.707462+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:27.707462+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:28.376445+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Graphics mode applied: Quality"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:28.533921+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Graphics mode applied: Faster + Quality"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:28.710519+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Graphics mode applied: Faster + Quality"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:29.108087+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Graphics mode applied: Faster"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:29.722898+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Graphics mode applied: Faster + Quality"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:43.765414+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:45.300039+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:45.302079+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:52.323450+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:53.742260+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:53.742260+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:54.307524+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Graphics mode applied: Faster"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:55.008808+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Graphics mode applied: Faster + Quality"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:55.426808+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Graphics mode applied: Faster"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:55.726182+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Graphics mode applied: Faster + Quality"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:56.888630+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-04T06:32:56.889479+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
   }
 ]
