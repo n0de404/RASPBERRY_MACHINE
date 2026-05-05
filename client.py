@@ -1007,6 +1007,13 @@ class ClientState:
     waiting_void_pack_scan: bool = False
     waiting_void_butal_scan: bool = False
     waiting_void_reject_scan: bool = False
+    waiting_butal_completion_carry_input: bool = False
+    waiting_butal_completion_butal_scan: bool = False
+    waiting_butal_completion_pack_scan: bool = False
+    butal_completion_input: str = ""
+    butal_completion_carried_qty: int = 0
+    butal_completion_new_qty: int = 0
+    butal_completion_butal_raw: str = ""
     waiting_cycle_time_input: bool = False
     waiting_initial_cycle_time_input: bool = False
     waiting_initial_machine_counter_input: bool = False
@@ -8578,6 +8585,13 @@ QWidget#ClientUIRoot {{
             "waiting_void_pack_scan": bool(s.waiting_void_pack_scan),
             "waiting_void_butal_scan": bool(s.waiting_void_butal_scan),
             "waiting_void_reject_scan": bool(s.waiting_void_reject_scan),
+            "waiting_butal_completion_carry_input": bool(s.waiting_butal_completion_carry_input),
+            "waiting_butal_completion_butal_scan": bool(s.waiting_butal_completion_butal_scan),
+            "waiting_butal_completion_pack_scan": bool(s.waiting_butal_completion_pack_scan),
+            "butal_completion_input": str(s.butal_completion_input or ""),
+            "butal_completion_carried_qty": int(s.butal_completion_carried_qty or 0),
+            "butal_completion_new_qty": int(s.butal_completion_new_qty or 0),
+            "butal_completion_butal_raw": str(s.butal_completion_butal_raw or ""),
             "showing_reject_summary": bool(s.showing_reject_summary),
             "reject_summary_last_scanned_at": s.reject_summary_last_scanned_at,
             "job_payload": s.job_payload or {},
@@ -8761,6 +8775,13 @@ QWidget#ClientUIRoot {{
         s.waiting_void_pack_scan = bool(snap.get("waiting_void_pack_scan"))
         s.waiting_void_butal_scan = bool(snap.get("waiting_void_butal_scan"))
         s.waiting_void_reject_scan = bool(snap.get("waiting_void_reject_scan"))
+        s.waiting_butal_completion_carry_input = bool(snap.get("waiting_butal_completion_carry_input"))
+        s.waiting_butal_completion_butal_scan = bool(snap.get("waiting_butal_completion_butal_scan"))
+        s.waiting_butal_completion_pack_scan = bool(snap.get("waiting_butal_completion_pack_scan"))
+        s.butal_completion_input = str(snap.get("butal_completion_input") or "")
+        s.butal_completion_carried_qty = int(snap.get("butal_completion_carried_qty") or 0)
+        s.butal_completion_new_qty = int(snap.get("butal_completion_new_qty") or 0)
+        s.butal_completion_butal_raw = str(snap.get("butal_completion_butal_raw") or "")
         s.showing_reject_summary = bool(snap.get("showing_reject_summary"))
         s.reject_summary_last_scanned_at = snap.get("reject_summary_last_scanned_at")
         s.job_payload = snap.get("job_payload") or {}
@@ -9056,6 +9077,7 @@ QWidget#ClientUIRoot {{
         s.waiting_void_pack_scan = False
         s.waiting_void_butal_scan = False
         s.waiting_void_reject_scan = False
+        self._clear_butal_completion_mode()
         s.showing_reject_summary = False
         s.reject_summary_last_scanned_at = None
         s.job_payload = {}
@@ -11494,6 +11516,16 @@ QWidget#ClientUIRoot {{
         text = f"BUTAL | {qty_text} | {time_text}"
         return f"{text} | VOID" if voided else text
 
+    def _clear_butal_completion_mode(self):
+        s = self.state
+        s.waiting_butal_completion_carry_input = False
+        s.waiting_butal_completion_butal_scan = False
+        s.waiting_butal_completion_pack_scan = False
+        s.butal_completion_input = ""
+        s.butal_completion_carried_qty = 0
+        s.butal_completion_new_qty = 0
+        s.butal_completion_butal_raw = ""
+
     def _format_reject_history_action_text(self, row: Dict[str, Any], *, voided: bool = False) -> str:
         reason_text = str(row.get("reason_code") or "-").strip() or "-"
         time_text = self._format_history_time_short(row.get("voided_at") if voided else row.get("scanned_at"))
@@ -11658,6 +11690,8 @@ QWidget#ClientUIRoot {{
             return f"{display_name}  Q:{qty_text}  I:{idx_text}"
         if res.kind == "BUTAL":
             return f"Butal +{int(res.qty or 0)}"
+        if res.kind == "BUTAL_COMPLETION_TRIGGER":
+            return "Butal completion mode"
         if res.kind == "REJECT_TRIGGER":
             return "Reject mode enabled"
         if res.kind == "REJECT_REASON":
@@ -11968,6 +12002,9 @@ QWidget#ClientUIRoot {{
             s.machine_code and s.job_code and s.operator_id
             and not s.waiting_initial_cycle_time_input
             and not s.waiting_production_report_reason
+            and not s.waiting_butal_completion_carry_input
+            and not s.waiting_butal_completion_butal_scan
+            and not s.waiting_butal_completion_pack_scan
             and not s.waiting_downtime_start_maintenance
             and not s.waiting_pdr_maintenance_reason
             and not s.waiting_downtime_end_maintenance
@@ -12329,6 +12366,35 @@ QWidget#ClientUIRoot {{
             self.status.setText("Cycle Time setup: scan num_0..num_9, backspace, confirm.")
             return
 
+        if s.waiting_butal_completion_carry_input:
+            if raw_l.startswith("num_") and raw_l[-1:].isdigit():
+                s.butal_completion_input += raw_l[-1]
+                self.status.setText(f"BUTAL completion carried qty: {s.butal_completion_input}. Scan confirm.")
+                self._save_active_session_snapshot()
+                return
+            if raw_l == "backspace":
+                s.butal_completion_input = s.butal_completion_input[:-1]
+                self.status.setText(
+                    f"BUTAL completion carried qty: {s.butal_completion_input or '0'}. Scan confirm."
+                )
+                self._save_active_session_snapshot()
+                return
+            if raw_l == "confirm":
+                carried = int(s.butal_completion_input or 0)
+                if carried <= 0:
+                    self.status.setText("BUTAL completion carried qty is empty. Scan num_ digits first.")
+                    return
+                s.butal_completion_carried_qty = carried
+                s.butal_completion_input = ""
+                s.waiting_butal_completion_carry_input = False
+                s.waiting_butal_completion_butal_scan = True
+                self.status.setText(f"Carried BUTAL set: {carried}. Scan remaining BUTAL QR.")
+                self._refresh_ui()
+                self._save_active_session_snapshot()
+                return
+            self.status.setText("BUTAL completion: scan carried qty with num_ digits, backspace, confirm.")
+            return
+
         if raw_l.startswith("num_") and raw_l[-1:].isdigit():
             if self.can_accept_production_scans() or s.waiting_reject_reason:
                 if self._append_reject_multiplier_digit(raw_l[-1]):
@@ -12664,6 +12730,7 @@ QWidget#ClientUIRoot {{
             self._consume_reject_multiplier_if_inapplicable(raw_l)
         suppress_scan_log = bool(
             s.waiting_void_scan and res.kind in ("PACK", "BUTAL", "REJECT_REASON", "STARTUP_REJECT")
+            or s.waiting_butal_completion_pack_scan and res.kind == "PACK"
         )
         if res.kind != "VOID_TRIGGER" and not suppress_scan_log:
             self.log_last(self._scan_display_text(res, raw_s))
@@ -12714,6 +12781,22 @@ QWidget#ClientUIRoot {{
         if res is None:
             self.status.setText("Invalid scan: QR code is not recognized.")
             self._show_invalid_overlay("QR code is not recognized.")
+            return
+
+        if res.kind == "BUTAL_COMPLETION_TRIGGER":
+            if not self.can_accept_production_scans():
+                msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
+                self.status.setText(msg[:1].upper() + msg[1:])
+                self._show_invalid_overlay(msg)
+                return
+            self._clear_butal_completion_mode()
+            s.waiting_butal_completion_carry_input = True
+            s.waiting_reject_reason = False
+            self._hide_production_overlay()
+            self.status.setText("BUTAL completion mode: scan carried qty with num_ digits, then confirm.")
+            self._refresh_ui()
+            self._save_active_session_snapshot()
+            self.push_event({"type": "BUTAL_COMPLETION_MODE"}, "BUTAL COMPLETION MODE")
             return
 
         if res.kind == "VOID_TRIGGER":
@@ -12784,6 +12867,118 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Supervisor review void: scan the wrong REJECT QR.")
             else:
                 self.status.setText("Void mode: scan the wrong PACK / BUTAL / REJECT QR.")
+            return
+
+        if s.waiting_butal_completion_butal_scan:
+            if res.kind != "BUTAL":
+                self.status.setText("BUTAL completion: scan remaining BUTAL QR.")
+                return
+            qty = int(res.qty or 0)
+            if qty <= 0:
+                self.status.setText("BUTAL completion: remaining BUTAL quantity is invalid.")
+                return
+            s.butal_total += qty
+            s.butal_completion_new_qty = qty
+            s.butal_completion_butal_raw = raw_s
+            s.butal_scan_logs.append(
+                {
+                    "raw_scan": raw_s,
+                    "qty": qty,
+                    "base_qty": qty,
+                    "multiplier": 1,
+                    "scanned_at": datetime.now(timezone.utc).isoformat(),
+                    "operator": str(s.operator_id or "").strip() or "-",
+                    "operator_name": self._operator_display_name(s.operator_id),
+                    "voided": False,
+                    "source": "BUTAL_COMPLETION",
+                    "carried_qty": int(s.butal_completion_carried_qty or 0),
+                }
+            )
+            s.waiting_butal_completion_butal_scan = False
+            s.waiting_butal_completion_pack_scan = True
+            self.status.setText(
+                f"Remaining BUTAL +{qty}. Scan PACK QR to complete pack without adding GOOD."
+            )
+            self.lblButal.add_points(qty)
+            self.lblTotalGood.add_points(qty)
+            self._refresh_ui()
+            self._pulse_card(self.cardStatButal)
+            self._pulse_card(self.cardStatTotalGood)
+            self._save_active_session_snapshot()
+            self.push_event(
+                {
+                    "type": "BUTAL_COMPLETION_REMAINING",
+                    "qty": qty,
+                    "carried_qty": int(s.butal_completion_carried_qty or 0),
+                },
+                f"BUTAL COMPLETION REMAINING +{qty}",
+            )
+            return
+
+        if s.waiting_butal_completion_pack_scan:
+            if res.kind != "PACK":
+                self.status.setText("BUTAL completion: scan PACK QR to complete pack.")
+                return
+            pack_hist = self._extract_pack_history_fields(raw_s)
+            if pack_hist is not None:
+                scanned_job_code = self._extract_job_code_from_pack_qr(raw_s)
+                current_job_code = self._normalize_job_code(s.job_code)
+                if scanned_job_code is None:
+                    self.status.setText("Invalid PACK QR format: missing job code segment.")
+                    self._show_invalid_overlay("PACK QR format is invalid.")
+                    return
+                allowed_pack_job_codes = {current_job_code} if current_job_code else set()
+                if s.linkage_enabled:
+                    for row in (s.linkage_jobs or []):
+                        linked_code_norm = self._normalize_job_code((row or {}).get("job_code"))
+                        if linked_code_norm:
+                            allowed_pack_job_codes.add(linked_code_norm)
+                if allowed_pack_job_codes and scanned_job_code not in allowed_pack_job_codes:
+                    self.status.setText(
+                        f"Invalid PACK QR: job code {scanned_job_code} does not match main/linked job."
+                    )
+                    self._show_invalid_overlay("This QR is not for this job.")
+                    return
+                pack_hist["raw_scan"] = raw_s
+                pack_hist["operator"] = str(s.operator_id or "").strip() or "-"
+                pack_hist["operator_name"] = self._operator_display_name(s.operator_id)
+                pack_hist["status"] = "BUTAL_COMPLETED"
+                pack_hist["voided"] = False
+                pack_hist["scanned_at"] = datetime.now(timezone.utc).isoformat()
+                pack_hist["source"] = "BUTAL_COMPLETION"
+                pack_hist["carried_butal_qty"] = int(s.butal_completion_carried_qty or 0)
+                pack_hist["new_butal_qty"] = int(s.butal_completion_new_qty or 0)
+                pack_hist["completed_pack_qty"] = int(s.butal_completion_carried_qty or 0) + int(s.butal_completion_new_qty or 0)
+                pack_hist["good_qty"] = 0
+                pack_hist["qty_q"] = 0
+                pack_key = self._pack_history_key(pack_hist)
+                if pack_key and pack_key in (s.product_pack_history_keys or set()):
+                    self.status.setText("Invalid PACK QR: duplicate index and lot.")
+                    self._show_invalid_overlay("PACK QR index and lot number already scanned.")
+                    return
+                s.product_pack_history_logs.append(pack_hist)
+                if pack_key:
+                    s.product_pack_history_keys.add(pack_key)
+            s.pack_count += 1
+            carried_qty = int(s.butal_completion_carried_qty or 0)
+            new_qty = int(s.butal_completion_new_qty or 0)
+            self.status.setText(f"BUTAL pack completed: Pack +1, Good +0, Butal +{new_qty}.")
+            self.log_last(f"BUTAL PACK COMPLETE | Pack +1 | Good +0 | Butal +{new_qty}")
+            self.lblPack.add_points(1)
+            self._refresh_ui()
+            self._pulse_card(self.cardStatPack)
+            self.push_event(
+                {
+                    "type": "BUTAL_COMPLETION_PACK",
+                    "pack_qty": 1,
+                    "good_qty": 0,
+                    "butal_qty": new_qty,
+                    "carried_qty": carried_qty,
+                },
+                f"BUTAL COMPLETION PACK +1 BUTAL +{new_qty}",
+            )
+            self._clear_butal_completion_mode()
+            self._save_active_session_snapshot()
             return
 
         if res.kind == "OPERATOR_SHIFT_TRIGGER":

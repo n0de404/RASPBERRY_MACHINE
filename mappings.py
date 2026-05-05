@@ -190,6 +190,8 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="OPERATOR_SHIFT_TRIGGER", raw=raw, value="Finish shift")
     if s_l in ("void", "void~1", "voidscan~1", "voidqr~1", "voidpack~1", "void_pack~1", "packvoid~1", "voidbutal~1", "void_butal~1", "butalvoid~1", "voidreject~1", "void_reject~1", "rejectvoid~1"):
         return ScanResult(kind="VOID_TRIGGER", raw=raw, value="Void mode")
+    if s_l in ("butalpack~1", "butalcomplete~1", "butalcompletion~1"):
+        return ScanResult(kind="BUTAL_COMPLETION_TRIGGER", raw=raw, value="Butal pack completion mode")
 
     # Production daily report trigger
     if s_l in ("productiondailyreport~1", "pdr_start", "pdrstart"):
