@@ -51,14 +51,14 @@ async def _app_lifespan(app: FastAPI):
 APP = FastAPI(title="Machine Dashboard Server", lifespan=_app_lifespan)
 APP.mount("/Images", StaticFiles(directory=str(Path(__file__).resolve().parent / "Images")), name="images")
 
-ACTIVE_TTL_SECONDS = 2  # aggressive monitoring: mark disconnected quickly
+ACTIVE_TTL_SECONDS = 15  # allow several 5s client heartbeat intervals before marking disconnected
 STATE_TICK_SECONDS = 0.25
 PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"  # legacy fallback
 PRODUCT_API_CONFIG_FILE = Path(__file__).resolve().parent / "Database" / "product_api_config.json"
 PRODUCT_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "product_catalog_cache.json"
 ACTIVE_MACHINE_SESSIONS_FILE = Path(__file__).resolve().parent / "Database" / "active_machine_sessions.json"
 PROFILE_REPRINT_ADMIN_PASSWORD = "0t1docmtl$tm"
-QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.1.149:5000").strip().rstrip("/")
+QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.10.166:5000").strip().rstrip("/")
 RAW_QR_O_SEGMENT = "O000000000240000010237800000000000"
 RAW_QR_REMARK = "V2"
 WIDTH_P = 11
@@ -414,6 +414,38 @@ def _ensure_sql_schema() -> bool:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `pdr_reports` (
+                  `id` BIGINT NOT NULL AUTO_INCREMENT,
+                  `client_id` VARCHAR(100) NULL,
+                  `machine_code` VARCHAR(50) NULL,
+                  `machine_name` VARCHAR(255) NULL,
+                  `job_code` VARCHAR(100) NULL,
+                  `job_name` VARCHAR(255) NULL,
+                  `operator_id` VARCHAR(255) NULL,
+                  `operator_reason_code` VARCHAR(50) NULL,
+                  `operator_reason` TEXT NULL,
+                  `reason_code` VARCHAR(50) NULL,
+                  `reason` TEXT NULL,
+                  `waiting_seconds` INT NULL,
+                  `downtime_seconds` INT NULL,
+                  `maintenance_downtime_seconds` INT NULL,
+                  `cycle_time` VARCHAR(100) NULL,
+                  `maintenance` VARCHAR(255) NULL,
+                  `supervisor` VARCHAR(255) NULL,
+                  `created_at_utc` VARCHAR(50) NULL,
+                  `reason_segments` JSON NULL,
+                  `raw_json` JSON NOT NULL,
+                  PRIMARY KEY (`id`),
+                  KEY `idx_pdr_reports_machine_code` (`machine_code`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            try:
+                cur.execute("CREATE TABLE IF NOT EXISTS `finish_shift` LIKE `finished_jobs`")
+            except Exception:
+                pass
             try:
                 cur.execute("ALTER TABLE `archived_jobs_server` ADD COLUMN `no_shot_total` INT NOT NULL DEFAULT 0 AFTER `startup_reject_total`")
             except Exception:
@@ -433,11 +465,47 @@ def _ensure_sql_schema() -> bool:
                 "ALTER TABLE `finished_jobs` ADD COLUMN `machine_counter_app_delta` INT NULL AFTER `machine_counter_end`",
                 "ALTER TABLE `finished_jobs` ADD COLUMN `machine_counter_app_end` INT NULL AFTER `machine_counter_app_delta`",
                 "ALTER TABLE `finished_jobs` ADD COLUMN `machine_counter_difference` INT NULL AFTER `machine_counter_app_end`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `record_type` VARCHAR(50) NULL AFTER `id`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `reason` VARCHAR(100) NULL AFTER `record_type`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `shift_index` INT NULL AFTER `reason`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `started_at_utc` VARCHAR(50) NULL AFTER `shift_index`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `ended_at_utc` VARCHAR(50) NULL AFTER `started_at_utc`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `partial_qty` INT NOT NULL DEFAULT 0 AFTER `total_good`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `cycle_time_shift_avg_seconds` DOUBLE NULL AFTER `machine_counter_difference`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `qty_per_shift_avg_cycle` INT NULL AFTER `cycle_time_shift_avg_seconds`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `approved_by` VARCHAR(255) NULL AFTER `supervisor_name`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `approved_by_code` VARCHAR(100) NULL AFTER `approved_by`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `approved_by_role` VARCHAR(100) NULL AFTER `approved_by_code`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `changed_by` VARCHAR(255) NULL AFTER `approved_by_role`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `changed_by_code` VARCHAR(100) NULL AFTER `changed_by`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `changed_by_role` VARCHAR(100) NULL AFTER `changed_by_code`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `approved_remarks` TEXT NULL AFTER `changed_by_role`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `change_remarks` TEXT NULL AFTER `approved_remarks`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `approved_at_utc` VARCHAR(50) NULL AFTER `change_remarks`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `changed_at_utc` VARCHAR(50) NULL AFTER `approved_at_utc`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `review_status` VARCHAR(100) NULL AFTER `changed_at_utc`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_enabled` TINYINT NOT NULL DEFAULT 0 AFTER `review_status`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_job_code` VARCHAR(100) NULL AFTER `linkage_enabled`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_job_name` VARCHAR(255) NULL AFTER `linkage_job_code`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_role` VARCHAR(50) NULL AFTER `linkage_job_name`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_group_total_jobs` INT NULL AFTER `linkage_role`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_main_job_code` VARCHAR(100) NULL AFTER `linkage_group_total_jobs`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_main_job_name` VARCHAR(255) NULL AFTER `linkage_main_job_code`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_note` TEXT NULL AFTER `linkage_main_job_name`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_job_payload` JSON NULL AFTER `reject_review_logs`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_jobs` JSON NULL AFTER `linkage_job_payload`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `linkage_mirror` JSON NULL AFTER `linkage_jobs`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `review_history` JSON NULL AFTER `linkage_mirror`",
             ):
                 try:
                     cur.execute(stmt)
                 except Exception:
                     pass
+                if "`finished_jobs`" in stmt:
+                    try:
+                        cur.execute(stmt.replace("`finished_jobs`", "`finish_shift`"))
+                    except Exception:
+                        pass
         conn.commit()
         return True
     except Exception:
@@ -738,11 +806,15 @@ def _load_finished_jobs_sql() -> Optional[List[Dict[str, Any]]]:
     try:
         items: List[Dict[str, Any]] = []
         with conn.cursor() as cur:
-            cur.execute("SELECT `raw_json` FROM `finished_jobs` ORDER BY `id` ASC")
-            for row in cur.fetchall() or []:
-                item = _sql_decode_json((row or {}).get("raw_json"), {})
-                if isinstance(item, dict):
-                    items.append(item)
+            for table_name in ("finished_jobs", "finish_shift"):
+                try:
+                    cur.execute(f"SELECT `raw_json` FROM `{table_name}` ORDER BY `id` ASC")
+                except Exception:
+                    continue
+                for row in cur.fetchall() or []:
+                    item = _sql_decode_json((row or {}).get("raw_json"), {})
+                    if isinstance(item, dict):
+                        items.append(item)
         return items
     except Exception:
         return None
@@ -824,39 +896,49 @@ def _save_finished_jobs_sql(rows: List[Dict[str, Any]]) -> bool:
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM `finished_jobs`")
+            try:
+                cur.execute("DELETE FROM `finish_shift`")
+            except Exception:
+                pass
             for row in rows:
                 if not isinstance(row, dict):
                     continue
+                table_name = "finish_shift" if str(row.get("record_type") or "").strip().upper() == "SHIFT_PARTIAL" else "finished_jobs"
                 cur.execute(
-                    """
-                    INSERT INTO `finished_jobs`
-                    (`finished_at_utc`,`client_id`,`machine_code`,`machine_name`,`job_code`,`job_name`,`operator_id`,
-                     `pack_count`,`good_total`,`butal_total`,`reject_total`,`total_good`,`startup_reject_total`,`no_shot_total`,`raw_sacks_count`,
+                    f"""
+                    INSERT INTO `{table_name}`
+                    (`record_type`,`reason`,`shift_index`,`started_at_utc`,`ended_at_utc`,`finished_at_utc`,
+                     `client_id`,`machine_code`,`machine_name`,`job_code`,`job_name`,`operator_id`,
+                     `pack_count`,`good_total`,`butal_total`,`reject_total`,`total_good`,`partial_qty`,`startup_reject_total`,`no_shot_total`,`raw_sacks_count`,
                      `downtime_last_seconds`,`downtime_reason_code`,`downtime_reason_text`,`cycle_time_current`,
                      `machine_counter_start`,`machine_counter_end`,`machine_counter_app_delta`,`machine_counter_app_end`,`machine_counter_difference`,
-                     `maintenance_name`,`supervisor_name`,
-                     `approved_by`,`approved_by_code`,`approved_by_role`,`approved_remarks`,`approved_at_utc`,`review_status`,
+                     `cycle_time_shift_avg_seconds`,`qty_per_shift_avg_cycle`,`maintenance_name`,`supervisor_name`,
+                     `approved_by`,`approved_by_code`,`approved_by_role`,`changed_by`,`changed_by_code`,`changed_by_role`,
+                     `approved_remarks`,`change_remarks`,`approved_at_utc`,`changed_at_utc`,`review_status`,
                      `linkage_enabled`,`linkage_job_code`,`linkage_job_name`,`linkage_role`,`linkage_group_total_jobs`,
                      `linkage_main_job_code`,`linkage_main_job_name`,`linkage_note`,
                      `reject_breakdown`,`raw_material_scans`,`raw_material_logs`,`job_payload`,`reject_review_logs`,
                      `linkage_job_payload`,`linkage_jobs`,`linkage_mirror`,`review_history`,`raw_json`)
                     VALUES
-                    (%s,%s,%s,%s,%s,%s,%s,
-                     %s,%s,%s,%s,%s,%s,%s,%s,
-                     %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                    (%s,%s,%s,%s,%s,%s,
                      %s,%s,%s,%s,%s,%s,
+                     %s,%s,%s,%s,%s,%s,%s,%s,%s,
+                     %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                     %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                      %s,%s,%s,%s,%s,
                      %s,%s,%s,
                      CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),
                      CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON),CAST(%s AS JSON))
                     """,
                     (
-                        row.get("finished_at_utc"), row.get("client_id"), row.get("machine_code"), row.get("machine_name"), row.get("job_code"), row.get("job_name"), row.get("operator_id"),
-                        int(row.get("pack_count", 0) or 0), int(row.get("good_total", 0) or 0), int(row.get("butal_total", 0) or 0), int(row.get("reject_total", 0) or 0), int(row.get("total_good", 0) or 0), int(row.get("startup_reject_total", 0) or 0), int(row.get("no_shot_total", 0) or 0), int(row.get("raw_sacks_count", 0) or 0),
+                        row.get("record_type"), row.get("reason"), row.get("shift_index"), row.get("started_at_utc"), row.get("ended_at_utc"), row.get("finished_at_utc"),
+                        row.get("client_id"), row.get("machine_code"), row.get("machine_name"), row.get("job_code"), row.get("job_name"), row.get("operator_id"),
+                        int(row.get("pack_count", 0) or 0), int(row.get("good_total", 0) or 0), int(row.get("butal_total", 0) or 0), int(row.get("reject_total", 0) or 0), int(row.get("total_good", 0) or 0), int(row.get("partial_qty", 0) or 0), int(row.get("startup_reject_total", 0) or 0), int(row.get("no_shot_total", 0) or 0), int(row.get("raw_sacks_count", 0) or 0),
                         row.get("downtime_last_seconds"), row.get("downtime_reason_code"), row.get("downtime_reason_text"), row.get("cycle_time_current"),
                         row.get("machine_counter_start"), row.get("machine_counter_end"), row.get("machine_counter_app_delta"), row.get("machine_counter_app_end"), row.get("machine_counter_difference"),
-                        row.get("maintenance_name"), row.get("supervisor_name"),
-                        row.get("approved_by"), row.get("approved_by_code"), row.get("approved_by_role"), row.get("approved_remarks"), row.get("approved_at_utc"), row.get("review_status"),
+                        row.get("cycle_time_shift_avg_seconds"), row.get("qty_per_shift_avg_cycle"), row.get("maintenance_name"), row.get("supervisor_name"),
+                        row.get("approved_by"), row.get("approved_by_code"), row.get("approved_by_role"), row.get("changed_by"), row.get("changed_by_code"), row.get("changed_by_role"),
+                        row.get("approved_remarks"), row.get("change_remarks"), row.get("approved_at_utc"), row.get("changed_at_utc"), row.get("review_status"),
                         1 if row.get("linkage_enabled") else 0, row.get("linkage_job_code"), row.get("linkage_job_name"), row.get("linkage_role"), row.get("linkage_group_total_jobs"),
                         row.get("linkage_main_job_code"), row.get("linkage_main_job_name"), row.get("linkage_note"),
                         json.dumps(row.get("reject_breakdown", {}), ensure_ascii=False), json.dumps(row.get("raw_material_scans", []), ensure_ascii=False), json.dumps(row.get("raw_material_logs", []), ensure_ascii=False), json.dumps(row.get("job_payload", {}), ensure_ascii=False), json.dumps(row.get("reject_review_logs", []), ensure_ascii=False),
@@ -865,7 +947,46 @@ def _save_finished_jobs_sql(rows: List[Dict[str, Any]]) -> bool:
                 )
         conn.commit()
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[SQL] Failed to save finished_jobs: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _insert_pdr_report_sql(row: Dict[str, Any]) -> bool:
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        raw = dict(row or {})
+        raw.setdefault("created_at_utc", utc_now().isoformat())
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO `pdr_reports`
+                (`client_id`,`machine_code`,`machine_name`,`job_code`,`job_name`,`operator_id`,
+                 `operator_reason_code`,`operator_reason`,`reason_code`,`reason`,
+                 `waiting_seconds`,`downtime_seconds`,`maintenance_downtime_seconds`,`cycle_time`,
+                 `maintenance`,`supervisor`,`created_at_utc`,`reason_segments`,`raw_json`)
+                VALUES
+                (%s,%s,%s,%s,%s,%s,
+                 %s,%s,%s,%s,
+                 %s,%s,%s,%s,
+                 %s,%s,%s,CAST(%s AS JSON),CAST(%s AS JSON))
+                """,
+                (
+                    raw.get("client_id"), raw.get("machine_code"), raw.get("machine_name"), raw.get("job_code"), raw.get("job_name"), raw.get("operator_id"),
+                    raw.get("operator_reason_code"), raw.get("operator_reason"), raw.get("reason_code"), raw.get("reason"),
+                    raw.get("waiting_seconds"), raw.get("downtime_seconds"), raw.get("maintenance_downtime_seconds"), raw.get("cycle_time"),
+                    raw.get("maintenance"), raw.get("supervisor"), raw.get("created_at_utc"),
+                    json.dumps(raw.get("reason_segments", []), ensure_ascii=False), json.dumps(raw, ensure_ascii=False),
+                ),
+            )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[SQL] Failed to save pdr_reports: {e}")
         return False
     finally:
         conn.close()
@@ -912,6 +1033,10 @@ class MachineSession:
     downtime_active: bool = False
     downtime_wait_started_at: Optional[float] = None
     downtime_wait_last_seconds: Optional[int] = None
+    waiting_downtime_start_maintenance: bool = False
+    waiting_pdr_maintenance_reason: bool = False
+    waiting_downtime_end_maintenance: bool = False
+    waiting_maintenance_qr: bool = False
     cycle_time_current: Optional[str] = None
     live_cycle_avg_seconds: Optional[float] = None
     maintenance_name: Optional[str] = None
@@ -966,6 +1091,10 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         downtime_active=bool(raw.get("downtime_active", False)),
         downtime_wait_started_at=raw.get("downtime_wait_started_at"),
         downtime_wait_last_seconds=raw.get("downtime_wait_last_seconds"),
+        waiting_downtime_start_maintenance=bool(raw.get("waiting_downtime_start_maintenance", False)),
+        waiting_pdr_maintenance_reason=bool(raw.get("waiting_pdr_maintenance_reason", False)),
+        waiting_downtime_end_maintenance=bool(raw.get("waiting_downtime_end_maintenance", False)),
+        waiting_maintenance_qr=bool(raw.get("waiting_maintenance_qr", False)),
         cycle_time_current=raw.get("cycle_time_current"),
         live_cycle_avg_seconds=raw.get("live_cycle_avg_seconds"),
         maintenance_name=raw.get("maintenance_name"),
@@ -1411,6 +1540,27 @@ def _find_finished_job_index(rows: List[Dict[str, Any]], key: str) -> int:
     return -1
 
 
+def _finished_job_review_rank(row: Dict[str, Any]) -> int:
+    status = str((row or {}).get("review_status") or "").strip().upper()
+    if status == "APPROVED":
+        return 3
+    if status == "DISAPPROVED_CHANGED":
+        return 2
+    if status:
+        return 1
+    return 0
+
+
+def _prefer_finished_job_row(existing: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    if _finished_job_review_rank(incoming) > _finished_job_review_rank(existing):
+        return incoming
+    existing_stamp = str((existing or {}).get("approved_at_utc") or (existing or {}).get("changed_at_utc") or (existing or {}).get("finished_at_utc") or "")
+    incoming_stamp = str((incoming or {}).get("approved_at_utc") or (incoming or {}).get("changed_at_utc") or (incoming or {}).get("finished_at_utc") or "")
+    if incoming_stamp and incoming_stamp >= existing_stamp:
+        return incoming
+    return existing
+
+
 def _reviewer_from_badge(code: str) -> Optional[Dict[str, str]]:
     badge = str(code or "").strip()
     today = get_today_role_assignments()
@@ -1525,14 +1675,16 @@ def load_finished_jobs() -> List[Dict[str, Any]]:
     if current_rows is None:
         raise RuntimeError("finished_jobs SQL storage is unavailable")
     merged: List[Dict[str, Any]] = []
-    seen = set()
+    index_by_key: Dict[str, int] = {}
     for row in current_rows:
         if not isinstance(row, dict):
             continue
         key = _finished_job_key(row)
-        if key in seen:
+        if key in index_by_key:
+            existing_idx = index_by_key[key]
+            merged[existing_idx] = _prefer_finished_job_row(merged[existing_idx], row)
             continue
-        seen.add(key)
+        index_by_key[key] = len(merged)
         merged.append(row)
     return merged
 
@@ -2573,7 +2725,7 @@ def get_products(force_refresh: bool = False) -> Dict[str, Any]:
 
     return {"items": cached_items, "from_cache": True, "updated": False, "error": fetch_error}
 
-
+_ensure_sql_schema()
 FINISHED_JOBS: List[Dict[str, Any]] = load_finished_jobs()
 ARCHIVED_JOBS: List[Dict[str, Any]] = load_archived_jobs()
 PROFILES: List[Dict[str, Any]] = load_profiles()
@@ -2782,12 +2934,12 @@ DASHBOARD_HTML = """
     .approve-print-btn:active { transform: translateY(0) scale(0.985); }
     .overlay-backdrop { position: fixed; inset: 0; background: rgba(104, 120, 143, 0.52); backdrop-filter: blur(8px); display: none; align-items: center; justify-content: center; padding: 14px; z-index: 999; }
     .overlay-backdrop.active { display: flex; }
-    .overlay-card { width: min(900px, calc(100vw - 160px)); background: #f4f5f7; border: 1px solid #cfd4dc; border-radius: 20px; box-shadow: 0 22px 56px rgba(15, 23, 42, 0.20); position: relative; }
+    .overlay-card { width: min(1120px, calc(100vw - 160px)); max-height: calc(100vh - 36px); background: #f4f5f7; border: 1px solid #cfd4dc; border-radius: 20px; box-shadow: 0 22px 56px rgba(15, 23, 42, 0.20); position: relative; overflow: hidden; display: flex; flex-direction: column; }
     .overlay-head { padding: 18px 24px 14px; border-bottom: 1px solid #d7dbe1; display: flex; align-items: center; justify-content: space-between; }
     .overlay-title { font-weight: 800; font-size: 1.08rem; color: #1d273c; letter-spacing: .01em; }
     .overlay-close { border: 1px solid #cfd4dc; background: #dde1e7; color: #2d3342; border-radius: 14px; width: 44px; height: 44px; padding: 0; cursor: pointer; font-size: 0; position: relative; }
     .overlay-close::before { content: "×"; font-size: 22px; line-height: 1; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
-    .overlay-body { padding: 10px 18px 8px; display: grid; gap: 6px; }
+    .overlay-body { padding: 10px 18px 8px; display: grid; gap: 6px; min-height: 0; overflow: hidden; flex: 1 1 auto; }
     .overlay-row { display: grid; grid-template-columns: 180px 1fr; gap: 12px; align-items: center; }
     .overlay-row > * { min-width: 0; }
     .overlay-row label { font-weight: 600; color: #40485a; font-size: 0.95rem; }
@@ -2825,25 +2977,25 @@ DASHBOARD_HTML = """
     #overlayQrPayload { font-family: "Consolas", "Courier New", monospace; font-size: 0.78rem; line-height: 1.35; overflow-wrap: anywhere; word-break: break-all; }
     .overlay-preview { display: flex; align-items: center; justify-content: center; background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 10px; padding: 10px; min-height: 170px; }
     .overlay-preview img { width: 320px; max-width: 100%; height: auto; object-fit: contain; background: #fff; border: 1px solid #dbe4f0; border-radius: 8px; }
-    .overlay-actions { padding: 10px 18px 14px; border-top: 1px solid #d7dbe1; display: flex; justify-content: flex-end; gap: 10px; }
+    .overlay-actions { padding: 10px 18px 14px; border-top: 1px solid #d7dbe1; display: flex; justify-content: flex-end; gap: 10px; flex: 0 0 auto; }
     .btn-secondary { border: 1px solid #c7cdd8; background: #f3f4f6; color: #202737; border-radius: 14px; padding: 9px 20px; cursor: pointer; font-size: 0.94rem; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .btn-secondary:hover { background: #f8f9fb; transform: translateY(-1px); box-shadow: 0 8px 18px rgba(15,23,42,0.08); }
     .btn-secondary:active { transform: translateY(0) scale(0.985); }
     .btn-primary { border: none; background: linear-gradient(180deg, #3961dc 0%, #2d52cb 100%); color: #fff; border-radius: 14px; padding: 9px 20px; cursor: pointer; font-size: 0.94rem; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.10); transition: transform .12s ease, box-shadow .16s ease, filter .16s ease; }
     .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 10px 22px rgba(45,82,203,0.28), inset 0 0 0 1px rgba(255,255,255,0.10); filter: brightness(1.03); }
     .btn-primary:active { transform: translateY(0) scale(0.985); }
-    .review-slide-toolbar { display:flex; align-items:center; justify-content:space-between; gap:10px; margin: 0 0 10px; }
+    .review-slide-toolbar { display:flex; align-items:center; justify-content:center; gap:10px; margin: 0 0 10px; min-height: 42px; }
     .review-slide-status { font-size: 0.92rem; color: #4b5567; font-weight: 700; margin: 0; flex:1; text-align:center; }
     .review-slide-arrow { border: 1px solid rgba(199, 207, 219, 0.95); background: rgba(242,245,249,0.96); border-radius: 999px; width: 42px; height: 42px; cursor: pointer; font-size: 18px; box-shadow: 0 8px 22px rgba(15,23,42,0.11); color: #2f3a4d; transition: box-shadow .16s ease, background-color .16s ease, opacity .16s ease; }
     .review-slide-arrow:hover:not(:disabled) { box-shadow: 0 10px 22px rgba(15,23,42,0.13); background: rgba(248,250,252,0.98); }
     .review-slide-arrow:active:not(:disabled) { box-shadow: 0 7px 16px rgba(15,23,42,0.12); }
     .review-slide-arrow:disabled { opacity: 0.45; cursor: not-allowed; }
     .review-edge-arrow { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; }
-    .review-edge-arrow.left { left: -54px; }
-    .review-edge-arrow.right { right: -54px; }
+    .review-edge-arrow.left { left: 14px; }
+    .review-edge-arrow.right { right: 14px; }
     .review-subslide { display: none; animation: reviewSlideIn .16s ease; }
-    .review-subslide.active { display: block; }
-    #overlayReviewStep { padding: 0; width: min(690px, 100%); margin: 0 auto; }
+    .review-subslide.active { display: grid; grid-template-columns: 1fr; gap: 10px; align-items: start; }
+    #overlayReviewStep { padding: 0 58px; width: 100%; box-sizing: border-box; margin: 0 auto; min-height: 0; overflow-y: auto; max-height: calc(100vh - 190px); }
     #overlayReviewStep .overlay-row { grid-template-columns: 190px 1fr; }
     #overlayReviewStep .overlay-row input[readonly] { background: #fff; }
     #overlayReviewStep .overlay-row textarea[readonly] { background: #fff; }
@@ -2852,7 +3004,8 @@ DASHBOARD_HTML = """
       border: 1px solid #d0d5de;
       border-radius: 16px;
       overflow: hidden;
-      margin-bottom: 10px;
+      margin-bottom: 0;
+      min-width: 0;
     }
     .review-panel-title {
       background: #dfe3e8;
@@ -2864,17 +3017,19 @@ DASHBOARD_HTML = """
     }
     .review-panel-body {
       background: #f7f8fb;
-      padding: 10px 12px;
+      padding: 9px 12px;
       color: #1f2937;
-      font-size: 0.94rem;
-      line-height: 1.32;
+      font-size: 0.88rem;
+      line-height: 1.24;
+      max-height: none;
+      overflow: hidden;
     }
     .review-line-list { margin: 0; padding-left: 24px; display: grid; gap: 6px; }
     .review-line-list li { font-size: 0.92rem; color: #1f2937; }
     .review-inline-metrics { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
     .review-inline-metrics .dot { color: #8b93a1; }
     .review-inline-metrics .reject-emph { color: #d63b45; font-weight: 700; }
-    .review-form-card { background: #f7f8fb; border: 1px solid #d0d5de; border-radius: 16px; padding: 10px; width: min(690px, 100%); margin: 0 auto; }
+    .review-form-card { background: #f7f8fb; border: 1px solid #d0d5de; border-radius: 16px; padding: 10px; width: min(760px, 100%); margin: 0 auto; }
     .scan-capture-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,0.35); display: none; align-items: center; justify-content: center; z-index: 1200; }
     .scan-capture-backdrop.active { display: flex; }
     .scan-capture-card { width: min(460px, calc(100vw - 32px)); background: #f8fafc; border: 1px solid #cfd8e3; border-radius: 16px; box-shadow: 0 20px 40px rgba(15,23,42,0.20); padding: 16px; }
@@ -2957,16 +3112,19 @@ DASHBOARD_HTML = """
     #overlayReviewRemarks { min-height: 58px; height: 58px; }
     #editRejectBreakdown { min-height: 58px; height: 58px; }
     .review-pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 600 12px/1.45 "Consolas", "Courier New", monospace; color: #dbeafe; }
-    .review-group-list { display: grid; gap: 12px; }
+    .review-group-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 10px; }
     .review-group-card { border: 1px solid #dbe4f0; border-radius: 12px; background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%); overflow: hidden; }
     .review-group-head { padding: 10px 12px; background: linear-gradient(90deg, #e8f0fb 0%, #f4f8fc 100%); border-bottom: 1px solid #dbe4f0; font-size: .83rem; font-weight: 800; color: #334155; letter-spacing: .04em; text-transform: uppercase; }
-    .review-group-body { padding: 12px; }
-    .review-kv-table { width: 100%; border-collapse: collapse; }
-    .review-kv-table td { padding: 7px 8px; border-bottom: 1px solid #e8eef6; vertical-align: top; }
+    .review-group-body { padding: 10px 12px; }
+    .review-kv-table { width: 100%; border-collapse: collapse; table-layout: auto; }
+    .review-data-table th { padding: 6px 8px; border-bottom: 1px solid #d8e3f0; text-align: left; font-size: .72rem; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
+    .review-data-table td { font-size: .82rem; font-weight: 600; color: #0f172a; }
+    .review-kv-table td { padding: 6px 8px; border-bottom: 1px solid #e8eef6; vertical-align: top; }
     .review-kv-table tr:last-child td { border-bottom: none; }
-    .review-kv-key { width: 210px; font-size: .78rem; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
-    .review-kv-value { font-size: .9rem; font-weight: 600; color: #0f172a; word-break: break-word; }
-    .review-json-block { margin: 0; white-space: pre-wrap; word-break: break-word; font: 600 12px/1.45 "Consolas", "Courier New", monospace; color: #0f172a; background: #f8fafc; border: 1px solid #dbe4f0; border-radius: 10px; padding: 10px; max-height: 280px; overflow: auto; }
+    .review-kv-key { width: 150px; min-width: 120px; font-size: .76rem; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
+    .review-kv-value { font-size: .9rem; font-weight: 600; color: #0f172a; word-break: normal; overflow-wrap: break-word; }
+    .review-more-note { margin-top: 8px; font-size: .78rem; font-weight: 700; color: #64748b; }
+    .review-json-block { margin: 0; white-space: pre-wrap; word-break: break-word; font: 600 12px/1.45 "Consolas", "Courier New", monospace; color: #0f172a; background: #f8fafc; border: 1px solid #dbe4f0; border-radius: 10px; padding: 10px; max-height: 42vh; overflow: auto; }
     @keyframes reviewSlideIn { from { opacity: .45; transform: translateX(6px); } to { opacity: 1; transform: translateX(0); } }
     @keyframes cardPulseGreen {
       0% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(76,175,80,0.30); }
@@ -3146,7 +3304,7 @@ DASHBOARD_HTML = """
     @media (max-width: 1400px) { .grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
     @media (max-width: 1100px) { .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
     @media (max-width: 1100px) { .diagnostics { grid-template-columns: 48px 48px 48px 48px repeat(2, minmax(180px, 1fr)); } }
-    @media (max-width: 768px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .finished-wrap { grid-template-columns: 1fr; } .finished-grid { grid-template-columns: 1fr; } .overlay-row { grid-template-columns: 1fr; } .main-tab-content { padding: 0 12px 12px; } .main-tabs { padding: 12px; } .diagnostics { padding: 8px 10px; grid-template-columns: 48px 48px 48px 48px 1fr; gap: 6px; } .machine-detail-grid { grid-template-columns: 1fr; } .overlay-card { width: calc(100vw - 18px); border-radius: 16px; } .review-edge-arrow.left { left: 8px; } .review-edge-arrow.right { right: 8px; } #overlayReviewStep, .review-form-card { width: 100%; } .people-role-row { grid-template-columns: 1fr; } .operator-directory-row { grid-template-columns: 1fr; gap:6px; padding:10px 12px; } .operator-directory-row.header { display:none; } .operator-directory-label { display:block; } .operator-detail-grid { grid-template-columns:1fr; } .maintenance-topbar { flex-direction:column; } .maintenance-date { text-align:left; white-space:normal; } .maintenance-summary { grid-template-columns:1fr; } .maintenance-list { grid-template-columns:1fr; } .maintenance-person { grid-template-columns:1fr; } .maintenance-avatar-wrap { border-right:none; border-bottom:1px solid #e5ecf4; } .maintenance-stats { border-left:none; border-top:1px solid #e5ecf4; } }
+    @media (max-width: 768px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .finished-wrap { grid-template-columns: 1fr; } .finished-grid { grid-template-columns: 1fr; } .overlay-row { grid-template-columns: 1fr; } .main-tab-content { padding: 0 12px 12px; } .main-tabs { padding: 12px; } .diagnostics { padding: 8px 10px; grid-template-columns: 48px 48px 48px 48px 1fr; gap: 6px; } .machine-detail-grid { grid-template-columns: 1fr; } .overlay-card { width: calc(100vw - 18px); border-radius: 16px; } .review-edge-arrow.left { left: 8px; } .review-edge-arrow.right { right: 8px; } .review-subslide.active, .review-group-list { grid-template-columns: 1fr; } #overlayReviewStep { padding: 0 48px; } #overlayReviewStep, .review-form-card { width: 100%; } .people-role-row { grid-template-columns: 1fr; } .operator-directory-row { grid-template-columns: 1fr; gap:6px; padding:10px 12px; } .operator-directory-row.header { display:none; } .operator-directory-label { display:block; } .operator-detail-grid { grid-template-columns:1fr; } .maintenance-topbar { flex-direction:column; } .maintenance-date { text-align:left; white-space:normal; } .maintenance-summary { grid-template-columns:1fr; } .maintenance-list { grid-template-columns:1fr; } .maintenance-person { grid-template-columns:1fr; } .maintenance-avatar-wrap { border-right:none; border-bottom:1px solid #e5ecf4; } .maintenance-stats { border-left:none; border-top:1px solid #e5ecf4; } }
   </style>
 </head>
 <body>
@@ -3280,9 +3438,9 @@ DASHBOARD_HTML = """
       <div class="overlay-body">
         <div id="overlayReviewStep">
         <div class="review-slide-toolbar">
-          <button id="overlayReviewPrevBtn" class="review-slide-arrow" type="button" aria-label="Previous page">‹</button>
-          <div id="overlayReviewSlideStatus" class="review-slide-status">Slide 1 / 4</div>
-          <button id="overlayReviewNextBtn" class="review-slide-arrow" type="button" aria-label="Next page">›</button>
+          <button id="overlayReviewPrevBtn" class="review-slide-arrow review-edge-arrow left" type="button" aria-label="Previous page">‹</button>
+          <div id="overlayReviewSlideStatus" class="review-slide-status">Slide 1 / 6</div>
+          <button id="overlayReviewNextBtn" class="review-slide-arrow review-edge-arrow right" type="button" aria-label="Next page">›</button>
         </div>
         <div id="reviewSubslide1" class="review-subslide">
           <div class="review-panel">
@@ -3301,17 +3459,25 @@ DASHBOARD_HTML = """
         </div>
         <div id="reviewSubslide2" class="review-subslide">
           <div class="review-panel">
-            <div class="review-panel-title">Raw Materials Consumption</div>
+            <div class="review-panel-title">Reject Details</div>
+            <div class="review-panel-body" id="overlayRejectDetailsPageDisplay"></div>
+          </div>
+        </div>
+        <div id="reviewSubslide3" class="review-subslide">
+          <div class="review-panel">
+            <div class="review-panel-title">Raw Materials</div>
             <div class="review-panel-body" id="overlayRawConsumptionDisplay"></div>
           </div>
+        </div>
+        <div id="reviewSubslide4" class="review-subslide">
           <div class="review-panel">
-            <div class="review-panel-title">Raw Materials / Cycle</div>
+            <div class="review-panel-title">Job / Cycle</div>
             <div class="review-panel-body" id="overlayRawCycleSummaryDisplay"></div>
           </div>
           <textarea id="overlayRawConsumption" readonly style="display:none;"></textarea>
           <textarea id="overlayRawCycleSummary" readonly style="display:none;"></textarea>
         </div>
-        <div id="reviewSubslide3" class="review-subslide">
+        <div id="reviewSubslide5" class="review-subslide">
           <div class="review-panel">
             <div class="review-panel-title">Downtime</div>
             <div class="review-panel-body" id="overlayDowntimeSummaryDisplay"></div>
@@ -3323,7 +3489,7 @@ DASHBOARD_HTML = """
           <textarea id="overlayDowntimeSummary" readonly style="display:none;"></textarea>
           <textarea id="overlayPeopleSummary" readonly style="display:none;"></textarea>
         </div>
-        <div id="reviewSubslide4" class="review-subslide">
+        <div id="reviewSubslide6" class="review-subslide">
           <div class="review-form-card">
           <div class="overlay-row" style="display:none;"><label>Scan QR Input</label><input id="overlayReviewerScanInput" type="text" placeholder="Click 'Open QR Field' then scan..." style="display:none;" /></div>
           <div class="overlay-row"><label>Reviewer (Supervisor/QC QR)</label><input id="overlayReviewerBadge" type="text" placeholder="Scan supervisor/QC QR badge..." /></div>
@@ -3516,7 +3682,7 @@ DASHBOARD_HTML = """
             <div class="settings-form">
               <div class="settings-row">
                 <label>QR Print API Base URL</label>
-                <input id="settingsQrApiBaseUrl" type="text" placeholder="http://192.168.1.149:5000" />
+                <input id="settingsQrApiBaseUrl" type="text" placeholder="http://192.168.10.166:5000" />
               </div>
               <div class="settings-note">This is used by Request Print (`/api/qrgen/pending-request`) forwarding to your QR system.</div>
               <div class="settings-row" style="margin-top:8px;">
@@ -3675,6 +3841,7 @@ DASHBOARD_HTML = """
   const overlayReviewRejects = document.getElementById("overlayReviewRejects");
   const overlayReviewSummaryDisplay = document.getElementById("overlayReviewSummaryDisplay");
   const overlayReviewRejectsDisplay = document.getElementById("overlayReviewRejectsDisplay");
+  const overlayRejectDetailsPageDisplay = document.getElementById("overlayRejectDetailsPageDisplay");
   const overlayRawConsumption = document.getElementById("overlayRawConsumption");
   const overlayRawCycleSummary = document.getElementById("overlayRawCycleSummary");
   const overlayDowntimeSummary = document.getElementById("overlayDowntimeSummary");
@@ -3707,6 +3874,8 @@ DASHBOARD_HTML = """
   const reviewSubslide2 = document.getElementById("reviewSubslide2");
   const reviewSubslide3 = document.getElementById("reviewSubslide3");
   const reviewSubslide4 = document.getElementById("reviewSubslide4");
+  const reviewSubslide5 = document.getElementById("reviewSubslide5");
+  const reviewSubslide6 = document.getElementById("reviewSubslide6");
   const overlayProductSelect = document.getElementById("overlayProductSelect");
   const overlayProductSuggest = document.getElementById("overlayProductSuggest");
   const overlayQrPayload = document.getElementById("overlayQrPayload");
@@ -3799,13 +3968,27 @@ DASHBOARD_HTML = """
     try { return esc(JSON.stringify(v ?? {}, null, 2)); } catch { return esc(String(v ?? "")); }
   }
 
-  function statusClass(lastSeenUtc, activeTtlSeconds = 30, manualStatus = ""){
+  function isMaintenanceSession(session){
+    if(!session || typeof session !== "object") return false;
+    return !!(
+      session.downtime_active ||
+      session.waiting_downtime_start_maintenance ||
+      session.waiting_pdr_maintenance_reason ||
+      session.waiting_downtime_end_maintenance ||
+      session.waiting_maintenance_qr ||
+      Number(session.downtime_wait_started_at || 0) > 0
+    );
+  }
+
+  function statusClass(lastSeenUtc, activeTtlSeconds = 30, manualStatus = "", session = null){
     if(String(manualStatus || "").trim()) return "maintenance";
     if(!lastSeenUtc) return "disconnected";
     const seen = new Date(lastSeenUtc).getTime();
     if(Number.isNaN(seen)) return "disconnected";
     const ageSec = (Date.now() - seen) / 1000;
-    return ageSec <= Number(activeTtlSeconds || 30) ? "active" : "disconnected";
+    const connected = ageSec <= Number(activeTtlSeconds || 30);
+    if(!connected) return "disconnected";
+    return isMaintenanceSession(session) ? "maintenance" : "active";
   }
 
   function fmtDateLocal(iso){
@@ -3848,7 +4031,8 @@ DASHBOARD_HTML = """
     const manual = machineStatusOverrideFor(activeMachineDetailCode);
     const manualStatus = String((manual && manual.status) || "").trim();
     const manualReason = String((manual && manual.reason) || "").trim();
-    const status = manualStatus || statusClass(session.last_seen_utc, activeTtlSeconds).toUpperCase();
+    const status = manualStatus || statusClass(session.last_seen_utc, activeTtlSeconds, "", session).toUpperCase();
+    const maintenanceMode = isMaintenanceSession(session);
     const totalGood = Number(session.good_total || 0) + Number(session.butal_total || 0);
     const job = extractJobRecord(session) || {};
     const rejectBreakdown = (session && typeof session.reject_breakdown === "object" && session.reject_breakdown) || {};
@@ -3897,6 +4081,7 @@ DASHBOARD_HTML = """
           ${detailItem("Start Up Reject", Number(session.startup_reject_total || 0))}
           ${detailItem("Raw Sacks Count", Number(session.raw_sacks_count || 0))}
           ${detailItem("Cycle Time", session.cycle_time_current || "-")}
+          ${detailItem("Maintenance/Downtime", maintenanceMode ? "YES" : "NO")}
           ${detailItem("Downtime Active", session.downtime_active ? "YES" : "NO")}
         </div>
       </div>
@@ -4403,9 +4588,10 @@ DASHBOARD_HTML = """
 
   function setOverlayStep(step){
     const isReview = step !== "qr";
+    const approvedShiftView = isReview && overlayReviewMode === "shift" && isApprovedShiftRecord(activeJobRow);
     overlayReviewStep.style.display = isReview ? "" : "none";
     overlayQrStep.style.display = isReview ? "none" : "";
-    overlayReviewSubmitBtn.style.display = isReview ? "" : "none";
+    overlayReviewSubmitBtn.style.display = (isReview && !approvedShiftView) ? "" : "none";
     overlayReviewContinueBtn.style.display = (isReview && overlayReviewMode !== "shift") ? "" : "none";
     overlayBackToReviewBtn.style.display = isReview ? "none" : "";
     overlayGenerateBtn.style.display = "none";
@@ -4414,19 +4600,23 @@ DASHBOARD_HTML = """
   }
 
   function syncReviewSubslides(){
-    const slides = [reviewSubslide1, reviewSubslide2, reviewSubslide3, reviewSubslide4];
+    const slides = [reviewSubslide1, reviewSubslide2, reviewSubslide3, reviewSubslide4, reviewSubslide5, reviewSubslide6];
+    const visibleSlides = slides.filter((el, idx) => el && !(overlayReviewMode !== "shift" && idx === 1));
     const total = slides.length;
-    reviewSlideIndex = Math.max(0, Math.min(total - 1, Number(reviewSlideIndex || 0)));
-    slides.forEach((el, idx) => {
-      if(el) el.classList.toggle("active", idx === reviewSlideIndex);
+    const visibleTotal = visibleSlides.length;
+    reviewSlideIndex = Math.max(0, Math.min(visibleTotal - 1, Number(reviewSlideIndex || 0)));
+    slides.forEach(el => {
+      if(el) el.classList.remove("active");
     });
+    const active = visibleSlides[reviewSlideIndex];
+    if(active) active.classList.add("active");
     if(overlayReviewPrevBtn) overlayReviewPrevBtn.disabled = reviewSlideIndex <= 0;
-    if(overlayReviewNextBtn) overlayReviewNextBtn.disabled = reviewSlideIndex >= (total - 1);
+    if(overlayReviewNextBtn) overlayReviewNextBtn.disabled = reviewSlideIndex >= (visibleTotal - 1);
     if(overlayReviewSlideStatus){
       const labels = overlayReviewMode === "shift"
-        ? ["Shift Summary", "Materials / Job API", "Downtime / Team", "Review / Edit"]
+        ? ["Shift Summary", "Reject Details", "Raw Materials", "Job / Cycle", "Downtime / Team", "Review / Edit"]
         : ["Job Summary", "Raw Mats / Cycle", "Downtime / Team", "Approval"];
-      overlayReviewSlideStatus.textContent = `Slide ${reviewSlideIndex + 1} / ${total} - ${labels[reviewSlideIndex] || ""}`;
+      overlayReviewSlideStatus.textContent = `Slide ${reviewSlideIndex + 1} / ${visibleTotal} - ${labels[reviewSlideIndex] || ""}`;
     }
   }
 
@@ -4503,6 +4693,38 @@ DASHBOARD_HTML = """
     `;
   }
 
+  function compactValue(value){
+    if(value === null || value === undefined || value === "") return "-";
+    if(typeof value === "boolean") return value ? "Yes" : "No";
+    if(Array.isArray(value)) return `${value.length} item${value.length === 1 ? "" : "s"}`;
+    if(typeof value === "object") return Object.keys(value).length ? "Available" : "-";
+    return String(value);
+  }
+
+  function tableFromRows(rows, columns, emptyLabel = "No data.", maxRows = 8){
+    const items = Array.isArray(rows) ? rows : [];
+    const cols = Array.isArray(columns) ? columns : [];
+    if(!items.length || !cols.length) return `<div class="machine-detail-empty">${esc(emptyLabel)}</div>`;
+    const limit = Math.max(1, Number(maxRows || 8));
+    const visible = items.slice(0, limit);
+    const hidden = Math.max(0, items.length - visible.length);
+    return `
+      <table class="review-kv-table review-data-table">
+        <thead>
+          <tr>${cols.map(col => `<th>${esc(col.label)}</th>`).join("")}</tr>
+        </thead>
+        <tbody>
+          ${visible.map(item => `
+            <tr>
+              ${cols.map(col => `<td>${esc(compactValue(col.value(item)))}</td>`).join("")}
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+      ${hidden ? `<div class="review-more-note">Showing ${visible.length} of ${items.length} records.</div>` : ""}
+    `;
+  }
+
   function renderShiftGroupedPanelHtml(panel, emptyLabel = "No data."){
     const groups = Array.isArray(panel) ? panel : [];
     if(!groups.length) return `<div class="machine-detail-empty">${esc(emptyLabel)}</div>`;
@@ -4515,9 +4737,10 @@ DASHBOARD_HTML = """
           let bodyHtml = "";
           if(kind === "table"){
             bodyHtml = renderKeyValueTableHtml(content, emptyLabel);
+          } else if(kind === "html") {
+            bodyHtml = String(content || "");
           } else {
-            const raw = safeJsonPretty(content);
-            bodyHtml = `<pre class="review-json-block">${esc(raw)}</pre>`;
+            bodyHtml = `<div class="machine-detail-empty">Details are summarized in the other cards.</div>`;
           }
           return `
             <div class="review-group-card">
@@ -4538,11 +4761,46 @@ DASHBOARD_HTML = """
     const jobDetails = (data.job_details && typeof data.job_details === "object") ? data.job_details : {};
     const partials = Array.isArray(data.partials) ? data.partials : [];
     const productParts = Array.isArray(data.product_parts) ? data.product_parts : [];
+    let targetRawMaterials = [];
+    if(Array.isArray(data.parts)) targetRawMaterials = data.parts.filter(x => x && typeof x === "object");
+    else if(Array.isArray(jobDetails.parts)) targetRawMaterials = jobDetails.parts.filter(x => x && typeof x === "object");
+    else if(Array.isArray(jobDetails.part_ids)) targetRawMaterials = jobDetails.part_ids.filter(x => x && typeof x === "object");
+    else if(jobDetails.part_ids && typeof jobDetails.part_ids === "object") targetRawMaterials = [jobDetails.part_ids];
+    else if(Array.isArray(data.part_ids)) targetRawMaterials = data.part_ids.filter(x => x && typeof x === "object");
+    else if(Array.isArray(payload.part_ids)) targetRawMaterials = payload.part_ids.filter(x => x && typeof x === "object");
     const rawLogs = Array.isArray(item.raw_material_logs) ? item.raw_material_logs : [];
     const rawScans = Array.isArray(item.raw_material_scans) ? item.raw_material_scans : [];
     const packHistory = Array.isArray(item.product_pack_history_logs) ? item.product_pack_history_logs : [];
     const rejectReviews = Array.isArray(item.reject_review_logs) ? item.reject_review_logs : [];
-    const summary = {
+    const rejectBreakdownRows = Object.entries((item.reject_breakdown && typeof item.reject_breakdown === "object") ? item.reject_breakdown : {})
+      .map(([reason, qty]) => ({reason, qty}));
+    const materialKey = value => String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const partKeys = part => [part?.sku, part?.name, part?.part_name, part?.material_name, part?.product_name, part?.description]
+      .map(materialKey)
+      .filter(Boolean);
+    const rawKeys = row => [row?.material_sku, row?.sku, row?.material_product_id, row?.product_id, row?.material_code, row?.material_name, row?.material]
+      .map(materialKey)
+      .filter(Boolean);
+    const scannedQtyForPart = part => {
+      const keys = new Set(partKeys(part));
+      if(!keys.size) return "";
+      return rawLogs.reduce((sum, row) => {
+        const hit = rawKeys(row).some(k => keys.has(k));
+        return hit ? sum + Number(row?.qty || row?.quantity || 0) : sum;
+      }, 0);
+    };
+    const jobApiSummary = {
+      ref_no: job.ref_no || job.code || item.job_code || "-",
+      status: job.status || "-",
+      mold: jobDetails.mold || job.custom_05 || "-",
+      color: jobDetails.color || job.custom_06 || "-",
+      machine_num: jobDetails.machine_num || item.machine_code || "-",
+      machine_tons: jobDetails.machine_tons || "-",
+      no_of_cavity: jobDetails.no_of_cavity || "-",
+      qty_per_shift: jobDetails.qty_per_shift || job.custom_11 || "-",
+      standard_cycle_time: jobDetails.std_cycle_time || job.custom_09 || item.cycle_time_current || "-",
+    };
+    const summaryIdentity = {
       record_type: item.record_type || "SHIFT_PARTIAL",
       review_status: item.review_status || "-",
       reason: item.reason || "-",
@@ -4555,6 +4813,8 @@ DASHBOARD_HTML = """
       shift_index: item.shift_index ?? "-",
       started_at_utc: item.started_at_utc || "-",
       ended_at_utc: item.ended_at_utc || item.finished_at_utc || "-",
+    };
+    const summaryProduction = {
       pack_count: item.pack_count ?? 0,
       good_total: item.good_total ?? 0,
       butal_total: item.butal_total ?? 0,
@@ -4564,12 +4824,16 @@ DASHBOARD_HTML = """
       total_good: item.total_good ?? item.partial_qty ?? 0,
       partial_qty: item.partial_qty ?? item.total_good ?? 0,
       raw_sacks_count: item.raw_sacks_count ?? 0,
+    };
+    const summaryTiming = {
       cycle_time_current: item.cycle_time_current || "-",
       cycle_time_shift_avg_seconds: item.cycle_time_shift_avg_seconds ?? "-",
       qty_per_shift_avg_cycle: item.qty_per_shift_avg_cycle ?? "-",
       downtime_reason_code: item.downtime_reason_code || "-",
       downtime_reason_text: item.downtime_reason_text || "-",
       downtime_last_seconds: item.downtime_last_seconds ?? 0,
+    };
+    const summaryPeople = {
       maintenance_name: item.maintenance_name || "-",
       supervisor_name: item.supervisor_name || "-",
       linkage_enabled: !!item.linkage_enabled,
@@ -4584,22 +4848,59 @@ DASHBOARD_HTML = """
     };
     return {
       summary: [
-        { title: "Shift Summary", kind: "table", content: summary },
+        { title: "Shift / Job", kind: "table", content: summaryIdentity },
+        { title: "Production Counts", kind: "table", content: summaryProduction },
+        { title: "Timing / Downtime", kind: "table", content: summaryTiming },
+        { title: "People / Counts", kind: "table", content: summaryPeople },
       ],
       rejects: [
-        { title: "Reject Breakdown", kind: "json", content: item.reject_breakdown || {} },
-        { title: "Reject Review Logs", kind: "json", content: rejectReviews },
+        { title: "Reject Breakdown", kind: "html", content: tableFromRows(rejectBreakdownRows, [
+          { label: "Reason", value: x => x.reason },
+          { label: "Qty", value: x => x.qty },
+        ], "No reject breakdown recorded.") },
+        { title: "Reject Review Logs", kind: "html", content: tableFromRows(rejectReviews, [
+          { label: "Type", value: x => x.entry_type || x.action || "-" },
+          { label: "Reason", value: x => x.reason_text || x.reason_code || "-" },
+          { label: "Operator", value: x => x.operator_name || x.operator || x.actor_name || "-" },
+          { label: "Time", value: x => fmtDateLocal(x.scanned_at || x.timestamp_utc || "") || "-" },
+        ], "No reject review logs recorded.", 5) },
       ],
       rawConsumption: [
-        { title: "Raw Material Logs", kind: "json", content: rawLogs },
-        { title: "Raw Material Scans", kind: "json", content: rawScans },
-        { title: "Product Pack History", kind: "json", content: packHistory },
+        { title: "Target Raw Materials", kind: "html", content: tableFromRows(targetRawMaterials, [
+          { label: "SKU", value: x => x.sku || x.part_code || x.product_code || x.code || "-" },
+          { label: "Material", value: x => x.name || x.part_name || x.material_name || x.product_name || x.description || "-" },
+          { label: "Target Qty", value: x => x.request_part_qty || x.qty || x.quantity || x.required_qty || "-" },
+          { label: "Scanned Qty", value: x => scannedQtyForPart(x) || 0 },
+        ], "No target raw materials from Job API.", 8) },
+        { title: "Scanned Raw Materials", kind: "html", content: tableFromRows(rawLogs, [
+          { label: "Material", value: x => x.material_name || x.material || x.code || x.value || "-" },
+          { label: "Qty", value: x => x.qty ?? x.quantity ?? "-" },
+          { label: "Lot", value: x => x.lot_number || x.lot || "-" },
+          { label: "Time", value: x => fmtDateLocal(x.timestamp_utc || x.scanned_at || "") || "-" },
+        ], "No raw material logs recorded.", 5) },
+        { title: "Raw Material Scans", kind: "html", content: tableFromRows(rawScans, [
+          { label: "Material", value: x => x.material_name || x.material || x.code || x.value || "-" },
+          { label: "Qty", value: x => x.qty ?? x.quantity ?? "-" },
+          { label: "Lot", value: x => x.lot_number || x.lot || "-" },
+        ], "No raw material scans recorded.", 5) },
+        { title: "Product Pack History", kind: "html", content: tableFromRows(packHistory, [
+          { label: "Type", value: x => x.type || x.source || "Pack" },
+          { label: "Qty", value: x => x.qty || x.qty_q || x.good_qty || "-" },
+          { label: "Time", value: x => fmtDateLocal(x.timestamp_utc || x.scanned_at || "") || "-" },
+        ], "No product pack history recorded.", 8) },
       ],
       rawCycle: [
-        { title: "Job API Job", kind: "json", content: job },
-        { title: "Job API Job Details", kind: "json", content: jobDetails },
-        { title: "Job API Product Parts", kind: "json", content: productParts },
-        { title: "Job API Partials", kind: "json", content: partials },
+        { title: "Job API Summary", kind: "table", content: jobApiSummary },
+        { title: "Job API Product Parts", kind: "html", content: tableFromRows(productParts, [
+          { label: "Part", value: x => x.part_name || x.product_name || x.name || x.item_name || "-" },
+          { label: "Code", value: x => x.part_code || x.product_code || x.code || x.sku || "-" },
+          { label: "Qty", value: x => x.qty || x.quantity || x.required_qty || "-" },
+        ], "No product parts recorded.", 5) },
+        { title: "Job API Partials", kind: "html", content: tableFromRows(partials, [
+          { label: "Date", value: x => fmtDateLocal(x.date || x.created_at || x.timestamp_utc || "") || "-" },
+          { label: "Qty", value: x => x.partial_qty || x.qty || x.quantity || "-" },
+          { label: "Status", value: x => x.status || "-" },
+        ], "No API partials recorded.", 5) },
       ],
       downtime: [
         {
@@ -4629,7 +4930,6 @@ DASHBOARD_HTML = """
             startup_reject_total: item.startup_reject_total ?? 0,
           },
         },
-        { title: "Full Job API Payload", kind: "json", content: payload },
       ],
     };
   }
@@ -4691,7 +4991,7 @@ DASHBOARD_HTML = """
           </div>
           <div class="raw-list">${esc(rawText)}</div>
           <div class="finished-actions">
-            <button class="approve-print-btn shift-review-btn" data-row-index="${idx}" type="button">Review Shift</button>
+            <button class="approve-print-btn shift-review-btn" data-row-index="${idx}" type="button">${isApprovedShiftRecord(r) ? "View Shift" : "Review Shift"}</button>
           </div>
         </div>
       `;
@@ -5491,6 +5791,9 @@ DASHBOARD_HTML = """
       ? renderShiftGroupedPanelHtml(shiftPanels.summary, "No shift summary.")
       : renderSummaryMetricsHtml(activeJobRow);
     if(overlayReviewRejectsDisplay) overlayReviewRejectsDisplay.innerHTML = shiftPanels
+      ? '<div class="machine-detail-empty">Use the next arrow for reject details.</div>'
+      : renderBulletListHtml(reviewRejectsText(activeJobRow), "No reject details recorded.");
+    if(overlayRejectDetailsPageDisplay) overlayRejectDetailsPageDisplay.innerHTML = shiftPanels
       ? renderShiftGroupedPanelHtml(shiftPanels.rejects, "No reject details recorded.")
       : renderBulletListHtml(reviewRejectsText(activeJobRow), "No reject details recorded.");
     const rawLogs = Array.isArray(activeJobRow?.raw_material_logs) ? activeJobRow.raw_material_logs : [];
@@ -5500,7 +5803,7 @@ DASHBOARD_HTML = """
         ? rawLogs.map((x, i) => `${i + 1}. ${(x?.material || x?.code || x?.value || "-")} | qty=${x?.qty ?? 0}`).join("\\n")
         : "No raw material consumption records.");
     if(overlayRawConsumptionDisplay) overlayRawConsumptionDisplay.innerHTML = shiftPanels
-      ? renderShiftGroupedPanelHtml(shiftPanels.rawConsumption, "No raw material consumption records.")
+      ? renderShiftGroupedPanelHtml(shiftPanels.rawConsumption, "No raw material records.")
       : renderBulletListHtml(overlayRawConsumption?.value || "", "No raw material consumption records.");
     if(overlayRawCycleSummary) overlayRawCycleSummary.value = shiftPanels
       ? shiftPanels.rawCycle
@@ -5649,7 +5952,7 @@ DASHBOARD_HTML = """
       };
       const manual = machineStatusOverrideFor(code);
       const manualStatus = String((manual && manual.status) || "").trim();
-      const css = statusClass(s.last_seen_utc, activeTtlSeconds, manualStatus) || "disconnected";
+      const css = statusClass(s.last_seen_utc, activeTtlSeconds, manualStatus, s) || "disconnected";
       const statusLabel = manualStatus || css.toUpperCase();
       s.machine_name = s.machine_name || MACHINE_NAME_MAP[code] || code;
       const card = upsertMachineCard(s, code, css, statusLabel);
@@ -5886,7 +6189,7 @@ DASHBOARD_HTML = """
     syncReviewSubslides();
   });
   if(overlayReviewNextBtn) overlayReviewNextBtn.addEventListener("click", () => {
-    reviewSlideIndex = Math.min(3, Number(reviewSlideIndex || 0) + 1);
+    reviewSlideIndex = Number(reviewSlideIndex || 0) + 1;
     syncReviewSubslides();
   });
   machineDetailCloseBtn.addEventListener("click", closeMachineDetail);
@@ -6178,6 +6481,9 @@ DASHBOARD_HTML = """
       ? renderShiftGroupedPanelHtml(shiftPanels.summary, "No shift summary.")
       : renderSummaryMetricsHtml(activeJobRow);
     if(overlayReviewRejectsDisplay) overlayReviewRejectsDisplay.innerHTML = shiftPanels
+      ? '<div class="machine-detail-empty">Use the next arrow for reject details.</div>'
+      : renderBulletListHtml(overlayReviewRejects.value || "", "No reject details recorded.");
+    if(overlayRejectDetailsPageDisplay) overlayRejectDetailsPageDisplay.innerHTML = shiftPanels
       ? renderShiftGroupedPanelHtml(shiftPanels.rejects, "No reject details recorded.")
       : renderBulletListHtml(overlayReviewRejects.value || "", "No reject details recorded.");
     fillDisapproveFields(activeJobRow);
@@ -6794,15 +7100,40 @@ async def api_event(req: Request):
     if ev_type == "FINISH_SHIFT":
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
-            FINISHED_JOBS.append(finished_job)
-            save_finished_jobs(FINISHED_JOBS)
+            finished_job = dict(finished_job)
+            finished_job["record_type"] = "SHIFT_PARTIAL"
+            key = _finished_job_key(finished_job)
+            idx = _find_finished_job_index(FINISHED_JOBS, key)
+            if idx >= 0:
+                FINISHED_JOBS[idx] = _prefer_finished_job_row(FINISHED_JOBS[idx], finished_job)
+            else:
+                FINISHED_JOBS.append(finished_job)
+            try:
+                save_finished_jobs(FINISHED_JOBS)
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=503)
     elif ev_type == "FINISH_JOB":
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
             FINISHED_JOBS.append(finished_job)
-            save_finished_jobs(FINISHED_JOBS)
+            try:
+                save_finished_jobs(FINISHED_JOBS)
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=503)
         if machine_code in SESSIONS:
             del SESSIONS[machine_code]
+    elif ev_type == "PRODUCTION_DAILY_REPORT_RESOLVED":
+        pdr_row = dict(ev)
+        pdr_row.update({
+            "client_id": client_id,
+            "machine_code": machine_code,
+            "machine_name": data.get("machine_name", machine_code),
+            "job_code": data.get("job_code"),
+            "job_name": data.get("job_name"),
+            "operator_id": data.get("operator_id"),
+        })
+        if not _insert_pdr_report_sql(pdr_row):
+            return JSONResponse({"ok": False, "error": "pdr_reports SQL storage is unavailable"}, status_code=503)
             _remove_persisted_active_session(machine_code)
     elif ev_type == "JOB_LINKAGE_SET":
         sess.linkage_enabled = True
@@ -6846,6 +7177,10 @@ async def api_event(req: Request):
             sess.downtime_active = bool(snap.get("downtime_active", sess.downtime_active))
             sess.downtime_wait_started_at = snap.get("downtime_wait_started_at", sess.downtime_wait_started_at)
             sess.downtime_wait_last_seconds = snap.get("downtime_wait_last_seconds", sess.downtime_wait_last_seconds)
+            sess.waiting_downtime_start_maintenance = bool(snap.get("waiting_downtime_start_maintenance", sess.waiting_downtime_start_maintenance))
+            sess.waiting_pdr_maintenance_reason = bool(snap.get("waiting_pdr_maintenance_reason", sess.waiting_pdr_maintenance_reason))
+            sess.waiting_downtime_end_maintenance = bool(snap.get("waiting_downtime_end_maintenance", sess.waiting_downtime_end_maintenance))
+            sess.waiting_maintenance_qr = bool(snap.get("waiting_maintenance_qr", sess.waiting_maintenance_qr))
             sess.cycle_time_current = snap.get("cycle_time_current", sess.cycle_time_current)
             live_avg = snap.get("live_cycle_avg_seconds", sess.live_cycle_avg_seconds)
             try:

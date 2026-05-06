@@ -2646,6 +2646,7 @@ class ClientUI(QWidget):
         self._product_catalog_sku_by_id: Optional[Dict[str, str]] = None
         self._product_catalog_last_refresh_attempt = 0.0
         self._product_catalog_refresh_inflight = False
+        self._last_finish_shift_sync_signature = ""
         self._action_logs: List[str] = []
         self._app_logs: List[Dict[str, Any]] = _load_app_logs_json()
         self._app_logs_dirty = True
@@ -4051,7 +4052,9 @@ QWidget#ClientUIRoot {{
         self.productionActionBanner = QLabel('SCAN PDR DONE QR WHEN\nREPAIR IS DONE')
         self.productionActionBanner.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.productionActionBanner.setWordWrap(True)
-        self.productionActionBanner.setFixedSize(292, 66)
+        self.productionActionBanner.setMinimumHeight(50)
+        self.productionActionBanner.setMaximumHeight(74)
+        self.productionActionBanner.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.productionOverlay.layout().addWidget(self.productionActionBanner, 0, Qt.AlignmentFlag.AlignHCenter)
         self.productionOverlay.layout().addSpacing(14)
 
@@ -4631,8 +4634,8 @@ QWidget#ClientUIRoot {{
         self.finishOverlay = QFrame(self)
         self.finishOverlay.setObjectName("ProductionOverlay")
         self.finishOverlay.setLayout(QVBoxLayout())
-        self.finishOverlay.layout().setContentsMargins(10, 8, 10, 8)
-        self.finishOverlay.layout().setSpacing(5)
+        self.finishOverlay.layout().setContentsMargins(14, 10, 14, 10)
+        self.finishOverlay.layout().setSpacing(6)
         self.finishOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishTitle = QLabel("FINISHING JOB")
         self.finishTitle.setStyleSheet("color: #f8fafc; font-size: 20px; font-weight: 900; background: transparent; border: none;")
@@ -4658,6 +4661,7 @@ QWidget#ClientUIRoot {{
         self.finishProgressBar.setFixedWidth(300)
         self.finishSummaryScroll = QFrame()
         self.finishSummaryScroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.finishSummaryScroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.finishSummaryScroll.setStyleSheet("QFrame { background: transparent; border: none; }")
         self.finishSummaryScroll.setLayout(QVBoxLayout())
         self.finishSummaryScroll.layout().setContentsMargins(0, 0, 0, 0)
@@ -4667,12 +4671,15 @@ QWidget#ClientUIRoot {{
         self.finishSummaryBody.layout().setContentsMargins(2, 2, 2, 2)
         self.finishSummaryBody.layout().setSpacing(6)
         self.finishSummaryStack = QStackedWidget()
+        self.finishSummaryStack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.finishSummaryStack.setStyleSheet("background: transparent; border: none;")
         self.finishSummaryScroll.layout().addWidget(self.finishSummaryBody)
         self.finishSummaryBody.layout().addWidget(self.finishSummaryStack)
         self.finishSummaryScroll.hide()
         self._finish_review_total_pages = 1
         self._finish_review_page_index = 0
+        self._finish_review_stack_indices: List[int] = [0]
+        self._finish_review_extra_pages: List[QWidget] = []
         self.finishReviewPageInfo = QLabel("Page 1 of 1")
         self.finishReviewPageInfo.setStyleSheet("color:#dbeafe; font-size:13px; font-weight:900; background:transparent; border:none;")
         self.finishReviewPageInfo.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -4794,13 +4801,13 @@ QWidget#ClientUIRoot {{
         self.finishOverlay.layout().addWidget(self.finishReviewHint)
         self.finishOverlay.layout().addWidget(self.finishReviewPageInfo)
         self.finishOverlay.layout().addWidget(self.finishProgressBar, 0, Qt.AlignmentFlag.AlignCenter)
-        self.finishOverlay.layout().addWidget(self.finishSummaryScroll)
+        self.finishOverlay.layout().addWidget(self.finishSummaryScroll, 1)
         self.finishOverlay.layout().addWidget(self.finishSuccessRow, 0, Qt.AlignmentFlag.AlignCenter)
         self.finishOverlay.setStyleSheet(
             "QFrame#ProductionOverlay {"
             "background: qradialgradient(cx:0.5, cy:0.12, radius:1.2, fx:0.5, fy:0.02,"
             "stop:0 rgba(112,116,124,242), stop:0.38 rgba(70,74,82,244), stop:1 rgba(24,26,31,248));"
-            "border: 1px solid rgba(124,130,140,235); border-radius: 28px; }"
+            "border: 1px solid rgba(124,130,140,235); border-radius: 0px; }"
             "QWidget#FinishSuccessRow { background: transparent; border: none; }"
             "QLabel#FinishDoneText { background: transparent; border: none; }"
             "QProgressBar {"
@@ -5435,6 +5442,10 @@ QWidget#ClientUIRoot {{
         self.identitySyncTimer.timeout.connect(lambda: self._trigger_identity_cache_sync(force=False))
         self.identitySyncTimer.start(max(3000, IDENTITY_SYNC_INTERVAL_MS))
         QTimer.singleShot(250, lambda: self._trigger_identity_cache_sync(force=True))
+        self.finishShiftSyncTimer = QTimer(self)
+        self.finishShiftSyncTimer.timeout.connect(lambda: self.sync_local_finish_shifts_to_server(force=False))
+        self.finishShiftSyncTimer.start(30000)
+        QTimer.singleShot(1500, lambda: self.sync_local_finish_shifts_to_server(force=True))
 
         self.motionTimer = QTimer(self)
         self.motionTimer.timeout.connect(self._tick_motion)
@@ -5835,6 +5846,9 @@ QWidget#ClientUIRoot {{
         else:
             y = max(12, (self.height() - h) // 2 - 8)
         self.productionOverlay.setGeometry(x, y, w, h)
+        if hasattr(self, "productionActionBanner") and self.productionActionBanner is not None:
+            self.productionActionBanner.setFixedWidth(max(220, min(360, int(w * 0.58))))
+            self._apply_production_action_banner_style()
         self._sync_production_reason_card_sizes()
         self._position_marquee()
 
@@ -5948,10 +5962,11 @@ QWidget#ClientUIRoot {{
         self.rejectReviewLoadingLayer.setGeometry(0, 0, w, h)
 
     def _position_finish_overlay(self):
-        w = min(1120, max(880, int(self.width() * 0.74)))
-        h = min(760, max(620, int(self.height() * 0.72)))
-        x = max(0, (self.width() - w) // 2)
-        y = max(0, (self.height() - h) // 2)
+        margin = 10
+        w = max(1, self.width() - (margin * 2))
+        h = max(1, self.height() - (margin * 2))
+        x = margin
+        y = margin
         self.finishOverlay.setGeometry(x, y, w, h)
 
     def _set_finish_review_page_info(self):
@@ -6004,13 +6019,53 @@ QWidget#ClientUIRoot {{
             self.finishReviewPageFour.layout().addWidget(self.finishReviewRaw._finish_section)
         self.finishReviewPageFour.layout().addStretch(1)
 
+    def _clear_finish_review_extra_pages(self):
+        for page in list(getattr(self, "_finish_review_extra_pages", []) or []):
+            try:
+                idx = self.finishSummaryStack.indexOf(page)
+                if idx >= 0:
+                    self.finishSummaryStack.removeWidget(page)
+                page.deleteLater()
+            except Exception:
+                pass
+        self._finish_review_extra_pages = []
+
+    def _add_finish_review_extra_page(self, title: str, headers: List[str], rows: List[List[str]], section_height: int = 620):
+        page = QWidget()
+        page.setLayout(QVBoxLayout())
+        page.layout().setContentsMargins(0, 0, 0, 0)
+        page.layout().setSpacing(6)
+        page.setAutoFillBackground(True)
+        page.setStyleSheet("background: rgba(37,42,50,245); border: none;")
+        table = self._make_finish_summary_table(title, headers)
+        self._set_finish_summary_table_rows(table, rows)
+        self._stretch_finish_summary_table(table, section_height)
+        section = getattr(table, "_finish_section", None)
+        if section is not None:
+            page.layout().addWidget(section)
+        page.layout().addStretch(1)
+        self.finishSummaryStack.addWidget(page)
+        self._finish_review_extra_pages.append(page)
+
     def _rebuild_finish_review_pages(self, include_second_page: bool, include_third_page: bool = False, include_fourth_page: bool = False):
-        self._finish_review_total_pages = 1 + (1 if include_second_page else 0) + (1 if include_third_page else 0) + (1 if include_fourth_page else 0)
         self.finishSummaryStack.widget(1).setVisible(include_second_page)
         self.finishSummaryStack.widget(2).setVisible(include_third_page)
         self.finishSummaryStack.widget(3).setVisible(include_fourth_page)
+        page_indices = [0]
+        if include_second_page:
+            page_indices.append(1)
+        if include_third_page:
+            page_indices.append(2)
+        if include_fourth_page:
+            page_indices.append(3)
+        for page in getattr(self, "_finish_review_extra_pages", []) or []:
+            idx = self.finishSummaryStack.indexOf(page)
+            if idx >= 0:
+                page_indices.append(idx)
+        self._finish_review_stack_indices = page_indices
+        self._finish_review_total_pages = max(1, len(page_indices))
         self._finish_review_page_index = min(int(getattr(self, "_finish_review_page_index", 0) or 0), self._finish_review_total_pages - 1)
-        self.finishSummaryStack.setCurrentIndex(self._finish_review_page_index)
+        self.finishSummaryStack.setCurrentIndex(page_indices[self._finish_review_page_index])
         self._set_finish_review_page_info()
 
     def _change_finish_review_page(self, direction: int):
@@ -6025,7 +6080,8 @@ QWidget#ClientUIRoot {{
             self.status.setText(f"Finish review: already on {edge} page.")
             return
         self._finish_review_page_index = next_index
-        self.finishSummaryStack.setCurrentIndex(next_index)
+        page_indices = list(getattr(self, "_finish_review_stack_indices", [0]) or [0])
+        self.finishSummaryStack.setCurrentIndex(page_indices[next_index])
         self._set_finish_review_page_info()
         self.status.setText(f"Finish review page {next_index + 1} of {total_pages}.")
 
@@ -7173,6 +7229,12 @@ QWidget#ClientUIRoot {{
         local_ok = self._approve_local_finished_shift(shift_payload, reviewer, remarks)
         server_ok = self._approve_server_finished_shift(shift_payload, reviewer_badge, remarks)
         self._pending_shift_review_payload = shift_payload
+        if local_ok and not server_ok:
+            self.push_event(
+                {"type": "FINISH_SHIFT", "finished_job": shift_payload},
+                f"FINISH SHIFT {shift_payload.get('job_name') or shift_payload.get('job_code') or ''}".strip(),
+                silent=False,
+            )
         self._populate_finish_shift_summary(shift_payload)
         self.finishTitle.setText("FINISH SHIFT APPROVED")
         self.finishReviewHint.setText(
@@ -7341,15 +7403,7 @@ QWidget#ClientUIRoot {{
             "border: 1px solid rgba(148,163,184,0.45); border-radius: 11px;"
             "padding: 8px 12px;"
         )
-        self.productionActionBanner.setStyleSheet(
-            "color: #ffffff; font-size: 17px; font-weight: 900;"
-            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #5aa4ee, stop:0.52 #4795e3, stop:1 #3b84d2);"
-            "border-top: 1px solid rgba(255,255,255,0.20);"
-            "border-left: 1px solid rgba(255,255,255,0.12);"
-            "border-right: 1px solid rgba(31,88,156,0.55);"
-            "border-bottom: 1px solid rgba(22,67,122,0.72);"
-            "border-radius: 12px; padding: 8px 18px;"
-        )
+        self._apply_production_action_banner_style()
         self.productionRepairZone.setStyleSheet("background: transparent; border: none;")
         self.productionRepairZoneBody.setStyleSheet(
             "QFrame#ProductionRepairZoneBody {"
@@ -7369,6 +7423,56 @@ QWidget#ClientUIRoot {{
         self._apply_widget_shadow(self.productionLiveReason, 16, 2, QColor(0, 0, 0, 45))
         self._apply_widget_shadow(self.productionMaintenanceLine, 16, 2, QColor(0, 0, 0, 42))
         self.productionActionBanner.setGraphicsEffect(None)
+
+    def _apply_production_action_banner_style(self):
+        banner = getattr(self, "productionActionBanner", None)
+        if banner is None:
+            return
+        text = str(banner.text() or "SCAN PDR DONE QR WHEN\nREPAIR IS DONE")
+        width = max(1, int(banner.width() or banner.maximumWidth() or 292))
+        height = max(1, int(banner.height() or banner.minimumHeight() or 60))
+        font_px = self._fit_multiline_font_px(
+            text=text,
+            width=max(1, width - 32),
+            height=max(1, height - 16),
+            min_px=10,
+            max_px=18,
+            family="",
+            weight=QFont.Weight.Black,
+        )
+        banner.setStyleSheet(
+            f"color: #ffffff; font-size: {font_px}px; font-weight: 900;"
+            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #5aa4ee, stop:0.52 #4795e3, stop:1 #3b84d2);"
+            "border-top: 1px solid rgba(255,255,255,0.20);"
+            "border-left: 1px solid rgba(255,255,255,0.12);"
+            "border-right: 1px solid rgba(31,88,156,0.55);"
+            "border-bottom: 1px solid rgba(22,67,122,0.72);"
+            "border-radius: 12px; padding: 8px 16px;"
+        )
+
+    def _fit_multiline_font_px(
+        self,
+        text: str,
+        width: int,
+        height: int,
+        min_px: int,
+        max_px: int,
+        family: str = "",
+        weight: QFont.Weight = QFont.Weight.Bold,
+    ) -> int:
+        lines = [line.strip() for line in str(text or "").splitlines() if line.strip()] or [str(text or "")]
+        best = min_px
+        for px in range(max_px, min_px - 1, -1):
+            font = QFont(family) if family else QFont()
+            font.setPixelSize(px)
+            font.setWeight(weight)
+            metrics = QFontMetrics(font)
+            line_w = max(metrics.horizontalAdvance(line) for line in lines)
+            total_h = metrics.height() * len(lines)
+            if line_w <= max(1, width) and total_h <= max(1, height):
+                best = px
+                break
+        return best
 
     def _apply_widget_shadow(self, widget: Optional[QWidget], blur: int, offset_y: int, color: QColor):
         if widget is None:
@@ -7843,7 +7947,7 @@ QWidget#ClientUIRoot {{
         elif s.waiting_maintenance_qr:
             self._set_banner_text("Downtime resolve: Scan Maintenance QR to stop downtime")
         elif s.waiting_supervisor_qr:
-            self._set_banner_text("Downtime resolve: Scan Supervisor QR")
+            self._set_banner_text("Downtime resolve: Scan Supervisor QR to proceed")
         elif s.waiting_operator_downtime_confirm:
             self._set_banner_text("Downtime resolve: Scan Operator QR to proceed")
         elif s.downtime_active:
@@ -7856,14 +7960,18 @@ QWidget#ClientUIRoot {{
         if s.cycle_time_pending_supervisor and not s.waiting_cycle_time_confirm_popup:
             self.status.setToolTip("Operator cycle time is active. Supervisor confirmation is still pending.")
 
-        show_pdr_select = bool(s.waiting_production_report_reason)
+        show_pdr_select = bool(s.waiting_production_report_reason or s.waiting_pdr_maintenance_reason)
+        in_downtime_resolution_overlay = bool(
+            s.waiting_cycle_time_input
+            or s.waiting_supervisor_qr
+            or s.waiting_operator_downtime_confirm
+        )
         show_pdr_active = bool(
             s.waiting_downtime_start_maintenance
-            or s.waiting_pdr_maintenance_reason
             or s.waiting_downtime_end_maintenance
             or s.downtime_active
             or s.downtime_started_at
-        )
+        ) and not in_downtime_resolution_overlay
         if show_pdr_select:
             self._set_production_overlay_mode("select")
             self._show_production_overlay()
@@ -8047,12 +8155,13 @@ QWidget#ClientUIRoot {{
         elif s.waiting_maintenance_qr:
             action_text = "SCAN MAINTENANCE QR\nTO STOP DOWNTIME"
         elif s.waiting_supervisor_qr:
-            action_text = "MACHINE UNDER REPAIR /\nADJUSTMENT"
+            action_text = "SCAN SUPERVISOR QR\nTO PROCEED"
         elif s.waiting_operator_downtime_confirm:
             action_text = "SCAN OPERATOR QR\nTO PROCEED"
         else:
             action_text = "MACHINE UNDER REPAIR /\nADJUSTMENT"
         self.productionActionBanner.setText(action_text)
+        self._apply_production_action_banner_style()
         self.rightStartupReject.setText(f"Start Up Reject: {s.startup_reject_total}")
         self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or '-'}")
         self.productionMaintenanceLine.setText(f"MAINTENANCE: {s.maintenance_name or '-'}")
@@ -8949,7 +9058,7 @@ QWidget#ClientUIRoot {{
                 else:
                     self.resolveHint.setText("SCAN NUMKEYS TO INPUT")
             else:
-                self.resolveHint.setText("SCAN SUPERVISOR QR")
+                self.resolveHint.setText("SCAN SUPERVISOR QR TO PROCEED")
             self._show_resolve_overlay()
 
     def _build_finished_job_payload(self) -> Dict[str, Any]:
@@ -9237,9 +9346,10 @@ QWidget#ClientUIRoot {{
 
     def _pdr_elapsed_seconds(self) -> int:
         s = self.state
+        base_seconds = int(s.downtime_last_seconds or s.maintenance_downtime_seconds or 0)
         if s.downtime_started_at:
-            return max(0, int(time.time() - s.downtime_started_at))
-        return int(s.downtime_last_seconds or s.maintenance_downtime_seconds or 0)
+            return base_seconds + max(0, int(time.time() - s.downtime_started_at))
+        return base_seconds
 
     def _close_pdr_reason_segment(self, ended_by: str) -> Optional[Dict[str, Any]]:
         s = self.state
@@ -9252,6 +9362,7 @@ QWidget#ClientUIRoot {{
         if start_seconds is None:
             start_seconds = 0
         row = {
+            "segment_index": len(list(s.pdr_reason_segments or [])) + 1,
             "reason_code": code,
             "reason": reason,
             "started_at_seconds": int(start_seconds),
@@ -10395,6 +10506,7 @@ QWidget#ClientUIRoot {{
             return False
 
     def _populate_finish_shift_summary(self, shift_payload: Dict[str, Any]):
+        self._clear_finish_review_extra_pages()
         payload = shift_payload.get("job_payload") if isinstance(shift_payload.get("job_payload"), dict) else {}
         ctx = self._extract_job_payload_context(payload if isinstance(payload, dict) else {})
         job = ctx["job"]
@@ -10503,7 +10615,10 @@ QWidget#ClientUIRoot {{
                 self._safe_text(part.get("request_part_qty")),
                 f"{remaining_part_qty:.2f}".rstrip("0").rstrip("."),
             ])
-        self._set_finish_summary_table_rows(self.finishReviewParts, part_table_rows)
+        part_page_size = 8
+        visible_part_table_rows = part_table_rows[:part_page_size]
+        extra_part_table_rows = part_table_rows[part_page_size:]
+        self._set_finish_summary_table_rows(self.finishReviewParts, visible_part_table_rows)
 
         partial_payload_rows = [
             [f"Record Type: {self._safe_text(shift_payload.get('record_type'), RECORD_TYPE_SHIFT_PARTIAL)}"],
@@ -10524,7 +10639,16 @@ QWidget#ClientUIRoot {{
         ]
         self._set_finish_summary_table_rows(self.finishReviewPartialPayload, partial_payload_rows)
         self._stretch_finish_summary_table(self.finishReviewPartialPayload, 390)
-        self._stretch_finish_summary_table(self.finishReviewParts, 110)
+        self._stretch_finish_summary_table(self.finishReviewParts, 220)
+        for idx in range(0, len(extra_part_table_rows), 14):
+            chunk = extra_part_table_rows[idx:idx + 14]
+            page_no = 2 + (idx // 14)
+            self._add_finish_review_extra_page(
+                f"Product Parts Continued {page_no}",
+                ["SKU", "Name", "Qty/Unit", "Scanned", "Requested", "Remaining"],
+                chunk,
+                section_height=680,
+            )
 
         raw_rows = []
         for row in raw_logs:
@@ -10537,12 +10661,24 @@ QWidget#ClientUIRoot {{
                 self._safe_text(row.get("po_number")),
                 self._safe_text(row.get("scanned_at")),
             ])
-        self._set_finish_summary_table_rows(self.finishReviewRaw, raw_rows)
+        raw_page_size = 16
+        visible_raw_rows = raw_rows[:raw_page_size]
+        extra_raw_rows = raw_rows[raw_page_size:]
+        self._set_finish_summary_table_rows(self.finishReviewRaw, visible_raw_rows)
         self._stretch_finish_summary_table(self.finishReviewRaw, 500)
+        for idx in range(0, len(extra_raw_rows), raw_page_size):
+            chunk = extra_raw_rows[idx:idx + raw_page_size]
+            page_no = 2 + (idx // raw_page_size)
+            self._add_finish_review_extra_page(
+                f"Raw Materials Continued {page_no}",
+                ["Material", "Qty", "Index", "Total", "Lot", "PO", "Scanned At"],
+                chunk,
+                section_height=680,
+            )
 
         include_second_page = True
-        include_third_page = bool(partial_payload_rows or part_table_rows)
-        include_fourth_page = bool(raw_rows)
+        include_third_page = bool(partial_payload_rows or visible_part_table_rows)
+        include_fourth_page = bool(visible_raw_rows)
         self._rebuild_finish_review_pages(
             include_second_page=include_second_page,
             include_third_page=include_third_page,
@@ -12332,7 +12468,7 @@ QWidget#ClientUIRoot {{
                 self.push_event(
                     {"type": "FINISH_SHIFT", "finished_job": shift_payload},
                     f"FINISH SHIFT {shift_payload.get('job_name') or shift_payload.get('job_code') or ''}".strip(),
-                    silent=True,
+                    silent=False,
                 )
                 self._show_operator_shift_overlay(shift_payload)
                 self.status.setText("Finish shift saved. Waiting for Supervisor QR approval.")
@@ -12490,6 +12626,8 @@ QWidget#ClientUIRoot {{
                 s.waiting_downtime_start_maintenance = False
                 s.waiting_pdr_maintenance_reason = True
                 self.status.setText("Maintenance acknowledged. Scan valid PDR reason QR (01-15) to start downtime.")
+                self._set_production_overlay_mode("select")
+                self._show_production_overlay()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 return
@@ -12506,12 +12644,14 @@ QWidget#ClientUIRoot {{
             if not code or not reason:
                 self.status.setText("PDR validation: scan valid reason QR (01-15).")
                 return
-            if s.downtime_active and s.downtime_started_at:
+            if s.downtime_active or s.downtime_started_at or int(s.downtime_last_seconds or 0) > 0 or (s.pdr_reason_segments or []):
                 s.waiting_pdr_maintenance_reason = False
                 s.downtime_reason_code = code
                 s.downtime_reason_text = reason
                 if s.pdr_current_segment_start_seconds is None:
                     s.pdr_current_segment_start_seconds = self._pdr_elapsed_seconds()
+                s.downtime_started_at = time.time()
+                s.downtime_active = True
                 s.waiting_downtime_end_maintenance = True
                 self.status.setText(f"Next PDR reason started: {code} - {reason}. Downtime timer continues.")
                 self._refresh_ui()
@@ -12524,7 +12664,7 @@ QWidget#ClientUIRoot {{
             s.downtime_reason_code = code
             s.downtime_reason_text = reason
             s.downtime_started_at = time.time()
-            s.downtime_last_seconds = None
+            s.downtime_last_seconds = 0
             s.maintenance_downtime_seconds = None
             s.pdr_reason_segments = []
             s.pdr_current_segment_start_seconds = 0
@@ -12561,7 +12701,7 @@ QWidget#ClientUIRoot {{
                 s.supervisor_downtime_confirmation_started_at = time.time()
                 s.waiting_supervisor_qr = True
                 self._refresh_ui()
-                self.resolveHint.setText("SCAN SUPERVISOR QR")
+                self.resolveHint.setText("SCAN SUPERVISOR QR TO PROCEED")
                 self._show_resolve_overlay()
                 return
             self.status.setText("Cycle Time input mode: scan num_0..num_9, backspace, confirm.")
@@ -12631,6 +12771,8 @@ QWidget#ClientUIRoot {{
                 if s.downtime_started_at:
                     s.maintenance_downtime_seconds = max(0, int(time.time() - s.downtime_started_at))
                     s.downtime_last_seconds = s.maintenance_downtime_seconds
+                elif s.downtime_last_seconds is not None:
+                    s.maintenance_downtime_seconds = int(s.downtime_last_seconds or 0)
                 s.downtime_started_at = None
                 s.waiting_maintenance_qr = False
                 self._begin_downtime_resolution()
@@ -13096,13 +13238,17 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Downtime resolution is already in progress.")
                 return
             self._close_pdr_reason_segment("pdr_done")
+            s.downtime_last_seconds = self._pdr_elapsed_seconds()
+            s.downtime_started_at = None
+            s.downtime_active = False
             if int(s.pdr_followup_reasons_remaining or 0) > 0:
                 s.pdr_followup_reasons_remaining = max(0, int(s.pdr_followup_reasons_remaining or 0) - 1)
                 s.waiting_downtime_end_maintenance = False
                 s.waiting_pdr_maintenance_reason = True
                 s.downtime_reason_code = None
                 s.downtime_reason_text = None
-                self.status.setText("Mold Change follow-up needed. Scan next valid PDR reason QR (01-15). Downtime timer continues.")
+                s.pdr_current_segment_start_seconds = int(s.downtime_last_seconds or 0)
+                self.status.setText("Mold Change follow-up needed. Downtime paused. Scan next valid PDR reason QR (01-15).")
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 return
@@ -13870,6 +14016,51 @@ QWidget#ClientUIRoot {{
             return
         snapshot = self._state_to_active_snapshot()
         self.push_event({"type": "SESSION_SYNC", "session_snapshot": snapshot}, note)
+
+    def sync_local_finish_shifts_to_server(self, force: bool = False):
+        rows = [row for row in _load_finish_shift_json() if isinstance(row, dict)]
+        if not rows:
+            self._last_finish_shift_sync_signature = ""
+            return
+        try:
+            signature = json.dumps(
+                [
+                    [
+                        row.get("finished_at_utc"),
+                        row.get("machine_code"),
+                        row.get("job_code"),
+                        row.get("operator_id"),
+                        row.get("review_status"),
+                        row.get("approved_at_utc"),
+                        row.get("changed_at_utc"),
+                    ]
+                    for row in rows
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except Exception:
+            signature = str(len(rows))
+        if not force and signature == str(getattr(self, "_last_finish_shift_sync_signature", "")):
+            return
+        self._last_finish_shift_sync_signature = signature
+        client_id = str(self.client_config.get("client_id", CLIENT_ID)).strip() or CLIENT_ID
+        for row in rows:
+            machine_code = str(row.get("machine_code") or "").strip()
+            if not machine_code:
+                continue
+            payload = {
+                "client_id": str(row.get("client_id") or client_id).strip() or client_id,
+                "machine_code": machine_code,
+                "machine_name": row.get("machine_name") or machine_code,
+                "job_code": row.get("job_code"),
+                "job_name": row.get("job_name"),
+                "operator_id": row.get("operator_id"),
+                "event": {"type": "FINISH_SHIFT", "finished_job": row},
+                "last_event": f"FINISH SHIFT SYNC {row.get('job_name') or row.get('job_code') or ''}".strip(),
+            }
+            self._enqueue_server_event(payload, silent=True)
 
     def _event_dispatch_loop(self):
         while not self._event_worker_stop.is_set():

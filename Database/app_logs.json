@@ -19552,5 +19552,107 @@
     "source": "APP",
     "actor": "-",
     "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:57:28.454498+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:58:33.648542+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00002"
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:58:33.658721+00:00",
+    "source": "STATUS",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "Recovered ongoing session for IMM 302 / 105111."
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:58:36.668193+00:00",
+    "source": "STATUS",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:58:39.682017+00:00",
+    "source": "STATUS",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:59:21.928699+00:00",
+    "source": "SCAN",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "QR scanned: productiondailyreport~1"
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:59:21.932058+00:00",
+    "source": "STATUS",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "Production Daily Report mode enabled. Scan reason QR now (01-15)."
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:59:24.945098+00:00",
+    "source": "STATUS",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:59:25.383320+00:00",
+    "source": "SCAN",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "QR scanned: OC09"
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:59:25.388442+00:00",
+    "source": "STATUS",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "Operator PDR reason set: 09 - No production schedule. Waiting for maintenance scan."
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:59:30.978641+00:00",
+    "source": "STATUS",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "Server send failed: HTTPConnectionPool(host='192.168.1.213', port=8000): Max retries exceeded with url: /api/event (C..."
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:59:57.888297+00:00",
+    "source": "SCAN",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "QR scanned: 80033"
+  },
+  {
+    "timestamp_utc": "2026-05-06T03:59:57.898352+00:00",
+    "source": "STATUS",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "Waiting mode: scanned badge is SUPERVISOR. Scan Maintenance QR."
+  },
+  {
+    "timestamp_utc": "2026-05-06T04:00:22.638503+00:00",
+    "source": "SCAN",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "QR scanned: 80035"
+  },
+  {
+    "timestamp_utc": "2026-05-06T04:00:22.638503+00:00",
+    "source": "STATUS",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "Maintenance acknowledged. Scan valid PDR reason QR (01-15) to start downtime."
+  },
+  {
+    "timestamp_utc": "2026-05-06T04:03:10.678397+00:00",
+    "source": "SCAN",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "QR scanned: SK13"
+  },
+  {
+    "timestamp_utc": "2026-05-06T04:03:10.678397+00:00",
+    "source": "STATUS",
+    "actor": "JOEL AYAWAN (Operator)",
+    "message": "PDR reason validated: 13 - Power interruption. Downtime timer started. Scan \"pdr_done\" when done."
   }
 ]
