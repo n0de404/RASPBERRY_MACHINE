@@ -1,6 +1,10 @@
 {
   "server_url": "http://192.168.1.213:8000",
-  "client_id": "philtop-it-001",
+  "client_id": "RPI-CLIENT-01",
+  "known_clients": [
+    "RPI-CLIENT-01",
+    "RPI-CLIENT-02"
+  ],
   "scanner_mode": "auto",
   "scanner_com_port": "Com2",
   "scanner_baudrate": 9600,

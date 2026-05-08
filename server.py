@@ -1045,6 +1045,12 @@ class MachineSession:
     linkage_enabled: bool = False
     linkage_jobs: List[Dict[str, Any]] = None
     operator_shift_logs: List[Dict[str, Any]] = None
+    last_shift_butal_qty: int = 0
+    last_shift_butal_raw: str = ""
+    last_shift_butal_saved_at: Optional[str] = None
+    last_shift_butal_job_code: Optional[str] = None
+    last_shift_butal_job_name: Optional[str] = None
+    last_shift_butal_by_job: Dict[str, Dict[str, Any]] = None
     last_event: str = ""
     last_seen_utc: str = ""
 
@@ -1056,6 +1062,7 @@ class MachineSession:
         d["job_payload"] = d["job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
         d["operator_shift_logs"] = d["operator_shift_logs"] or []
+        d["last_shift_butal_by_job"] = d["last_shift_butal_by_job"] or {}
         return d
 
 
@@ -1074,7 +1081,7 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         job_name=str(raw.get("job_name") or "").strip() or None,
         job_started_at=str(raw.get("job_started_at") or "").strip() or None,
         operator_id=str(raw.get("operator_id") or "").strip() or None,
-        pack_total=int(raw.get("pack_count", 0) or 0),
+        pack_total=int(raw.get("pack_total", raw.get("pack_count", 0)) or 0),
         good_total=int(raw.get("good_total", 0) or 0),
         butal_total=int(raw.get("butal_total", 0) or 0),
         reject_total=int(raw.get("reject_total", 0) or 0),
@@ -1103,6 +1110,12 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         linkage_enabled=bool(raw.get("linkage_enabled", False)),
         linkage_jobs=list(raw.get("linkage_jobs") or []),
         operator_shift_logs=list(raw.get("operator_shift_logs") or []),
+        last_shift_butal_qty=int(raw.get("last_shift_butal_qty", 0) or 0),
+        last_shift_butal_raw=str(raw.get("last_shift_butal_raw") or ""),
+        last_shift_butal_saved_at=raw.get("last_shift_butal_saved_at"),
+        last_shift_butal_job_code=raw.get("last_shift_butal_job_code"),
+        last_shift_butal_job_name=raw.get("last_shift_butal_job_name"),
+        last_shift_butal_by_job=dict(raw.get("last_shift_butal_by_job") or {}),
         last_event=str(raw.get("last_event") or "Recovered from active session snapshot").strip(),
         last_seen_utc=last_seen_utc,
     )
@@ -7157,7 +7170,7 @@ async def api_event(req: Request):
             sess.job_name = snap.get("job_name", sess.job_name)
             sess.job_started_at = snap.get("job_started_at", sess.job_started_at)
             sess.operator_id = snap.get("operator_id", sess.operator_id)
-            sess.pack_total = int(snap.get("pack_count", sess.pack_total) or 0)
+            sess.pack_total = int(snap.get("pack_total", snap.get("pack_count", sess.pack_total)) or 0)
             sess.good_total = int(snap.get("good_total", sess.good_total) or 0)
             sess.butal_total = int(snap.get("butal_total", sess.butal_total) or 0)
             sess.reject_total = int(snap.get("reject_total", sess.reject_total) or 0)
@@ -7196,11 +7209,30 @@ async def api_event(req: Request):
                 sess.linkage_jobs = list(snap.get("linkage_jobs") or [])
             if isinstance(snap.get("operator_shift_logs"), list):
                 sess.operator_shift_logs = list(snap.get("operator_shift_logs") or [])
+            sess.last_shift_butal_qty = int(snap.get("last_shift_butal_qty", sess.last_shift_butal_qty) or 0)
+            sess.last_shift_butal_raw = str(snap.get("last_shift_butal_raw", sess.last_shift_butal_raw) or "")
+            sess.last_shift_butal_saved_at = snap.get("last_shift_butal_saved_at", sess.last_shift_butal_saved_at)
+            sess.last_shift_butal_job_code = snap.get("last_shift_butal_job_code", sess.last_shift_butal_job_code)
+            sess.last_shift_butal_job_name = snap.get("last_shift_butal_job_name", sess.last_shift_butal_job_name)
+            if isinstance(snap.get("last_shift_butal_by_job"), dict):
+                sess.last_shift_butal_by_job = dict(snap.get("last_shift_butal_by_job") or {})
             _persist_active_sessions_state()
     elif ev_type == "PACK":
         qty = int(ev.get("qty", 0) or 0)
         sess.pack_total += qty
         sess.good_total += qty
+    elif ev_type == "LAST_SHIFT_BUTAL_PACK":
+        sess.pack_total += int(ev.get("pack_qty", 1) or 1)
+        sess.butal_total += int(ev.get("butal_qty", 0) or 0)
+        sess.last_shift_butal_qty = 0
+        sess.last_shift_butal_raw = ""
+        sess.last_shift_butal_saved_at = None
+        sess.last_shift_butal_job_code = None
+        sess.last_shift_butal_job_name = None
+        if isinstance(sess.last_shift_butal_by_job, dict):
+            key = str(sess.job_code or "").strip()
+            if key:
+                sess.last_shift_butal_by_job.pop(key, None)
     elif ev_type == "BUTAL":
         sess.butal_total += int(ev.get("qty", 0) or 0)
     elif ev_type == "REJECT":
