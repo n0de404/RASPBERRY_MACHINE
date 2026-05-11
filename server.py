@@ -7083,11 +7083,12 @@ async def api_event(req: Request):
     machine_code = str(data.get("machine_code", "")).strip()
     if not machine_code:
         return JSONResponse({"ok": False, "error": "machine_code required"}, status_code=400)
+    client_id = str(data.get("client_id", "UNKNOWN")).strip() or "UNKNOWN"
 
     sess = SESSIONS.get(machine_code)
     if sess is None:
         sess = MachineSession(
-            client_id=str(data.get("client_id", "UNKNOWN")),
+            client_id=client_id,
             machine_code=machine_code,
             machine_name=_machine_display_name(machine_code, data.get("machine_name", machine_code)),
             reject_breakdown={},
@@ -7099,7 +7100,7 @@ async def api_event(req: Request):
         SESSIONS[machine_code] = sess
 
     # update common fields
-    sess.client_id = str(data.get("client_id", sess.client_id))
+    sess.client_id = client_id
     sess.machine_name = _machine_display_name(machine_code, data.get("machine_name", sess.machine_name))
     sess.job_code = data.get("job_code", sess.job_code)
     sess.job_name = data.get("job_name", sess.job_name)

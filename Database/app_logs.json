@@ -5734,5 +5734,557 @@
     "source": "STATUS",
     "actor": "ROLAND RECLA (Operator)",
     "message": "Finish review page 2 of 2."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:54:24.264226+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:54:35.604008+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00003"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:54:35.607361+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Recovered last state for IMM 303. Scan job QR first."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:54:54.250833+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: O000000000240000010538000000000000"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:54:55.789653+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "GET https://sbk-ptii.net/philtop/IMS/v1/jobs/105380 -> HTTP 200 (try 1/3)"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:54:55.789653+00:00",
+    "source": "JOB_API",
+    "actor": "-",
+    "message": "GET OK: job 105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:54:55.791034+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Job set (API): 3-26-0328-2"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:54:56.498805+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:55:01.495425+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:38.033809+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: 25-00446"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:38.040315+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Operator set: 25-00446 - ROLAND RECLA. Enter cycle time now."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:38.368421+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:43.377786+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:47.034202+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:47.752394+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:50.939271+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:50.947677+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Cycle time saved. Input machine counter next."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:51.024885+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:51.792674+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_1"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:52.430047+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: num_2"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:53.028762+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: confirm"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:53.034290+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Machine counter saved. Production can continue."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:56:56.023729+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:12.405692+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: butal~1"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:12.406696+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Butal +1"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:12.771382+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:13.944894+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: butal~1"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:13.944894+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Butal +1"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:17.764143+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:20.127726+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:20.129731+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:22.418133+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Graphics mode applied: Quality"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:23.492349+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:23.494337+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:34.267564+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: butal~1"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:34.267564+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Butal +1"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:34.604367+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:37.119536+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:37.119967+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:37.937209+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Graphics mode applied: Quality"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:38.399497+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Graphics mode applied: Quality"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:38.791143+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Graphics mode applied: Faster + Quality"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:39.662808+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:39.924461+00:00",
+    "source": "SETTINGS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:39.924461+00:00",
+    "source": "UI",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:57:56.014166+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:07.766123+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00003"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:07.766123+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 303 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:08.485339+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:12.464044+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000000883Q00000000036I00000000018T00000000030L20260506100311-000000105111"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:12.466563+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Invalid PACK QR: job code 105111 does not match main/linked job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:13.484243+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:15.969326+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000008T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:15.969326+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Pack +1 (Good +260)"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:16.355023+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:18.200790+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000009T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:18.200790+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Pack +1 (Good +260)"
+  },
+  {
+    "timestamp_utc": "2026-05-09T06:58:21.362827+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:00.749561+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:12.894303+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00003"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:12.894303+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 303 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:13.643015+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:18.437591+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000011T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:18.437591+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Pack +1 (Good +260)"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:18.802233+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:21.084386+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000012T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:21.084386+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Pack +1 (Good +260)"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:21.460417+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:07:26.464406+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:11.954395+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:24.628248+00:00",
+    "source": "SCAN",
+    "actor": "-",
+    "message": "QR scanned: M00003"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:24.628755+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Recovered ongoing session for IMM 303 / 3-26-0328-2."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:25.511011+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:30.510959+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:30.516207+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000003T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:30.516207+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Pack +1 (Good +260)"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:30.870114+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:33.078071+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000002T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:33.078071+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Pack +1 (Good +260)"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:34.399313+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000001T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:34.402204+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Pack +1 (Good +260)"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:34.853896+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000001T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:34.853896+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Invalid PACK QR: duplicate index 1 and lot 20260504150600."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:35.637391+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000001T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:35.639957+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Invalid PACK QR: duplicate index 1 and lot 20260504150600."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:35.868260+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Ready: request fulfilled. You can still scan or finish the job."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:36.761323+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000004T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:36.761323+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Pack +1 (Good +260)"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:37.170606+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Job quantity request fulfilled."
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:38.211411+00:00",
+    "source": "SCAN",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "QR scanned: O000000000240000010237800000000000V2P00000005165Q00000000260I00000000007T00000000012L20260504150600-000000105380"
+  },
+  {
+    "timestamp_utc": "2026-05-09T07:09:38.211411+00:00",
+    "source": "STATUS",
+    "actor": "ROLAND RECLA (Operator)",
+    "message": "Pack +1 (Good +260)"
+  },
+  {
+    "timestamp_utc": "2026-05-09T09:11:01.967831+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
   }
 ]

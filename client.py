@@ -8754,6 +8754,13 @@ QWidget#ClientUIRoot {{
         s.operator_shift_baseline_product_pack_history_logs_len = len(s.product_pack_history_logs or [])
         s.operator_shift_baseline_reject_review_logs_len = len(s.reject_review_logs or [])
 
+    def _current_client_id(self) -> str:
+        return str(self.client_config.get("client_id", CLIENT_ID)).strip() or CLIENT_ID
+
+    def _belongs_to_current_client(self, row: Dict[str, Any]) -> bool:
+        row_client_id = str((row or {}).get("client_id") or "").strip()
+        return not row_client_id or row_client_id == self._current_client_id()
+
     def _build_operator_shift_payload(self, reason: str) -> Optional[Dict[str, Any]]:
         s = self.state
         if not (s.machine_code and s.job_code and s.operator_id):
@@ -8819,7 +8826,7 @@ QWidget#ClientUIRoot {{
             "finished_at_utc": ended_at_utc,
             "machine_code": s.machine_code,
             "machine_name": _machine_display_name(s.machine_code, s.machine_name),
-            "client_id": CLIENT_ID,
+            "client_id": self._current_client_id(),
             "job_code": s.job_code,
             "job_name": s.job_name,
             "operator_id": s.operator_id,
@@ -8880,6 +8887,7 @@ QWidget#ClientUIRoot {{
         s = self.state
         return {
             "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "client_id": self._current_client_id(),
             "machine_code": s.machine_code,
             "machine_name": s.machine_name,
             "job_code": s.job_code,
@@ -9057,7 +9065,7 @@ QWidget#ClientUIRoot {{
             return None
         rows = _load_active_sessions_json()
         snap = rows.get(code)
-        if isinstance(snap, dict):
+        if isinstance(snap, dict) and self._belongs_to_current_client(snap):
             return snap
         return None
 
@@ -9283,7 +9291,7 @@ QWidget#ClientUIRoot {{
         return {
             "record_type": RECORD_TYPE_FINAL_JOB,
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
-            "client_id": CLIENT_ID,
+            "client_id": self._current_client_id(),
             "machine_code": s.machine_code,
             "machine_name": _machine_display_name(s.machine_code, s.machine_name),
             "job_code": s.job_code,
@@ -14556,13 +14564,15 @@ QWidget#ClientUIRoot {{
         if not force and signature == str(getattr(self, "_last_finish_shift_sync_signature", "")):
             return
         self._last_finish_shift_sync_signature = signature
-        client_id = str(self.client_config.get("client_id", CLIENT_ID)).strip() or CLIENT_ID
+        client_id = self._current_client_id()
         for row in rows:
+            if not self._belongs_to_current_client(row):
+                continue
             machine_code = str(row.get("machine_code") or "").strip()
             if not machine_code:
                 continue
             payload = {
-                "client_id": str(row.get("client_id") or client_id).strip() or client_id,
+                "client_id": client_id,
                 "machine_code": machine_code,
                 "machine_name": row.get("machine_name") or machine_code,
                 "job_code": row.get("job_code"),
@@ -14579,6 +14589,12 @@ QWidget#ClientUIRoot {{
         if isinstance(event, dict):
             return str(event.get("type") or "").strip().upper()
         return ""
+
+    def _server_event_belongs_to_current_client(self, item: Dict[str, Any]) -> bool:
+        payload = item.get("payload") if isinstance(item, dict) else {}
+        if not isinstance(payload, dict):
+            return True
+        return self._belongs_to_current_client(payload)
 
     def _should_persist_server_event(self, item: Dict[str, Any]) -> bool:
         ev_type = self._server_event_type_from_item(item)
@@ -14638,6 +14654,9 @@ QWidget#ClientUIRoot {{
     def _load_persisted_server_events(self):
         for row in _load_server_event_queue_json():
             item = self._normalize_server_event_item(row, silent=bool(row.get("silent")))
+            if not self._server_event_belongs_to_current_client(item):
+                self._remove_persisted_server_event(str(item.get("id") or ""))
+                continue
             try:
                 self._event_queue.put_nowait(item)
             except queue.Full:
@@ -14650,6 +14669,10 @@ QWidget#ClientUIRoot {{
             except queue.Empty:
                 continue
             item = self._normalize_server_event_item(item, silent=bool(item.get("silent")))
+            if not self._server_event_belongs_to_current_client(item):
+                self._remove_persisted_server_event(str(item.get("id") or ""))
+                self._event_queue.task_done()
+                continue
             self._persist_server_event_item(item)
             retry_item = False
             last_error: Any = ""
@@ -14783,7 +14806,7 @@ QWidget#ClientUIRoot {{
             self._save_active_session_snapshot()
 
         payload = {
-            "client_id": str(self.client_config.get("client_id", CLIENT_ID)).strip() or CLIENT_ID,
+            "client_id": self._current_client_id(),
             "machine_code": s.machine_code,
             "machine_name": s.machine_name or s.machine_code,
             "job_code": s.job_code,
