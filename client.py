@@ -107,6 +107,8 @@ AVERAGE_WEIGHT_API_ENDPOINT = "/average-weight"
 HEARTBEAT_INTERVAL_MS = int(os.environ.get("MACHINE_HEARTBEAT_INTERVAL_MS", "5000"))
 IDENTITY_SYNC_INTERVAL_MS = int(os.environ.get("MACHINE_IDENTITY_SYNC_INTERVAL_MS", "15000"))
 SERVER_EVENT_QUEUE_MAXSIZE = int(os.environ.get("MACHINE_SERVER_EVENT_QUEUE_MAXSIZE", "256"))
+JOB_API_PENDING_RETRY_INTERVAL_MS = int(os.environ.get("MACHINE_JOB_API_PENDING_RETRY_INTERVAL_MS", "3000"))
+JOB_API_PENDING_MAX_RETRIES = int(os.environ.get("MACHINE_JOB_API_PENDING_MAX_RETRIES", "10"))
 SCANNER_MIN_TIMEOUT_SECONDS = float(os.environ.get("MACHINE_SCANNER_MIN_TIMEOUT", "0.2"))
 UI_REFRESH_DEBOUNCE_MS = int(os.environ.get("MACHINE_UI_REFRESH_DEBOUNCE_MS", "60"))
 MOTION_TIMER_INTERVAL_MS = int(os.environ.get("MACHINE_MOTION_TIMER_INTERVAL_MS", "250"))
@@ -2708,6 +2710,10 @@ class ClientUI(QWidget):
         self.state = ClientState()
         self.client_config = _load_client_config()
         self.job_api_config = _load_job_api_config()
+        self._pending_job_api_retry: Optional[Dict[str, Any]] = None
+        self._pending_job_api_retry_timer = QTimer(self)
+        self._pending_job_api_retry_timer.setSingleShot(True)
+        self._pending_job_api_retry_timer.timeout.connect(self._retry_pending_job_api_lookup)
         self._digital_font_family = self._load_digital_font_family()
         self._identity_sync_lock = threading.Lock()
         self._identity_sync_inflight = False
@@ -11374,6 +11380,64 @@ QWidget#ClientUIRoot {{
         if isinstance(snap_data.get("job"), dict) or isinstance(snap_payload.get("job"), dict):
             s.job_payload = snap_payload
 
+    def _clear_pending_job_api_retry(self):
+        self._pending_job_api_retry = None
+        try:
+            self._pending_job_api_retry_timer.stop()
+        except Exception:
+            pass
+
+    def _start_pending_job_api_retry(self, job_identifier: str, raw_scan: str, display_name: str):
+        job_id = str(job_identifier or "").strip()
+        raw_value = str(raw_scan or "").strip()
+        if not job_id or not raw_value:
+            return
+        existing = self._pending_job_api_retry if isinstance(self._pending_job_api_retry, dict) else {}
+        attempts = int(existing.get("attempts") or 0) if str(existing.get("job_identifier") or "") == job_id else 0
+        max_retries = max(1, int(JOB_API_PENDING_MAX_RETRIES or 10))
+        if attempts >= max_retries:
+            self.status.setText(f"Job API details not ready for {display_name or job_id}. Please rescan the JOB QR or check BMS.")
+            self._append_job_api_log(f"PENDING stopped after {attempts} retries")
+            self._clear_pending_job_api_retry()
+            return
+        self._pending_job_api_retry = {
+            "job_identifier": job_id,
+            "raw_scan": raw_value,
+            "display_name": str(display_name or job_id).strip() or job_id,
+            "attempts": attempts,
+            "started_at": existing.get("started_at") or time.time(),
+        }
+        interval = max(500, int(JOB_API_PENDING_RETRY_INTERVAL_MS or 3000))
+        self.status.setText(
+            f"Job API details are still loading for {self._pending_job_api_retry['display_name']} "
+            f"(retry {attempts + 1}/{max_retries})."
+        )
+        self._append_job_api_log(f"PENDING job {job_id}; retry scheduled in {interval} ms")
+        self._pending_job_api_retry_timer.start(interval)
+
+    def _retry_pending_job_api_lookup(self):
+        pending = self._pending_job_api_retry if isinstance(self._pending_job_api_retry, dict) else None
+        if not pending:
+            return
+        if not self.state.machine_code:
+            self._clear_pending_job_api_retry()
+            return
+        attempts = int(pending.get("attempts") or 0)
+        max_retries = max(1, int(JOB_API_PENDING_MAX_RETRIES or 10))
+        if attempts >= max_retries:
+            name = str(pending.get("display_name") or pending.get("job_identifier") or "").strip()
+            self.status.setText(f"Job API details not ready for {name}. Please rescan the JOB QR or check BMS.")
+            self._append_job_api_log(f"PENDING stopped after {attempts} retries")
+            self._clear_pending_job_api_retry()
+            return
+        pending["attempts"] = attempts + 1
+        self._pending_job_api_retry = pending
+        self.status.setText(
+            f"Retrying Job API for {pending.get('display_name') or pending.get('job_identifier')} "
+            f"({pending['attempts']}/{max_retries})..."
+        )
+        self.on_scanned(str(pending.get("raw_scan") or ""))
+
     def _fetch_job_payload_from_api(self, job_identifier: str) -> Optional[Dict[str, Any]]:
         # Reload from disk so config edits apply without restarting the client.
         try:
@@ -11441,7 +11505,7 @@ QWidget#ClientUIRoot {{
                 print("[JobAPI] FETCH no cached token; requesting new token via login")
                 token = self._get_job_api_bearer_token(base=base, user=user, password=password) or ""
                 if not token:
-                    self.status.setText("Job API login failed; using local job mapping/stub.")
+                    self.status.setText("Job API login failed; waiting for valid job details.")
                     return None
             for attempt in range(1, max_attempts + 1):
                 if attempt > 1:
@@ -11467,7 +11531,7 @@ QWidget#ClientUIRoot {{
                     )
                     self._append_job_api_log(f"GET FAIL: {self._http_error_snippet(resp) or 'No response body'}")
                     print(f"[JobAPI] GET FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
-                    return best_partial_wrapped
+                    return None
                 data = resp.json()
                 if self._job_api_body_is_unauthorized(data):
                     if user and password:
@@ -11476,20 +11540,20 @@ QWidget#ClientUIRoot {{
                         token = self._get_job_api_bearer_token(base=base, user=user, password=password) or token
                         if attempt < max_attempts:
                             continue
-                    self.status.setText("Job API bearer token unauthorized; using local job mapping/stub.")
+                    self.status.setText("Job API bearer token unauthorized; waiting for valid job details.")
                     self._append_job_api_log("GET FAIL: response body reported unauthorized bearer token")
-                    return best_partial_wrapped
+                    return None
                 if not isinstance(data, dict):
                     if attempt < max_attempts:
                         continue
-                    self.status.setText("Job API fetch returned invalid response; using local job mapping/stub.")
-                    return best_partial_wrapped
+                    self.status.setText("Job API fetch returned invalid response; waiting for valid job details.")
+                    return None
                 payload = data.get("data")
                 if not isinstance(payload, dict):
                     if attempt < max_attempts:
                         continue
-                    self.status.setText("Job API fetch has no job payload; using local job mapping/stub.")
-                    return best_partial_wrapped
+                    self.status.setText("Job API fetch has no job payload; waiting for valid job details.")
+                    return None
 
                 wrapped = {"code": data.get("code"), "message": data.get("message"), "data": payload}
                 if _payload_has_useful_job_details(payload):
@@ -11501,12 +11565,12 @@ QWidget#ClientUIRoot {{
                 print(f"[JobAPI] GET partial/blank job_details; retrying ({attempt}/{max_attempts})")
 
             if best_partial_wrapped is not None:
-                self.status.setText("Job API returned partial job details after retries.")
-                return best_partial_wrapped
-            self.status.setText("Job API fetch failed after retries; using local job mapping/stub.")
+                self.status.setText("Job API returned partial job details after retries; waiting for full details.")
+                return None
+            self.status.setText("Job API fetch failed after retries; waiting for valid job details.")
             return None
         except Exception as e:
-            self.status.setText(f"Job API fetch error: {e}; using local job mapping/stub.")
+            self.status.setText(f"Job API fetch error: {e}; waiting for valid job details.")
             self._append_job_api_log(f"GET ERROR: {e}")
             print(f"[JobAPI] GET ERROR: {e}")
             return None
@@ -14016,6 +14080,7 @@ QWidget#ClientUIRoot {{
                 finally:
                     self._hide_bms_loading()
                 if isinstance(fetched_payload, dict):
+                    self._clear_pending_job_api_retry()
                     s.job_payload = fetched_payload
                     api_job = self._extract_job_record()
                     s.job_code = (
@@ -14024,8 +14089,9 @@ QWidget#ClientUIRoot {{
                         or requested_job_id
                     )
                 else:
-                    s.job_payload = {}
-                    s.job_code = requested_job_id
+                    self._start_pending_job_api_retry(requested_job_id, raw_s, res.value or requested_job_id)
+                    self._show_invalid_overlay("Waiting for complete job details from BMS.")
+                    return
                 s.job_name = (
                     self._safe_text(api_job.get("ref_no"), "")
                     or res.value

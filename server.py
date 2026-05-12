@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
@@ -57,6 +58,7 @@ PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"  # leg
 PRODUCT_API_CONFIG_FILE = Path(__file__).resolve().parent / "Database" / "product_api_config.json"
 PRODUCT_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "product_catalog_cache.json"
 ACTIVE_MACHINE_SESSIONS_FILE = Path(__file__).resolve().parent / "Database" / "active_machine_sessions.json"
+PLANNING_BOARD_FILE = Path(__file__).resolve().parent / "Database" / "planning_board.json"
 PROFILE_REPRINT_ADMIN_PASSWORD = "0t1docmtl$tm"
 QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.10.166:5000").strip().rstrip("/")
 RAW_QR_O_SEGMENT = "O000000000240000010237800000000000"
@@ -2489,6 +2491,124 @@ def _save_product_cache(items: List[Dict[str, str]], source_meta: Optional[Dict[
     PRODUCT_CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def load_planning_board() -> Dict[str, Any]:
+    raw = _load_json_object(PLANNING_BOARD_FILE)
+    lanes = raw.get("lanes") if isinstance(raw.get("lanes"), dict) else {}
+    clean_lanes: Dict[str, List[Dict[str, Any]]] = {}
+    for lane, cards in lanes.items():
+        lane_key = str(lane or "").strip() or "BACKLOG"
+        if not isinstance(cards, list):
+            continue
+        clean_lanes[lane_key] = [dict(c) for c in cards if isinstance(c, dict)]
+    clean_lanes.setdefault("BACKLOG", [])
+    return {
+        "lanes": clean_lanes,
+        "updated_at_utc": str(raw.get("updated_at_utc") or ""),
+    }
+
+
+def save_planning_board(board: Dict[str, Any]) -> Dict[str, Any]:
+    lanes = board.get("lanes") if isinstance(board.get("lanes"), dict) else {}
+    clean: Dict[str, List[Dict[str, Any]]] = {}
+    for lane, cards in lanes.items():
+        lane_key = str(lane or "").strip() or "BACKLOG"
+        if not isinstance(cards, list):
+            continue
+        clean[lane_key] = [dict(c) for c in cards if isinstance(c, dict)]
+    clean.setdefault("BACKLOG", [])
+    payload = {
+        "lanes": clean,
+        "updated_at_utc": utc_now().isoformat(),
+    }
+    PLANNING_BOARD_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PLANNING_BOARD_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def _planning_extract_job_record(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if isinstance(data.get("job"), dict):
+        return data.get("job") or {}
+    if isinstance(payload.get("job"), dict):
+        return payload.get("job") or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _planning_job_card_from_payload(identifier: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    job = _planning_extract_job_record(payload)
+    details = data.get("job_details") if isinstance(data, dict) and isinstance(data.get("job_details"), dict) else {}
+    parts = data.get("parts") if isinstance(data, dict) and isinstance(data.get("parts"), list) else []
+    ref_no = str(job.get("ref_no") or job.get("reference_no") or job.get("job_no") or "").strip()
+    job_id = str(job.get("id") or job.get("job_id") or identifier or "").strip()
+    product_id = str(details.get("product_id") or job.get("product_id") or "").strip()
+    product_meta = _lookup_product_meta(product_id) if product_id else {"id": "", "name": "", "sku": ""}
+    return {
+        "id": f"plan-{re.sub(r'[^A-Za-z0-9_-]+', '-', job_id or str(identifier or 'job')).strip('-') or int(time.time())}",
+        "job_id": job_id,
+        "job_ref": ref_no or job_id,
+        "job_name": ref_no or job_id,
+        "product_id": product_id,
+        "product_name": str(product_meta.get("name") or details.get("product_name") or job.get("product_name") or "").strip(),
+        "product_sku": str(product_meta.get("sku") or details.get("product_sku") or job.get("product_sku") or "").strip(),
+        "mold": str(details.get("mold") or details.get("mold_no") or "").strip(),
+        "color": str(details.get("color") or "").strip(),
+        "std_cycle_time": str(details.get("std_cycle_time") or details.get("cycle_time") or "").strip(),
+        "qty_per_shift": str(details.get("qty_per_shift") or "").strip(),
+        "request_qty": str(job.get("request_qty") or job.get("qty") or "").strip(),
+        "parts_count": len(parts),
+        "source": "BMS",
+        "raw_payload": payload,
+        "created_at_utc": utc_now().isoformat(),
+    }
+
+
+def fetch_planning_job_from_bms(identifier: str) -> Dict[str, Any]:
+    raw_id = str(identifier or "").strip()
+    m_job_url = re.search(r"/v1/jobs/(\d+)\s*$", raw_id, flags=re.IGNORECASE)
+    job_id = (m_job_url.group(1) if m_job_url else raw_id).strip()
+    if not job_id:
+        raise ValueError("job_id is required")
+    cfg = _load_product_source_config()
+    bms = cfg.get("bms") if isinstance(cfg.get("bms"), dict) else {}
+    base_url = str(bms.get("base_url", "")).strip().rstrip("/")
+    username = str(bms.get("username") or bms.get("user") or "").strip()
+    password = str(bms.get("password") or "").strip()
+    ttl_seconds = int(bms.get("ttl_seconds", 604800) or 604800)
+    force_new_token = bool(bms.get("force_new_token", True))
+    if not (base_url and username and password):
+        raise RuntimeError("BMS config is missing base_url, username, or password")
+
+    req_auth = urllib_request.Request(
+        url=f"{base_url}/auth/login",
+        data=json.dumps({
+            "identity": username,
+            "password": password,
+            "ttlSeconds": ttl_seconds,
+            "forceNewToken": force_new_token,
+        }).encode("utf-8"),
+        method="POST",
+    )
+    req_auth.add_header("Content-Type", "application/json")
+    req_auth.add_header("Accept", "application/json")
+    with urllib_request.urlopen(req_auth, timeout=12) as resp:
+        auth_parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    token = str(((auth_parsed or {}).get("data") or {}).get("token") or "").strip()
+    if not token:
+        raise RuntimeError("BMS login did not return a token")
+
+    req_job = urllib_request.Request(url=f"{base_url}/jobs/{job_id}", method="GET")
+    req_job.add_header("Authorization", f"Bearer {token}")
+    req_job.add_header("Accept", "application/json")
+    with urllib_request.urlopen(req_job, timeout=12) as resp:
+        parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("BMS job response is invalid")
+    return _planning_job_card_from_payload(job_id, parsed)
+
+
 def _fetch_products_from_source() -> List[Dict[str, str]]:
     cfg = _load_product_source_config()
     if not cfg:
@@ -2742,6 +2862,7 @@ _ensure_sql_schema()
 FINISHED_JOBS: List[Dict[str, Any]] = load_finished_jobs()
 ARCHIVED_JOBS: List[Dict[str, Any]] = load_archived_jobs()
 PROFILES: List[Dict[str, Any]] = load_profiles()
+PLANNING_BOARD: Dict[str, Any] = load_planning_board()
 MACHINE_STATUS_OVERRIDES = load_machine_status_overrides()
 MACHINE_STATUS_ARCHIVE = load_machine_status_archive()
 
@@ -2771,6 +2892,7 @@ async def broadcast_state():
         "job_queue": _build_job_queue_rows(),
         "machine_status_overrides": MACHINE_STATUS_OVERRIDES,
         "machine_status_archive": MACHINE_STATUS_ARCHIVE,
+        "planning_board": PLANNING_BOARD,
         "finished_jobs": FINISHED_JOBS,
         "archived_jobs": ARCHIVED_JOBS,
         "server_time_utc": utc_now().isoformat(),
@@ -2902,6 +3024,77 @@ DASHBOARD_HTML = """
     .maintenance-performance-title { margin:0; font-size:1rem; line-height:1.1; }
     .maintenance-performance-wrap { margin-top:10px; border:1px solid #dbe4f0; border-radius:0 0 12px 12px; overflow:auto; background:rgba(255,255,255,.92); }
     .maintenance-performance-wrap .data-table { min-width:760px; }
+    #maintenanceTab { background:#eef3f8; border-radius:18px; padding:14px; }
+    #maintenanceTab .maintenance-shell { position:relative; background:linear-gradient(180deg, #f8fbff 0%, #eef4fb 100%); border:1px solid #d4e0ec; border-radius:18px; padding:18px; box-shadow:0 18px 44px rgba(15,23,42,.10); }
+    #maintenanceTab .maintenance-shell::before { content:""; position:absolute; inset:0 0 auto 0; height:120px; pointer-events:none; opacity:1; background:linear-gradient(135deg, rgba(14,165,233,.14), rgba(16,185,129,.10) 48%, rgba(245,158,11,.10)); }
+    #maintenanceTab .maintenance-topbar { align-items:center; padding:2px 2px 10px; border-bottom:1px solid rgba(148,163,184,.22); }
+    #maintenanceTab .maintenance-topbar h3 { font-size:1.28rem; font-weight:800; letter-spacing:0; color:#0f172a; }
+    #maintenanceTab .maintenance-date { padding:8px 12px; border:1px solid #d2deea; border-radius:999px; background:rgba(255,255,255,.78); color:#475569; box-shadow:0 6px 18px rgba(15,23,42,.06); }
+    #maintenanceTab .maintenance-summary { gap:14px; margin-top:16px; }
+    #maintenanceTab .maintenance-metric { position:relative; display:grid; grid-template-columns:minmax(0,1fr) 44px; align-items:center; min-height:116px; border:1px solid rgba(203,213,225,.92); border-radius:14px; padding:16px; background:rgba(255,255,255,.86); box-shadow:0 12px 28px rgba(15,23,42,.08), inset 0 1px 0 rgba(255,255,255,.78); overflow:hidden; }
+    #maintenanceTab .maintenance-metric::before { content:""; position:absolute; inset:0 auto 0 0; width:4px; background:#3b82f6; }
+    #maintenanceTab .maintenance-metric.green::before { background:#10b981; }
+    #maintenanceTab .maintenance-metric.amber::before { background:#f59e0b; }
+    #maintenanceTab .maintenance-metric.red::before { background:#ef4444; }
+    #maintenanceTab .maintenance-metric.blue { background:linear-gradient(180deg, rgba(255,255,255,.92), rgba(239,246,255,.88)); }
+    #maintenanceTab .maintenance-metric.green { background:linear-gradient(180deg, rgba(255,255,255,.92), rgba(236,253,245,.88)); }
+    #maintenanceTab .maintenance-metric.amber { background:linear-gradient(180deg, rgba(255,255,255,.92), rgba(255,251,235,.88)); }
+    #maintenanceTab .maintenance-metric.red { background:linear-gradient(180deg, rgba(255,255,255,.92), rgba(254,242,242,.88)); }
+    #maintenanceTab .maintenance-metric .icon { width:42px; height:42px; border-radius:12px; background:#eff6ff; color:#2563eb; font-size:0; }
+    #maintenanceTab .maintenance-metric .icon::before { content:""; width:18px; height:18px; border-radius:6px; border:2px solid currentColor; display:block; }
+    #maintenanceTab .maintenance-metric.green .icon { background:#ecfdf5; color:#059669; }
+    #maintenanceTab .maintenance-metric.amber .icon { background:#fffbeb; color:#d97706; }
+    #maintenanceTab .maintenance-metric.red .icon { background:#fef2f2; color:#dc2626; }
+    #maintenanceTab .maintenance-metric .k { color:#475569; font-size:.8rem; font-weight:800; text-transform:uppercase; letter-spacing:.05em; }
+    #maintenanceTab .maintenance-metric .v { color:#0f172a; font-size:2.15rem; line-height:1; font-weight:800; margin-top:8px; }
+    #maintenanceTab .maintenance-metric .s { color:#64748b; font-size:.82rem; margin-top:8px; }
+    #maintenanceTab .maintenance-live-grid { grid-template-columns:1fr; gap:14px; margin-top:16px; }
+    #maintenanceTab .maintenance-section-title, #maintenanceTab .maintenance-performance-title { color:#0f172a; font-size:1.05rem; font-weight:800; }
+    #maintenanceTab .maintenance-list { grid-template-columns:repeat(auto-fit, minmax(360px, 1fr)); gap:14px; margin-top:12px; }
+    #maintenanceTab .maintenance-person { grid-template-columns:74px minmax(0,1fr) minmax(170px,.72fr); border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.92); box-shadow:0 12px 26px rgba(15,23,42,.07); }
+    #maintenanceTab .maintenance-person.busy { border-color:#f6c37a; box-shadow:0 12px 28px rgba(217,119,6,.12); }
+    #maintenanceTab .maintenance-avatar-wrap { padding:12px; background:linear-gradient(180deg, #f8fafc, #edf4fb); }
+    #maintenanceTab .maintenance-avatar { width:50px; height:50px; border-radius:50%; background:radial-gradient(circle at 50% 33%, #f3c9ad 0 13px, transparent 14px), radial-gradient(circle at 50% 92%, #64748b 0 24px, transparent 25px), linear-gradient(135deg, #e0f2fe, #f8fafc); border:1px solid #cbd5e1; }
+    #maintenanceTab .maintenance-person .title { color:#0f172a; font-size:1rem; font-weight:800; }
+    #maintenanceTab .maintenance-person .meta, #maintenanceTab .maintenance-person .submeta { color:#64748b; }
+    #maintenanceTab .maintenance-badge { min-width:0; border-radius:999px; padding:5px 9px; font-size:.68rem; letter-spacing:.02em; }
+    #maintenanceTab .maintenance-badge.available { background:#dcfce7; color:#047857; }
+    #maintenanceTab .maintenance-badge.busy { background:#ffedd5; color:#b45309; }
+    #maintenanceTab .maintenance-badge.waiting { background:#fee2e2; color:#b91c1c; }
+    #maintenanceTab .maintenance-machine { border-color:#dce6f1; border-radius:10px; background:#f8fafc; }
+    #maintenanceTab .maintenance-machine.busy { background:#fff7ed; border-color:#fed7aa; }
+    #maintenanceTab .maintenance-stats { background:#f8fafc; }
+    #maintenanceTab .maintenance-stat-icon { width:18px; height:18px; border-radius:6px; background:#e0f2fe; color:#0284c7; font-size:0; display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; }
+    #maintenanceTab .maintenance-stat-icon::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; }
+    #maintenanceTab .maintenance-performance-panel { margin-top:16px; border-top:0; padding-top:0; }
+    #maintenanceTab .maintenance-performance-wrap { border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.92); box-shadow:0 12px 26px rgba(15,23,42,.07); }
+    #maintenanceTab .maintenance-performance-wrap .data-table th { background:#f8fafc; color:#475569; }
+    .planning-shell { background:linear-gradient(180deg, #f8fbff, #eef4fb); border:1px solid #d5e1ed; border-radius:18px; padding:16px; box-shadow:0 18px 44px rgba(15,23,42,.10); }
+    .planning-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+    .planning-title h3 { margin:0; color:#0f172a; font-size:1.22rem; }
+    .planning-controls { display:grid; grid-template-columns:minmax(220px, 360px) auto auto; gap:8px; align-items:center; }
+    .planning-controls input { border:1px solid #cbd5e1; border-radius:10px; padding:10px 12px; font:inherit; background:#fff; color:#0f172a; }
+    .planning-controls button { border:0; border-radius:10px; padding:10px 14px; font-weight:800; cursor:pointer; background:#2563eb; color:#fff; box-shadow:0 8px 18px rgba(37,99,235,.22); }
+    .planning-controls button.secondary { background:#fff; color:#334155; border:1px solid #cbd5e1; box-shadow:none; }
+    .planning-status { margin-top:10px; min-height:20px; color:#64748b; font-size:.85rem; }
+    .planning-board { display:grid; grid-template-columns:260px minmax(0,1fr); gap:14px; margin-top:14px; }
+    .planning-lane, .planning-running { border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.88); box-shadow:0 10px 24px rgba(15,23,42,.06); min-width:0; }
+    .planning-lane-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 12px 8px; border-bottom:1px solid #e2e8f0; }
+    .planning-lane-title { font-weight:800; color:#0f172a; }
+    .planning-lane-count { color:#64748b; font-size:.78rem; }
+    .planning-dropzone { min-height:140px; padding:10px; display:grid; gap:10px; align-content:start; }
+    .planning-dropzone.drag-over { outline:2px dashed #2563eb; outline-offset:-8px; background:#eff6ff; }
+    .planning-machine-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(270px, 1fr)); gap:14px; }
+    .planning-card { border:1px solid #dbe5ef; border-radius:12px; background:#fff; padding:11px; box-shadow:0 8px 18px rgba(15,23,42,.07); cursor:grab; }
+    .planning-card:active { cursor:grabbing; }
+    .planning-card.live { cursor:default; border-color:#bbf7d0; background:#f0fdf4; }
+    .planning-card-top { display:flex; align-items:flex-start; justify-content:space-between; gap:8px; }
+    .planning-job { font-weight:900; color:#0f172a; overflow-wrap:anywhere; }
+    .planning-chip { border-radius:999px; padding:3px 7px; font-size:.68rem; font-weight:800; background:#dbeafe; color:#1d4ed8; white-space:nowrap; }
+    .planning-meta { margin-top:7px; color:#475569; font-size:.78rem; line-height:1.4; }
+    .planning-card-actions { display:flex; justify-content:flex-end; margin-top:8px; }
+    .planning-remove { border:0; background:#fee2e2; color:#b91c1c; border-radius:8px; padding:4px 8px; cursor:pointer; font-size:.72rem; font-weight:800; }
+    .planning-empty { color:#94a3b8; border:1px dashed #cbd5e1; border-radius:10px; padding:12px; font-size:.84rem; }
     .table-actions { display: flex; gap: 8px; }
     .mini-btn { border: 1px solid #cbd5e1; background: #fff; color: #1f2937; border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; cursor: pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .mini-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 12px rgba(15,23,42,0.08); }
@@ -3343,6 +3536,7 @@ DASHBOARD_HTML = """
   <div class="main-tabs">
     <button class="main-tab-button active" data-target="machinesTab">Machines</button>
     <button class="main-tab-button" data-target="jobQueueTab">Job Queue</button>
+    <button class="main-tab-button" data-target="planningTab">Planning</button>
     <button class="main-tab-button" data-target="finishShiftTab">Finish Shift</button>
     <button class="main-tab-button" data-target="finishedJobsTab">Finished Jobs</button>
     <button class="main-tab-button" data-target="archivedJobsTab">Archived Jobs</button>
@@ -3361,6 +3555,33 @@ DASHBOARD_HTML = """
       <div class="muted">Live queue from active sessions. ETA shows one estimate from act cycle time and one from live pack cycle time.</div>
       <div id="jobQueueSummary" class="job-queue-summary"></div>
       <div id="jobQueueTableWrap" class="table-wrap"></div>
+    </div>
+  </div>
+
+  <div id="planningTab" class="main-tab-content">
+    <div class="planning-shell">
+      <div class="planning-head">
+        <div class="planning-title">
+          <h3>Planning Board</h3>
+          <div class="muted">Scan or type a BMS job/work order, then drag the job card into the machine lane you want to run it on.</div>
+          <div id="planningStatus" class="planning-status"></div>
+        </div>
+        <div class="planning-controls">
+          <input id="planningJobInput" type="text" placeholder="Scan or type job / work order..." />
+          <button id="planningLookupBtn" type="button">Add Job</button>
+          <button id="planningClearBtn" class="secondary" type="button">Clear Backlog</button>
+        </div>
+      </div>
+      <div class="planning-board">
+        <div class="planning-lane">
+          <div class="planning-lane-head">
+            <div class="planning-lane-title">Backlog</div>
+            <div id="planningBacklogCount" class="planning-lane-count">0 jobs</div>
+          </div>
+          <div id="planningBacklog" class="planning-dropzone" data-lane="BACKLOG"></div>
+        </div>
+        <div id="planningMachineGrid" class="planning-machine-grid"></div>
+      </div>
     </div>
   </div>
 
@@ -3415,21 +3636,21 @@ DASHBOARD_HTML = """
       <div class="maintenance-topbar">
         <div>
           <h3>Maintenance Overview</h3>
-          <div class="muted">Live maintenance availability from today&apos;s roles and active machine downtime, plus repair speed from stored downtime records.</div>
+          <div class="muted">Live availability, active downtime, assignments, and repair performance.</div>
         </div>
         <div id="maintenanceCurrentDate" class="maintenance-date">Accurate current date: -</div>
       </div>
       <div id="maintenanceSummary" class="maintenance-summary"></div>
       <div class="maintenance-live-grid">
         <div>
-          <h3 class="maintenance-section-title">Active Maintenance Team</h3>
-          <div class="muted">Live maintenance availability from Maintenance People.</div>
+          <h3 class="maintenance-section-title">Maintenance Team</h3>
+          <div class="muted">Current assignment view from Maintenance People and active machine downtime.</div>
           <div id="maintenancePeopleList" class="maintenance-list"></div>
         </div>
       </div>
       <div class="maintenance-performance-panel">
-        <h3 class="maintenance-performance-title">Performance Analytics</h3>
-        <div class="muted">Average repair speed computed from downtime records with saved maintenance names.</div>
+        <h3 class="maintenance-performance-title">Repair Performance</h3>
+        <div class="muted">Average repair speed computed from completed downtime records.</div>
         <div id="maintenancePerformanceTableWrap" class="maintenance-performance-wrap"></div>
       </div>
     </div>
@@ -3832,6 +4053,13 @@ DASHBOARD_HTML = """
   const machineGrid = document.getElementById("machineGrid");
   const jobQueueSummary = document.getElementById("jobQueueSummary");
   const jobQueueTableWrap = document.getElementById("jobQueueTableWrap");
+  const planningJobInput = document.getElementById("planningJobInput");
+  const planningLookupBtn = document.getElementById("planningLookupBtn");
+  const planningClearBtn = document.getElementById("planningClearBtn");
+  const planningStatus = document.getElementById("planningStatus");
+  const planningBacklog = document.getElementById("planningBacklog");
+  const planningBacklogCount = document.getElementById("planningBacklogCount");
+  const planningMachineGrid = document.getElementById("planningMachineGrid");
   const finishedShiftQueueList = document.getElementById("finishedShiftQueueList");
   const finishedShiftJobProgress = document.getElementById("finishedShiftJobProgress");
   const finishedJobsList = document.getElementById("finishedJobsList");
@@ -3939,6 +4167,9 @@ DASHBOARD_HTML = """
   };
   const DEFAULT_MACHINE_CODES = Object.keys(MACHINE_NAME_MAP);
   let latestState = { sessions: [], active_ttl_seconds: 30 };
+  let planningBoard = { lanes: { BACKLOG: [] }, updated_at_utc: "" };
+  let planningSaveTimer = null;
+  let planningLocalDirty = false;
   let operatorDirectoryState = [];
   const machineCardEls = new Map();
   let finishedJobsState = [];
@@ -5496,8 +5727,8 @@ DASHBOARD_HTML = """
 
   function maintenanceDateLabel(iso){
     const date = iso ? new Date(iso) : new Date();
-    if(Number.isNaN(date.getTime())) return "Accurate current date: -";
-    return "Accurate current date: " + date.toLocaleString("en-US", {
+    if(Number.isNaN(date.getTime())) return "Date unavailable";
+    return date.toLocaleString("en-US", {
       weekday: "short",
       month: "short",
       day: "2-digit",
@@ -5559,10 +5790,10 @@ DASHBOARD_HTML = """
 
     if(maintenanceSummary){
       maintenanceSummary.innerHTML = `
-        <div class="maintenance-metric blue"><div class="icon"></div><div><div class="k">Maintenance Today</div><div class="v">${esc(maintenancePeople.length)}</div><div class="s">Maintenance today&apos;s roles.</div></div></div>
-        <div class="maintenance-metric green"><div class="icon"></div><div><div class="k">Available Team</div><div class="v">${esc(availableCount)}</div><div class="s">Metric card for available team.</div></div></div>
-        <div class="maintenance-metric amber"><div class="icon"></div><div><div class="k">Active Repairs</div><div class="v">${esc(activeFixCount)}</div><div class="s">Active repairs in motion.</div></div></div>
-        <div class="maintenance-metric red"><div class="icon"></div><div><div class="k">Machines Waiting</div><div class="v">${esc(waitingCount)}</div><div class="s">Machines waiting assigned.</div></div></div>
+        <div class="maintenance-metric blue"><div><div class="k">Maintenance Team</div><div class="v">${esc(maintenancePeople.length)}</div><div class="s">Technicians available in profiles or daily roles.</div></div><div class="icon"></div></div>
+        <div class="maintenance-metric green"><div><div class="k">Available Now</div><div class="v">${esc(availableCount)}</div><div class="s">Not currently assigned to active downtime.</div></div><div class="icon"></div></div>
+        <div class="maintenance-metric amber"><div><div class="k">Active Repairs</div><div class="v">${esc(activeFixCount)}</div><div class="s">Machines currently in repair downtime.</div></div><div class="icon"></div></div>
+        <div class="maintenance-metric red"><div><div class="k">Waiting Queue</div><div class="v">${esc(waitingCount)}</div><div class="s">Machines waiting for maintenance assignment.</div></div><div class="icon"></div></div>
       `;
     }
 
@@ -5753,6 +5984,166 @@ DASHBOARD_HTML = """
         </tbody>
       </table>
     `;
+  }
+
+  function normalizePlanningBoard(board){
+    const lanes = (board && typeof board.lanes === "object") ? board.lanes : {};
+    const out = { lanes: {}, updated_at_utc: String(board?.updated_at_utc || "") };
+    out.lanes.BACKLOG = Array.isArray(lanes.BACKLOG) ? lanes.BACKLOG : [];
+    DEFAULT_MACHINE_CODES.forEach(code => { out.lanes[code] = Array.isArray(lanes[code]) ? lanes[code] : []; });
+    Object.entries(lanes).forEach(([lane, cards]) => {
+      if(!out.lanes[lane] && Array.isArray(cards)) out.lanes[lane] = cards;
+    });
+    return out;
+  }
+
+  function planningLaneCards(lane){
+    planningBoard = normalizePlanningBoard(planningBoard);
+    return planningBoard.lanes[lane] || [];
+  }
+
+  function planningSetStatus(text, isError=false){
+    if(!planningStatus) return;
+    planningStatus.textContent = text || "";
+    planningStatus.style.color = isError ? "#b91c1c" : "#64748b";
+  }
+
+  function planningCardHtml(card, lane){
+    const job = card || {};
+    const title = job.job_ref || job.job_name || job.job_id || "Planned Job";
+    const product = [job.product_sku, job.product_name].filter(Boolean).join(" - ") || job.product_id || "-";
+    const details = [
+      `Product: ${product}`,
+      job.mold ? `Mold: ${job.mold}` : "",
+      job.color ? `Color: ${job.color}` : "",
+      job.std_cycle_time ? `Cycle: ${job.std_cycle_time}` : "",
+      job.request_qty ? `Qty: ${job.request_qty}` : "",
+    ].filter(Boolean).join("<br>");
+    return `<div class="planning-card" draggable="true" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip">${esc(job.source || "PLAN")}</span></div><div class="planning-meta">${details || "No BMS details available."}</div><div class="planning-card-actions"><button class="planning-remove" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}">Remove</button></div></div>`;
+  }
+
+  function livePlanningCardHtml(session){
+    const title = session.job_name || session.job_code || "Running Job";
+    return `<div class="planning-card live"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip">LIVE</span></div><div class="planning-meta">Operator: ${esc(session.operator_id || "-")}<br>Pack: ${esc(session.pack_total || 0)} | Good: ${esc(session.good_total || 0)} | Reject: ${esc(session.reject_total || 0)}</div></div>`;
+  }
+
+  function renderPlanningBoard(state){
+    planningBoard = normalizePlanningBoard((planningLocalDirty ? planningBoard : state?.planning_board) || planningBoard);
+    if(planningBacklogCount) planningBacklogCount.textContent = `${planningLaneCards("BACKLOG").length} jobs`;
+    if(planningBacklog){
+      planningBacklog.innerHTML = planningLaneCards("BACKLOG").map(c => planningCardHtml(c, "BACKLOG")).join("") || '<div class="planning-empty">Scan or type a job to add it here.</div>';
+    }
+    if(planningMachineGrid){
+      const sessionsByMachine = new Map((state?.sessions || []).map(s => [String(s.machine_code || ""), s]));
+      planningMachineGrid.innerHTML = DEFAULT_MACHINE_CODES.map(code => {
+        const cards = planningLaneCards(code);
+        const live = sessionsByMachine.get(code);
+        return `<div class="planning-lane"><div class="planning-lane-head"><div class="planning-lane-title">${esc(MACHINE_NAME_MAP[code] || code)}</div><div class="planning-lane-count">${esc(cards.length)} planned</div></div><div class="planning-dropzone" data-lane="${esc(code)}">${live && live.job_code ? livePlanningCardHtml(live) : ""}${cards.map(c => planningCardHtml(c, code)).join("") || (!live || !live.job_code ? '<div class="planning-empty">Drop jobs here.</div>' : "")}</div></div>`;
+      }).join("");
+    }
+    bindPlanningDragHandlers();
+  }
+
+  function findAndMovePlanningCard(cardId, targetLane){
+    planningBoard = normalizePlanningBoard(planningBoard);
+    let found = null;
+    for(const [lane, cards] of Object.entries(planningBoard.lanes)){
+      const idx = (cards || []).findIndex(c => String(c.id || "") === String(cardId || ""));
+      if(idx >= 0){
+        found = cards.splice(idx, 1)[0];
+        break;
+      }
+    }
+    if(!found) return false;
+    if(!Array.isArray(planningBoard.lanes[targetLane])) planningBoard.lanes[targetLane] = [];
+    planningBoard.lanes[targetLane].push(found);
+    return true;
+  }
+
+  function bindPlanningDragHandlers(){
+    document.querySelectorAll(".planning-card[draggable='true']").forEach(card => {
+      card.addEventListener("dragstart", ev => {
+        ev.dataTransfer.setData("text/plain", card.getAttribute("data-card-id") || "");
+      });
+    });
+    document.querySelectorAll(".planning-dropzone").forEach(zone => {
+      zone.addEventListener("dragover", ev => { ev.preventDefault(); zone.classList.add("drag-over"); });
+      zone.addEventListener("dragleave", () => zone.classList.remove("drag-over"));
+      zone.addEventListener("drop", ev => {
+        ev.preventDefault();
+        zone.classList.remove("drag-over");
+        const cardId = ev.dataTransfer.getData("text/plain");
+        const lane = zone.getAttribute("data-lane") || "BACKLOG";
+        if(findAndMovePlanningCard(cardId, lane)){
+          renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+          schedulePlanningSave();
+        }
+      });
+    });
+    document.querySelectorAll(".planning-remove").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const cardId = btn.getAttribute("data-card-id") || "";
+        const lane = btn.getAttribute("data-lane") || "BACKLOG";
+        planningBoard = normalizePlanningBoard(planningBoard);
+        planningBoard.lanes[lane] = (planningBoard.lanes[lane] || []).filter(c => String(c.id || "") !== cardId);
+        renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+        schedulePlanningSave();
+      });
+    });
+  }
+
+  function schedulePlanningSave(){
+    planningLocalDirty = true;
+    if(planningSaveTimer) clearTimeout(planningSaveTimer);
+    planningSaveTimer = setTimeout(savePlanningBoard, 350);
+  }
+
+  async function savePlanningBoard(){
+    planningBoard = normalizePlanningBoard(planningBoard);
+    const resp = await fetch("/api/planning/board", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ board: planningBoard }),
+    });
+    const out = await resp.json();
+    if(out.ok && out.board){
+      planningBoard = normalizePlanningBoard(out.board);
+      planningLocalDirty = false;
+      planningSetStatus("Planning board saved.");
+    } else {
+      planningSetStatus(out.error || "Failed to save planning board.", true);
+    }
+  }
+
+  async function addPlanningJobFromInput(){
+    const value = String(planningJobInput?.value || "").trim();
+    if(!value){
+      planningSetStatus("Scan or type a job/work order first.", true);
+      return;
+    }
+    planningSetStatus("Getting job details from BMS...");
+    try{
+      const resp = await fetch("/api/planning/lookup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_identifier: value }),
+      });
+      const out = await resp.json();
+      if(!out.ok || !out.item){
+        planningSetStatus(out.error || "BMS lookup failed.", true);
+        return;
+      }
+      planningBoard = normalizePlanningBoard(planningBoard);
+      const card = out.item;
+      card.id = `${card.id || "plan-job"}-${Date.now()}`;
+      planningBoard.lanes.BACKLOG.unshift(card);
+      if(planningJobInput) planningJobInput.value = "";
+      renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+      schedulePlanningSave();
+      planningSetStatus(`Added ${card.job_ref || card.job_id || value} to backlog.`);
+    }catch(e){
+      planningSetStatus(`Planning lookup failed: ${e}`, true);
+    }
   }
 
   function setFinishedJobsInteractionLock(locked){
@@ -5985,6 +6376,7 @@ DASHBOARD_HTML = """
     renderMachineStatusArchive(machineStatusArchiveState);
     renderDowntimeArchive(state.finished_jobs || [], state.archived_jobs || []);
     renderMaintenanceTab(state || {});
+    renderPlanningBoard(state || {});
   }
 
   // tab handling
@@ -6008,6 +6400,24 @@ DASHBOARD_HTML = """
       host.querySelector(`#${target}`)?.classList.add("active");
     });
   });
+
+  if(planningLookupBtn){
+    planningLookupBtn.addEventListener("click", () => addPlanningJobFromInput());
+  }
+  if(planningJobInput){
+    planningJobInput.addEventListener("keydown", ev => {
+      if(ev.key === "Enter") addPlanningJobFromInput();
+    });
+  }
+  if(planningClearBtn){
+    planningClearBtn.addEventListener("click", () => {
+      if(!confirm("Clear all jobs from the planning backlog?")) return;
+      planningBoard = normalizePlanningBoard(planningBoard);
+      planningBoard.lanes.BACKLOG = [];
+      renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+      schedulePlanningSave();
+    });
+  }
 
   if(serverSettingsBtn){
     serverSettingsBtn.addEventListener("click", async () => {
@@ -7256,6 +7666,39 @@ async def api_event(req: Request):
 @APP.get("/api/finished-jobs")
 def api_finished_jobs():
     return {"ok": True, "items": FINISHED_JOBS}
+
+
+@APP.get("/api/planning/board")
+def api_planning_board():
+    return {"ok": True, "board": PLANNING_BOARD, "machines": MACHINE_NAME_MAP}
+
+
+@APP.post("/api/planning/board")
+async def api_planning_board_save(req: Request):
+    global PLANNING_BOARD
+    data = await req.json()
+    board = data.get("board") if isinstance(data.get("board"), dict) else data
+    if not isinstance(board, dict):
+        return JSONResponse({"ok": False, "error": "board object is required"}, status_code=400)
+    PLANNING_BOARD = save_planning_board(board)
+    await broadcast_state()
+    return {"ok": True, "board": PLANNING_BOARD}
+
+
+@APP.post("/api/planning/lookup")
+async def api_planning_lookup(req: Request):
+    data = await req.json()
+    job_identifier = str(data.get("job_identifier") or data.get("job_id") or data.get("work_order") or "").strip()
+    if not job_identifier:
+        return JSONResponse({"ok": False, "error": "job_identifier is required"}, status_code=400)
+    try:
+        card = fetch_planning_job_from_bms(job_identifier)
+        return {"ok": True, "item": card}
+    except urllib_error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        return JSONResponse({"ok": False, "error": f"BMS HTTP {e.code}", "body": body[:500]}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
 
 
 @APP.get("/api/server-settings")

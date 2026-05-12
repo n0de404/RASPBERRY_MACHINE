@@ -1,15 +1,15 @@
 {
   "M00003": {
-    "client_id": "RPI-CLIENT-01",
+    "client_id": "RPI-CLIENT-02",
     "machine_code": "M00003",
     "machine_name": "IMM 303",
     "job_code": "105380",
     "job_name": "3-26-0328-2",
-    "job_started_at": "2026-05-09T06:54:55.791034+00:00",
+    "job_started_at": "2026-05-12T06:21:27.104958+00:00",
     "operator_id": "25-00446 - ROLAND RECLA",
-    "pack_total": 9,
-    "good_total": 2340,
-    "butal_total": 3,
+    "pack_total": 3,
+    "good_total": 780,
+    "butal_total": 5,
     "reject_total": 0,
     "reject_breakdown": {},
     "no_shot_total": 0,
@@ -28,8 +28,8 @@
     "waiting_pdr_maintenance_reason": false,
     "waiting_downtime_end_maintenance": false,
     "waiting_maintenance_qr": false,
-    "cycle_time_current": "11",
-    "live_cycle_avg_seconds": 0.37710272532242994,
+    "cycle_time_current": "38",
+    "live_cycle_avg_seconds": 0.3212467581797869,
     "maintenance_name": null,
     "supervisor_name": null,
     "job_payload": {
@@ -353,14 +353,14 @@
     "linkage_enabled": false,
     "linkage_jobs": [],
     "operator_shift_logs": [],
-    "last_shift_butal_qty": 10,
-    "last_shift_butal_raw": "butal~1",
-    "last_shift_butal_saved_at": "2026-05-08T03:55:23.098756+00:00",
+    "last_shift_butal_qty": 0,
+    "last_shift_butal_raw": "",
+    "last_shift_butal_saved_at": null,
     "last_shift_butal_job_code": null,
     "last_shift_butal_job_name": null,
     "last_shift_butal_by_job": {},
     "last_event": "HEARTBEAT",
-    "last_seen_utc": "2026-05-09T09:56:19.891696+00:00"
+    "last_seen_utc": "2026-05-12T09:03:04.386871+00:00"
   },
   "M00005": {
     "client_id": "philtop-it-001",
@@ -2231,15 +2231,15 @@
     "last_seen_utc": "2026-05-09T09:34:09.097165+00:00"
   },
   "M00002": {
-    "client_id": "philtop-it-001",
+    "client_id": "RPI-CLIENT-01",
     "machine_code": "M00002",
     "machine_name": "IMM 302",
-    "job_code": "105111",
-    "job_name": "3-26-0293-1",
-    "job_started_at": null,
+    "job_code": "105380",
+    "job_name": "105380",
+    "job_started_at": "2026-05-12T03:43:25.746388+00:00",
     "operator_id": "25-00446 - ROLAND RECLA",
-    "pack_total": 0,
-    "good_total": 0,
+    "pack_total": 2,
+    "good_total": 520,
     "butal_total": 0,
     "reject_total": 0,
     "reject_breakdown": {},
@@ -2259,8 +2259,8 @@
     "waiting_pdr_maintenance_reason": false,
     "waiting_downtime_end_maintenance": false,
     "waiting_maintenance_qr": false,
-    "cycle_time_current": null,
-    "live_cycle_avg_seconds": null,
+    "cycle_time_current": "1",
+    "live_cycle_avg_seconds": 0.2759654572376838,
     "maintenance_name": null,
     "supervisor_name": null,
     "job_payload": {},
@@ -2273,8 +2273,8 @@
     "last_shift_butal_job_code": null,
     "last_shift_butal_job_name": null,
     "last_shift_butal_by_job": {},
-    "last_event": "FINISH SHIFT SYNC 3-26-0293-1",
-    "last_seen_utc": "2026-05-09T09:28:00.666526+00:00"
+    "last_event": "HEARTBEAT",
+    "last_seen_utc": "2026-05-12T09:03:00.509999+00:00"
   },
   "M00019": {
     "client_id": "philtop-it-001",
@@ -2330,8 +2330,8 @@
     "job_name": "105111",
     "job_started_at": "2026-05-09T09:19:03.054640+00:00",
     "operator_id": "25-00446 - ROLAND RECLA",
-    "pack_total": 4,
-    "good_total": 144,
+    "pack_total": 12,
+    "good_total": 432,
     "butal_total": 0,
     "reject_total": 0,
     "reject_breakdown": {},
@@ -2352,7 +2352,7 @@
     "waiting_downtime_end_maintenance": false,
     "waiting_maintenance_qr": false,
     "cycle_time_current": "7",
-    "live_cycle_avg_seconds": 0.7880148771736357,
+    "live_cycle_avg_seconds": 21.570896633797222,
     "maintenance_name": null,
     "supervisor_name": null,
     "job_payload": {},
@@ -2366,6 +2366,6 @@
     "last_shift_butal_job_name": null,
     "last_shift_butal_by_job": {},
     "last_event": "HEARTBEAT",
-    "last_seen_utc": "2026-05-09T09:55:34.186265+00:00"
+    "last_seen_utc": "2026-05-12T06:09:42.185472+00:00"
   }
 }
