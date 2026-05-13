@@ -1039,6 +1039,12 @@ class ClientState:
     butal_completion_carried_qty: int = 0
     butal_completion_new_qty: int = 0
     butal_completion_butal_raw: str = ""
+    waiting_butal_job_assignment: bool = False
+    pending_butal_qty: int = 0
+    pending_butal_base_qty: int = 0
+    pending_butal_multiplier: int = 1
+    pending_butal_raw: str = ""
+    butal_by_job: Dict[str, int] = None
     last_shift_butal_qty: int = 0
     last_shift_butal_raw: str = ""
     last_shift_butal_saved_at: Optional[str] = None
@@ -1152,6 +1158,8 @@ class ClientState:
             self.job_payload = {}
         if self.last_shift_butal_by_job is None:
             self.last_shift_butal_by_job = {}
+        if self.butal_by_job is None:
+            self.butal_by_job = {}
         if self.raw_material_scans is None:
             self.raw_material_scans = []
         if self.raw_material_logs is None:
@@ -4023,6 +4031,7 @@ QWidget#ClientUIRoot {{
         self.invalidTextBand.layout().addWidget(self.invalidReasonLabel, 0, Qt.AlignmentFlag.AlignCenter)
         self.invalidOverlay.layout().addWidget(self.invalidTextBand)
         self.invalidOverlay.hide()
+
         self.invalidOverlay.raise_()
 
         self.bmsLoadingOverlay = QFrame(self)
@@ -8143,6 +8152,8 @@ QWidget#ClientUIRoot {{
             self._set_banner_text("Initial setup: Scan QC badge to confirm cycle time")
         elif s.waiting_void_scan:
             self._set_banner_text("Void mode: scan the wrong PACK / BUTAL / REJECT QR to subtract it")
+        elif s.waiting_butal_job_assignment:
+            self._set_banner_text(f"Butal +{int(s.pending_butal_qty or 0)} pending: scan MAIN or LINKED JOB QR")
         elif s.waiting_cycle_time_input:
             if str(s.cycle_time_new_input or "").strip():
                 self._set_banner_text("Downtime resolve: Scan QR to confirm")
@@ -8580,7 +8591,7 @@ QWidget#ClientUIRoot {{
             return
         linked_rows = list(s.linkage_jobs or [])
         linked_names = [
-            str(r.get("job_name") or r.get("job_code") or "-")
+            f"{str(r.get('job_name') or r.get('job_code') or '-')}  |  B:{self._butal_qty_for_job(r.get('job_code'))}"
             for r in linked_rows[:3]
         ]
         while len(linked_names) < 3:
@@ -8920,6 +8931,12 @@ QWidget#ClientUIRoot {{
             "butal_completion_carried_qty": int(s.butal_completion_carried_qty or 0),
             "butal_completion_new_qty": int(s.butal_completion_new_qty or 0),
             "butal_completion_butal_raw": str(s.butal_completion_butal_raw or ""),
+            "waiting_butal_job_assignment": bool(s.waiting_butal_job_assignment),
+            "pending_butal_qty": int(s.pending_butal_qty or 0),
+            "pending_butal_base_qty": int(s.pending_butal_base_qty or 0),
+            "pending_butal_multiplier": int(s.pending_butal_multiplier or 1),
+            "pending_butal_raw": str(s.pending_butal_raw or ""),
+            "butal_by_job": dict(s.butal_by_job or {}),
             "last_shift_butal_qty": int(s.last_shift_butal_qty or 0),
             "last_shift_butal_raw": str(s.last_shift_butal_raw or ""),
             "last_shift_butal_saved_at": s.last_shift_butal_saved_at,
@@ -9116,6 +9133,12 @@ QWidget#ClientUIRoot {{
         s.butal_completion_carried_qty = int(snap.get("butal_completion_carried_qty") or 0)
         s.butal_completion_new_qty = int(snap.get("butal_completion_new_qty") or 0)
         s.butal_completion_butal_raw = str(snap.get("butal_completion_butal_raw") or "")
+        s.waiting_butal_job_assignment = bool(snap.get("waiting_butal_job_assignment"))
+        s.pending_butal_qty = int(snap.get("pending_butal_qty") or 0)
+        s.pending_butal_base_qty = int(snap.get("pending_butal_base_qty") or 0)
+        s.pending_butal_multiplier = int(snap.get("pending_butal_multiplier") or 1)
+        s.pending_butal_raw = str(snap.get("pending_butal_raw") or "")
+        s.butal_by_job = {str(k): int(v or 0) for k, v in dict(snap.get("butal_by_job") or {}).items()}
         s.last_shift_butal_qty = int(snap.get("last_shift_butal_qty") or 0)
         s.last_shift_butal_raw = str(snap.get("last_shift_butal_raw") or "")
         s.last_shift_butal_saved_at = snap.get("last_shift_butal_saved_at")
@@ -9294,6 +9317,7 @@ QWidget#ClientUIRoot {{
 
     def _build_finished_job_payload(self) -> Dict[str, Any]:
         s = self.state
+        main_butal_total = self._butal_qty_for_job(s.job_code, fallback_current=not bool(s.linkage_enabled and (s.linkage_jobs or [])))
         return {
             "record_type": RECORD_TYPE_FINAL_JOB,
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -9305,9 +9329,9 @@ QWidget#ClientUIRoot {{
             "operator_id": s.operator_id,
             "pack_count": int(s.pack_count or 0),
             "good_total": int(s.good_total or 0),
-            "butal_total": int(s.butal_total or 0),
+            "butal_total": int(main_butal_total or 0),
             "reject_total": int(s.reject_total or 0),
-            "total_good": int((s.good_total or 0) + (s.butal_total or 0)),
+            "total_good": int((s.good_total or 0) + (main_butal_total or 0)),
             "reject_breakdown": dict(s.reject_breakdown or {}),
             "startup_reject_total": int(s.startup_reject_total or 0),
             "no_shot_total": int(s.no_shot_total or 0),
@@ -9315,6 +9339,8 @@ QWidget#ClientUIRoot {{
             "raw_material_scans": list(s.raw_material_scans or []),
             "raw_material_logs": list(s.raw_material_logs or []),
             "product_pack_history_logs": list(s.product_pack_history_logs or []),
+            "butal_by_job": dict(s.butal_by_job or {}),
+            "butal_scan_logs": list(s.butal_scan_logs or []),
             "job_payload": s.job_payload or {},
             "reject_review_logs": list(s.reject_review_logs or []),
             "downtime_last_seconds": s.downtime_last_seconds,
@@ -9344,7 +9370,7 @@ QWidget#ClientUIRoot {{
             "maintenance_name": s.maintenance_name,
             "supervisor_name": s.supervisor_name,
             "operator_shift_logs": list(s.operator_shift_logs or []),
-            "partial_qty": int((s.good_total or 0) + (s.butal_total or 0)),
+            "partial_qty": int((s.good_total or 0) + (main_butal_total or 0)),
             "review_status": REVIEW_STATUS_CLOSED,
             "linkage_enabled": bool(s.linkage_enabled),
             "linkage_job_code": s.linkage_job_code,
@@ -9358,6 +9384,7 @@ QWidget#ClientUIRoot {{
                 "pack_count": int(s.pack_count or 0),
                 "good_total": int(s.good_total or 0),
                 "butal_total": int(s.butal_total or 0),
+                "butal_by_job": dict(s.butal_by_job or {}),
                 "total_good": int((s.good_total or 0) + (s.butal_total or 0)),
             } if s.linkage_enabled else None,
         }
@@ -9377,10 +9404,12 @@ QWidget#ClientUIRoot {{
             # Linked jobs mirror only finish-goods counters, not rejects.
             linked_payload["pack_count"] = int(s.pack_count or 0)
             linked_payload["good_total"] = int(s.good_total or 0)
-            linked_payload["butal_total"] = 0
+            linked_butal_total = self._butal_qty_for_job(row.get("job_code"))
+            linked_payload["butal_total"] = int(linked_butal_total or 0)
             linked_payload["reject_total"] = 0
             linked_payload["reject_breakdown"] = {}
-            linked_payload["total_good"] = int(s.good_total or 0)
+            linked_payload["total_good"] = int(s.good_total or 0) + int(linked_butal_total or 0)
+            linked_payload["partial_qty"] = int(s.good_total or 0) + int(linked_butal_total or 0)
             linked_payload["startup_reject_total"] = 0
             linked_payload["no_shot_total"] = 0
             linked_payload["linkage_enabled"] = True
@@ -9418,6 +9447,8 @@ QWidget#ClientUIRoot {{
         s.waiting_void_butal_scan = False
         s.waiting_void_reject_scan = False
         self._clear_butal_completion_mode()
+        self._clear_pending_butal_assignment()
+        s.butal_by_job = {}
         s.last_shift_butal_qty = 0
         s.last_shift_butal_raw = ""
         s.last_shift_butal_saved_at = None
@@ -12036,7 +12067,8 @@ QWidget#ClientUIRoot {{
     def _format_butal_history_action_text(self, row: Dict[str, Any], *, voided: bool = False) -> str:
         qty_text = str(row.get("qty") or "-").strip() or "-"
         time_text = self._format_history_time_short(row.get("voided_at") if voided else row.get("scanned_at"))
-        text = f"BUTAL | {qty_text} | {time_text}"
+        job_text = str(row.get("assigned_job_name") or row.get("assigned_job_code") or "").strip()
+        text = f"BUTAL | {qty_text} | {job_text} | {time_text}" if job_text else f"BUTAL | {qty_text} | {time_text}"
         return f"{text} | VOID" if voided else text
 
     def _clear_butal_completion_mode(self):
@@ -12049,9 +12081,158 @@ QWidget#ClientUIRoot {{
         s.butal_completion_new_qty = 0
         s.butal_completion_butal_raw = ""
 
+    def _clear_pending_butal_assignment(self):
+        s = self.state
+        s.waiting_butal_job_assignment = False
+        s.pending_butal_qty = 0
+        s.pending_butal_base_qty = 0
+        s.pending_butal_multiplier = 1
+        s.pending_butal_raw = ""
+
+    def _butal_qty_for_job(self, job_code: Optional[str], *, fallback_current: bool = False) -> int:
+        s = self.state
+        job_key = self._normalize_job_code(job_code)
+        if job_key and isinstance(s.butal_by_job, dict) and s.butal_by_job:
+            return max(0, int(s.butal_by_job.get(job_key, 0) or 0))
+        if fallback_current:
+            return max(0, int(s.butal_total or 0))
+        return 0
+
+    def _butal_assignment_candidates(self) -> List[Dict[str, Any]]:
+        s = self.state
+        rows: List[Dict[str, Any]] = []
+        if str(s.job_code or "").strip():
+            rows.append({
+                "job_code": s.job_code,
+                "job_name": s.job_name,
+                "job_payload": s.job_payload or {},
+                "role": "MAIN",
+            })
+        for row in (s.linkage_jobs or []):
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("job_code") or "").strip()
+            if not code:
+                continue
+            rows.append({
+                "job_code": code,
+                "job_name": row.get("job_name"),
+                "job_payload": row.get("job_payload") if isinstance(row.get("job_payload"), dict) else {},
+                "role": "LINKED",
+            })
+        return rows
+
+    def _find_butal_assignment_target(self, job_code: Optional[str]) -> Optional[Dict[str, Any]]:
+        target_key = self._normalize_job_code(job_code)
+        if not target_key:
+            return None
+        for row in self._butal_assignment_candidates():
+            if self._normalize_job_code(row.get("job_code")) == target_key:
+                return row
+        return None
+
+    def _job_identity_from_scan_result(self, res: ScanResult, raw_s: str) -> Dict[str, Any]:
+        if res.kind == "JOB":
+            po_from_meta = ""
+            if isinstance(res.meta, dict):
+                po_from_meta = self._safe_text(res.meta.get("po_number"), "")
+            requested_job_id = po_from_meta or raw_s
+            payload: Dict[str, Any] = {}
+            job_code = requested_job_id
+            job_name = res.value or requested_job_id
+            self._show_bms_loading("Getting job data from BMS...")
+            try:
+                fetched_payload = self._fetch_job_payload_from_api(requested_job_id)
+            finally:
+                self._hide_bms_loading()
+            if isinstance(fetched_payload, dict):
+                payload = fetched_payload
+                api_job = {}
+                if isinstance(fetched_payload.get("data"), dict) and isinstance(fetched_payload["data"].get("job"), dict):
+                    api_job = fetched_payload["data"]["job"]
+                elif isinstance(fetched_payload.get("job"), dict):
+                    api_job = fetched_payload["job"]
+                job_code = (
+                    self._safe_text(api_job.get("id"), "")
+                    or self._safe_text(api_job.get("ref_no"), "")
+                    or requested_job_id
+                )
+                job_name = (
+                    self._safe_text(api_job.get("ref_no"), "")
+                    or self._safe_text(res.value, "")
+                    or requested_job_id
+                )
+            return {"job_code": job_code, "job_name": job_name, "job_payload": payload}
+        payload = res.meta if isinstance(res.meta, dict) else {}
+        job = {}
+        if isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("job"), dict):
+            job = payload["data"]["job"]
+        elif isinstance(payload.get("job"), dict):
+            job = payload["job"]
+        job_code = (
+            self._safe_text(job.get("id"), "")
+            or self._safe_text(job.get("ref_no"), "")
+            or self._safe_text(payload.get("job_code"), "")
+            or self._safe_text(res.value, "")
+            or "QR-STUB"
+        )
+        job_name = (
+            self._safe_text(job.get("ref_no"), "")
+            or self._safe_text(payload.get("job_name"), "")
+            or self._safe_text(res.value, "")
+            or "Job Stub"
+        )
+        return {"job_code": job_code, "job_name": job_name, "job_payload": payload}
+
+    def _assign_pending_butal_to_job(self, target: Dict[str, Any]) -> bool:
+        s = self.state
+        qty = int(s.pending_butal_qty or 0)
+        if qty <= 0:
+            self._clear_pending_butal_assignment()
+            return False
+        job_code = str(target.get("job_code") or "").strip()
+        job_name = str(target.get("job_name") or job_code or "").strip()
+        job_key = self._normalize_job_code(job_code)
+        if not job_key:
+            return False
+        s.butal_total += qty
+        rows = dict(s.butal_by_job or {})
+        rows[job_key] = int(rows.get(job_key, 0) or 0) + qty
+        s.butal_by_job = rows
+        scan_row = {
+            "raw_scan": str(s.pending_butal_raw or ""),
+            "qty": qty,
+            "base_qty": int(s.pending_butal_base_qty or qty),
+            "multiplier": int(s.pending_butal_multiplier or 1),
+            "scanned_at": datetime.now(timezone.utc).isoformat(),
+            "operator": str(s.operator_id or "").strip() or "-",
+            "operator_name": self._operator_display_name(s.operator_id),
+            "voided": False,
+            "source": "BUTAL_LINKAGE_ASSIGNMENT",
+            "assigned_job_code": job_code,
+            "assigned_job_name": job_name,
+        }
+        s.butal_scan_logs.append(scan_row)
+        self._clear_pending_butal_assignment()
+        self.status.setText(f"Butal +{qty} assigned to {job_name or job_code}.")
+        self.lblButal.add_points(qty)
+        self.lblTotalGood.add_points(qty)
+        self._refresh_ui()
+        self._pulse_card(self.cardStatButal)
+        self._pulse_card(self.cardStatTotalGood)
+        self._save_active_session_snapshot()
+        self.push_event(
+            {"type": "BUTAL", "qty": qty, "assigned_job_code": job_code, "assigned_job_name": job_name},
+            f"BUTAL +{qty} {job_name or job_code}",
+        )
+        return True
+
     def _store_last_shift_butal_from_current_shift(self):
         s = self.state
-        butal_delta = max(0, int(s.butal_total or 0) - int(s.operator_shift_baseline_butal_total or 0))
+        if isinstance(s.butal_by_job, dict) and s.butal_by_job:
+            butal_delta = self._butal_qty_for_job(s.job_code)
+        else:
+            butal_delta = max(0, int(s.butal_total or 0) - int(s.operator_shift_baseline_butal_total or 0))
         if butal_delta <= 0 or not str(s.job_code or "").strip():
             return
         excluded_sources = {"BUTAL_COMPLETION", "LAST_SHIFT_BUTAL_COMPLETION"}
@@ -12197,6 +12378,13 @@ QWidget#ClientUIRoot {{
             row["voided_at"] = datetime.now(timezone.utc).isoformat()
             void_qty = int(row.get("qty") or qty or 0)
             s.butal_total = max(0, int(s.butal_total or 0) - void_qty)
+            assigned_key = self._normalize_job_code(row.get("assigned_job_code"))
+            if assigned_key and isinstance(s.butal_by_job, dict):
+                rows = dict(s.butal_by_job or {})
+                rows[assigned_key] = max(0, int(rows.get(assigned_key, 0) or 0) - void_qty)
+                if rows[assigned_key] <= 0:
+                    rows.pop(assigned_key, None)
+                s.butal_by_job = rows
             self._append_adjustment_log("BUTAL", "VOID", {"raw_scan": raw_scan, "qty": void_qty})
             self.lblButal.add_points(-void_qty)
             self.lblTotalGood.add_points(-void_qty)
@@ -12728,6 +12916,25 @@ QWidget#ClientUIRoot {{
             return
 
         res_pre = parse_scan(raw_s)
+        if s.waiting_butal_job_assignment:
+            if raw_l in ("cancel", "cancel~1", "void", "clear"):
+                self._clear_pending_butal_assignment()
+                self.status.setText("Butal assignment cancelled.")
+                self._refresh_ui()
+                self._save_active_session_snapshot()
+                return
+            if res_pre is None or res_pre.kind not in ("JOB", "JOB_STUB"):
+                self.status.setText("Butal pending: scan the MAIN or LINKED JOB QR for this Butal.")
+                self._show_invalid_overlay("Scan a job QR to assign the pending Butal.")
+                return
+            identity = self._job_identity_from_scan_result(res_pre, raw_s)
+            target = self._find_butal_assignment_target(identity.get("job_code"))
+            if target is None:
+                self.status.setText("Butal assignment failed: scanned job is not in this linkage group.")
+                self._show_invalid_overlay("Scan the main job or one of the linked job QRs.")
+                return
+            self._assign_pending_butal_to_job(target)
+            return
         reviewer = self._reviewer_from_scan(raw_s) if res_pre is None else None
         if reviewer is not None:
             reviewer_can_supervisor = str(reviewer.get("can_supervisor", "0")) == "1"
@@ -13479,6 +13686,11 @@ QWidget#ClientUIRoot {{
                 self.status.setText("BUTAL completion: remaining BUTAL quantity is invalid.")
                 return
             s.butal_total += qty
+            job_key = self._normalize_job_code(s.job_code)
+            if job_key:
+                rows = dict(s.butal_by_job or {})
+                rows[job_key] = int(rows.get(job_key, 0) or 0) + qty
+                s.butal_by_job = rows
             s.butal_completion_new_qty = qty
             s.butal_completion_butal_raw = raw_s
             s.butal_scan_logs.append(
@@ -13493,6 +13705,8 @@ QWidget#ClientUIRoot {{
                     "voided": False,
                     "source": "BUTAL_COMPLETION",
                     "carried_qty": int(s.butal_completion_carried_qty or 0),
+                    "assigned_job_code": s.job_code,
+                    "assigned_job_name": s.job_name,
                 }
             )
             s.waiting_butal_completion_butal_scan = False
@@ -13685,6 +13899,10 @@ QWidget#ClientUIRoot {{
             s.linkage_job_name = None
             s.linkage_job_payload = {}
             s.linkage_jobs = []
+            self._clear_pending_butal_assignment()
+            if int(s.butal_total or 0) > 0 and not (s.butal_by_job or {}):
+                job_key = self._normalize_job_code(s.job_code)
+                s.butal_by_job = {job_key: int(s.butal_total or 0)} if job_key else {}
             self.status.setText("Linkage mode enabled. Scan another JOB QR to mirror current session.")
             self._refresh_ui()
             return
@@ -14166,6 +14384,9 @@ QWidget#ClientUIRoot {{
             s.raw_material_unique_keys = set()
             s.product_pack_history_logs = []
             s.product_pack_history_keys = set()
+            s.butal_scan_logs = []
+            self._clear_pending_butal_assignment()
+            s.butal_by_job = {}
             s.startup_reject_total = 0
             s.no_shot_total = 0
             s.reject_review_logs = []
@@ -14447,6 +14668,11 @@ QWidget#ClientUIRoot {{
                             s.product_pack_history_keys.add(pack_key)
                         s.pack_count += 1
                         s.butal_total += new_butal_qty
+                        job_key = self._normalize_job_code(s.job_code)
+                        if job_key:
+                            rows = dict(s.butal_by_job or {})
+                            rows[job_key] = int(rows.get(job_key, 0) or 0) + new_butal_qty
+                            s.butal_by_job = rows
                         s.butal_scan_logs.append(
                             {
                                 "raw_scan": raw_s,
@@ -14461,6 +14687,8 @@ QWidget#ClientUIRoot {{
                                 "carried_qty": carried_butal_qty,
                                 "carried_raw_scan": str(carryover.get("raw") or ""),
                                 "pack_qty": int(qty or 0),
+                                "assigned_job_code": s.job_code,
+                                "assigned_job_name": s.job_name,
                             }
                         )
                         self._clear_last_shift_butal_carryover()
@@ -14502,6 +14730,11 @@ QWidget#ClientUIRoot {{
                         return
                     s.pack_count += 1
                     s.butal_total += new_butal_qty
+                    job_key = self._normalize_job_code(s.job_code)
+                    if job_key:
+                        rows = dict(s.butal_by_job or {})
+                        rows[job_key] = int(rows.get(job_key, 0) or 0) + new_butal_qty
+                        s.butal_by_job = rows
                     s.butal_scan_logs.append(
                         {
                             "raw_scan": raw_s,
@@ -14516,6 +14749,8 @@ QWidget#ClientUIRoot {{
                             "carried_qty": carried_butal_qty,
                             "carried_raw_scan": str(carryover.get("raw") or ""),
                             "pack_qty": int(qty or 0),
+                            "assigned_job_code": s.job_code,
+                            "assigned_job_name": s.job_name,
                         }
                     )
                     self._clear_last_shift_butal_carryover()
@@ -14560,7 +14795,29 @@ QWidget#ClientUIRoot {{
                 base_qty = int(res.qty or 0)
                 multiplier = self._reject_multiplier_value()
                 qty = base_qty * multiplier
+                if s.linkage_enabled and (s.linkage_jobs or []):
+                    s.waiting_butal_job_assignment = True
+                    s.pending_butal_qty = qty
+                    s.pending_butal_base_qty = base_qty
+                    s.pending_butal_multiplier = multiplier
+                    s.pending_butal_raw = raw_s
+                    self._clear_reject_multiplier()
+                    job_names = [
+                        str(row.get("job_name") or row.get("job_code") or "-")
+                        for row in self._butal_assignment_candidates()
+                    ]
+                    self.status.setText(
+                        f"Butal +{qty} pending. Scan job QR to assign it: {', '.join(job_names[:4])}."
+                    )
+                    self._refresh_ui()
+                    self._save_active_session_snapshot()
+                    return
                 s.butal_total += qty
+                job_key = self._normalize_job_code(s.job_code)
+                if job_key:
+                    rows = dict(s.butal_by_job or {})
+                    rows[job_key] = int(rows.get(job_key, 0) or 0) + qty
+                    s.butal_by_job = rows
                 s.butal_scan_logs.append(
                     {
                         "raw_scan": raw_s,
@@ -14572,6 +14829,8 @@ QWidget#ClientUIRoot {{
                         "operator_name": self._operator_display_name(s.operator_id),
                         "voided": False,
                         "source": "BUTAL",
+                        "assigned_job_code": s.job_code,
+                        "assigned_job_name": s.job_name,
                     }
                 )
                 self._clear_reject_multiplier()

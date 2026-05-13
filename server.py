@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from urllib import request as urllib_request
 from urllib import error as urllib_error
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
 
@@ -57,10 +57,11 @@ STATE_TICK_SECONDS = 0.25
 PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"  # legacy fallback
 PRODUCT_API_CONFIG_FILE = Path(__file__).resolve().parent / "Database" / "product_api_config.json"
 PRODUCT_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "product_catalog_cache.json"
+LOW_STOCK_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "low_stock_recommendations.json"
 ACTIVE_MACHINE_SESSIONS_FILE = Path(__file__).resolve().parent / "Database" / "active_machine_sessions.json"
 PLANNING_BOARD_FILE = Path(__file__).resolve().parent / "Database" / "planning_board.json"
 PROFILE_REPRINT_ADMIN_PASSWORD = "0t1docmtl$tm"
-QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.10.166:5000").strip().rstrip("/")
+QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.11.173:5000").strip().rstrip("/")
 RAW_QR_O_SEGMENT = "O000000000240000010237800000000000"
 RAW_QR_REMARK = "V2"
 WIDTH_P = 11
@@ -101,6 +102,8 @@ SUPERVISOR_BADGES: Dict[str, str] = {"3000001": "Charlie Brown"}
 QC_BADGES: Dict[str, str] = {"4000001": "Lucy Van Pelt"}
 APP_BASE_DIR = Path(__file__).resolve().parent
 SQL_CONFIG_FILE = APP_BASE_DIR / "Database" / "sql_config.json"
+FINISHED_JOBS_FALLBACK_FILE = APP_BASE_DIR / "Database" / "finished_jobs_server.json"
+ARCHIVED_JOBS_FALLBACK_FILE = APP_BASE_DIR / "Database" / "archived_jobs_server.json"
 
 
 def _load_sql_config() -> Dict[str, Any]:
@@ -170,6 +173,30 @@ def _load_json_object(path: Path) -> Dict[str, Any]:
     except Exception:
         pass
     return {}
+
+
+def _load_json_list(path: Path) -> List[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return []
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(raw, list):
+            return [x for x in raw if isinstance(x, dict)]
+    except Exception as e:
+        print(f"[JSON] Failed to load {path.name}: {e}")
+    return []
+
+
+def _save_json_list(path: Path, rows: List[Dict[str, Any]]) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except Exception as e:
+        print(f"[JSON] Failed to save {path.name}: {e}")
+        return False
 
 
 def _ensure_sql_schema() -> bool:
@@ -510,7 +537,8 @@ def _ensure_sql_schema() -> bool:
                         pass
         conn.commit()
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[SQL] Failed to ensure schema: {e}")
         return False
     finally:
         conn.close()
@@ -650,7 +678,8 @@ def _save_archived_jobs_sql(rows: List[Dict[str, Any]]) -> bool:
                 )
         conn.commit()
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[SQL] Failed to save archived_jobs_server: {e}")
         return False
     finally:
         conn.close()
@@ -1047,6 +1076,7 @@ class MachineSession:
     linkage_enabled: bool = False
     linkage_jobs: List[Dict[str, Any]] = None
     operator_shift_logs: List[Dict[str, Any]] = None
+    butal_by_job: Dict[str, int] = None
     last_shift_butal_qty: int = 0
     last_shift_butal_raw: str = ""
     last_shift_butal_saved_at: Optional[str] = None
@@ -1064,6 +1094,7 @@ class MachineSession:
         d["job_payload"] = d["job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
         d["operator_shift_logs"] = d["operator_shift_logs"] or []
+        d["butal_by_job"] = d["butal_by_job"] or {}
         d["last_shift_butal_by_job"] = d["last_shift_butal_by_job"] or {}
         return d
 
@@ -1112,6 +1143,7 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         linkage_enabled=bool(raw.get("linkage_enabled", False)),
         linkage_jobs=list(raw.get("linkage_jobs") or []),
         operator_shift_logs=list(raw.get("operator_shift_logs") or []),
+        butal_by_job={str(k): int(v or 0) for k, v in dict(raw.get("butal_by_job") or {}).items()},
         last_shift_butal_qty=int(raw.get("last_shift_butal_qty", 0) or 0),
         last_shift_butal_raw=str(raw.get("last_shift_butal_raw") or ""),
         last_shift_butal_saved_at=raw.get("last_shift_butal_saved_at"),
@@ -1590,6 +1622,15 @@ def _reviewer_from_badge(code: str) -> Optional[Dict[str, str]]:
         return {"code": badge, "name": SUPERVISOR_BADGES[badge], "role": "Supervisor", "rights": "supervisor"}
     if badge in QC_BADGES:
         return {"code": badge, "name": QC_BADGES[badge], "role": "QC", "rights": "qc"}
+    profile = _find_profile_by_id_number(badge)
+    if isinstance(profile, dict):
+        company_role = _normalize_company_role(profile.get("company_role") or profile.get("role") or "")
+        extra = str(profile.get("extra_privilege", "") or "").strip().lower()
+        rights = _combine_privileges(_base_privilege_from_company_role(company_role), extra)
+        if rights in ("supervisor", "qc", "both"):
+            role = "Supervisor/QC" if rights == "both" else ("Supervisor" if rights == "supervisor" else "QC")
+            name = str(profile.get("name", "") or "").strip() or badge
+            return {"code": badge, "name": name, "role": role, "rights": rights}
     return None
 
 
@@ -1611,7 +1652,7 @@ def _person_from_badge_any(code: str) -> Optional[Dict[str, str]]:
         return {"code": badge, "name": name, "role": role or "User", "rights": rights or "viewer"}
     profile = _find_profile_by_id_number(badge)
     if isinstance(profile, dict):
-        company_role = _normalize_company_role(profile.get("company_role", ""))
+        company_role = _normalize_company_role(profile.get("company_role") or profile.get("role") or "")
         extra = str(profile.get("extra_privilege", "") or "").strip().lower()
         rights = _combine_privileges(_base_privilege_from_company_role(company_role), extra)
         name = str(profile.get("name", "") or "").strip() or badge
@@ -1687,8 +1728,14 @@ def _combine_privileges(base_privilege: str, extra_privilege: str) -> str:
 
 def load_finished_jobs() -> List[Dict[str, Any]]:
     current_rows = _load_finished_jobs_sql()
+    fallback_rows = _load_json_list(FINISHED_JOBS_FALLBACK_FILE)
     if current_rows is None:
-        raise RuntimeError("finished_jobs SQL storage is unavailable")
+        if fallback_rows:
+            current_rows = fallback_rows
+        else:
+            raise RuntimeError("finished_jobs SQL storage is unavailable")
+    elif fallback_rows:
+        current_rows = list(current_rows) + fallback_rows
     merged: List[Dict[str, Any]] = []
     index_by_key: Dict[str, int] = {}
     for row in current_rows:
@@ -1705,17 +1752,37 @@ def load_finished_jobs() -> List[Dict[str, Any]]:
 
 
 def save_finished_jobs(rows: List[Dict[str, Any]]):
-    if not _save_finished_jobs_sql(rows):
+    json_ok = _save_json_list(FINISHED_JOBS_FALLBACK_FILE, rows)
+    sql_ok = _save_finished_jobs_sql(rows)
+    if not sql_ok and not json_ok:
         raise RuntimeError("finished_jobs SQL storage is unavailable")
 
 
 def load_archived_jobs() -> List[Dict[str, Any]]:
     rows = _load_archived_jobs_sql()
-    return rows if isinstance(rows, list) else []
+    fallback_rows = _load_json_list(ARCHIVED_JOBS_FALLBACK_FILE)
+    if not isinstance(rows, list):
+        rows = []
+    if fallback_rows:
+        merged: List[Dict[str, Any]] = []
+        index_by_key: Dict[str, int] = {}
+        for row in list(rows) + fallback_rows:
+            if not isinstance(row, dict):
+                continue
+            key = _finished_job_key(row)
+            if key in index_by_key:
+                merged[index_by_key[key]] = _prefer_finished_job_row(merged[index_by_key[key]], row)
+                continue
+            index_by_key[key] = len(merged)
+            merged.append(row)
+        return merged
+    return rows
 
 
 def save_archived_jobs(rows: List[Dict[str, Any]]):
-    if not _save_archived_jobs_sql(rows):
+    json_ok = _save_json_list(ARCHIVED_JOBS_FALLBACK_FILE, rows)
+    sql_ok = _save_archived_jobs_sql(rows)
+    if not sql_ok and not json_ok:
         raise RuntimeError("archived_jobs_server SQL storage is unavailable")
 
 
@@ -1959,6 +2026,8 @@ def _extract_primary_part_row(payload: Any) -> Dict[str, Any]:
 def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, po_number: str) -> List[Dict[str, Any]]:
     row = finished_job if isinstance(finished_job, dict) else {}
     payload = row.get("job_payload") if isinstance(row.get("job_payload"), dict) else {}
+    data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    job = data_obj.get("job") if isinstance(data_obj.get("job"), dict) else {}
     part_row = _extract_primary_part_row(payload)
     part_qty_per_unit = _parse_number_like(part_row.get("part_qty_per_unit"))
     if part_qty_per_unit <= 0:
@@ -1966,6 +2035,7 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
     total_good = max(0.0, _parse_number_like(row.get("total_good", 0)))
     raw_logs = row.get("raw_material_logs") if isinstance(row.get("raw_material_logs"), list) else []
     pack_logs = row.get("product_pack_history_logs") if isinstance(row.get("product_pack_history_logs"), list) else []
+    butal_logs = row.get("butal_scan_logs") if isinstance(row.get("butal_scan_logs"), list) else []
     scanned_raw_qty = 0.0
     for item in raw_logs:
         if not isinstance(item, dict):
@@ -2001,7 +2071,30 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
         )
     if butal_total > 0:
         latest_pack = pack_logs[-1] if pack_logs and isinstance(pack_logs[-1], dict) else {}
-        pack_product_id = str(latest_pack.get("product_p") or latest_pack.get("product_id") or "").strip()
+        if not latest_pack and butal_logs:
+            for item in reversed(butal_logs):
+                if isinstance(item, dict) and str(item.get("raw_scan") or "").strip():
+                    parsed_butal = _parse_qr_segments(str(item.get("raw_scan") or ""))
+                    if parsed_butal:
+                        latest_pack = {
+                            "raw_scan": str(item.get("raw_scan") or ""),
+                            "product_p": parsed_butal.get("product_id", ""),
+                            "qty_q": parsed_butal.get("qty", butal_total),
+                            "index": parsed_butal.get("index", "1"),
+                            "total_labels": parsed_butal.get("total", "1"),
+                            "lot_number": parsed_butal.get("lot_number", ""),
+                            "po_number": parsed_butal.get("po_number", ""),
+                        }
+                        break
+        pack_product_id = str(
+            latest_pack.get("product_p")
+            or latest_pack.get("product_id")
+            or row.get("product_id")
+            or job.get("product_id")
+            or part_row.get("product_id")
+            or product_id
+            or ""
+        ).strip()
         pack_meta = _lookup_product_meta(pack_product_id.lstrip("0") if pack_product_id.isdigit() else pack_product_id)
         plan.append(
             {
@@ -2401,8 +2494,17 @@ def _extract_products_from_payload(payload: Any) -> List[Dict[str, str]]:
         pid = str(it.get("id", "") or it.get("product_id", "") or it.get("productId", "")).strip()
         name = str(it.get("name", "") or it.get("product_name", "") or it.get("productName", "")).strip()
         sku = str(it.get("sku", "") or it.get("product_sku", "")).strip()
+        tonnage = str(
+            it.get("tonnage", "")
+            or it.get("tons", "")
+            or it.get("machine_tons", "")
+            or it.get("machineTons", "")
+            or it.get("clamping_force", "")
+            or it.get("clampingForce", "")
+            or ""
+        ).strip()
         if pid and name:
-            out.append({"id": pid, "name": name, "sku": sku})
+            out.append({"id": pid, "name": name, "sku": sku, "tonnage": tonnage})
     return out
 
 
@@ -2824,6 +2926,249 @@ def _fetch_products_from_source() -> List[Dict[str, str]]:
     return _extract_products_from_payload(parsed)
 
 
+def _bms_login_token(bms: Dict[str, Any]) -> str:
+    base_url = str(bms.get("base_url", "")).strip().rstrip("/")
+    username = str(bms.get("username") or bms.get("user") or "").strip()
+    password = str(bms.get("password") or "").strip()
+    ttl_seconds = int(bms.get("ttl_seconds", 604800) or 604800)
+    force_new_token = bool(bms.get("force_new_token", True))
+    if not (base_url and username and password):
+        raise RuntimeError("BMS config is missing base_url, username, or password")
+    auth_url = f"{base_url}/auth/login"
+    auth_variants = [
+        {"identity": username, "password": password, "ttlSeconds": ttl_seconds, "forceNewToken": force_new_token},
+        {"username": username, "password": password},
+    ]
+    last_error: Optional[Exception] = None
+    auth_parsed: Dict[str, Any] = {}
+    for auth_body in auth_variants:
+        req_auth = urllib_request.Request(
+            url=auth_url,
+            data=json.dumps(auth_body).encode("utf-8"),
+            method="POST",
+        )
+        req_auth.add_header("Content-Type", "application/json")
+        req_auth.add_header("Accept", "application/json")
+        try:
+            with urllib_request.urlopen(req_auth, timeout=12) as resp:
+                auth_parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            break
+        except Exception as e:
+            last_error = e
+            auth_parsed = {}
+    if not auth_parsed and last_error is not None:
+        raise last_error
+    token = str(
+        auth_parsed.get("access_token")
+        or auth_parsed.get("token")
+        or ((auth_parsed.get("data") or {}).get("access_token") if isinstance(auth_parsed.get("data"), dict) else "")
+        or ((auth_parsed.get("data") or {}).get("token") if isinstance(auth_parsed.get("data"), dict) else "")
+        or ""
+    ).strip()
+    if not token:
+        raise RuntimeError("BMS login did not return a bearer token")
+    return token
+
+
+def _extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("inventory", "products", "data", "items", "result", "rows"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
+        if isinstance(value, dict):
+            nested = _extract_rows_from_payload(value)
+            if nested:
+                return nested
+    return []
+
+
+def _parse_stock_qty(row: Dict[str, Any]) -> float:
+    for key in (
+        "qty", "quantity", "stock", "stocks", "available", "available_qty",
+        "available_quantity", "on_hand", "onhand", "balance", "total_stock",
+        "warehouse_stock", "current_stock",
+    ):
+        if key in row:
+            try:
+                return float(row.get(key) or 0)
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+def _stock_qty_source(row: Dict[str, Any]) -> str:
+    for key in (
+        "qty", "quantity", "stock", "stocks", "available", "available_qty",
+        "available_quantity", "on_hand", "onhand", "balance", "total_stock",
+        "warehouse_stock", "current_stock",
+    ):
+        if key in row:
+            return key
+    return ""
+
+
+def _product_key_candidates(row: Dict[str, Any]) -> List[str]:
+    keys = []
+    for key in ("product_id", "productId", "id", "product", "item_id", "itemId", "sku", "product_sku", "code"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            keys.append(value)
+    return keys
+
+
+def _fetch_low_stock_recommendations(threshold: float = 100.0, force_refresh: bool = False) -> Dict[str, Any]:
+    cache = _load_json_object(LOW_STOCK_CACHE_FILE)
+    saved_at = str(cache.get("saved_at_utc") or "")
+    try:
+        cache_age = (utc_now() - datetime.fromisoformat(saved_at)).total_seconds() if saved_at else 999999
+    except Exception:
+        cache_age = 999999
+    if not force_refresh and isinstance(cache.get("items"), list) and cache_age < 300 and float(cache.get("threshold", threshold) or threshold) == float(threshold):
+        return {"items": cache.get("items") or [], "from_cache": True, "saved_at_utc": saved_at, "error": ""}
+
+    cfg = _load_product_source_config()
+    bms = cfg.get("bms") if isinstance(cfg.get("bms"), dict) else {}
+    base_url = str(bms.get("base_url", "")).strip().rstrip("/")
+    if not base_url:
+        return {"items": cache.get("items") or [], "from_cache": True, "saved_at_utc": saved_at, "error": "BMS base_url is not configured."}
+
+    token = _bms_login_token(bms)
+    warehouse_ids = bms.get("inventory_warehouse_ids")
+    if not isinstance(warehouse_ids, list) or not warehouse_ids:
+        warehouse_ids = [3, 5, 14, 18, 2]
+    warehouse_names = {
+        "3": "Dock 1",
+        "5": "Dock 2",
+        "14": "Dock 3",
+        "18": "C5",
+        "2": "6116",
+    }
+    products = get_products(force_refresh=False).get("items") or []
+    by_id: Dict[str, Dict[str, Any]] = {}
+    by_sku: Dict[str, Dict[str, Any]] = {}
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        pid = str(product.get("id") or product.get("product_id") or "").strip()
+        sku = str(product.get("sku") or product.get("product_sku") or "").strip()
+        if pid:
+            by_id[pid] = product
+        if sku:
+            by_sku[sku] = product
+
+    stock_by_key: Dict[str, Dict[str, Any]] = {}
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        pid = str(product.get("id") or product.get("product_id") or "").strip()
+        sku = str(product.get("sku") or product.get("product_sku") or "").strip()
+        if not (pid or sku):
+            continue
+        key = pid or sku
+        stock_by_key[key] = {
+            "product_id": pid,
+            "sku": sku,
+            "name": str(product.get("name") or product.get("product_name") or "").strip(),
+            "tonnage": str(product.get("tonnage") or product.get("machine_tons") or product.get("tons") or "").strip(),
+            "unit": "",
+            "qty_source": "stock",
+            "total_stock": 0.0,
+            "warehouses": {},
+        }
+    for wh in warehouse_ids:
+        wh_id = str(wh).strip()
+        if not wh_id:
+            continue
+        req_inv = urllib_request.Request(url=f"{base_url}/inventory/{quote(wh_id)}", method="GET")
+        req_inv.add_header("Authorization", f"Bearer {token}")
+        req_inv.add_header("Accept", "application/json")
+        with urllib_request.urlopen(req_inv, timeout=20) as resp:
+            parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        rows = _extract_rows_from_payload(parsed)
+        for inv in rows:
+            qty = _parse_stock_qty(inv)
+            qty_source = _stock_qty_source(inv)
+            unit = str(inv.get("unit") or inv.get("uom") or inv.get("unit_name") or "").strip()
+            candidates = _product_key_candidates(inv)
+            product = None
+            key = ""
+            for cand in candidates:
+                if cand in by_id:
+                    product = by_id[cand]
+                    key = str(product.get("id") or cand)
+                    break
+                if cand in by_sku:
+                    product = by_sku[cand]
+                    key = str(product.get("id") or cand)
+                    break
+            if product is None:
+                pid = str(inv.get("product_id") or inv.get("productId") or inv.get("id") or "").strip()
+                sku = str(inv.get("sku") or inv.get("product_sku") or inv.get("code") or "").strip()
+                name = str(inv.get("name") or inv.get("product_name") or inv.get("productName") or "").strip()
+                if not (pid or sku):
+                    continue
+                tonnage = str(inv.get("tonnage") or inv.get("machine_tons") or inv.get("tons") or inv.get("clamping_force") or "").strip()
+                product = {"id": pid, "sku": sku, "name": name, "tonnage": tonnage}
+                key = pid or sku
+            entry = stock_by_key.setdefault(key, {
+                "product_id": str(product.get("id") or ""),
+                "sku": str(product.get("sku") or ""),
+                "name": str(product.get("name") or product.get("product_name") or ""),
+                "tonnage": str(product.get("tonnage") or product.get("machine_tons") or product.get("tons") or ""),
+                "unit": unit,
+                "qty_source": qty_source,
+                "total_stock": 0.0,
+                "warehouses": {},
+            })
+            if unit and not entry.get("unit"):
+                entry["unit"] = unit
+            if qty_source and not entry.get("qty_source"):
+                entry["qty_source"] = qty_source
+            entry["total_stock"] = float(entry.get("total_stock") or 0) + qty
+            entry["warehouses"][wh_id] = float(entry["warehouses"].get(wh_id) or 0) + qty
+
+    items = []
+    for entry in stock_by_key.values():
+        total = float(entry.get("total_stock") or 0)
+        if total > float(threshold):
+            continue
+        wh_parts = []
+        for wh_id in [str(x) for x in warehouse_ids]:
+            wh_parts.append({
+                "warehouse_id": wh_id,
+                "warehouse_name": warehouse_names.get(wh_id, wh_id),
+                "qty": entry.get("warehouses", {}).get(wh_id, 0),
+                "unit": entry.get("unit") or "",
+            })
+        items.append({
+            "product_id": entry.get("product_id") or "",
+            "sku": entry.get("sku") or "",
+            "name": entry.get("name") or "",
+            "tonnage": entry.get("tonnage") or "",
+            "total_stock": int(total) if total.is_integer() else round(total, 2),
+            "unit": entry.get("unit") or "",
+            "qty_source": entry.get("qty_source") or "",
+            "threshold": threshold,
+            "warehouses": wh_parts,
+        })
+    items.sort(key=lambda x: (float(x.get("total_stock") or 0), str(x.get("sku") or x.get("product_id") or "")))
+    payload = {
+        "saved_at_utc": utc_now().isoformat(),
+        "threshold": threshold,
+        "items": items,
+    }
+    _save_json_list(LOW_STOCK_CACHE_FILE, payload["items"])
+    try:
+        LOW_STOCK_CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[JSON] Failed to save low stock recommendations: {e}")
+    return {"items": payload["items"], "from_cache": False, "saved_at_utc": payload["saved_at_utc"], "error": ""}
+
+
 def get_products(force_refresh: bool = False) -> Dict[str, Any]:
     cache = _load_product_cache()
     cached_items = cache.get("items") if isinstance(cache.get("items"), list) else []
@@ -3077,15 +3422,20 @@ DASHBOARD_HTML = """
     .planning-controls button { border:0; border-radius:10px; padding:10px 14px; font-weight:800; cursor:pointer; background:#2563eb; color:#fff; box-shadow:0 8px 18px rgba(37,99,235,.22); }
     .planning-controls button.secondary { background:#fff; color:#334155; border:1px solid #cbd5e1; box-shadow:none; }
     .planning-status { margin-top:10px; min-height:20px; color:#64748b; font-size:.85rem; }
-    .planning-board { display:grid; grid-template-columns:260px minmax(0,1fr); gap:14px; margin-top:14px; }
+    .planning-board { display:grid; grid-template-columns:minmax(520px, 620px) minmax(0,1fr); gap:14px; margin-top:14px; }
     .planning-lane, .planning-running { border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.88); box-shadow:0 10px 24px rgba(15,23,42,.06); min-width:0; }
+    .planning-lane.backlog { display:flex; flex-direction:column; height:100%; min-height:620px; overflow:hidden; }
+    .planning-left-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; min-width:0; align-items:stretch; height:100%; }
     .planning-lane-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 12px 8px; border-bottom:1px solid #e2e8f0; }
     .planning-lane-title { font-weight:800; color:#0f172a; }
     .planning-lane-count { color:#64748b; font-size:.78rem; }
     .planning-dropzone { min-height:140px; padding:10px; display:grid; gap:10px; align-content:start; }
+    #planningBacklog { min-height:0; overflow:visible; }
+    .planning-backlog-scroll { min-height:0; overflow:auto; flex:1; display:grid; align-content:start; }
     .planning-dropzone.drag-over { outline:2px dashed #2563eb; outline-offset:-8px; background:#eff6ff; }
-    .planning-machine-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(270px, 1fr)); gap:14px; }
-    .planning-card { border:1px solid #dbe5ef; border-radius:12px; background:#fff; padding:11px; box-shadow:0 8px 18px rgba(15,23,42,.07); cursor:grab; }
+    .planning-machine-grid { display:grid; grid-template-columns:repeat(5, minmax(0, 1fr)); gap:14px; align-content:start; }
+    .planning-card { border:1px solid #dbe5ef; border-radius:12px; background:#fff; padding:11px; box-shadow:0 8px 18px rgba(15,23,42,.07); cursor:default; }
+    .planning-card[draggable="true"] { cursor:grab; }
     .planning-card:active { cursor:grabbing; }
     .planning-card.live { cursor:default; border-color:#bbf7d0; background:#f0fdf4; }
     .planning-card-top { display:flex; align-items:flex-start; justify-content:space-between; gap:8px; }
@@ -3095,6 +3445,27 @@ DASHBOARD_HTML = """
     .planning-card-actions { display:flex; justify-content:flex-end; margin-top:8px; }
     .planning-remove { border:0; background:#fee2e2; color:#b91c1c; border-radius:8px; padding:4px 8px; cursor:pointer; font-size:.72rem; font-weight:800; }
     .planning-empty { color:#94a3b8; border:1px dashed #cbd5e1; border-radius:10px; padding:12px; font-size:.84rem; }
+    .planning-recommend { border-top:1px solid #e2e8f0; background:#f8fbff; overflow:visible; }
+    .planning-recommend-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px; border-bottom:1px solid #e2e8f0; flex-wrap:wrap; }
+    .planning-recommend-title { font-weight:900; color:#0f172a; }
+    .planning-recommend-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .planning-recommend-actions input, .planning-recommend-actions select { width:70px; border:1px solid #cbd5e1; border-radius:10px; padding:7px 8px; font:inherit; background:#fff; }
+    .planning-recommend-actions button { border:0; border-radius:10px; padding:8px 10px; font-weight:800; cursor:pointer; background:#0f766e; color:#fff; }
+    .planning-recommend-list { padding:10px; display:grid; gap:8px; overflow:visible; }
+    .planning-stock-search-row { padding:0 10px 10px; display:grid; gap:7px; }
+    .planning-stock-search-row input { width:100%; box-sizing:border-box; border:1px solid #cbd5e1; border-radius:10px; padding:9px 10px; font:inherit; background:#fff; }
+    .planning-stock-range { display:grid; grid-template-columns:1fr 1fr; gap:7px; }
+    .stock-rec-card { border:1px solid #dbe5ef; border-radius:12px; background:#fff; padding:10px 11px; box-shadow:0 8px 18px rgba(15,23,42,.06); }
+    .stock-rec-top { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
+    .stock-rec-sku { font-weight:900; color:#0f172a; overflow-wrap:anywhere; }
+    .stock-rec-badge { border-radius:999px; padding:4px 8px; font-size:.68rem; font-weight:900; background:#fee2e2; color:#991b1b; white-space:nowrap; }
+    .stock-rec-name { margin-top:5px; font-size:.78rem; color:#475569; line-height:1.35; overflow-wrap:anywhere; }
+    .stock-rec-meta { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; font-size:.72rem; font-weight:800; color:#334155; }
+    .stock-rec-meta span { background:#f1f5f9; border:1px solid #e2e8f0; border-radius:999px; padding:3px 7px; }
+    .stock-rec-add { margin-top:9px; width:100%; border:0; border-radius:9px; padding:8px 10px; font-weight:900; cursor:pointer; background:#dbeafe; color:#1d4ed8; }
+    .planning-dropzone, .planning-backlog-scroll, .planning-recommend-list, .stock-rec-card { cursor:default; }
+    .planning-controls input, .planning-stock-search-row input, .planning-recommend-actions input, .planning-recommend-actions select { cursor:text; }
+    .planning-recommend-actions select { cursor:pointer; }
     .table-actions { display: flex; gap: 8px; }
     .mini-btn { border: 1px solid #cbd5e1; background: #fff; color: #1f2937; border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; cursor: pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .mini-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 12px rgba(15,23,42,0.08); }
@@ -3320,6 +3691,7 @@ DASHBOARD_HTML = """
     .review-pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 600 12px/1.45 "Consolas", "Courier New", monospace; color: #dbeafe; }
     .review-group-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 10px; }
     .review-group-card { border: 1px solid #dbe4f0; border-radius: 12px; background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%); overflow: hidden; }
+    .review-group-card.wide { grid-column: 1 / -1; }
     .review-group-head { padding: 10px 12px; background: linear-gradient(90deg, #e8f0fb 0%, #f4f8fc 100%); border-bottom: 1px solid #dbe4f0; font-size: .83rem; font-weight: 800; color: #334155; letter-spacing: .04em; text-transform: uppercase; }
     .review-group-body { padding: 10px 12px; }
     .review-kv-table { width: 100%; border-collapse: collapse; table-layout: auto; }
@@ -3387,6 +3759,64 @@ DASHBOARD_HTML = """
     .machine-detail-list { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
     .machine-detail-list li { font-size: .88rem; color: #1f2937; }
     .machine-detail-empty { color: #64748b; font-size: .88rem; }
+    .archive-detail-hero { display:grid; grid-template-columns: 1.35fr .9fr; gap:12px; align-items:stretch; background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 58%,#155e75 100%); color:#fff; border-radius:14px; padding:14px; }
+    .archive-detail-hero h3 { margin:0; font-size:1.24rem; letter-spacing:0; }
+    .archive-detail-hero .sub { margin-top:5px; font-size:.86rem; color:#dbeafe; overflow-wrap:anywhere; }
+    .archive-detail-hero .archive-pill-row { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; }
+    .archive-pill { display:inline-flex; align-items:center; border-radius:999px; padding:5px 9px; font-size:.72rem; font-weight:800; letter-spacing:.02em; text-transform:uppercase; background:rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.22); color:#eff6ff; }
+    .archive-detail-hero-side { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+    .archive-hero-stat { background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.20); border-radius:10px; padding:9px 10px; min-width:0; }
+    .archive-hero-stat .k { color:#bfdbfe; font-size:.68rem; font-weight:800; text-transform:uppercase; letter-spacing:.05em; }
+    .archive-hero-stat .v { margin-top:3px; font-size:1.08rem; font-weight:900; overflow-wrap:anywhere; }
+    .archive-metric-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+    .archive-metric { border:1px solid #dbe4f0; background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%); border-radius:10px; padding:10px 11px; min-width:0; }
+    .archive-metric .k { font-size:.72rem; color:#64748b; text-transform:uppercase; font-weight:800; letter-spacing:.04em; }
+    .archive-metric .v { margin-top:4px; font-size:1.1rem; font-weight:900; color:#0f172a; overflow-wrap:anywhere; }
+    .archive-metric.good { border-color:#bbf7d0; background:#f0fdf4; }
+    .archive-metric.warn { border-color:#fed7aa; background:#fff7ed; }
+    .archive-metric.bad { border-color:#fecaca; background:#fef2f2; }
+    .archive-raw-details { margin-top:10px; }
+    .archive-raw-details summary { cursor:pointer; font-size:.82rem; font-weight:800; color:#334155; }
+    .detail-chart-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:10px; }
+    .detail-chart-card { border:1px solid #dbe4f0; border-radius:12px; background:#fff; padding:11px 12px; min-width:0; }
+    .detail-chart-card .head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
+    .detail-chart-card .title { font-size:.78rem; font-weight:900; letter-spacing:.04em; text-transform:uppercase; color:#334155; }
+    .detail-chart-card .value { font-size:.82rem; font-weight:900; color:#0f172a; }
+    .detail-bar { height:13px; border-radius:999px; background:#e5edf5; overflow:hidden; display:flex; border:1px solid #dbe4f0; }
+    .detail-bar-seg { min-width:0; height:100%; }
+    .detail-bar-seg.good { background:#22c55e; }
+    .detail-bar-seg.butal { background:#f59e0b; }
+    .detail-bar-seg.reject { background:#ef4444; }
+    .detail-bar-seg.noshot { background:#64748b; }
+    .detail-bar-legend { display:flex; flex-wrap:wrap; gap:7px 10px; margin-top:8px; }
+    .detail-legend-item { display:inline-flex; align-items:center; gap:5px; font-size:.72rem; font-weight:800; color:#475569; }
+    .detail-dot { width:9px; height:9px; border-radius:999px; display:inline-block; }
+    .detail-dot.good { background:#22c55e; }
+    .detail-dot.butal { background:#f59e0b; }
+    .detail-dot.reject { background:#ef4444; }
+    .detail-dot.noshot { background:#64748b; }
+    .detail-progress { display:grid; gap:7px; }
+    .detail-progress-row { display:grid; grid-template-columns:110px 1fr 52px; align-items:center; gap:8px; font-size:.76rem; font-weight:800; color:#475569; }
+    .detail-progress-track { height:9px; border-radius:999px; background:#e5edf5; overflow:hidden; border:1px solid #dbe4f0; }
+    .detail-progress-fill { height:100%; border-radius:999px; background:#2563eb; }
+    .detail-progress-fill.warn { background:#f59e0b; }
+    .detail-progress-fill.bad { background:#ef4444; }
+    .raw-insight-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:10px; }
+    .raw-insight-card { border:1px solid #dbe4f0; border-radius:12px; background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%); padding:10px 11px; min-width:0; }
+    .raw-insight-card .k { font-size:.7rem; font-weight:900; color:#64748b; text-transform:uppercase; letter-spacing:.04em; }
+    .raw-insight-card .v { margin-top:4px; font-size:1.05rem; font-weight:900; color:#0f172a; overflow-wrap:anywhere; }
+    .raw-insight-card.warn { border-color:#fed7aa; background:#fff7ed; }
+    .raw-insight-card.good { border-color:#bbf7d0; background:#f0fdf4; }
+    .raw-insight-card.bad { border-color:#fecaca; background:#fef2f2; }
+    .raw-match-list { display:grid; gap:8px; }
+    .raw-match-item { border:1px solid #dbe4f0; border-radius:12px; background:#fff; padding:10px 11px; }
+    .raw-match-top { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
+    .raw-match-name { font-weight:900; color:#0f172a; overflow-wrap:anywhere; }
+    .raw-match-status { border-radius:999px; padding:4px 8px; font-size:.7rem; font-weight:900; text-transform:uppercase; white-space:nowrap; background:#e2e8f0; color:#334155; }
+    .raw-match-status.good { background:#dcfce7; color:#166534; }
+    .raw-match-status.warn { background:#ffedd5; color:#9a3412; }
+    .raw-match-status.bad { background:#fee2e2; color:#991b1b; }
+    .raw-match-meta { margin-top:7px; display:flex; flex-wrap:wrap; gap:7px; font-size:.76rem; font-weight:800; color:#475569; }
     body[data-theme="Soft Gray"] { background: #eef1f4; color: #243041; }
     body[data-theme="Soft Gray"] .diag-item,
     body[data-theme="Soft Gray"] .card,
@@ -3506,11 +3936,11 @@ DASHBOARD_HTML = """
     body[data-theme="Soft Gray"] .people-role-list, body[data-theme="Soft Gray"] .settings-table-wrap { border-color: #dbe2eb; }
     body[data-theme="Soft Gray"] .people-role-row { border-bottom-color: #e5e7eb; color: #475569; }
     body[data-theme="Soft Gray"] .people-role-row.head { background: #f8fafc; color: #475569; }
-    @media (max-width: 900px) { .machine-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-    @media (max-width: 1400px) { .grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
-    @media (max-width: 1100px) { .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+    @media (max-width: 900px) { .machine-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .archive-detail-hero { grid-template-columns:1fr; } .archive-metric-grid, .raw-insight-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    @media (max-width: 1400px) { .grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } .planning-board { grid-template-columns:1fr; } .planning-machine-grid { grid-template-columns:repeat(5, minmax(0, 1fr)); } }
+    @media (max-width: 1100px) { .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } .planning-machine-grid { grid-template-columns:repeat(3, minmax(0, 1fr)); } }
     @media (max-width: 1100px) { .diagnostics { grid-template-columns: 48px 48px 48px 48px repeat(2, minmax(180px, 1fr)); } }
-    @media (max-width: 768px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .finished-wrap { grid-template-columns: 1fr; } .finished-grid { grid-template-columns: 1fr; } .overlay-row { grid-template-columns: 1fr; } .main-tab-content { padding: 0 12px 12px; } .main-tabs { padding: 12px; } .diagnostics { padding: 8px 10px; grid-template-columns: 48px 48px 48px 48px 1fr; gap: 6px; } .machine-detail-grid { grid-template-columns: 1fr; } .overlay-card { width: calc(100vw - 18px); border-radius: 16px; } .review-edge-arrow.left { left: 8px; } .review-edge-arrow.right { right: 8px; } .review-subslide.active, .review-group-list { grid-template-columns: 1fr; } #overlayReviewStep { padding: 0 48px; } #overlayReviewStep, .review-form-card { width: 100%; } .people-role-row { grid-template-columns: 1fr; } .operator-directory-row { grid-template-columns: 1fr; gap:6px; padding:10px 12px; } .operator-directory-row.header { display:none; } .operator-directory-label { display:block; } .operator-detail-grid { grid-template-columns:1fr; } .maintenance-topbar { flex-direction:column; } .maintenance-date { text-align:left; white-space:normal; } .maintenance-summary { grid-template-columns:1fr; } .maintenance-list { grid-template-columns:1fr; } .maintenance-person { grid-template-columns:1fr; } .maintenance-avatar-wrap { border-right:none; border-bottom:1px solid #e5ecf4; } .maintenance-stats { border-left:none; border-top:1px solid #e5ecf4; } }
+    @media (max-width: 768px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .finished-wrap { grid-template-columns: 1fr; } .finished-grid { grid-template-columns: 1fr; } .overlay-row { grid-template-columns: 1fr; } .main-tab-content { padding: 0 12px 12px; } .main-tabs { padding: 12px; } .diagnostics { padding: 8px 10px; grid-template-columns: 48px 48px 48px 48px 1fr; gap: 6px; } .machine-detail-grid { grid-template-columns: 1fr; } .archive-detail-hero-side, .archive-metric-grid, .raw-insight-grid, .planning-left-grid { grid-template-columns:1fr; } .planning-machine-grid { grid-template-columns:1fr; } .planning-lane.backlog { min-height:320px; height:auto; } .overlay-card { width: calc(100vw - 18px); border-radius: 16px; } .review-edge-arrow.left { left: 8px; } .review-edge-arrow.right { right: 8px; } .review-subslide.active, .review-group-list { grid-template-columns: 1fr; } #overlayReviewStep { padding: 0 48px; } #overlayReviewStep, .review-form-card { width: 100%; } .people-role-row { grid-template-columns: 1fr; } .operator-directory-row { grid-template-columns: 1fr; gap:6px; padding:10px 12px; } .operator-directory-row.header { display:none; } .operator-directory-label { display:block; } .operator-detail-grid { grid-template-columns:1fr; } .maintenance-topbar { flex-direction:column; } .maintenance-date { text-align:left; white-space:normal; } .maintenance-summary { grid-template-columns:1fr; } .maintenance-list { grid-template-columns:1fr; } .maintenance-person { grid-template-columns:1fr; } .maintenance-avatar-wrap { border-right:none; border-bottom:1px solid #e5ecf4; } .maintenance-stats { border-left:none; border-top:1px solid #e5ecf4; } }
   </style>
 </head>
 <body>
@@ -3573,12 +4003,45 @@ DASHBOARD_HTML = """
         </div>
       </div>
       <div class="planning-board">
-        <div class="planning-lane">
+        <div class="planning-left-grid">
+        <div class="planning-lane backlog">
+            <div class="planning-recommend" style="border-top:none;">
+              <div class="planning-recommend-head">
+                <div>
+                  <div class="planning-recommend-title">Low Stock</div>
+                  <div class="muted">Suggested next-run items from IMS stock.</div>
+                </div>
+                <div class="planning-recommend-actions">
+                  <select id="planningLowStockLimit" title="Items to show">
+                    <option value="10">10</option>
+                    <option value="15" selected>15</option>
+                    <option value="25">25</option>
+                    <option value="50">50</option>
+                  </select>
+                  <button id="planningLowStockRefreshBtn" type="button">Refresh</button>
+                </div>
+              </div>
+              <div class="planning-stock-search-row">
+                <input id="planningLowStockSearch" type="text" placeholder="Search SKU, product ID, or item name..." />
+                <div class="planning-stock-range">
+                  <input id="planningLowStockMin" type="number" min="0" step="1" value="0" placeholder="Min stock" title="Minimum stock" />
+                  <input id="planningLowStockMax" type="number" min="0" step="1" value="100" placeholder="Max stock" title="Maximum stock" />
+                </div>
+              </div>
+              <div id="planningLowStockList" class="planning-recommend-list">
+                <div class="planning-empty">Refresh to load low-stock recommendations.</div>
+              </div>
+            </div>
+        </div>
+        <div class="planning-lane backlog">
           <div class="planning-lane-head">
             <div class="planning-lane-title">Backlog</div>
             <div id="planningBacklogCount" class="planning-lane-count">0 jobs</div>
           </div>
-          <div id="planningBacklog" class="planning-dropzone" data-lane="BACKLOG"></div>
+          <div class="planning-backlog-scroll">
+            <div id="planningBacklog" class="planning-dropzone" data-lane="BACKLOG"></div>
+          </div>
+        </div>
         </div>
         <div id="planningMachineGrid" class="planning-machine-grid"></div>
       </div>
@@ -3724,6 +4187,10 @@ DASHBOARD_HTML = """
           <textarea id="overlayPeopleSummary" readonly style="display:none;"></textarea>
         </div>
         <div id="reviewSubslide6" class="review-subslide">
+          <div class="review-panel">
+            <div class="review-panel-title">Transfer / Print Requirements</div>
+            <div class="review-panel-body" id="overlayTransferPreviewDisplay"></div>
+          </div>
           <div class="review-form-card">
           <div class="overlay-row" style="display:none;"><label>Scan QR Input</label><input id="overlayReviewerScanInput" type="text" placeholder="Click 'Open QR Field' then scan..." style="display:none;" /></div>
           <div class="overlay-row"><label>Reviewer (Supervisor/QC QR)</label><input id="overlayReviewerBadge" type="text" placeholder="Scan supervisor/QC QR badge..." /></div>
@@ -4060,6 +4527,12 @@ DASHBOARD_HTML = """
   const planningBacklog = document.getElementById("planningBacklog");
   const planningBacklogCount = document.getElementById("planningBacklogCount");
   const planningMachineGrid = document.getElementById("planningMachineGrid");
+  const planningLowStockLimit = document.getElementById("planningLowStockLimit");
+  const planningLowStockSearch = document.getElementById("planningLowStockSearch");
+  const planningLowStockMin = document.getElementById("planningLowStockMin");
+  const planningLowStockMax = document.getElementById("planningLowStockMax");
+  const planningLowStockRefreshBtn = document.getElementById("planningLowStockRefreshBtn");
+  const planningLowStockList = document.getElementById("planningLowStockList");
   const finishedShiftQueueList = document.getElementById("finishedShiftQueueList");
   const finishedShiftJobProgress = document.getElementById("finishedShiftJobProgress");
   const finishedJobsList = document.getElementById("finishedJobsList");
@@ -4117,6 +4590,7 @@ DASHBOARD_HTML = """
   const reviewSubslide4 = document.getElementById("reviewSubslide4");
   const reviewSubslide5 = document.getElementById("reviewSubslide5");
   const reviewSubslide6 = document.getElementById("reviewSubslide6");
+  const overlayTransferPreviewDisplay = document.getElementById("overlayTransferPreviewDisplay");
   const overlayProductSelect = document.getElementById("overlayProductSelect");
   const overlayProductSuggest = document.getElementById("overlayProductSuggest");
   const overlayQrPayload = document.getElementById("overlayQrPayload");
@@ -4185,6 +4659,7 @@ DASHBOARD_HTML = """
   let productSuggestionItems = [];
   let productSuggestionIndex = -1;
   const PRODUCT_SUGGEST_LIMIT = 8;
+  let lowStockItemsState = [];
   let generatedQrState = {
     jobKey: "",
     payload: "",
@@ -4263,6 +4738,348 @@ DASHBOARD_HTML = """
     return `<div class="machine-detail-item"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
   }
 
+  function archiveMetric(label, value, tone = ""){
+    return `<div class="archive-metric ${esc(tone)}"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
+  }
+
+  function pctPart(value, total){
+    const n = Math.max(0, Number(value || 0));
+    const t = Math.max(0, Number(total || 0));
+    if(t <= 0 || n <= 0) return 0;
+    return Math.max(1, Math.min(100, Math.round((n / t) * 100)));
+  }
+
+  function productionVisualHtml(row){
+    const r = row || {};
+    const good = Math.max(0, Number(r.good_total ?? r.good ?? 0));
+    const butal = Math.max(0, Number(r.butal_total ?? r.butal ?? 0));
+    const reject = Math.max(0, Number(r.reject_total ?? r.reject ?? 0));
+    const noShot = Math.max(0, Number(r.no_shot_total ?? r.no_shot ?? 0));
+    const total = good + butal + reject + noShot;
+    const goodPct = pctPart(good, total);
+    const butalPct = pctPart(butal, total);
+    const rejectPct = pctPart(reject, total);
+    const noShotPct = pctPart(noShot, total);
+    return `
+      <div class="detail-chart-grid">
+        <div class="detail-chart-card">
+          <div class="head"><div class="title">Production Mix</div><div class="value">${esc(total)} pcs</div></div>
+          <div class="detail-bar" title="Good ${good}, Butal ${butal}, Reject ${reject}, No Shot ${noShot}">
+            <div class="detail-bar-seg good" style="width:${goodPct}%"></div>
+            <div class="detail-bar-seg butal" style="width:${butalPct}%"></div>
+            <div class="detail-bar-seg reject" style="width:${rejectPct}%"></div>
+            <div class="detail-bar-seg noshot" style="width:${noShotPct}%"></div>
+          </div>
+          <div class="detail-bar-legend">
+            <span class="detail-legend-item"><span class="detail-dot good"></span>Good ${esc(good)}</span>
+            <span class="detail-legend-item"><span class="detail-dot butal"></span>Butal ${esc(butal)}</span>
+            <span class="detail-legend-item"><span class="detail-dot reject"></span>Reject ${esc(reject)}</span>
+            <span class="detail-legend-item"><span class="detail-dot noshot"></span>No Shot ${esc(noShot)}</span>
+          </div>
+        </div>
+        <div class="detail-chart-card">
+          <div class="head"><div class="title">Quality Signal</div><div class="value">${esc(total ? Math.round(((good + butal) / total) * 100) : 0)}%</div></div>
+          <div class="detail-progress">
+            <div class="detail-progress-row"><span>Good</span><div class="detail-progress-track"><div class="detail-progress-fill" style="width:${goodPct}%"></div></div><span>${goodPct}%</span></div>
+            <div class="detail-progress-row"><span>Butal</span><div class="detail-progress-track"><div class="detail-progress-fill warn" style="width:${butalPct}%"></div></div><span>${butalPct}%</span></div>
+            <div class="detail-progress-row"><span>Reject</span><div class="detail-progress-track"><div class="detail-progress-fill bad" style="width:${rejectPct}%"></div></div><span>${rejectPct}%</span></div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function firstValue(...values){
+    for(const value of values){
+      if(value !== undefined && value !== null && String(value).trim() !== "") return value;
+    }
+    return "";
+  }
+
+  function normalizedArchiveArray(value){
+    if(Array.isArray(value)) return value;
+    if(value && typeof value === "object") return [value];
+    return [];
+  }
+
+  function archivedMaterialRows(session){
+    const rawScans = Array.isArray(session.raw_material_scans) ? session.raw_material_scans : [];
+    const rawLogs = Array.isArray(session.raw_material_logs) ? session.raw_material_logs : [];
+    const max = Math.max(rawScans.length, rawLogs.length);
+    const rows = [];
+    for(let i = 0; i < max; i += 1){
+      const scan = rawScans[i];
+      const log = rawLogs[i];
+      const scanText = typeof scan === "string" ? scan : "";
+      const scanObj = (scan && typeof scan === "object") ? scan : {};
+      const logObj = (log && typeof log === "object") ? log : {};
+      rows.push({
+        index: i + 1,
+        material: firstValue(
+          logObj.material_name, logObj.material, logObj.product_name, logObj.code, logObj.value,
+          scanObj.material_name, scanObj.material, scanObj.product_name, scanObj.code, scanObj.value,
+          scanText
+        ) || "-",
+        qty: firstValue(logObj.qty, logObj.quantity, scanObj.qty, scanObj.quantity) || "-",
+        lot: firstValue(logObj.lot_number, logObj.lot, scanObj.lot_number, scanObj.lot) || "-",
+        time: firstValue(logObj.timestamp_utc, logObj.scanned_at, scanObj.timestamp_utc, scanObj.scanned_at) || "",
+      });
+    }
+    return rows;
+  }
+
+  function rawPartRows(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const payload = (item.job_payload && typeof item.job_payload === "object") ? item.job_payload : {};
+    const data = (payload.data && typeof payload.data === "object") ? payload.data : {};
+    const details = (data.job_details && typeof data.job_details === "object") ? data.job_details : {};
+    const candidates = [
+      Array.isArray(data.parts) ? data.parts : null,
+      Array.isArray(details.parts) ? details.parts : null,
+      Array.isArray(details.part_ids) ? details.part_ids : null,
+      details.part_ids && typeof details.part_ids === "object" ? [details.part_ids] : null,
+      Array.isArray(data.part_ids) ? data.part_ids : null,
+      Array.isArray(payload.part_ids) ? payload.part_ids : null,
+    ].filter(Boolean);
+    for(const rows of candidates){
+      const clean = rows.filter(x => x && typeof x === "object");
+      if(clean.length) return clean;
+    }
+    return [];
+  }
+
+  function materialLabel(row){
+    const x = row || {};
+    return firstValue(x.material_name, x.material, x.name, x.part_name, x.product_name, x.description, x.sku, x.part_code, x.product_code, x.code, x.value, "-");
+  }
+
+  function materialKeyText(value){
+    return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+  }
+
+  function rawMaterialInsightsHtml(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const materialRows = archivedMaterialRows(item);
+    const parts = rawPartRows(item);
+    const totalGood = Number(item.total_good ?? item.partial_qty ?? ((Number(item.good_total || 0) + Number(item.butal_total || 0))));
+    const scannedQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
+    const expectedQty = parts.reduce((sum, part) => {
+      const perUnit = Number(part.part_qty_per_unit || part.qty_per_unit || 0);
+      const fixedQty = Number(part.request_part_qty || part.required_qty || part.qty || part.quantity || 0);
+      return sum + Math.max(0, perUnit > 0 ? perUnit * totalGood : fixedQty);
+    }, 0);
+    const estimatedUsed = expectedQty > 0 ? Math.min(scannedQty, expectedQty) : "";
+    const estimatedExcess = expectedQty > 0 ? Math.max(0, scannedQty - expectedQty) : "";
+    const partMatches = parts.map(part => {
+      const keys = [part.sku, part.name, part.part_name, part.material_name, part.product_name, part.description, part.part_code, part.product_code, part.code]
+        .map(materialKeyText).filter(Boolean);
+      const scanned = materialRows.reduce((sum, raw) => {
+        const rawKeys = [raw.material, raw.lot].map(materialKeyText).filter(Boolean);
+        const hit = keys.length && rawKeys.some(k => keys.some(pk => k.includes(pk) || pk.includes(k)));
+        return hit ? sum + Math.max(0, Number(raw.qty || 0)) : sum;
+      }, 0);
+      const perUnit = Number(part.part_qty_per_unit || part.qty_per_unit || 0);
+      const required = Math.max(0, perUnit > 0 ? perUnit * totalGood : Number(part.request_part_qty || part.required_qty || part.qty || part.quantity || 0));
+      const status = required <= 0 ? "info" : (scanned >= required ? "good" : (scanned > 0 ? "warn" : "bad"));
+      const statusText = required <= 0 ? "No target" : (scanned >= required ? "Covered" : (scanned > 0 ? "Short" : "Missing"));
+      return { part, scanned, required, status, statusText };
+    });
+    const cards = `
+      <div class="raw-insight-grid">
+        <div class="raw-insight-card ${materialRows.length ? "good" : "bad"}"><div class="k">Scanned Bags</div><div class="v">${esc(materialRows.length)}</div></div>
+        <div class="raw-insight-card"><div class="k">Scanned Qty</div><div class="v">${esc(scannedQty || "-")}</div></div>
+        <div class="raw-insight-card"><div class="k">Expected Use</div><div class="v">${esc(expectedQty || "-")}</div></div>
+        <div class="raw-insight-card ${Number(estimatedExcess || 0) > 0 ? "warn" : "good"}"><div class="k">Est. Excess</div><div class="v">${esc(estimatedExcess === "" ? "-" : estimatedExcess)}</div></div>
+      </div>
+    `;
+    const coverage = partMatches.length ? `
+      <div class="raw-match-list">
+        ${partMatches.map(x => `
+          <div class="raw-match-item">
+            <div class="raw-match-top">
+              <div class="raw-match-name">${esc(materialLabel(x.part))}</div>
+              <span class="raw-match-status ${esc(x.status)}">${esc(x.statusText)}</span>
+            </div>
+            <div class="raw-match-meta">
+              <span>Required: ${esc(x.required || "-")}</span>
+              <span>Scanned: ${esc(x.scanned || 0)}</span>
+              <span>Per Unit: ${esc(x.part.part_qty_per_unit || x.part.qty_per_unit || "-")}</span>
+              <span>Code: ${esc(x.part.sku || x.part.part_code || x.part.product_code || x.part.code || "-")}</span>
+            </div>
+          </div>
+        `).join("")}
+      </div>
+    ` : `<div class="machine-detail-empty">No target raw material list found from the Job API.</div>`;
+    const table = tableFromRows(materialRows, [
+      { label: "#", value: x => x.index },
+      { label: "Material / Scan", value: x => x.material },
+      { label: "Qty", value: x => x.qty },
+      { label: "Lot", value: x => x.lot },
+      { label: "Scanned At", value: x => fmtDateLocal(x.time || "") },
+    ], "No raw materials scanned.", 12);
+    return `
+      ${cards}
+      <div class="review-group-list">
+        <div class="review-group-card wide">
+          <div class="review-group-head">Scanned Materials</div>
+          <div class="review-group-body">${table}</div>
+        </div>
+        <div class="review-group-card wide">
+          <div class="review-group-head">Material Coverage</div>
+          <div class="review-group-body">${coverage}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function archivePrintRows(session){
+    const row = (session && session._archive_row && typeof session._archive_row === "object") ? session._archive_row : session;
+    const payloads = [
+      ...normalizedArchiveArray(row.print_request_payloads),
+      ...normalizedArchiveArray(row.print_request_payload),
+      ...normalizedArchiveArray(row.printed_qr_payload),
+    ].filter(Boolean);
+    return payloads.map((item, idx) => {
+      const obj = (item && typeof item === "object") ? item : {};
+      const plan = Array.isArray(obj.plan) ? obj.plan : [];
+      const firstPlan = plan.find(x => x && typeof x === "object") || {};
+      return {
+        index: idx + 1,
+        stage: firstValue(obj.qr_stage_label, obj.stage_label, obj.stage, firstPlan.label, firstPlan.stage, firstPlan.kind, "Print Request"),
+        product: firstValue(obj.product_name, obj.product_id, firstPlan.product_name, firstPlan.product_id, obj.product, "-"),
+        qty: firstValue(obj.qty, obj.quantity, firstPlan.qty, firstPlan.quantity, "-"),
+        po: firstValue(obj.po_number, firstPlan.po_number, "-"),
+        lot: firstValue(obj.lot_number, firstPlan.lot_number, "-"),
+        printed_at: firstValue(obj.printed_at_utc, obj.created_at_utc, row.printed_at_utc, row.archived_at_utc, ""),
+      };
+    });
+  }
+
+  function renderArchivedMachineDetail(session){
+    const job = extractJobRecord(session) || {};
+    const row = (session && session._archive_row && typeof session._archive_row === "object") ? session._archive_row : {};
+    const totalGood = Number(row.total_good ?? (Number(session.good_total || 0) + Number(session.butal_total || 0)));
+    const rejectRows = Object.entries((session.reject_breakdown && typeof session.reject_breakdown === "object") ? session.reject_breakdown : {})
+      .sort((a,b) => String(a[0]).localeCompare(String(b[0])))
+      .map(([reason, qty]) => ({reason, qty}));
+    const materialRows = archivedMaterialRows(session);
+    const scannedRawQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
+    const part = primaryRawPart(row);
+    const perUnit = Number(part.part_qty_per_unit || 0);
+    const estimatedUsed = perUnit > 0 ? totalGood * perUnit : 0;
+    const estimatedExcess = estimatedUsed > 0 ? Math.max(0, scannedRawQty - estimatedUsed) : "";
+    const printRows = archivePrintRows(session);
+    const reviewLogs = Array.isArray(row.reject_review_logs) ? row.reject_review_logs : [];
+    const approvedBy = row.supervisor_name || row.qc_name || (reviewLogs.find(x => x?.actor_name)?.actor_name) || "-";
+    machineDetailTitle.textContent = `${session.machine_name || session.machine_code || "Archived Job"} Archive`;
+    if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "none";
+    if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
+    machineDetailBody.innerHTML = `
+      <div class="archive-detail-hero">
+        <div>
+          <h3>${esc(session.job_name || session.job_code || "Archived Job")}</h3>
+          <div class="sub">${esc(session.machine_name || session.machine_code || "-")} | Job ${esc(session.job_code || "-")}</div>
+          <div class="archive-pill-row">
+            <span class="archive-pill">${esc(row.archive_status || "Archived")}</span>
+            <span class="archive-pill">Printed ${esc(fmtDateLocal(row.printed_at_utc || ""))}</span>
+            <span class="archive-pill">Operator ${esc(displayNameForId(session.operator_id || "-"))}</span>
+          </div>
+        </div>
+        <div class="archive-detail-hero-side">
+          <div class="archive-hero-stat"><div class="k">Total Good</div><div class="v">${esc(totalGood)}</div></div>
+          <div class="archive-hero-stat"><div class="k">Butal</div><div class="v">${esc(session.butal_total || 0)}</div></div>
+          <div class="archive-hero-stat"><div class="k">Raw Sacks</div><div class="v">${esc(session.raw_sacks_count || materialRows.length || 0)}</div></div>
+          <div class="archive-hero-stat"><div class="k">Printed QR</div><div class="v">${esc(printRows.length || (row.printed_qr_payload ? 1 : 0))}</div></div>
+        </div>
+      </div>
+      <div class="machine-detail-section">
+        <h4>Job Summary</h4>
+        <div class="machine-detail-grid">
+          ${detailItem("Machine", session.machine_code || "-")}
+          ${detailItem("Machine Name", session.machine_name || "-")}
+          ${detailItem("Archive Status", row.archive_status || "Archived")}
+          ${detailItem("Job Code", session.job_code || "-")}
+          ${detailItem("Job Name", session.job_name || "-")}
+          ${detailItem("Job Ref", job.ref_no || job.reference || job.id || "-")}
+          ${detailItem("Product ID", job.product_id || "-")}
+          ${detailItem("Mold", job.custom_05 || "-")}
+          ${detailItem("Color", job.custom_06 || "-")}
+          ${detailItem("System Code", job.custom_09 || "-")}
+          ${detailItem("Target / Cavity Info", job.custom_11 || "-")}
+          ${detailItem("Approved By", approvedBy)}
+          ${detailItem("Finished At", fmtDateLocal(row.finished_at_utc || ""))}
+          ${detailItem("Printed At", fmtDateLocal(row.printed_at_utc || ""))}
+          ${detailItem("Archived At", fmtDateLocal(row.archived_at_utc || ""))}
+        </div>
+      </div>
+      <div class="machine-detail-section">
+        <h4>Production Summary</h4>
+        <div class="archive-metric-grid">
+          ${archiveMetric("Pack", Number(row.pack_count ?? session.pack_total ?? 0))}
+          ${archiveMetric("Good", Number(session.good_total || 0), "good")}
+          ${archiveMetric("Butal", Number(session.butal_total || 0), Number(session.butal_total || 0) > 0 ? "warn" : "")}
+          ${archiveMetric("Reject", Number(session.reject_total || 0), Number(session.reject_total || 0) > 0 ? "bad" : "")}
+          ${archiveMetric("No Shot", Number(session.no_shot_total || 0))}
+          ${archiveMetric("Total Good", totalGood, "good")}
+          ${archiveMetric("Startup Reject", Number(session.startup_reject_total || 0))}
+          ${archiveMetric("Cycle Time", session.cycle_time_current || "-")}
+        </div>
+        ${productionVisualHtml(session)}
+      </div>
+      <div class="machine-detail-section">
+        <h4>Raw Materials</h4>
+        ${rawMaterialInsightsHtml(row)}
+      </div>
+      <div class="machine-detail-section">
+        <h4>Transfer / Print Records</h4>
+        ${tableFromRows(printRows, [
+          { label: "#", value: x => x.index },
+          { label: "Stage", value: x => x.stage },
+          { label: "Product", value: x => x.product },
+          { label: "Qty", value: x => x.qty },
+          { label: "PO", value: x => x.po },
+          { label: "Lot", value: x => x.lot },
+          { label: "Printed At", value: x => fmtDateLocal(x.printed_at || "") },
+        ], "No print request payload recorded.", 8)}
+      </div>
+      <div class="machine-detail-section">
+        <h4>Rejects & Downtime</h4>
+        <div class="review-group-list">
+          <div class="review-group-card">
+            <div class="review-group-head">Reject Breakdown</div>
+            <div class="review-group-body">${tableFromRows(rejectRows, [
+              { label: "Reason", value: x => x.reason },
+              { label: "Qty", value: x => x.qty },
+            ], "No reject details recorded.", 8)}</div>
+          </div>
+          <div class="review-group-card">
+            <div class="review-group-head">Downtime</div>
+            <div class="review-group-body">
+              <div class="machine-detail-grid">
+                ${detailItem("Reason Code", session.downtime_reason_code || "-")}
+                ${detailItem("Reason", session.downtime_reason_text || "-")}
+                ${detailItem("Duration", fmtDowntimeSeconds(session.downtime_last_seconds))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="machine-detail-section">
+        <h4>Job API Details</h4>
+        <div class="machine-detail-grid">
+          ${detailItem("Customer", job.customer_02 || job.customer || "-")}
+          ${detailItem("Status", job.status || "-")}
+          ${detailItem("Remarks", job.remarks || "-")}
+        </div>
+        <details class="archive-raw-details">
+          <summary>Show raw Job API payload</summary>
+          <div class="machine-detail-code" style="margin-top:8px;">${escJson(session.job_payload || {})}</div>
+        </details>
+      </div>
+    `;
+    machineDetailOverlay.classList.add("active");
+  }
+
   function machineStatusOverrideFor(code){
     const c = String(code || "").trim();
     return (machineStatusOverridesState && machineStatusOverridesState[c]) || null;
@@ -4270,7 +5087,13 @@ DASHBOARD_HTML = """
 
   function openMachineDetail(session){
     if(!session) return;
+    if(session._is_archived_detail){
+      activeMachineDetailCode = String(session.machine_code || "").trim();
+      renderArchivedMachineDetail(session);
+      return;
+    }
     activeMachineDetailCode = String(session.machine_code || "").trim();
+    if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "";
     const activeTtlSeconds = Number((latestState && latestState.active_ttl_seconds) || 30);
     const manual = machineStatusOverrideFor(activeMachineDetailCode);
     const manualStatus = String((manual && manual.status) || "").trim();
@@ -4283,9 +5106,36 @@ DASHBOARD_HTML = """
     const rejectRows = Object.entries(rejectBreakdown).sort((a,b) => String(a[0]).localeCompare(String(b[0])));
     const rawScans = Array.isArray(session.raw_material_scans) ? session.raw_material_scans : [];
     const rawLogs = Array.isArray(session.raw_material_logs) ? session.raw_material_logs : [];
-    const rawConsumptionHtml = rawLogs.length
-      ? `<ol class="machine-detail-list">${rawLogs.map(x => `<li>${esc((x && (x.material || x.code || x.value)) || "-")} | qty=${esc((x && x.qty) ?? 0)}</li>`).join("")}</ol>`
-      : `<div class="machine-detail-empty">No raw material consumption records.</div>`;
+    const materialRows = archivedMaterialRows(session);
+    const scannedRawQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
+    const activeJobSummaryHtml = session.job_code || session.job_name ? `
+      <div class="archive-detail-hero">
+        <div>
+          <h3>${esc(session.job_name || session.job_code || "Active Job")}</h3>
+          <div class="sub">${esc(session.machine_name || session.machine_code || "-")} | Job ${esc(session.job_code || "-")}</div>
+          <div class="archive-pill-row">
+            <span class="archive-pill">${esc(status)}</span>
+            <span class="archive-pill">Operator ${esc(displayNameForId(session.operator_id || "-"))}</span>
+            <span class="archive-pill">Raw Bags ${esc(session.raw_sacks_count || materialRows.length || 0)}</span>
+          </div>
+        </div>
+        <div class="archive-detail-hero-side">
+          <div class="archive-hero-stat"><div class="k">Good</div><div class="v">${esc(session.good_total || 0)}</div></div>
+          <div class="archive-hero-stat"><div class="k">Butal</div><div class="v">${esc(session.butal_total || 0)}</div></div>
+          <div class="archive-hero-stat"><div class="k">Reject</div><div class="v">${esc(session.reject_total || 0)}</div></div>
+          <div class="archive-hero-stat"><div class="k">Total Good</div><div class="v">${esc(totalGood)}</div></div>
+        </div>
+      </div>
+    ` : "";
+    const rawMaterialsHtml = materialRows.length
+      ? tableFromRows(materialRows, [
+          { label: "#", value: x => x.index },
+          { label: "Material / Scan", value: x => x.material },
+          { label: "Qty", value: x => x.qty },
+          { label: "Lot", value: x => x.lot },
+          { label: "Scanned At", value: x => fmtDateLocal(x.time || "") },
+        ], "No raw materials scanned.", 12)
+      : `<div class="machine-detail-empty">No raw materials scanned.</div>`;
     const rejectHtml = rejectRows.length
       ? `<ol class="machine-detail-list">${rejectRows.map(([k,v]) => `<li>${esc(k)} = ${esc(v)}</li>`).join("")}</ol>`
       : `<div class="machine-detail-empty">No reject details recorded.</div>`;
@@ -4296,6 +5146,7 @@ DASHBOARD_HTML = """
     if(machineDetailStatusSetterBadge) machineDetailStatusSetterBadge.value = "";
     if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
     machineDetailBody.innerHTML = `
+      ${activeJobSummaryHtml}
       <div class="machine-detail-section">
         <h4>Overview</h4>
         <div class="machine-detail-grid">
@@ -4315,19 +5166,21 @@ DASHBOARD_HTML = """
       </div>
       <div class="machine-detail-section">
         <h4>Production Counters</h4>
-        <div class="machine-detail-grid">
-          ${detailItem("Pack", Number(session.pack_total || 0))}
-          ${detailItem("Good", Number(session.good_total || 0))}
-          ${detailItem("Butal", Number(session.butal_total || 0))}
-          ${detailItem("Reject", Number(session.reject_total || 0))}
-          ${detailItem("No Shot", Number(session.no_shot_total || 0))}
-          ${detailItem("Total Good", totalGood)}
-          ${detailItem("Start Up Reject", Number(session.startup_reject_total || 0))}
-          ${detailItem("Raw Sacks Count", Number(session.raw_sacks_count || 0))}
-          ${detailItem("Cycle Time", session.cycle_time_current || "-")}
-          ${detailItem("Maintenance/Downtime", maintenanceMode ? "YES" : "NO")}
-          ${detailItem("Downtime Active", session.downtime_active ? "YES" : "NO")}
+        <div class="archive-metric-grid">
+          ${archiveMetric("Pack", Number(session.pack_total || 0))}
+          ${archiveMetric("Good", Number(session.good_total || 0), "good")}
+          ${archiveMetric("Butal", Number(session.butal_total || 0), Number(session.butal_total || 0) > 0 ? "warn" : "")}
+          ${archiveMetric("Reject", Number(session.reject_total || 0), Number(session.reject_total || 0) > 0 ? "bad" : "")}
+          ${archiveMetric("No Shot", Number(session.no_shot_total || 0))}
+          ${archiveMetric("Total Good", totalGood, "good")}
+          ${archiveMetric("Startup Reject", Number(session.startup_reject_total || 0))}
+          ${archiveMetric("Raw Sacks", Number(session.raw_sacks_count || 0))}
+          ${archiveMetric("Scanned Raw Qty", scannedRawQty || "-")}
+          ${archiveMetric("Cycle Time", session.cycle_time_current || "-")}
+          ${archiveMetric("Maintenance", maintenanceMode ? "YES" : "NO")}
+          ${archiveMetric("Downtime Active", session.downtime_active ? "YES" : "NO")}
         </div>
+        ${productionVisualHtml(session)}
       </div>
       <div class="machine-detail-section">
         <h4>Downtime</h4>
@@ -4343,24 +5196,31 @@ DASHBOARD_HTML = """
         ${rejectHtml}
       </div>
       <div class="machine-detail-section">
-        <h4>Raw Materials (Scanned IDs)</h4>
-        ${rawScans.length ? `<div class="machine-detail-code">${esc(rawScans.join("\\n"))}</div>` : `<div class="machine-detail-empty">No raw materials scanned.</div>`}
+        <h4>Raw Materials</h4>
+        ${rawMaterialInsightsHtml(session)}
+        ${rawScans.length ? `
+          <details class="archive-raw-details">
+            <summary>Show scanned raw text</summary>
+            <div class="machine-detail-code" style="margin-top:8px;">${esc(rawScans.map(x => typeof x === "string" ? x : compactValue(x)).join("\\n"))}</div>
+          </details>
+        ` : ""}
       </div>
       <div class="machine-detail-section">
-        <h4>Raw Materials Consumption</h4>
-        ${rawConsumptionHtml}
-      </div>
-      <div class="machine-detail-section">
-        <h4>Job Details Payload</h4>
+        <h4>Job Details</h4>
         <div class="machine-detail-grid">
           ${detailItem("Job Ref", job.ref_no || job.reference || job.id || "-")}
           ${detailItem("Product ID", job.product_id || "-")}
           ${detailItem("Mold", job.custom_05 || "-")}
           ${detailItem("Color", job.custom_06 || "-")}
           ${detailItem("System Code", job.custom_09 || "-")}
-          ${detailItem("Cavities", job.custom_11 || "-")}
+          ${detailItem("Target / Cavity Info", job.custom_11 || "-")}
+          ${detailItem("Status", job.status || "-")}
+          ${detailItem("Remarks", job.remarks || "-")}
         </div>
-        <div class="machine-detail-code">${escJson(session.job_payload || {})}</div>
+        <details class="archive-raw-details">
+          <summary>Show raw Job API payload</summary>
+          <div class="machine-detail-code" style="margin-top:8px;">${escJson(session.job_payload || {})}</div>
+        </details>
       </div>
     `;
     machineDetailOverlay.classList.add("active");
@@ -4373,6 +5233,7 @@ DASHBOARD_HTML = """
     if(machineStatusSaveFeedback) machineStatusSaveFeedback.classList.remove("active");
     if(machineStatusSaveBar) machineStatusSaveBar.style.width = "0%";
     if(machineStatusSaveCheck) machineStatusSaveCheck.classList.remove("done");
+    if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "";
   }
 
   function applyDashboardTheme(themeName){
@@ -4561,7 +5422,7 @@ DASHBOARD_HTML = """
   function displayNameForId(idValue){
     const raw = String(idValue || "").trim();
     if(!raw) return "-";
-    const combinedMatch = raw.match(/^\s*[\w-]+\s*-\s*(.+)\s*$/);
+    const combinedMatch = raw.match(/^\\s*[\\w-]+\\s*-\\s*(.+)\\s*$/);
     if(combinedMatch && String(combinedMatch[1] || "").trim()){
       return String(combinedMatch[1] || "").trim();
     }
@@ -4969,26 +5830,104 @@ DASHBOARD_HTML = """
     `;
   }
 
+  function primaryRawPart(row){
+    const payload = (row?.job_payload && typeof row.job_payload === "object") ? row.job_payload : {};
+    const data = (payload.data && typeof payload.data === "object") ? payload.data : {};
+    const details = (data.job_details && typeof data.job_details === "object") ? data.job_details : {};
+    const candidates = [
+      Array.isArray(data.parts) ? data.parts : null,
+      Array.isArray(details.parts) ? details.parts : null,
+      Array.isArray(details.part_ids) ? details.part_ids : null,
+      details.part_ids && typeof details.part_ids === "object" ? [details.part_ids] : null,
+      Array.isArray(data.part_ids) ? data.part_ids : null,
+    ].filter(Boolean);
+    for(const rows of candidates){
+      const first = rows.find(x => x && typeof x === "object");
+      if(first) return first;
+    }
+    return {};
+  }
+
+  function transferPreviewRows(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const rawLogs = Array.isArray(item.raw_material_logs) ? item.raw_material_logs : [];
+    const packLogs = Array.isArray(item.product_pack_history_logs) ? item.product_pack_history_logs : [];
+    const part = primaryRawPart(item);
+    const partQtyPerUnit = Number(part.part_qty_per_unit || 0);
+    const totalGood = Number(item.total_good ?? ((Number(item.good_total || 0) + Number(item.butal_total || 0))));
+    const scannedRawQty = rawLogs.reduce((sum, x) => sum + Math.max(0, Number(x?.qty || x?.quantity || 0)), 0);
+    const usedRawQty = partQtyPerUnit > 0 ? Math.min(scannedRawQty, totalGood * partQtyPerUnit) : 0;
+    const rawExcessQty = Math.max(0, Math.floor(scannedRawQty - usedRawQty));
+    const butalQty = Math.max(0, Number(item.butal_total || 0));
+    const latestRaw = rawLogs.length ? rawLogs[rawLogs.length - 1] : {};
+    const latestPack = packLogs.length ? packLogs[packLogs.length - 1] : {};
+    const rows = [];
+    if(rawExcessQty > 0){
+      rows.push({
+        stage: "Raw Material Excess",
+        qty: rawExcessQty,
+        product: latestRaw.material_name || latestRaw.material || part.name || part.material_name || part.sku || "Select product",
+        po: "Not required",
+        required: "Product and generated lot",
+      });
+    }
+    if(butalQty > 0){
+      rows.push({
+        stage: "Butal Return",
+        qty: butalQty,
+        product: latestPack.product_name || latestPack.product_p || latestPack.product_id || item.job_name || "Finished product",
+        po: "Required",
+        required: "PO number before print request",
+      });
+    }
+    if(!rows.length){
+      rows.push({
+        stage: "Default Raw Material QR",
+        qty: 1,
+        product: "Selected product",
+        po: "Not required",
+        required: "Only used when no raw excess or Butal exists",
+      });
+    }
+    return rows;
+  }
+
+  function renderTransferPreviewHtml(row){
+    return tableFromRows(transferPreviewRows(row), [
+      { label: "Stage", value: x => x.stage },
+      { label: "Qty", value: x => x.qty },
+      { label: "Product", value: x => x.product },
+      { label: "PO", value: x => x.po },
+      { label: "Needed Before Transfer", value: x => x.required },
+    ], "No transfer data.", 6);
+  }
+
   function renderShiftGroupedPanelHtml(panel, emptyLabel = "No data."){
     const groups = Array.isArray(panel) ? panel : [];
     if(!groups.length) return `<div class="machine-detail-empty">${esc(emptyLabel)}</div>`;
     return `
       <div class="review-group-list">
         ${groups.map(group => {
-          const title = String(group?.title || "").trim() || "Section";
+          const rawTitle = group && Object.prototype.hasOwnProperty.call(group, "title") ? group.title : "Section";
+          const title = String(rawTitle || "").trim();
           const kind = String(group?.kind || "json").trim();
           const content = group?.content;
           let bodyHtml = "";
           if(kind === "table"){
             bodyHtml = renderKeyValueTableHtml(content, emptyLabel);
+          } else if(kind === "metrics"){
+            const metrics = Array.isArray(content) ? content : [];
+            bodyHtml = metrics.length
+              ? `<div class="archive-metric-grid">${metrics.map(x => archiveMetric(x?.label || "-", x?.value ?? "-", x?.tone || "")).join("")}</div>`
+              : `<div class="machine-detail-empty">${esc(emptyLabel)}</div>`;
           } else if(kind === "html") {
             bodyHtml = String(content || "");
           } else {
             bodyHtml = `<div class="machine-detail-empty">Details are summarized in the other cards.</div>`;
           }
           return `
-            <div class="review-group-card">
-              <div class="review-group-head">${esc(title)}</div>
+            <div class="review-group-card ${group?.wide ? "wide" : ""}">
+              ${title ? `<div class="review-group-head">${esc(title)}</div>` : ""}
               <div class="review-group-body">${bodyHtml}</div>
             </div>
           `;
@@ -5014,10 +5953,32 @@ DASHBOARD_HTML = """
     else if(Array.isArray(payload.part_ids)) targetRawMaterials = payload.part_ids.filter(x => x && typeof x === "object");
     const rawLogs = Array.isArray(item.raw_material_logs) ? item.raw_material_logs : [];
     const rawScans = Array.isArray(item.raw_material_scans) ? item.raw_material_scans : [];
+    const materialRows = archivedMaterialRows(item);
     const packHistory = Array.isArray(item.product_pack_history_logs) ? item.product_pack_history_logs : [];
     const rejectReviews = Array.isArray(item.reject_review_logs) ? item.reject_review_logs : [];
     const rejectBreakdownRows = Object.entries((item.reject_breakdown && typeof item.reject_breakdown === "object") ? item.reject_breakdown : {})
       .map(([reason, qty]) => ({reason, qty}));
+    const totalGood = Number(item.total_good ?? item.partial_qty ?? ((Number(item.good_total || 0) + Number(item.butal_total || 0))));
+    const scannedRawQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
+    const shiftHero = `
+      <div class="archive-detail-hero">
+        <div>
+          <h3>${esc(item.job_name || item.job_code || "Shift Review")}</h3>
+          <div class="sub">${esc(item.machine_name || item.machine_code || "-")} | Shift ${esc(item.shift_index ?? "-")} | ${esc(item.reason || "Shift handoff")}</div>
+          <div class="archive-pill-row">
+            <span class="archive-pill">${esc(item.review_status || "Pending Review")}</span>
+            <span class="archive-pill">Operator ${esc(displayNameForId(item.operator_id || item.operator_name || "-"))}</span>
+            <span class="archive-pill">Ended ${esc(fmtDateLocal(item.ended_at_utc || item.finished_at_utc || ""))}</span>
+          </div>
+        </div>
+        <div class="archive-detail-hero-side">
+          <div class="archive-hero-stat"><div class="k">Total Good</div><div class="v">${esc(totalGood)}</div></div>
+          <div class="archive-hero-stat"><div class="k">Good</div><div class="v">${esc(item.good_total ?? 0)}</div></div>
+          <div class="archive-hero-stat"><div class="k">Butal</div><div class="v">${esc(item.butal_total ?? 0)}</div></div>
+          <div class="archive-hero-stat"><div class="k">Reject</div><div class="v">${esc(item.reject_total ?? 0)}</div></div>
+        </div>
+      </div>
+    `;
     const materialKey = value => String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
     const partKeys = part => [part?.sku, part?.name, part?.part_name, part?.material_name, part?.product_name, part?.description]
       .map(materialKey)
@@ -5092,10 +6053,33 @@ DASHBOARD_HTML = """
     };
     return {
       summary: [
-        { title: "Shift / Job", kind: "table", content: summaryIdentity },
-        { title: "Production Counts", kind: "table", content: summaryProduction },
-        { title: "Timing / Downtime", kind: "table", content: summaryTiming },
-        { title: "People / Counts", kind: "table", content: summaryPeople },
+        { title: "", kind: "html", wide: true, content: shiftHero },
+        { title: "Production", kind: "metrics", wide: true, content: [
+          { label: "Pack", value: item.pack_count ?? 0 },
+          { label: "Good", value: item.good_total ?? 0, tone: "good" },
+          { label: "Butal", value: item.butal_total ?? 0, tone: Number(item.butal_total || 0) > 0 ? "warn" : "" },
+          { label: "Reject", value: item.reject_total ?? 0, tone: Number(item.reject_total || 0) > 0 ? "bad" : "" },
+          { label: "No Shot", value: item.no_shot_total ?? 0 },
+          { label: "Startup Reject", value: item.startup_reject_total ?? 0 },
+          { label: "Total Good", value: totalGood, tone: "good" },
+          { label: "Partial Qty", value: item.partial_qty ?? totalGood },
+        ] },
+        { title: "Production Chart", kind: "html", wide: true, content: productionVisualHtml(item) },
+        { title: "Shift Details", kind: "html", content: renderKeyValueTableHtml({
+          record_type: item.record_type || "SHIFT_PARTIAL",
+          reason: item.reason || "-",
+          machine: `${item.machine_name || item.machine_code || "-"} (${item.machine_code || "-"})`,
+          job: `${item.job_name || "-"} (${item.job_code || "-"})`,
+          shift_index: item.shift_index ?? "-",
+          started: fmtDateLocal(item.started_at_utc || ""),
+          ended: fmtDateLocal(item.ended_at_utc || item.finished_at_utc || ""),
+        }) },
+        { title: "Timing", kind: "metrics", content: [
+          { label: "Cycle Time", value: item.cycle_time_current || "-" },
+          { label: "Shift Avg", value: item.cycle_time_shift_avg_seconds ?? "-" },
+          { label: "Qty / Shift Avg", value: item.qty_per_shift_avg_cycle ?? "-" },
+          { label: "Downtime", value: fmtDowntimeSeconds(item.downtime_last_seconds ?? 0), tone: Number(item.downtime_last_seconds || 0) > 0 ? "warn" : "" },
+        ] },
       ],
       rejects: [
         { title: "Reject Breakdown", kind: "html", content: tableFromRows(rejectBreakdownRows, [
@@ -5110,23 +6094,13 @@ DASHBOARD_HTML = """
         ], "No reject review logs recorded.", 5) },
       ],
       rawConsumption: [
+        { title: "Raw Material Status", kind: "html", wide: true, content: rawMaterialInsightsHtml(item) },
         { title: "Target Raw Materials", kind: "html", content: tableFromRows(targetRawMaterials, [
           { label: "SKU", value: x => x.sku || x.part_code || x.product_code || x.code || "-" },
           { label: "Material", value: x => x.name || x.part_name || x.material_name || x.product_name || x.description || "-" },
           { label: "Target Qty", value: x => x.request_part_qty || x.qty || x.quantity || x.required_qty || "-" },
           { label: "Scanned Qty", value: x => scannedQtyForPart(x) || 0 },
         ], "No target raw materials from Job API.", 8) },
-        { title: "Scanned Raw Materials", kind: "html", content: tableFromRows(rawLogs, [
-          { label: "Material", value: x => x.material_name || x.material || x.code || x.value || "-" },
-          { label: "Qty", value: x => x.qty ?? x.quantity ?? "-" },
-          { label: "Lot", value: x => x.lot_number || x.lot || "-" },
-          { label: "Time", value: x => fmtDateLocal(x.timestamp_utc || x.scanned_at || "") || "-" },
-        ], "No raw material logs recorded.", 5) },
-        { title: "Raw Material Scans", kind: "html", content: tableFromRows(rawScans, [
-          { label: "Material", value: x => x.material_name || x.material || x.code || x.value || "-" },
-          { label: "Qty", value: x => x.qty ?? x.quantity ?? "-" },
-          { label: "Lot", value: x => x.lot_number || x.lot || "-" },
-        ], "No raw material scans recorded.", 5) },
         { title: "Product Pack History", kind: "html", content: tableFromRows(packHistory, [
           { label: "Type", value: x => x.type || x.source || "Pack" },
           { label: "Qty", value: x => x.qty || x.qty_q || x.good_qty || "-" },
@@ -5134,7 +6108,18 @@ DASHBOARD_HTML = """
         ], "No product pack history recorded.", 8) },
       ],
       rawCycle: [
-        { title: "Job API Summary", kind: "table", content: jobApiSummary },
+        { title: "Job Details", kind: "html", wide: true, content: `
+          <div class="machine-detail-grid">
+            ${detailItem("Job Ref", jobApiSummary.ref_no)}
+            ${detailItem("Status", jobApiSummary.status)}
+            ${detailItem("Mold", jobApiSummary.mold)}
+            ${detailItem("Color", jobApiSummary.color)}
+            ${detailItem("Machine Tons", jobApiSummary.machine_tons)}
+            ${detailItem("Cavities", jobApiSummary.no_of_cavity)}
+            ${detailItem("Qty / Shift", jobApiSummary.qty_per_shift)}
+            ${detailItem("Standard Cycle", jobApiSummary.standard_cycle_time)}
+          </div>
+        ` },
         { title: "Job API Product Parts", kind: "html", content: tableFromRows(productParts, [
           { label: "Part", value: x => x.part_name || x.product_name || x.name || x.item_name || "-" },
           { label: "Code", value: x => x.part_code || x.product_code || x.code || x.sku || "-" },
@@ -5147,33 +6132,29 @@ DASHBOARD_HTML = """
         ], "No API partials recorded.", 5) },
       ],
       downtime: [
-        {
-          title: "Downtime",
-          kind: "table",
-          content: {
-            downtime_reason_code: item.downtime_reason_code || "-",
-            downtime_reason_text: item.downtime_reason_text || "-",
-            downtime_last_seconds: item.downtime_last_seconds ?? 0,
-            downtime_active: !!item.downtime_active,
-            maintenance_name: item.maintenance_name || "-",
-            supervisor_name: item.supervisor_name || "-",
-          },
-        },
+        { title: "Downtime", kind: "metrics", wide: true, content: [
+          { label: "Reason Code", value: item.downtime_reason_code || "-" },
+          { label: "Reason", value: item.downtime_reason_text || "-" },
+          { label: "Duration", value: fmtDowntimeSeconds(item.downtime_last_seconds ?? 0), tone: Number(item.downtime_last_seconds || 0) > 0 ? "warn" : "" },
+          { label: "Active", value: item.downtime_active ? "YES" : "NO" },
+        ] },
       ],
       people: [
-        {
-          title: "People",
-          kind: "table",
-          content: {
-            operator_name: displayNameForId(item.operator_id || item.operator_name || "-"),
-            operator_id: item.operator_id || "-",
-            maintenance_name: item.maintenance_name || "-",
-            supervisor_name: item.supervisor_name || "-",
-            qc_name: qcFromFinishedJob(item),
-            no_shot_total: item.no_shot_total ?? 0,
-            startup_reject_total: item.startup_reject_total ?? 0,
-          },
-        },
+        { title: "Team", kind: "html", content: renderKeyValueTableHtml({
+          operator: displayNameForId(item.operator_id || item.operator_name || "-"),
+          operator_id: item.operator_id || "-",
+          maintenance: item.maintenance_name || "-",
+          supervisor: item.supervisor_name || "-",
+          qc: qcFromFinishedJob(item),
+        }) },
+        { title: "Linked Job / Records", kind: "metrics", content: [
+          { label: "Linked", value: item.linkage_enabled ? "YES" : "NO", tone: item.linkage_enabled ? "warn" : "" },
+          { label: "Linked Job", value: item.linkage_job_name || item.linkage_job_code || "-" },
+          { label: "Raw Logs", value: rawLogs.length },
+          { label: "Reject Logs", value: rejectReviews.length },
+          { label: "Partials", value: partials.length },
+          { label: "Product Parts", value: productParts.length },
+        ] },
       ],
     };
   }
@@ -5307,6 +6288,9 @@ DASHBOARD_HTML = """
     generatedQrState.lotNumber = overlayLotNumber.value || "";
     generatedQrState.stageLabel = String(item.stage_label || "");
     generatedQrState.stageKind = String(item.stage_kind || "");
+    generatedQrState.productName = String(item.product_name || "").trim();
+    generatedQrState.productSku = String(item.product_sku || "").trim();
+    generatedQrState.productId = String(item.product_id || "").trim();
     if(overlayPoNumberRow){
       overlayPoNumberRow.style.display = poRequired ? "" : "none";
     }
@@ -5449,6 +6433,8 @@ DASHBOARD_HTML = """
 
   function archivedRowToMachineSessionLike(row){
     return {
+      _is_archived_detail: true,
+      _archive_row: row || {},
       client_id: row.client_id || "",
       machine_code: row.machine_code || "",
       machine_name: row.machine_name || row.machine_code || "",
@@ -5471,9 +6457,15 @@ DASHBOARD_HTML = """
       cycle_time_current: row.cycle_time_current || "",
       maintenance_name: row.maintenance_name || "",
       supervisor_name: row.supervisor_name || "",
+      qc_name: row.qc_name || "",
       reject_review_logs: row.reject_review_logs || [],
       job_payload: row.job_payload || {},
-      last_seen_utc: row.printed_at_utc || row.finished_at_utc || "",
+      print_request_payload: row.print_request_payload || null,
+      print_request_payloads: row.print_request_payloads || [],
+      printed_qr_payload: row.printed_qr_payload || null,
+      product_pack_history_logs: row.product_pack_history_logs || [],
+      butal_scan_logs: row.butal_scan_logs || [],
+      last_seen_utc: row.printed_at_utc || row.archived_at_utc || row.finished_at_utc || "",
       last_event: `ARCHIVED${row.printed_at_utc ? " / PRINTED" : ""}`,
       downtime_active: false,
     };
@@ -6018,6 +7010,10 @@ DASHBOARD_HTML = """
       job.color ? `Color: ${job.color}` : "",
       job.std_cycle_time ? `Cycle: ${job.std_cycle_time}` : "",
       job.request_qty ? `Qty: ${job.request_qty}` : "",
+      job.source === "LOW STOCK" ? `Current stock: ${job.low_stock_total ?? 0}${job.low_stock_unit ? ` ${job.low_stock_unit}` : ""}` : "",
+      job.source === "LOW STOCK" && job.low_stock_qty_source ? `Source: IMS ${job.low_stock_qty_source}` : "",
+      job.source === "LOW STOCK" ? `Threshold: ${job.low_stock_threshold ?? "-"}` : "",
+      job.tonnage ? `Tonnage: ${job.tonnage}` : "",
     ].filter(Boolean).join("<br>");
     return `<div class="planning-card" draggable="true" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip">${esc(job.source || "PLAN")}</span></div><div class="planning-meta">${details || "No BMS details available."}</div><div class="planning-card-actions"><button class="planning-remove" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}">Remove</button></div></div>`;
   }
@@ -6027,12 +7023,138 @@ DASHBOARD_HTML = """
     return `<div class="planning-card live"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip">LIVE</span></div><div class="planning-meta">Operator: ${esc(session.operator_id || "-")}<br>Pack: ${esc(session.pack_total || 0)} | Good: ${esc(session.good_total || 0)} | Reject: ${esc(session.reject_total || 0)}</div></div>`;
   }
 
+  function renderLowStockRecommendations(items, meta = {}){
+    if(!planningLowStockList) return;
+    if(Array.isArray(items)) lowStockItemsState = items;
+    const q = String(planningLowStockSearch?.value || "").trim().toLowerCase();
+    const minStockRaw = String(planningLowStockMin?.value || "").trim();
+    const maxStockRaw = String(planningLowStockMax?.value || "").trim();
+    const minStock = minStockRaw === "" ? null : Number(minStockRaw);
+    const maxStock = maxStockRaw === "" ? null : Number(maxStockRaw);
+    const limit = Math.max(1, Number(planningLowStockLimit?.value || 15));
+    planningBoard = normalizePlanningBoard(planningBoard);
+    const backlogKeys = new Set((planningBoard.lanes.BACKLOG || []).flatMap(card => [
+      String(card?.product_id || "").trim(),
+      String(card?.product_sku || "").trim(),
+      String(card?.sku || "").trim(),
+    ]).filter(Boolean));
+    const rows = (Array.isArray(items) ? items : lowStockItemsState).filter(item => {
+      const productId = String(item?.product_id || "").trim();
+      const sku = String(item?.sku || "").trim();
+      if((productId && backlogKeys.has(productId)) || (sku && backlogKeys.has(sku))) return false;
+      const stock = Number(item?.total_stock ?? 0);
+      if(minStock !== null && Number.isFinite(minStock) && stock < minStock) return false;
+      if(maxStock !== null && Number.isFinite(maxStock) && stock > maxStock) return false;
+      if(!q) return true;
+      return [item?.sku, item?.product_id, item?.name, item?.tonnage]
+        .some(v => String(v || "").toLowerCase().includes(q));
+    });
+    if(!rows.length){
+      planningLowStockList.innerHTML = `<div class="planning-empty">${esc(meta.error || "No matching low-stock item.")}</div>`;
+      return;
+    }
+    const visible = rows.slice(0, limit);
+    planningLowStockList.innerHTML = visible.map((item, idx) => {
+      const wh = Array.isArray(item.warehouses) ? item.warehouses : [];
+      const whText = wh
+        .filter(x => Number(x?.qty || 0) > 0)
+        .slice(0, 3)
+        .map(x => `${x.warehouse_name || x.warehouse_id}: ${x.qty}${x.unit ? ` ${x.unit}` : ""}`)
+        .join(" | ") || "No warehouse qty";
+      const title = item.sku || item.product_id || "Product";
+      return `
+        <div class="stock-rec-card">
+          <div class="stock-rec-top">
+            <div class="stock-rec-sku">${esc(title)}</div>
+            <span class="stock-rec-badge">${esc(item.total_stock ?? 0)}${item.unit ? ` ${esc(item.unit)}` : ""}</span>
+          </div>
+          <div class="stock-rec-name">${esc(item.name || "No product name")}</div>
+          <div class="stock-rec-meta">
+            <span>ID ${esc(item.product_id || "-")}</span>
+            ${item.tonnage ? `<span>${esc(item.tonnage)} tons</span>` : ""}
+            ${item.qty_source ? `<span>IMS ${esc(item.qty_source)}</span>` : ""}
+            <span>Range ${esc(minStockRaw || "0")}-${esc(maxStockRaw || item.threshold || "-")}</span>
+          </div>
+          <div class="planning-meta">${esc(whText)}</div>
+          <button class="stock-rec-add" data-rec-index="${idx}" type="button">Add Recommendation</button>
+        </div>
+      `;
+    }).join("");
+    planningLowStockList.querySelectorAll(".stock-rec-add").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const idx = Number(btn.getAttribute("data-rec-index") || -1);
+        const item = visible[idx];
+        if(item) addLowStockRecommendationToBacklog(item);
+      });
+    });
+  }
+
+  function addLowStockRecommendationToBacklog(item){
+    planningBoard = normalizePlanningBoard(planningBoard);
+    const productId = String(item?.product_id || "").trim();
+    const sku = String(item?.sku || "").trim();
+    const title = sku || productId || "Low Stock Item";
+    const card = {
+      id: `low-stock-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      job_id: "",
+      job_ref: title,
+      job_name: title,
+      product_id: productId,
+      product_name: String(item?.name || "").trim(),
+      product_sku: sku,
+      tonnage: String(item?.tonnage || "").trim(),
+      request_qty: "",
+      source: "LOW STOCK",
+      low_stock_total: item?.total_stock ?? 0,
+      low_stock_unit: item?.unit || "",
+      low_stock_qty_source: item?.qty_source || "",
+      low_stock_threshold: item?.threshold ?? "",
+      warehouses: Array.isArray(item?.warehouses) ? item.warehouses : [],
+      created_at_utc: new Date().toISOString(),
+    };
+    planningBoard.lanes.BACKLOG.unshift(card);
+    lowStockItemsState = (lowStockItemsState || []).filter(x => {
+      const sameProduct = productId && String(x?.product_id || "").trim() === productId;
+      const sameSku = sku && String(x?.sku || "").trim() === sku;
+      return !(sameProduct || sameSku);
+    });
+    renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+    renderLowStockRecommendations(lowStockItemsState);
+    schedulePlanningSave();
+    planningSetStatus(`Added low-stock recommendation ${title} to backlog.`);
+  }
+
+  async function loadLowStockRecommendations(forceRefresh = false){
+    if(!planningLowStockList) return;
+    const threshold = Number(planningLowStockMax?.value || 100);
+    planningLowStockList.innerHTML = '<div class="planning-empty">Loading IMS stock recommendations...</div>';
+    planningSetStatus("Checking IMS low-stock products...");
+    try {
+      const resp = await fetch(`/api/planning/low-stock?threshold=${encodeURIComponent(threshold)}&refresh=${forceRefresh ? 1 : 0}`);
+      const out = await resp.json();
+      if(!out.ok){
+        lowStockItemsState = [];
+        renderLowStockRecommendations([], { error: out.error || "Failed to load low-stock recommendations." });
+        planningSetStatus(out.error || "Failed to load low-stock recommendations.", true);
+        return;
+      }
+      lowStockItemsState = out.items || [];
+      renderLowStockRecommendations(lowStockItemsState, out);
+      const suffix = out.from_cache ? " from cache" : "";
+      planningSetStatus(`Loaded ${(out.items || []).length} low-stock recommendation(s)${suffix}.`);
+    } catch(e){
+      renderLowStockRecommendations([], { error: `Low-stock lookup failed: ${e}` });
+      planningSetStatus(`Low-stock lookup failed: ${e}`, true);
+    }
+  }
+
   function renderPlanningBoard(state){
     planningBoard = normalizePlanningBoard((planningLocalDirty ? planningBoard : state?.planning_board) || planningBoard);
     if(planningBacklogCount) planningBacklogCount.textContent = `${planningLaneCards("BACKLOG").length} jobs`;
     if(planningBacklog){
       planningBacklog.innerHTML = planningLaneCards("BACKLOG").map(c => planningCardHtml(c, "BACKLOG")).join("") || '<div class="planning-empty">Scan or type a job to add it here.</div>';
     }
+    if(lowStockItemsState.length) renderLowStockRecommendations(lowStockItemsState);
     if(planningMachineGrid){
       const sessionsByMachine = new Map((state?.sessions || []).map(s => [String(s.machine_code || ""), s]));
       planningMachineGrid.innerHTML = DEFAULT_MACHINE_CODES.map(code => {
@@ -6085,8 +7207,31 @@ DASHBOARD_HTML = """
         const cardId = btn.getAttribute("data-card-id") || "";
         const lane = btn.getAttribute("data-lane") || "BACKLOG";
         planningBoard = normalizePlanningBoard(planningBoard);
+        const removed = (planningBoard.lanes[lane] || []).find(c => String(c.id || "") === cardId);
         planningBoard.lanes[lane] = (planningBoard.lanes[lane] || []).filter(c => String(c.id || "") !== cardId);
+        if(removed && String(removed.source || "") === "LOW STOCK"){
+          const productId = String(removed.product_id || "").trim();
+          const sku = String(removed.product_sku || removed.sku || "").trim();
+          const exists = (lowStockItemsState || []).some(x =>
+            (productId && String(x?.product_id || "").trim() === productId)
+            || (sku && String(x?.sku || "").trim() === sku)
+          );
+          if(!exists){
+            lowStockItemsState.unshift({
+              product_id: productId,
+              sku,
+              name: removed.product_name || "",
+              tonnage: removed.tonnage || "",
+              total_stock: removed.low_stock_total ?? 0,
+              unit: removed.low_stock_unit || "",
+              qty_source: removed.low_stock_qty_source || "stock",
+              threshold: removed.low_stock_threshold || "",
+              warehouses: Array.isArray(removed.warehouses) ? removed.warehouses : [],
+            });
+          }
+        }
         renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+        renderLowStockRecommendations(lowStockItemsState);
         schedulePlanningSave();
       });
     });
@@ -6179,7 +7324,7 @@ DASHBOARD_HTML = """
     activeJobRow = job || null;
     overlayReviewSavedApproved = false;
     overlayReviewMode = isShiftPartialRecord(activeJobRow) ? "shift" : "job";
-    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = overlayReviewMode === "shift" ? "Save Changes" : "Save Review";
+    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = overlayReviewMode === "shift" ? "Approve & Continue" : "Save Review";
     if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = overlayReviewMode === "shift" ? "none" : "";
     const title = activeJobRow
       ? `${activeJobRow.job_name || activeJobRow.job_code || "Finished Job"} | ${activeJobRow.machine_name || activeJobRow.machine_code || "-"}`
@@ -6240,6 +7385,7 @@ DASHBOARD_HTML = """
     if(overlayPeopleSummaryDisplay) overlayPeopleSummaryDisplay.innerHTML = shiftPanels
       ? renderShiftGroupedPanelHtml(shiftPanels.people, "No team data.")
       : renderBulletListHtml(overlayPeopleSummary?.value || "");
+    if(overlayTransferPreviewDisplay) overlayTransferPreviewDisplay.innerHTML = renderTransferPreviewHtml(activeJobRow);
     if(overlayReviewerBadge) overlayReviewerBadge.value = "";
     if(overlayReviewerScanInput){
       overlayReviewerScanInput.value = "";
@@ -6418,6 +7564,13 @@ DASHBOARD_HTML = """
       schedulePlanningSave();
     });
   }
+  if(planningLowStockRefreshBtn){
+    planningLowStockRefreshBtn.addEventListener("click", () => loadLowStockRecommendations(true));
+  }
+  [planningLowStockSearch, planningLowStockMin, planningLowStockMax, planningLowStockLimit].forEach(el => {
+    if(el) el.addEventListener("input", () => renderLowStockRecommendations(lowStockItemsState));
+    if(el) el.addEventListener("change", () => renderLowStockRecommendations(lowStockItemsState));
+  });
 
   if(serverSettingsBtn){
     serverSettingsBtn.addEventListener("click", async () => {
@@ -6556,7 +7709,7 @@ DASHBOARD_HTML = """
     openApprovePrintOverlay(row);
     setOverlayStep("review");
     if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = "none";
-    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = "Save Changes";
+    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = isApprovedShiftRecord(row) ? "Save Changes" : "Approve & Continue";
   });
   finishedJobsList.addEventListener("mouseover", (ev) => {
     if(ev.target.closest(".approve-print-btn")) setFinishedJobsInteractionLock(true);
@@ -6766,7 +7919,15 @@ DASHBOARD_HTML = """
       overlayQrPayload.value = "Review approval is required before requesting print.";
       return;
     }
-    const product = resolveProductFromText(overlayProductSelect.value || "");
+    const product = resolveProductFromText(overlayProductSelect.value || "") || (
+      (generatedQrState.productName || generatedQrState.productSku || generatedQrState.productId)
+        ? {
+            id: generatedQrState.productId || "",
+            sku: generatedQrState.productSku || "",
+            name: generatedQrState.productName || generatedQrState.productId || "Selected product",
+          }
+        : null
+    );
     if(!product){
       overlayQrPayload.value = "Select a product first.";
       return;
@@ -6783,7 +7944,9 @@ DASHBOARD_HTML = """
       return;
     }
 
-    const productName = `[${(product.sku || "").toString().trim()}] ${(product.name || "").toString().trim()}`.trim();
+    const productSku = (product.sku || "").toString().trim();
+    const productDisplayName = (product.name || "").toString().trim();
+    const productName = productSku ? `[${productSku}] ${productDisplayName}`.trim() : (productDisplayName || String(product.id || ""));
     const requestPayload = {
       product_name: productName,
       quantity: quantity,
@@ -6851,8 +8014,9 @@ DASHBOARD_HTML = """
     if(!activeJobRow) return;
     const reviewerBadge = (overlayReviewerBadge.value || "").trim();
     const remarks = (overlayReviewRemarks.value || "").trim();
+    const shiftNeedsPrint = overlayReviewMode === "shift" && !isApprovedShiftRecord(activeJobRow);
     const action = overlayReviewMode === "shift"
-      ? "update"
+      ? (shiftNeedsPrint ? "approve" : "update")
       : (actionMode === "continue" ? "approve" : "disapprove");
     if(!reviewerBadge){
       overlayReviewRemarks.value = remarks;
@@ -6909,13 +8073,14 @@ DASHBOARD_HTML = """
     if(overlayRejectDetailsPageDisplay) overlayRejectDetailsPageDisplay.innerHTML = shiftPanels
       ? renderShiftGroupedPanelHtml(shiftPanels.rejects, "No reject details recorded.")
       : renderBulletListHtml(overlayReviewRejects.value || "", "No reject details recorded.");
+    if(overlayTransferPreviewDisplay) overlayTransferPreviewDisplay.innerHTML = renderTransferPreviewHtml(activeJobRow);
     fillDisapproveFields(activeJobRow);
     if(Array.isArray(latestState.finished_jobs)){
       const k = jobKeyOf(activeJobRow);
       latestState.finished_jobs = latestState.finished_jobs.map(x => jobKeyOf(x) === k ? activeJobRow : x);
       renderFinishedJobs(latestState.finished_jobs);
     }
-    if(actionMode === "continue"){
+    if(actionMode === "continue" || shiftNeedsPrint){
       overlayReviewSavedApproved = true;
       setOverlayStep("qr");
       generatedQrState = { jobKey: jobKeyOf(activeJobRow), payload: "", qty: "", index: "", total: "", lotNumber: "", stageLabel: "", stageKind: "", plan: [], planIndex: 0, printRequests: [] };
@@ -7483,7 +8648,7 @@ async def api_event(req: Request):
       "machine_name": "Machine 01",
       "job_code": "101245",
       "job_name": "J024-0305",
-      "operator_id": "1000001",
+      "operator_id": "1000001",F
       "event": { ... },   # e.g. {"type":"PACK","qty":6}
       "last_event": "PACK +6"
     }
@@ -7620,6 +8785,8 @@ async def api_event(req: Request):
                 sess.linkage_jobs = list(snap.get("linkage_jobs") or [])
             if isinstance(snap.get("operator_shift_logs"), list):
                 sess.operator_shift_logs = list(snap.get("operator_shift_logs") or [])
+            if isinstance(snap.get("butal_by_job"), dict):
+                sess.butal_by_job = {str(k): int(v or 0) for k, v in dict(snap.get("butal_by_job") or {}).items()}
             sess.last_shift_butal_qty = int(snap.get("last_shift_butal_qty", sess.last_shift_butal_qty) or 0)
             sess.last_shift_butal_raw = str(snap.get("last_shift_butal_raw", sess.last_shift_butal_raw) or "")
             sess.last_shift_butal_saved_at = snap.get("last_shift_butal_saved_at", sess.last_shift_butal_saved_at)
@@ -7634,7 +8801,13 @@ async def api_event(req: Request):
         sess.good_total += qty
     elif ev_type == "LAST_SHIFT_BUTAL_PACK":
         sess.pack_total += int(ev.get("pack_qty", 1) or 1)
-        sess.butal_total += int(ev.get("butal_qty", 0) or 0)
+        butal_qty = int(ev.get("butal_qty", 0) or 0)
+        sess.butal_total += butal_qty
+        job_key = str(sess.job_code or "").strip()
+        if job_key and butal_qty > 0:
+            rows = dict(sess.butal_by_job or {})
+            rows[job_key] = int(rows.get(job_key, 0) or 0) + butal_qty
+            sess.butal_by_job = rows
         sess.last_shift_butal_qty = 0
         sess.last_shift_butal_raw = ""
         sess.last_shift_butal_saved_at = None
@@ -7645,7 +8818,13 @@ async def api_event(req: Request):
             if key:
                 sess.last_shift_butal_by_job.pop(key, None)
     elif ev_type == "BUTAL":
-        sess.butal_total += int(ev.get("qty", 0) or 0)
+        qty = int(ev.get("qty", 0) or 0)
+        sess.butal_total += qty
+        assigned_job_code = str(ev.get("assigned_job_code") or sess.job_code or "").strip()
+        if assigned_job_code and qty > 0:
+            rows = dict(sess.butal_by_job or {})
+            rows[assigned_job_code] = int(rows.get(assigned_job_code, 0) or 0) + qty
+            sess.butal_by_job = rows
     elif ev_type == "REJECT":
         qty = int(ev.get("qty", 1) or 1)
         reason = str(ev.get("reason", "")).strip()
@@ -7697,6 +8876,28 @@ async def api_planning_lookup(req: Request):
     except urllib_error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
         return JSONResponse({"ok": False, "error": f"BMS HTTP {e.code}", "body": body[:500]}, status_code=502)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
+
+
+@APP.get("/api/planning/low-stock")
+def api_planning_low_stock(threshold: float = 100, refresh: int = 0):
+    try:
+        result = _fetch_low_stock_recommendations(
+            threshold=max(0.0, float(threshold or 0)),
+            force_refresh=bool(refresh),
+        )
+        return {
+            "ok": not bool(result.get("error")),
+            "items": result.get("items") or [],
+            "from_cache": bool(result.get("from_cache")),
+            "saved_at_utc": result.get("saved_at_utc") or "",
+            "threshold": threshold,
+            "error": result.get("error") or "",
+        }
+    except urllib_error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        return JSONResponse({"ok": False, "error": f"IMS HTTP {e.code}", "body": body[:500]}, status_code=502)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
 
@@ -7800,32 +9001,17 @@ async def api_finished_jobs_review(req: Request):
     row = dict(FINISHED_JOBS[idx] or {})
     now_utc = utc_now().isoformat()
     row.setdefault("review_history", [])
+    original_snapshot = {
+        "pack_count": row.get("pack_count", 0),
+        "good_total": row.get("good_total", 0),
+        "butal_total": row.get("butal_total", 0),
+        "reject_total": row.get("reject_total", 0),
+        "no_shot_total": row.get("no_shot_total", 0),
+        "total_good": row.get("total_good", 0),
+        "reject_breakdown": dict(row.get("reject_breakdown") or {}),
+    }
 
-    if action == "approve":
-        row["approved_by"] = reviewer["name"]
-        row["approved_by_code"] = reviewer["code"]
-        row["approved_by_role"] = reviewer["role"]
-        row["approved_remarks"] = remarks
-        row["approved_at_utc"] = now_utc
-        row["review_status"] = "APPROVED"
-        row["review_history"].append({
-            "action": "APPROVE",
-            "remarks": remarks,
-            "actor_name": reviewer["name"],
-            "actor_code": reviewer["code"],
-            "actor_role": reviewer["role"],
-            "timestamp_utc": now_utc,
-        })
-    else:
-        original_snapshot = {
-            "pack_count": row.get("pack_count", 0),
-            "good_total": row.get("good_total", 0),
-            "butal_total": row.get("butal_total", 0),
-            "reject_total": row.get("reject_total", 0),
-            "no_shot_total": row.get("no_shot_total", 0),
-            "total_good": row.get("total_good", 0),
-            "reject_breakdown": dict(row.get("reject_breakdown") or {}),
-        }
+    def _apply_review_changes_to_row() -> Optional[JSONResponse]:
         int_fields = ("pack_count", "good_total", "butal_total", "reject_total", "startup_reject_total", "no_shot_total", "raw_sacks_count")
         for k in int_fields:
             if k in changes:
@@ -7846,6 +9032,38 @@ async def api_finished_jobs_review(req: Request):
             if not isinstance(rb, dict):
                 return JSONResponse({"ok": False, "error": "reject_breakdown must be an object"}, status_code=400)
             row["reject_breakdown"] = {str(k): int(v or 0) for k, v in rb.items()}
+        return None
+
+    if action == "approve":
+        change_error = _apply_review_changes_to_row() if changes else None
+        if change_error is not None:
+            return change_error
+        if changes:
+            row["last_original_snapshot"] = original_snapshot
+            row["changed_by"] = reviewer["name"]
+            row["changed_by_code"] = reviewer["code"]
+            row["changed_by_role"] = reviewer["role"]
+            row["change_remarks"] = remarks
+            row["changed_at_utc"] = now_utc
+        row["approved_by"] = reviewer["name"]
+        row["approved_by_code"] = reviewer["code"]
+        row["approved_by_role"] = reviewer["role"]
+        row["approved_remarks"] = remarks
+        row["approved_at_utc"] = now_utc
+        row["review_status"] = "APPROVED"
+        row["review_history"].append({
+            "action": "APPROVE",
+            "remarks": remarks,
+            "actor_name": reviewer["name"],
+            "actor_code": reviewer["code"],
+            "actor_role": reviewer["role"],
+            "timestamp_utc": now_utc,
+            "changes": changes if changes else {},
+        })
+    else:
+        change_error = _apply_review_changes_to_row()
+        if change_error is not None:
+            return change_error
 
         row["changed_by"] = reviewer["name"]
         row["changed_by_code"] = reviewer["code"]
@@ -7912,10 +9130,28 @@ async def api_finished_jobs_archive(req: Request):
         "timestamp_utc": now_utc,
     })
 
-    ARCHIVED_JOBS.append(row)
-    del FINISHED_JOBS[idx]
-    save_archived_jobs(ARCHIVED_JOBS)
-    save_finished_jobs(FINISHED_JOBS)
+    next_archived_jobs = list(ARCHIVED_JOBS)
+    next_finished_jobs = list(FINISHED_JOBS)
+    next_archived_jobs.append(row)
+    del next_finished_jobs[idx]
+    try:
+        save_archived_jobs(next_archived_jobs)
+        save_finished_jobs(next_finished_jobs)
+    except Exception as e:
+        try:
+            save_archived_jobs(ARCHIVED_JOBS)
+        except Exception:
+            pass
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"Archive storage is unavailable: {e}",
+                "item": row,
+            },
+            status_code=503,
+        )
+    ARCHIVED_JOBS[:] = next_archived_jobs
+    FINISHED_JOBS[:] = next_finished_jobs
     await broadcast_state()
     return {"ok": True, "item": row}
 

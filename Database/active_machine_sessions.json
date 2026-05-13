@@ -360,7 +360,7 @@
     "last_shift_butal_job_name": null,
     "last_shift_butal_by_job": {},
     "last_event": "HEARTBEAT",
-    "last_seen_utc": "2026-05-12T09:03:04.386871+00:00"
+    "last_seen_utc": "2026-05-12T09:03:44.319807+00:00"
   },
   "M00005": {
     "client_id": "philtop-it-001",
@@ -2274,7 +2274,7 @@
     "last_shift_butal_job_name": null,
     "last_shift_butal_by_job": {},
     "last_event": "HEARTBEAT",
-    "last_seen_utc": "2026-05-12T09:03:00.509999+00:00"
+    "last_seen_utc": "2026-05-12T09:03:40.473097+00:00"
   },
   "M00019": {
     "client_id": "philtop-it-001",
