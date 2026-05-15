@@ -1,5 +1,5 @@
 {
-  "saved_at_utc": "2026-05-14T08:58:44.204965+00:00",
+  "saved_at_utc": "2026-05-15T09:07:47.799387+00:00",
   "count": 2808,
   "items": [
     {
@@ -4870,31 +4870,31 @@
     },
     {
       "id": "13131",
-      "name": "518-B, 982-M - Bento Box & Tumbler Set",
+      "name": "518-B, 982-M - Bento Box & Tumbler BTS set",
       "sku": "ST-PT-SET-63",
       "tonnage": ""
     },
     {
       "id": "8581",
-      "name": "508, 985-S - Lunch Box & Tumbler Set",
+      "name": "508, 985-S - Lunch Box & Tumbler BTS set",
       "sku": "ST-PT-SET-64",
       "tonnage": ""
     },
     {
       "id": "8630",
-      "name": "257-A, 985, 909 - Lunch Box Set",
+      "name": "257-A, 985, 909 - Lunch Box BTS set",
       "sku": "ST-PT-SET-65",
       "tonnage": ""
     },
     {
       "id": "13132",
-      "name": "152-A, 982-M - Lunch Box & Tumbler Set",
+      "name": "152-A, 982-M - Lunch Box & Tumbler BTS set",
       "sku": "ST-PT-SET-66",
       "tonnage": ""
     },
     {
       "id": "13133",
-      "name": "2052, 982-S - Lunch Box & Tumbler Set",
+      "name": "2052, 982-S - Lunch Box & Tumbler BTS set",
       "sku": "ST-PT-SET-67",
       "tonnage": ""
     },
@@ -4906,13 +4906,13 @@
     },
     {
       "id": "13135",
-      "name": "510, 982-M - Bento Box & Tumbler Set",
+      "name": "510, 982-M - Bento Box & Tumbler BTS set",
       "sku": "ST-PT-SET-69",
       "tonnage": ""
     },
     {
       "id": "13136",
-      "name": "519, 985-S - Bento Box & Tumbler Set",
+      "name": "519, 985-S - Bento Box & Tumbler BTS set",
       "sku": "ST-PT-SET-70",
       "tonnage": ""
     },
@@ -15352,8 +15352,8 @@
     },
     {
       "id": "12959",
-      "name": "Sticker Water Dispenser",
-      "sku": "Z-FS-STK-9848-S-FRONT",
+      "name": "AQUAMATE Water Dispenser sticker",
+      "sku": "Z-FS-STK-9848-FRONT",
       "tonnage": ""
     },
     {
@@ -15492,12 +15492,6 @@
       "id": "3098",
       "name": "Sunnyware (Red) 2311, 2551, 2552. 357, 633, 932, 885",
       "sku": "Z-FS-STK-GENERIC-ROUND",
-      "tonnage": ""
-    },
-    {
-      "id": "3267",
-      "name": "Sticker (2030, 2053, 2088, 9737, 2503, 337, 9537, 9606)",
-      "sku": "Z-FS-STK-GENERIC-STOOL",
       "tonnage": ""
     },
     {
@@ -15700,8 +15694,14 @@
     },
     {
       "id": "12960",
-      "name": "Background for 9848 and 9533, 9536, 158",
+      "name": "9848 and Pitchers sticker (Clear Background)",
       "sku": "Z-FS-STK-SUNNYWARE LOGO-CLEAR",
+      "tonnage": ""
+    },
+    {
+      "id": "3267",
+      "name": "Generic Stickers for laundry stools (White Background)",
+      "sku": "Z-FS-STK-SUNNYWARE LOGO-WHITE",
       "tonnage": ""
     },
     {

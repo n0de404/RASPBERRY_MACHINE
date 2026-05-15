@@ -3,417 +3,209 @@
     "BACKLOG": [],
     "M00001": [],
     "M00002": [],
-    "M00003": [],
+    "M00003": [
+      {
+        "id": "low-stock-1778826565848-49c0bfb365bed",
+        "job_id": "",
+        "job_ref": "-I-004-GREEN",
+        "job_name": "-I-004-GREEN",
+        "product_id": "33",
+        "product_name": "Multi-Purpose Crate Close Type Green",
+        "product_sku": "-I-004-GREEN",
+        "tonnage": "",
+        "request_qty": "",
+        "source": "LOW STOCK",
+        "low_stock_total": 0,
+        "low_stock_unit": "",
+        "low_stock_qty_source": "stock",
+        "low_stock_threshold": 100,
+        "warehouses": [
+          {
+            "warehouse_id": "3",
+            "warehouse_name": "Dock 1",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "5",
+            "warehouse_name": "Dock 2",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "14",
+            "warehouse_name": "Dock 3",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "18",
+            "warehouse_name": "C5",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "2",
+            "warehouse_name": "6116",
+            "qty": 0,
+            "unit": ""
+          }
+        ],
+        "created_at_utc": "2026-05-15T06:29:25.848Z"
+      },
+      {
+        "id": "low-stock-1778827361531-66850120ad8e98",
+        "job_id": "",
+        "job_ref": "-H-002-RED",
+        "job_name": "-H-002-RED",
+        "product_id": "8279",
+        "product_name": "Goblet Crate - 25 Goblets Red",
+        "product_sku": "-H-002-RED",
+        "tonnage": "",
+        "request_qty": "",
+        "source": "LOW STOCK",
+        "low_stock_total": 0,
+        "low_stock_unit": "",
+        "low_stock_qty_source": "stock",
+        "low_stock_threshold": 100,
+        "warehouses": [
+          {
+            "warehouse_id": "3",
+            "warehouse_name": "Dock 1",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "5",
+            "warehouse_name": "Dock 2",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "14",
+            "warehouse_name": "Dock 3",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "18",
+            "warehouse_name": "C5",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "2",
+            "warehouse_name": "6116",
+            "qty": 0,
+            "unit": ""
+          }
+        ],
+        "created_at_utc": "2026-05-15T06:42:41.531Z"
+      },
+      {
+        "id": "low-stock-1778827359565-23911d52da5b88",
+        "job_id": "",
+        "job_ref": "-H-002-GREEN",
+        "job_name": "-H-002-GREEN",
+        "product_id": "8280",
+        "product_name": "Goblet Crate - 25 Goblets Green",
+        "product_sku": "-H-002-GREEN",
+        "tonnage": "",
+        "request_qty": "",
+        "source": "LOW STOCK",
+        "low_stock_total": 0,
+        "low_stock_unit": "",
+        "low_stock_qty_source": "stock",
+        "low_stock_threshold": 100,
+        "warehouses": [
+          {
+            "warehouse_id": "3",
+            "warehouse_name": "Dock 1",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "5",
+            "warehouse_name": "Dock 2",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "14",
+            "warehouse_name": "Dock 3",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "18",
+            "warehouse_name": "C5",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "2",
+            "warehouse_name": "6116",
+            "qty": 0,
+            "unit": ""
+          }
+        ],
+        "created_at_utc": "2026-05-15T06:42:39.565Z"
+      },
+      {
+        "id": "low-stock-1778827702498-d2841769968fe",
+        "job_id": "",
+        "job_ref": "-H-002-GREEN",
+        "job_name": "-H-002-GREEN",
+        "product_id": "8280",
+        "product_name": "Goblet Crate - 25 Goblets Green",
+        "product_sku": "-H-002-GREEN",
+        "tonnage": "",
+        "request_qty": "",
+        "source": "LOW STOCK",
+        "low_stock_total": 0,
+        "low_stock_unit": "",
+        "low_stock_qty_source": "stock",
+        "low_stock_threshold": 100,
+        "warehouses": [
+          {
+            "warehouse_id": "3",
+            "warehouse_name": "Dock 1",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "5",
+            "warehouse_name": "Dock 2",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "14",
+            "warehouse_name": "Dock 3",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "18",
+            "warehouse_name": "C5",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "2",
+            "warehouse_name": "6116",
+            "qty": 0,
+            "unit": ""
+          }
+        ],
+        "created_at_utc": "2026-05-15T06:48:22.498Z"
+      }
+    ],
     "M00004": [],
     "M00005": [],
-    "M00006": [
-      {
-        "id": "low-stock-1778661409023-2234f6d7230818",
-        "job_id": "",
-        "job_ref": "-I-001-2178-C-BLUE",
-        "job_name": "-I-001-2178-C-BLUE",
-        "product_id": "28",
-        "product_name": "Crate Cover (I-001 & 2178) Blue",
-        "product_sku": "-I-001-2178-C-BLUE",
-        "tonnage": "",
-        "request_qty": "",
-        "source": "LOW STOCK",
-        "low_stock_total": 204,
-        "low_stock_unit": "PC",
-        "low_stock_qty_source": "stock",
-        "low_stock_threshold": 1000,
-        "warehouses": [
-          {
-            "warehouse_id": "3",
-            "warehouse_name": "Dock 1",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "5",
-            "warehouse_name": "Dock 2",
-            "qty": 2,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "14",
-            "warehouse_name": "Dock 3",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "18",
-            "warehouse_name": "C5",
-            "qty": 200,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "2",
-            "warehouse_name": "6116",
-            "qty": 2,
-            "unit": "PC"
-          }
-        ],
-        "created_at_utc": "2026-05-13T08:36:49.024Z"
-      },
-      {
-        "id": "low-stock-1778659470574-b406d294384588",
-        "job_id": "",
-        "job_ref": "9929-4-BROWN",
-        "job_name": "9929-4-BROWN",
-        "product_id": "66",
-        "product_name": "Flower Pot Brown",
-        "product_sku": "9929-4-BROWN",
-        "tonnage": "",
-        "request_qty": "",
-        "source": "LOW STOCK",
-        "low_stock_total": 10,
-        "low_stock_unit": "PC",
-        "low_stock_qty_source": "stock",
-        "low_stock_threshold": 100,
-        "warehouses": [
-          {
-            "warehouse_id": "3",
-            "warehouse_name": "Dock 1",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "5",
-            "warehouse_name": "Dock 2",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "14",
-            "warehouse_name": "Dock 3",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "18",
-            "warehouse_name": "C5",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "2",
-            "warehouse_name": "6116",
-            "qty": 10,
-            "unit": "PC"
-          }
-        ],
-        "created_at_utc": "2026-05-13T08:04:30.574Z"
-      }
-    ],
-    "M00007": [
-      {
-        "id": "plan-110404-1778661690399",
-        "job_id": "110404",
-        "job_ref": "3-26-0733",
-        "job_name": "3-26-0733",
-        "product_id": "232",
-        "product_name": "Spoon & Fork Travel Case",
-        "product_sku": "909",
-        "mold": "909",
-        "color": "RANDOM NO COLOR",
-        "std_cycle_time": "21",
-        "qty_per_shift": "2057",
-        "request_qty": "10000.0000",
-        "parts_count": 4,
-        "source": "BMS",
-        "raw_payload": {
-          "code": 200,
-          "message": "Saved Successfully",
-          "data": {
-            "job": {
-              "id": "110404",
-              "ref_no": "3-26-0733",
-              "product_id": "232",
-              "from_warehouse_id": "15",
-              "to_warehouse_id": "15",
-              "next_warehouse_id": "3",
-              "status": "approve",
-              "request_date": "2026-05-08",
-              "approve_date": "2026-05-08",
-              "complete_date": null,
-              "cancel_date": null,
-              "request_start_date": "2026-05-08",
-              "request_end_date": "2026-05-23",
-              "approve_start_date": "2026-05-08",
-              "approve_end_date": "2026-05-23",
-              "complete_start_date": "2026-05-12",
-              "complete_end_date": "2026-05-12",
-              "request_qty": "10000.0000",
-              "approve_qty": "10000.0000",
-              "complete_qty": "3241.0000",
-              "request_by": "98",
-              "approve_by": "65",
-              "complete_by": "77",
-              "cancel_by": null,
-              "remarks": "",
-              "custom_01": "0",
-              "custom_02": "305",
-              "custom_03": "72",
-              "custom_04": "1",
-              "custom_05": "909",
-              "custom_06": "RANDOM NO COLOR",
-              "custom_07": "",
-              "custom_08": "",
-              "custom_09": "21",
-              "custom_10": "0",
-              "custom_11": "2057",
-              "custom_12": "0.00",
-              "custom_13": "16.00",
-              "custom_14": "0",
-              "custom_15": "num_sacks",
-              "custom_16": "120",
-              "custom_17": "0.00",
-              "custom_18": "",
-              "custom_19": "",
-              "custom_20": "",
-              "created_by": "105",
-              "modified_by": "82",
-              "created_date": "2026-05-08 16:38:19",
-              "modified_date": "2026-05-13 13:29:19",
-              "request_by_name": "Alyssa Karla Mendoza",
-              "approve_by_name": "Maria Sango",
-              "complete_by_name": "Alyssa Karla Mendoza",
-              "request_duration": "0",
-              "approve_duration": "0",
-              "complete_duration": "0"
-            },
-            "job_details": {
-              "product_id": 232,
-              "machine_num": "305",
-              "no_of_cavity": "1",
-              "mold": "909",
-              "color": "RANDOM NO COLOR",
-              "sticker_label": "",
-              "special_instructions": "",
-              "std_cycle_time": "21",
-              "qty_per_shift": "2057",
-              "machine_tons": "120"
-            },
-            "partials": [
-              {
-                "id": "355836",
-                "job_id": "110404",
-                "partial_inventory_account_id": "127",
-                "partial_expense_account_id": "54",
-                "partial_date": "2026-05-13",
-                "partial_start_date": "2026-05-12",
-                "partial_end_date": "2026-05-12",
-                "partial_qty": "1066.0000",
-                "partial_unit_wt": "38.630",
-                "partial_by": "77",
-                "partial_note": "",
-                "reject_warehouse_id": "16",
-                "reject_product_id": "232",
-                "reject_inventory_account_id": "127",
-                "reject_expense_account_id": "54",
-                "reject_qty": "11.0000",
-                "reject_wt_product_id": "8659",
-                "reject_wt_inventory_account_id": "134",
-                "reject_wt_expense_account_id": "58",
-                "reject_wt": "380.000",
-                "reject_wt_qty": "0.3800",
-                "reject_wt_fg_qty": "9.8369",
-                "reject_wt_excess_account_id": "299",
-                "created_by": "82",
-                "modified_by": "82",
-                "created_date": "2026-05-13 13:28:06",
-                "modified_date": "2026-05-13 13:28:06",
-                "reject_wt_warehouse_id": "16",
-                "partial_by_name": "Regine",
-                "partial_duration": "0"
-              },
-              {
-                "id": "355837",
-                "job_id": "110404",
-                "partial_inventory_account_id": "127",
-                "partial_expense_account_id": "54",
-                "partial_date": "2026-05-13",
-                "partial_start_date": "2026-05-12",
-                "partial_end_date": "2026-05-12",
-                "partial_qty": "2175.0000",
-                "partial_unit_wt": "38.230",
-                "partial_by": "77",
-                "partial_note": "",
-                "reject_warehouse_id": "16",
-                "reject_product_id": "232",
-                "reject_inventory_account_id": "127",
-                "reject_expense_account_id": "54",
-                "reject_qty": "1.0000",
-                "reject_wt_product_id": null,
-                "reject_wt_inventory_account_id": null,
-                "reject_wt_expense_account_id": null,
-                "reject_wt": "0.000",
-                "reject_wt_qty": "0.0000",
-                "reject_wt_fg_qty": "0.0000",
-                "reject_wt_excess_account_id": "299",
-                "created_by": "82",
-                "modified_by": "82",
-                "created_date": "2026-05-13 13:29:19",
-                "modified_date": "2026-05-13 13:29:19",
-                "reject_wt_warehouse_id": "16",
-                "partial_by_name": "Kate",
-                "partial_duration": "0"
-              }
-            ],
-            "parts_ids": [
-              8335,
-              3188,
-              1284,
-              1208
-            ],
-            "parts": [
-              {
-                "part_product_id": 8335,
-                "sku": "Z-RM-PP-R-MF27-SINOPEC-3248R",
-                "name": "PP Random Copolymer (25 KGS)",
-                "part_qty_per_unit": "0.0000",
-                "request_part_qty": "395.0000",
-                "approve_part_qty": "395.0000",
-                "complete_part_qty": "125.0751"
-              },
-              {
-                "part_product_id": 3188,
-                "sku": "Z-FS-STK-909",
-                "name": "Spoon & Fork Case Sticker",
-                "part_qty_per_unit": "1.0000",
-                "request_part_qty": "10000.0000",
-                "approve_part_qty": "10000.0000",
-                "complete_part_qty": "3241.0000"
-              },
-              {
-                "part_product_id": 1284,
-                "sku": "Z-FS-PE-9X20X_0015",
-                "name": "Polybag PE",
-                "part_qty_per_unit": "0.0833",
-                "request_part_qty": "833.0000",
-                "approve_part_qty": "833.0000",
-                "complete_part_qty": "269.9753"
-              },
-              {
-                "part_product_id": 1208,
-                "sku": "Z-FS-PE-19X26X0015",
-                "name": "Polybag PE",
-                "part_qty_per_unit": "0.0139",
-                "request_part_qty": "139.0000",
-                "approve_part_qty": "139.0000",
-                "complete_part_qty": "45.0499"
-              }
-            ],
-            "message": [],
-            "error": [],
-            "warning": []
-          },
-          "warning": []
-        },
-        "created_at_utc": "2026-05-13T08:41:28.568778+00:00"
-      }
-    ],
-    "M00008": [
-      {
-        "id": "low-stock-1778659468125-0d6af6d11c23e8",
-        "job_id": "",
-        "job_ref": "118",
-        "job_name": "118",
-        "product_id": "279",
-        "product_name": "2 L Food Keeper",
-        "product_sku": "118",
-        "tonnage": "",
-        "request_qty": "",
-        "source": "LOW STOCK",
-        "low_stock_total": 10,
-        "low_stock_unit": "PC",
-        "low_stock_qty_source": "stock",
-        "low_stock_threshold": 100,
-        "warehouses": [
-          {
-            "warehouse_id": "3",
-            "warehouse_name": "Dock 1",
-            "qty": 10,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "5",
-            "warehouse_name": "Dock 2",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "14",
-            "warehouse_name": "Dock 3",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "18",
-            "warehouse_name": "C5",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "2",
-            "warehouse_name": "6116",
-            "qty": 0,
-            "unit": "PC"
-          }
-        ],
-        "created_at_utc": "2026-05-13T08:04:28.125Z"
-      },
-      {
-        "id": "low-stock-1778659470053-536e0a43e5afd8",
-        "job_id": "",
-        "job_ref": "9529-M-GREEN",
-        "job_name": "9529-M-GREEN",
-        "product_id": "8616",
-        "product_name": "Flower Pot - Medium Green",
-        "product_sku": "9529-M-GREEN",
-        "tonnage": "",
-        "request_qty": "",
-        "source": "LOW STOCK",
-        "low_stock_total": 10,
-        "low_stock_unit": "PC",
-        "low_stock_qty_source": "stock",
-        "low_stock_threshold": 100,
-        "warehouses": [
-          {
-            "warehouse_id": "3",
-            "warehouse_name": "Dock 1",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "5",
-            "warehouse_name": "Dock 2",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "14",
-            "warehouse_name": "Dock 3",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "18",
-            "warehouse_name": "C5",
-            "qty": 0,
-            "unit": "PC"
-          },
-          {
-            "warehouse_id": "2",
-            "warehouse_name": "6116",
-            "qty": 10,
-            "unit": "PC"
-          }
-        ],
-        "created_at_utc": "2026-05-13T08:04:30.053Z"
-      }
-    ],
+    "M00006": [],
+    "M00007": [],
+    "M00008": [],
     "M00009": [],
     "M00010": [],
     "M00011": [],
@@ -428,5 +220,5 @@
     "M00020": [],
     "M00021": []
   },
-  "updated_at_utc": "2026-05-14T08:53:15.989295+00:00"
+  "updated_at_utc": "2026-05-15T06:48:23.813150+00:00"
 }

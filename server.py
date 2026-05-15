@@ -3310,7 +3310,7 @@ DASHBOARD_HTML = """
     .sub-tab-content { display:none; }
     .sub-tab-content.active { display:block; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(clamp(150px, 11vw, 190px), 1fr)); gap: clamp(10px, 1.2vw, 18px); }
-    #machineGrid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+    #machineGrid { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); align-items:stretch; }
     .card { min-width:0; background: #fff; border-radius: 12px; padding: clamp(10px, 1vw, 16px); border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform .12s ease, box-shadow .12s ease; }
     .card:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(0,0,0,0.12); }
     .card.active { border-color: #4CAF50; animation: cardPulseGreen 1.5s ease-in-out infinite; }
@@ -3318,6 +3318,31 @@ DASHBOARD_HTML = """
     .card.maintenance { border-color: #FF9800; animation: cardPulseOrange 1.5s ease-in-out infinite; }
     .card h3 { margin: 0 0 10px; font-size: clamp(.9rem, .9vw, 1.05rem); border-bottom: 1px solid #eee; padding-bottom: 8px; overflow-wrap:anywhere; }
     .card p { margin: 6px 0; font-size: 0.9rem; overflow-wrap:break-word; word-break:normal; }
+    #machineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); gap:10px; min-height:0; padding:12px; border:1px solid #d8e2ef; border-top:4px solid #94a3b8; border-radius:10px; background:#fff; box-shadow:0 8px 20px rgba(15,23,42,.06); overflow:hidden; }
+    #machineGrid .card:hover { transform:translateY(-1px); box-shadow:0 14px 28px rgba(15,23,42,.10); }
+    #machineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
+    #machineGrid .card.disconnected { border-color:#d8e2ef; border-top-color:#ef4444; background:#fff; }
+    #machineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; animation:none; background:#fffdf8; }
+    .machine-card-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; }
+    .machine-card-title { min-width:0; display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
+    #machineGrid .card .machine-card-title h3 { margin:0; padding:0; border:0; color:#0f172a; font-size:1.16rem; line-height:1.15; }
+    .machine-card-code { display:none; }
+    .machine-status-badge { flex:0 0 auto; border-radius:6px; padding:6px 9px; font-size:.74rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; background:#f1f5f9; color:#475569; border:1px solid #e2e8f0; }
+    .machine-status-badge.active { background:#dcfce7; color:#047857; border-color:#86efac; }
+    .machine-status-badge.disconnected { background:#fef2f2; color:#b91c1c; border-color:#fecaca; }
+    .machine-status-badge.maintenance { background:#ffedd5; color:#b45309; border-color:#fed7aa; }
+    .machine-job-block { padding:0 0 9px; border-bottom:1px solid #edf2f7; }
+    .machine-job-name { color:#0f172a; font-size:1rem; line-height:1.3; font-weight:900; overflow-wrap:anywhere; }
+    .machine-job-meta { margin-top:5px; display:grid; grid-template-columns:1fr 1fr; gap:4px 10px; color:#64748b; font-size:.86rem; line-height:1.3; }
+    .machine-job-meta span { min-width:0; overflow-wrap:anywhere; }
+    .machine-metrics { display:flex; flex-wrap:wrap; gap:6px; }
+    .machine-metric { min-width:64px; flex:1 1 64px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; padding:6px 8px; }
+    .machine-metric .k { color:#64748b; font-size:.72rem; font-weight:900; text-transform:uppercase; letter-spacing:.04em; }
+    .machine-metric .v { margin-top:3px; color:#0f172a; font-size:1.08rem; line-height:1; font-weight:900; overflow-wrap:anywhere; }
+    .machine-metric.good .v { color:#047857; }
+    .machine-metric.bad .v { color:#b91c1c; }
+    .machine-card-foot { margin-top:0; padding-top:8px; border-top:1px solid #edf2f7; color:#64748b; font-size:.8rem; line-height:1.4; display:grid; gap:2px; }
+    .machine-linkage-flag { border:1px solid #bfdbfe; background:#eff6ff; color:#1d4ed8; border-radius:6px; padding:5px 8px; font-size:.64rem; font-weight:900; letter-spacing:.04em; width:max-content; max-width:100%; }
     .panel { margin-top: 14px; background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     .panel h3 { margin: 0 0 6px; }
     .muted { color: #666; font-size: 0.9rem; }
@@ -3425,50 +3450,76 @@ DASHBOARD_HTML = """
     .planning-controls button { border:0; border-radius:10px; padding:10px 14px; font-weight:800; cursor:pointer; background:#2563eb; color:#fff; box-shadow:0 8px 18px rgba(37,99,235,.22); }
     .planning-controls button.secondary { background:#fff; color:#334155; border:1px solid #cbd5e1; box-shadow:none; }
     .planning-status { margin-top:10px; min-height:20px; color:#64748b; font-size:.85rem; }
+    .planning-ops-summary { display:grid; grid-template-columns:repeat(5, minmax(140px,1fr)); gap:12px; margin-top:14px; }
+    .planning-ops-metric { min-width:0; border-radius:14px; background:#111827; color:#fff; padding:13px 16px; box-shadow:0 12px 26px rgba(15,23,42,.14); }
+    .planning-ops-metric.warn { background:#92400e; }
+    .planning-ops-metric.good { background:#065f46; }
+    .planning-ops-metric .k { color:#aeb8c8; font-size:.68rem; font-weight:900; letter-spacing:.06em; text-transform:uppercase; }
+    .planning-ops-metric .v { margin-top:5px; color:#fff; font-size:1.55rem; line-height:1; font-weight:900; }
+    .planning-ops-metric .s { margin-top:6px; color:#cbd5e1; font-size:.74rem; line-height:1.25; overflow-wrap:break-word; }
     .planning-board { display:grid; grid-template-columns:minmax(520px, 620px) minmax(0,1fr); gap:14px; margin-top:14px; }
     .planning-lane, .planning-running { border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.88); box-shadow:0 10px 24px rgba(15,23,42,.06); min-width:0; }
-    .planning-lane.backlog { display:flex; flex-direction:column; height:100%; min-height:620px; overflow:hidden; }
-    .planning-left-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; min-width:0; align-items:stretch; height:100%; }
+    .planning-lane.backlog { display:flex; flex-direction:column; height:620px; min-height:0; overflow:hidden; }
+    .planning-left-grid { display:grid; grid-template-columns:1fr; gap:14px; min-width:0; align-items:stretch; height:100%; }
     .planning-lane-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 12px 8px; border-bottom:1px solid #e2e8f0; }
     .planning-lane-title { font-weight:800; color:#0f172a; }
     .planning-lane-count { color:#64748b; font-size:.78rem; }
+    .planning-lane-time { grid-column:1/-1; display:grid; gap:4px; margin-top:8px; color:#475569; font-size:.72rem; line-height:1.35; }
+    .planning-lane-time span { display:block; overflow-wrap:break-word; }
     .planning-dropzone { min-height:140px; padding:10px; display:grid; gap:10px; align-content:start; }
-    #planningBacklog { min-height:0; overflow:visible; }
-    .planning-backlog-scroll { min-height:0; overflow:auto; flex:1; display:grid; align-content:start; }
     .planning-dropzone.drag-over { outline:2px dashed #2563eb; outline-offset:-8px; background:#eff6ff; }
-    .planning-machine-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:14px; align-content:start; }
+    .planning-machine-grid { display:grid; grid-template-columns:1fr; gap:10px; align-content:start; max-height:620px; overflow-y:auto; padding-right:4px; }
+    .planning-machine-grid .planning-lane { width:100%; }
+    .planning-machine-grid .planning-lane-head { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; padding:10px 12px; }
+    .planning-machine-grid .planning-lane-time { display:flex; flex-wrap:wrap; column-gap:12px; row-gap:3px; margin-top:5px; }
+    .planning-machine-grid .planning-dropzone { min-height:112px; max-height:128px; overflow-x:auto; overflow-y:hidden; padding:8px 10px; gap:8px; grid-auto-flow:column; grid-template-rows:1fr; grid-auto-columns:260px; align-content:start; justify-content:start; }
+    .planning-machine-grid .planning-dropzone > * { width:260px; min-width:260px; box-sizing:border-box; }
+    .planning-machine-grid .planning-empty { border:0; background:transparent; padding:2px 0; }
+    .planning-machine-grid .planning-card { padding:8px 10px; box-shadow:none; max-height:104px; overflow:hidden; }
+    .planning-machine-grid .planning-job { font-size:.9rem; }
+    .planning-machine-grid .planning-meta { margin-top:4px; font-size:.72rem; line-height:1.28; }
+    .planning-machine-grid .planning-card-actions { margin-top:5px; }
     .planning-card { border:1px solid #dbe5ef; border-radius:12px; background:#fff; padding:11px; box-shadow:0 8px 18px rgba(15,23,42,.07); cursor:default; }
     .planning-card[draggable="true"] { cursor:default; }
     .planning-card:active { cursor:default; }
     .planning-card.live { cursor:default; border-color:#bbf7d0; background:#f0fdf4; }
+    .planning-card.next-job { border-color:#bfdbfe; background:#eff6ff; }
+    .planning-card.queue-job { border-color:#dbe5ef; background:#fff; }
     .planning-card-top { display:flex; align-items:flex-start; justify-content:space-between; gap:8px; min-width:0; }
     .planning-job { min-width:0; font-weight:900; color:#0f172a; overflow-wrap:break-word; word-break:normal; }
     .planning-chip { border-radius:999px; padding:3px 7px; font-size:.68rem; font-weight:800; background:#dbeafe; color:#1d4ed8; white-space:nowrap; }
+    .planning-chip.ongoing { background:#dcfce7; color:#047857; }
+    .planning-chip.next { background:#dbeafe; color:#1d4ed8; }
+    .planning-chip.queue { background:#f1f5f9; color:#475569; }
     .planning-meta { margin-top:7px; color:#475569; font-size:.78rem; line-height:1.4; overflow-wrap:break-word; word-break:normal; }
     .planning-card-actions { display:flex; justify-content:flex-end; margin-top:8px; }
     .planning-remove { border:0; background:#fee2e2; color:#b91c1c; border-radius:8px; padding:4px 8px; cursor:pointer; font-size:.72rem; font-weight:800; }
     .planning-empty { color:#94a3b8; border:1px dashed #cbd5e1; border-radius:10px; padding:12px; font-size:.84rem; }
-    .planning-recommend { border-top:1px solid #e2e8f0; background:#f8fbff; overflow:visible; }
+    .planning-recommend { border-top:1px solid #e2e8f0; background:#f8fbff; overflow:hidden; display:flex; flex-direction:column; height:100%; min-height:0; }
     .planning-recommend-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px; border-bottom:1px solid #e2e8f0; flex-wrap:wrap; }
     .planning-recommend-title { font-weight:900; color:#0f172a; }
     .planning-recommend-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
     .planning-recommend-actions input, .planning-recommend-actions select { width:70px; border:1px solid #cbd5e1; border-radius:10px; padding:7px 8px; font:inherit; background:#fff; }
     .planning-recommend-actions button { border:0; border-radius:10px; padding:8px 10px; font-weight:800; cursor:pointer; background:#0f766e; color:#fff; }
-    .planning-recommend-list { padding:10px; display:grid; gap:8px; overflow:visible; }
+    .planning-recommend-list { padding:10px; display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px; overflow:auto; min-height:0; flex:1; align-content:start; }
     .planning-stock-search-row { padding:0 10px 10px; display:grid; gap:7px; }
     .planning-stock-search-row input { width:100%; box-sizing:border-box; border:1px solid #cbd5e1; border-radius:10px; padding:9px 10px; font:inherit; background:#fff; }
     .planning-stock-range { display:grid; grid-template-columns:1fr 1fr; gap:7px; }
     .stock-rec-card { border:1px solid #dbe5ef; border-radius:12px; background:#fff; padding:10px 11px; box-shadow:0 8px 18px rgba(15,23,42,.06); }
+    .stock-rec-card[draggable="true"] { cursor:default; }
     .stock-rec-top { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
     .stock-rec-sku { min-width:0; font-weight:900; color:#0f172a; overflow-wrap:break-word; word-break:normal; }
     .stock-rec-badge { border-radius:999px; padding:4px 8px; font-size:.68rem; font-weight:900; background:#fee2e2; color:#991b1b; white-space:nowrap; }
     .stock-rec-name { margin-top:5px; font-size:.78rem; color:#475569; line-height:1.35; overflow-wrap:break-word; word-break:normal; }
     .stock-rec-meta { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; font-size:.72rem; font-weight:800; color:#334155; }
     .stock-rec-meta span { background:#f1f5f9; border:1px solid #e2e8f0; border-radius:999px; padding:3px 7px; }
-    .stock-rec-add { margin-top:9px; width:100%; border:0; border-radius:9px; padding:8px 10px; font-weight:900; cursor:pointer; background:#dbeafe; color:#1d4ed8; }
-    .planning-dropzone, .planning-backlog-scroll, .planning-recommend-list, .stock-rec-card { cursor:default; }
+    .planning-dropzone, .planning-recommend-list, .stock-rec-card { cursor:default; }
     .planning-controls input, .planning-stock-search-row input, .planning-recommend-actions input, .planning-recommend-actions select { cursor:text; }
     .planning-recommend-actions select { cursor:pointer; }
+    .planning-live-queue { margin-top:14px; border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.9); box-shadow:0 10px 24px rgba(15,23,42,.06); overflow:hidden; }
+    .planning-live-queue-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid #e2e8f0; }
+    .planning-live-queue-title { color:#0f172a; font-weight:900; }
+    .planning-live-queue .table-wrap { margin:0; box-shadow:none; border:0; border-radius:0; }
     .table-actions { display: flex; gap: 8px; }
     .mini-btn { border: 1px solid #cbd5e1; background: #fff; color: #1f2937; border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; cursor: pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .mini-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 12px rgba(15,23,42,0.08); }
@@ -3941,7 +3992,8 @@ DASHBOARD_HTML = """
     body[data-theme="Soft Gray"] .people-role-row.head { background: #f8fafc; color: #475569; }
     @media (max-width: 1650px) {
       .planning-board { grid-template-columns:1fr; }
-      .planning-lane.backlog { min-height:420px; }
+      .planning-lane.backlog { height:460px; min-height:0; }
+      .planning-ops-summary { grid-template-columns:repeat(3, minmax(140px,1fr)); }
     }
     @media (max-width: 1200px) {
       .diagnostics { grid-template-columns: repeat(4, 48px) repeat(2, minmax(150px, 1fr)); }
@@ -3955,8 +4007,12 @@ DASHBOARD_HTML = """
       .diagnostics { grid-template-columns: repeat(4, 48px) minmax(0, 1fr); }
       .main-tab-button { flex:1 1 140px; }
       .planning-head { display:grid; grid-template-columns:1fr; }
+      .planning-ops-summary { grid-template-columns:repeat(2, minmax(0,1fr)); }
       .planning-controls { grid-template-columns:1fr auto auto; }
-      .planning-machine-grid { grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); }
+      .planning-machine-grid { grid-template-columns:1fr; max-height:560px; }
+      .planning-machine-grid .planning-dropzone { grid-auto-columns:220px; }
+      .planning-machine-grid .planning-dropzone > * { width:220px; min-width:220px; }
+      .planning-recommend-list { grid-template-columns:1fr; }
       .machine-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .archive-detail-hero { grid-template-columns:1fr; }
       .archive-detail-hero-side, .planning-left-grid, .detail-chart-grid { grid-template-columns:1fr; }
@@ -4063,17 +4119,18 @@ DASHBOARD_HTML = """
         <div class="planning-controls">
           <input id="planningJobInput" type="text" placeholder="Scan or type job / work order..." />
           <button id="planningLookupBtn" type="button">Add Job</button>
-          <button id="planningClearBtn" class="secondary" type="button">Clear Backlog</button>
+          <button id="planningClearBtn" class="secondary" type="button">Clear List</button>
         </div>
       </div>
+      <div id="planningOpsSummary" class="planning-ops-summary"></div>
       <div class="planning-board">
         <div class="planning-left-grid">
         <div class="planning-lane backlog">
             <div class="planning-recommend" style="border-top:none;">
               <div class="planning-recommend-head">
                 <div>
-                  <div class="planning-recommend-title">Low Stock</div>
-                  <div class="muted">Suggested next-run items from IMS stock.</div>
+                  <div class="planning-recommend-title">Jobs & Low Stock</div>
+                  <div class="muted">Scanned jobs stay at the top. Drag any item into a machine.</div>
                 </div>
                 <div class="planning-recommend-actions">
                   <select id="planningLowStockLimit" title="Items to show">
@@ -4097,17 +4154,18 @@ DASHBOARD_HTML = """
               </div>
             </div>
         </div>
-        <div class="planning-lane backlog">
-          <div class="planning-lane-head">
-            <div class="planning-lane-title">Backlog</div>
-            <div id="planningBacklogCount" class="planning-lane-count">0 jobs</div>
-          </div>
-          <div class="planning-backlog-scroll">
-            <div id="planningBacklog" class="planning-dropzone" data-lane="BACKLOG"></div>
-          </div>
-        </div>
         </div>
         <div id="planningMachineGrid" class="planning-machine-grid"></div>
+      </div>
+      <div class="planning-live-queue">
+        <div class="planning-live-queue-head">
+          <div>
+            <div class="planning-live-queue-title">Live Job Queue</div>
+            <div class="muted">Active machine jobs with cycle-time ETA used by planning lanes.</div>
+          </div>
+          <div id="planningQueueHint" class="muted"></div>
+        </div>
+        <div id="planningQueueTableWrap" class="table-wrap"></div>
       </div>
     </div>
   </div>
@@ -4588,9 +4646,10 @@ DASHBOARD_HTML = """
   const planningLookupBtn = document.getElementById("planningLookupBtn");
   const planningClearBtn = document.getElementById("planningClearBtn");
   const planningStatus = document.getElementById("planningStatus");
-  const planningBacklog = document.getElementById("planningBacklog");
-  const planningBacklogCount = document.getElementById("planningBacklogCount");
+  const planningOpsSummary = document.getElementById("planningOpsSummary");
   const planningMachineGrid = document.getElementById("planningMachineGrid");
+  const planningQueueHint = document.getElementById("planningQueueHint");
+  const planningQueueTableWrap = document.getElementById("planningQueueTableWrap");
   const planningLowStockLimit = document.getElementById("planningLowStockLimit");
   const planningLowStockSearch = document.getElementById("planningLowStockSearch");
   const planningLowStockMin = document.getElementById("planningLowStockMin");
@@ -4708,6 +4767,11 @@ DASHBOARD_HTML = """
   let planningBoard = { lanes: { BACKLOG: [] }, updated_at_utc: "" };
   let planningSaveTimer = null;
   let planningLocalDirty = false;
+  let planningDragActive = false;
+  let planningDeferredState = null;
+  let planningDropCompleted = false;
+  let planningMachineDropScrollLeft = {};
+  let planningMachineScrollActiveUntil = 0;
   let operatorDirectoryState = [];
   const machineCardEls = new Map();
   let finishedJobsState = [];
@@ -6961,13 +7025,134 @@ DASHBOARD_HTML = """
     return `<span class="queue-status-badge ${esc(css)}">${esc(raw || "RUNNING")}</span>`;
   }
 
-  function renderJobQueue(rows){
-    if(!jobQueueTableWrap) return;
-    const list = Array.isArray(rows) ? rows : [];
-    const runningRows = list.filter(r => {
+  function queueRunningRows(rows){
+    return (Array.isArray(rows) ? rows : []).filter(r => {
       const status = String(r?.status || "").trim();
       return status !== "DONE" && status !== "DISCONNECTED";
     });
+  }
+
+  function preferredQueueFinish(row){
+    return row?.expected_finish_pack_utc || row?.expected_finish_act_utc || "";
+  }
+
+  function preferredQueueRemaining(row){
+    return row?.remaining_seconds_pack ?? row?.remaining_seconds_act ?? null;
+  }
+
+  function planningCardCycleSeconds(card, fallback=0){
+    const raw = card?.std_cycle_time ?? card?.cycle_time ?? card?.cycle_time_seconds ?? fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : Number(fallback || 0);
+  }
+
+  function planningShiftHours(card){
+    const raw = card?.shift_hours ?? card?.hours_per_shift ?? card?.total_hours_per_shift ?? 12;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : 12;
+  }
+
+  function planningQtyPerShift(card, fallbackCycle=0){
+    const explicit = Number(card?.qty_per_shift || card?.quantity_per_shift || 0);
+    if(Number.isFinite(explicit) && explicit > 0) return explicit;
+    const cycle = planningCardCycleSeconds(card, fallbackCycle);
+    if(!cycle) return 0;
+    const cavity = Math.max(1, Number(card?.cavity_count || card?.cavity || 1));
+    return Math.floor(((planningShiftHours(card) * 60 * 60) / cycle) * cavity);
+  }
+
+  function planningCardDurationSeconds(card, fallbackCycle=0){
+    const qty = Math.max(0, Number(card?.request_qty || card?.qty || card?.quantity || 0));
+    if(!qty) return 0;
+    const qtyPerShift = planningQtyPerShift(card, fallbackCycle);
+    const hours = planningShiftHours(card);
+    if(qtyPerShift > 0) return (qty / qtyPerShift) * hours * 60 * 60;
+    const cycle = planningCardCycleSeconds(card, fallbackCycle);
+    const cavity = Math.max(1, Number(card?.cavity_count || card?.cavity || 1));
+    return cycle ? Math.ceil(qty / cavity) * cycle : 0;
+  }
+
+  function renderPlanningOpsSummary(state, rows){
+    if(!planningOpsSummary) return;
+    const list = Array.isArray(rows) ? rows : [];
+    const runningRows = queueRunningRows(list);
+    const activeMachineCodes = new Set(runningRows.map(r => String(r?.machine_code || "").trim()).filter(Boolean));
+    const lowStockCount = (lowStockItemsState || []).length;
+    const nearFinishRows = runningRows.filter(r => {
+      const remain = preferredQueueRemaining(r);
+      return remain != null && Number(remain) >= 0 && Number(remain) <= 7200;
+    });
+    const machineTotal = Math.max(1, DEFAULT_MACHINE_CODES.length || activeMachineCodes.size || 1);
+    const utilization = Math.round((activeMachineCodes.size / machineTotal) * 100);
+    const nextFinish = nearFinishRows
+      .slice()
+      .sort((a,b) => Number(preferredQueueRemaining(a) ?? 999999999) - Number(preferredQueueRemaining(b) ?? 999999999))[0];
+    planningOpsSummary.innerHTML = `
+      <div class="planning-ops-metric"><div class="k">Active Jobs</div><div class="v">${esc(list.length)}</div><div class="s">${esc(runningRows.length)} running now</div></div>
+      <div class="planning-ops-metric"><div class="k">Active Machines</div><div class="v">${esc(activeMachineCodes.size)}</div><div class="s">${esc(machineTotal)} configured lanes</div></div>
+      <div class="planning-ops-metric warn"><div class="k">Low Stock</div><div class="v">${esc(lowStockCount)}</div><div class="s">IMS recommendations loaded</div></div>
+      <div class="planning-ops-metric ${nearFinishRows.length ? "warn" : "good"}"><div class="k">Nearly Finished</div><div class="v">${esc(nearFinishRows.length)}</div><div class="s">${nextFinish ? `${esc(nextFinish.machine_name || nextFinish.machine_code || "-")} in ${esc(fmtDowntimeSeconds(preferredQueueRemaining(nextFinish)))}` : "No jobs under 2h"}</div></div>
+      <div class="planning-ops-metric"><div class="k">Utilization</div><div class="v">${esc(utilization)}%</div><div class="s">Running machines / lanes</div></div>
+    `;
+  }
+
+  function renderPlanningQueue(rows){
+    if(!planningQueueTableWrap) return;
+    const list = Array.isArray(rows) ? rows : [];
+    if(planningQueueHint) planningQueueHint.textContent = `${list.length} active job${list.length === 1 ? "" : "s"}`;
+    if(!list.length){
+      planningQueueTableWrap.innerHTML = '<div class="placeholder">No active jobs in queue yet.</div>';
+      return;
+    }
+    planningQueueTableWrap.innerHTML = `
+      <table class="data-table">
+        <thead><tr><th>Machine</th><th>Job</th><th>Start</th><th>Est Finish</th><th>Remaining</th><th>Cycle Basis</th></tr></thead>
+        <tbody>
+          ${list.map(row => {
+            const finish = preferredQueueFinish(row);
+            const remaining = preferredQueueRemaining(row);
+            const cycle = row?.live_cycle_seconds ? `${Number(row.live_cycle_seconds).toFixed(2)}s pack` : (row?.act_cycle_seconds ? `${Number(row.act_cycle_seconds).toFixed(2)}s act` : "-");
+            return `<tr>
+              <td>${esc(row?.machine_name || row?.machine_code || "-")}<br><span class="muted">${esc(row?.machine_code || "-")}</span></td>
+              <td>${esc(row?.job_name || row?.job_code || "-")}<br><span class="muted">${esc(row?.job_code || "-")}</span></td>
+              <td>${esc(row?.job_started_at ? fmtDateLocal(row.job_started_at) : "-")}</td>
+              <td>${esc(finish ? fmtDateLocal(finish) : "-")}</td>
+              <td>${esc(remaining != null ? fmtDowntimeSeconds(remaining) : "-")}</td>
+              <td>${esc(cycle)}</td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+      </table>
+    `;
+  }
+
+  function planningMachineTimingHtml(code, queueRow, cards){
+    const finish = preferredQueueFinish(queueRow);
+    const remaining = preferredQueueRemaining(queueRow);
+    const activeStart = queueRow?.job_started_at ? fmtDateLocal(queueRow.job_started_at) : "-";
+    const activeFinish = finish ? fmtDateLocal(finish) : "-";
+    const fallbackCycle = Number(queueRow?.live_cycle_seconds || queueRow?.act_cycle_seconds || 0);
+    let nextStartMs = finish ? Date.parse(finish) : Date.now();
+    if(!Number.isFinite(nextStartMs)) nextStartMs = Date.now();
+    const firstPlanned = Array.isArray(cards) && cards.length ? cards[0] : null;
+    const firstDuration = firstPlanned ? planningCardDurationSeconds(firstPlanned, fallbackCycle) : 0;
+    const firstEndMs = firstDuration ? nextStartMs + firstDuration * 1000 : null;
+    const firstQtyPerShift = firstPlanned ? planningQtyPerShift(firstPlanned, fallbackCycle) : 0;
+    const firstShiftHours = firstPlanned ? planningShiftHours(firstPlanned) : 12;
+    return `
+      <div class="planning-lane-time">
+        <span>Live start: ${esc(activeStart)}</span>
+        <span>Est finish: ${esc(activeFinish)}${remaining != null ? ` (${esc(fmtDowntimeSeconds(remaining))} left)` : ""}</span>
+        <span>Next start: ${esc(firstPlanned ? new Date(nextStartMs).toLocaleString() : "-")}</span>
+        <span>Next est finish: ${esc(firstEndMs ? new Date(firstEndMs).toLocaleString() : "-")}${firstQtyPerShift ? ` (${esc(Math.round(firstQtyPerShift))}/shift @ ${esc(firstShiftHours)}h)` : ""}</span>
+      </div>
+    `;
+  }
+
+  function renderJobQueue(rows){
+    if(!jobQueueTableWrap) return;
+    const list = Array.isArray(rows) ? rows : [];
+    const runningRows = queueRunningRows(list);
     const disconnectedRows = list.filter(r => String(r?.status || "").trim() === "DISCONNECTED");
     const remainingTotal = runningRows.reduce((sum, r) => sum + Number(r?.remaining_qty || 0), 0);
 
@@ -7064,11 +7249,15 @@ DASHBOARD_HTML = """
     planningStatus.style.color = isError ? "#b91c1c" : "#64748b";
   }
 
-  function planningCardHtml(card, lane){
+  function planningCardHtml(card, lane, queueIndex=null){
     const job = card || {};
     const title = job.job_ref || job.job_name || job.job_id || "Planned Job";
+    const roleLabel = queueIndex === 0 ? "NEXT" : (Number.isInteger(queueIndex) ? `QUEUE ${queueIndex + 1}` : (job.source || "PLAN"));
+    const roleClass = queueIndex === 0 ? "next" : (Number.isInteger(queueIndex) ? "queue" : "");
+    const cardClass = queueIndex === 0 ? " next-job" : (Number.isInteger(queueIndex) ? " queue-job" : "");
     const product = [job.product_sku, job.product_name].filter(Boolean).join(" - ") || job.product_id || "-";
     const details = [
+      Number.isInteger(queueIndex) ? (queueIndex === 0 ? "Status: next after ongoing job" : `Status: queued position ${queueIndex + 1}`) : "",
       `Product: ${product}`,
       job.mold ? `Mold: ${job.mold}` : "",
       job.color ? `Color: ${job.color}` : "",
@@ -7079,12 +7268,12 @@ DASHBOARD_HTML = """
       job.source === "LOW STOCK" ? `Threshold: ${job.low_stock_threshold ?? "-"}` : "",
       job.tonnage ? `Tonnage: ${job.tonnage}` : "",
     ].filter(Boolean).join("<br>");
-    return `<div class="planning-card" draggable="true" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip">${esc(job.source || "PLAN")}</span></div><div class="planning-meta">${details || "No BMS details available."}</div><div class="planning-card-actions"><button class="planning-remove" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}">Remove</button></div></div>`;
+    return `<div class="planning-card${cardClass}" draggable="true" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip ${esc(roleClass)}">${esc(roleLabel)}</span></div><div class="planning-meta">${details || "No BMS details available."}</div><div class="planning-card-actions"><button class="planning-remove" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}">Remove</button></div></div>`;
   }
 
   function livePlanningCardHtml(session){
     const title = session.job_name || session.job_code || "Running Job";
-    return `<div class="planning-card live"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip">LIVE</span></div><div class="planning-meta">Operator: ${esc(session.operator_id || "-")}<br>Pack: ${esc(session.pack_total || 0)} | Good: ${esc(session.good_total || 0)} | Reject: ${esc(session.reject_total || 0)}</div></div>`;
+    return `<div class="planning-card live"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip ongoing">ONGOING</span></div><div class="planning-meta">Status: running now<br>Operator: ${esc(session.operator_id || "-")}<br>Pack: ${esc(session.pack_total || 0)} | Good: ${esc(session.good_total || 0)} | Reject: ${esc(session.reject_total || 0)}</div></div>`;
   }
 
   function renderLowStockRecommendations(items, meta = {}){
@@ -7113,12 +7302,14 @@ DASHBOARD_HTML = """
       return [item?.sku, item?.product_id, item?.name, item?.tonnage]
         .some(v => String(v || "").toLowerCase().includes(q));
     });
-    if(!rows.length){
+    const queuedCards = planningLaneCards("BACKLOG");
+    const queuedHtml = queuedCards.length ? queuedCards.map(c => planningCardHtml(c, "BACKLOG")).join("") : "";
+    if(!rows.length && !queuedCards.length){
       planningLowStockList.innerHTML = `<div class="planning-empty">${esc(meta.error || "No matching low-stock item.")}</div>`;
       return;
     }
     const visible = rows.slice(0, limit);
-    planningLowStockList.innerHTML = visible.map((item, idx) => {
+    const lowStockHtml = visible.map((item, idx) => {
       const wh = Array.isArray(item.warehouses) ? item.warehouses : [];
       const whText = wh
         .filter(x => Number(x?.qty || 0) > 0)
@@ -7127,7 +7318,7 @@ DASHBOARD_HTML = """
         .join(" | ") || "No warehouse qty";
       const title = item.sku || item.product_id || "Product";
       return `
-        <div class="stock-rec-card">
+        <div class="stock-rec-card" draggable="true" data-rec-index="${idx}">
           <div class="stock-rec-top">
             <div class="stock-rec-sku">${esc(title)}</div>
             <span class="stock-rec-badge">${esc(item.total_stock ?? 0)}${item.unit ? ` ${esc(item.unit)}` : ""}</span>
@@ -7140,20 +7331,30 @@ DASHBOARD_HTML = """
             <span>Range ${esc(minStockRaw || "0")}-${esc(maxStockRaw || item.threshold || "-")}</span>
           </div>
           <div class="planning-meta">${esc(whText)}</div>
-          <button class="stock-rec-add" data-rec-index="${idx}" type="button">Add Recommendation</button>
         </div>
       `;
     }).join("");
-    planningLowStockList.querySelectorAll(".stock-rec-add").forEach(btn => {
-      btn.addEventListener("click", () => {
-        const idx = Number(btn.getAttribute("data-rec-index") || -1);
+    planningLowStockList.innerHTML = `${queuedHtml}${lowStockHtml}`;
+    planningLowStockList.querySelectorAll(".stock-rec-card[draggable='true']").forEach(cardEl => {
+      cardEl.addEventListener("dragstart", ev => {
+        const idx = Number(cardEl.getAttribute("data-rec-index") || -1);
         const item = visible[idx];
-        if(item) addLowStockRecommendationToBacklog(item);
+        const card = item ? queueLowStockPlanningItem(item, { render: false, status: false }) : null;
+        if(!card) return;
+        planningDragActive = true;
+        planningDropCompleted = false;
+        ev.dataTransfer.setData("text/plain", card.id || "");
+        ev.dataTransfer.effectAllowed = "move";
+      });
+      cardEl.addEventListener("dragend", () => {
+        planningDragActive = false;
+        document.querySelectorAll(".planning-dropzone.drag-over").forEach(zone => zone.classList.remove("drag-over"));
+        renderPlanningBoard({ ...latestState, planning_board: planningBoard });
       });
     });
   }
 
-  function addLowStockRecommendationToBacklog(item){
+  function lowStockItemToPlanningCard(item){
     planningBoard = normalizePlanningBoard(planningBoard);
     const productId = String(item?.product_id || "").trim();
     const sku = String(item?.sku || "").trim();
@@ -7176,16 +7377,28 @@ DASHBOARD_HTML = """
       warehouses: Array.isArray(item?.warehouses) ? item.warehouses : [],
       created_at_utc: new Date().toISOString(),
     };
+    return card;
+  }
+
+  function queueLowStockPlanningItem(item, options = {}){
+    planningBoard = normalizePlanningBoard(planningBoard);
+    const card = lowStockItemToPlanningCard(item);
+    const productId = String(card.product_id || "").trim();
+    const sku = String(card.product_sku || card.sku || "").trim();
+    const title = card.job_ref || card.job_name || "Low Stock Item";
     planningBoard.lanes.BACKLOG.unshift(card);
     lowStockItemsState = (lowStockItemsState || []).filter(x => {
       const sameProduct = productId && String(x?.product_id || "").trim() === productId;
       const sameSku = sku && String(x?.sku || "").trim() === sku;
       return !(sameProduct || sameSku);
     });
-    renderPlanningBoard({ ...latestState, planning_board: planningBoard });
-    renderLowStockRecommendations(lowStockItemsState);
     schedulePlanningSave();
-    planningSetStatus(`Added low-stock recommendation ${title} to backlog.`);
+    if(options.render !== false){
+      renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+      renderLowStockRecommendations(lowStockItemsState);
+    }
+    if(options.status !== false) planningSetStatus(`Queued low-stock recommendation ${title}.`);
+    return card;
   }
 
   async function loadLowStockRecommendations(forceRefresh = false){
@@ -7204,30 +7417,39 @@ DASHBOARD_HTML = """
       }
       lowStockItemsState = out.items || [];
       renderLowStockRecommendations(lowStockItemsState, out);
+      renderPlanningOpsSummary(latestState || {}, latestState?.job_queue || []);
       const suffix = out.from_cache ? " from cache" : "";
       planningSetStatus(`Loaded ${(out.items || []).length} low-stock recommendation(s)${suffix}.`);
     } catch(e){
       renderLowStockRecommendations([], { error: `Low-stock lookup failed: ${e}` });
+      renderPlanningOpsSummary(latestState || {}, latestState?.job_queue || []);
       planningSetStatus(`Low-stock lookup failed: ${e}`, true);
     }
   }
 
   function renderPlanningBoard(state){
+    if(planningDragActive || Date.now() < planningMachineScrollActiveUntil) return;
+    document.querySelectorAll(".planning-machine-grid .planning-dropzone").forEach(zone => {
+      const lane = zone.getAttribute("data-lane") || "";
+      if(lane) planningMachineDropScrollLeft[lane] = zone.scrollLeft || 0;
+    });
     planningBoard = normalizePlanningBoard((planningLocalDirty ? planningBoard : state?.planning_board) || planningBoard);
-    if(planningBacklogCount) planningBacklogCount.textContent = `${planningLaneCards("BACKLOG").length} jobs`;
-    if(planningBacklog){
-      planningBacklog.innerHTML = planningLaneCards("BACKLOG").map(c => planningCardHtml(c, "BACKLOG")).join("") || '<div class="planning-empty">Scan or type a job to add it here.</div>';
-    }
-    if(lowStockItemsState.length) renderLowStockRecommendations(lowStockItemsState);
+    renderLowStockRecommendations(lowStockItemsState);
     if(planningMachineGrid){
       const sessionsByMachine = new Map((state?.sessions || []).map(s => [String(s.machine_code || ""), s]));
+      const queueByMachine = new Map(((state?.job_queue || [])).map(row => [String(row?.machine_code || "").trim(), row]));
       planningMachineGrid.innerHTML = DEFAULT_MACHINE_CODES.map(code => {
         const cards = planningLaneCards(code);
         const live = sessionsByMachine.get(code);
-        return `<div class="planning-lane"><div class="planning-lane-head"><div class="planning-lane-title">${esc(MACHINE_NAME_MAP[code] || code)}</div><div class="planning-lane-count">${esc(cards.length)} planned</div></div><div class="planning-dropzone" data-lane="${esc(code)}">${live && live.job_code ? livePlanningCardHtml(live) : ""}${cards.map(c => planningCardHtml(c, code)).join("") || (!live || !live.job_code ? '<div class="planning-empty">Drop jobs here.</div>' : "")}</div></div>`;
+        const queueRow = queueByMachine.get(code);
+        return `<div class="planning-lane"><div class="planning-lane-head"><div><div class="planning-lane-title">${esc(MACHINE_NAME_MAP[code] || code)}</div>${planningMachineTimingHtml(code, queueRow, cards)}</div><div class="planning-lane-count">${esc(cards.length)} planned</div></div><div class="planning-dropzone" data-lane="${esc(code)}">${live && live.job_code ? livePlanningCardHtml(live) : ""}${cards.map((c, idx) => planningCardHtml(c, code, idx)).join("") || (!live || !live.job_code ? '<div class="planning-empty">Drop jobs here.</div>' : "")}</div></div>`;
       }).join("");
     }
     bindPlanningDragHandlers();
+    document.querySelectorAll(".planning-machine-grid .planning-dropzone").forEach(zone => {
+      const lane = zone.getAttribute("data-lane") || "";
+      if(lane && planningMachineDropScrollLeft[lane] != null) zone.scrollLeft = planningMachineDropScrollLeft[lane];
+    });
   }
 
   function findAndMovePlanningCard(cardId, targetLane){
@@ -7247,23 +7469,60 @@ DASHBOARD_HTML = """
   }
 
   function bindPlanningDragHandlers(){
+    const clearPlanningDragState = () => {
+      planningDragActive = false;
+      document.querySelectorAll(".planning-dropzone.drag-over").forEach(zone => zone.classList.remove("drag-over"));
+    };
+    const flushPlanningDeferredRender = () => {
+      if(!planningDeferredState) return false;
+      const state = planningDeferredState;
+      planningDeferredState = null;
+      render(state);
+      return true;
+    };
     document.querySelectorAll(".planning-card[draggable='true']").forEach(card => {
       card.addEventListener("dragstart", ev => {
+        planningDragActive = true;
+        planningDropCompleted = false;
         ev.dataTransfer.setData("text/plain", card.getAttribute("data-card-id") || "");
+        ev.dataTransfer.effectAllowed = "move";
+      });
+      card.addEventListener("dragend", () => {
+        clearPlanningDragState();
+        if(!flushPlanningDeferredRender() && !planningDropCompleted){
+          renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+        }
+        planningDropCompleted = false;
       });
     });
     document.querySelectorAll(".planning-dropzone").forEach(zone => {
-      zone.addEventListener("dragover", ev => { ev.preventDefault(); zone.classList.add("drag-over"); });
-      zone.addEventListener("dragleave", () => zone.classList.remove("drag-over"));
+      zone.addEventListener("scroll", () => {
+        const lane = zone.getAttribute("data-lane") || "";
+        if(lane) planningMachineDropScrollLeft[lane] = zone.scrollLeft || 0;
+        if(zone.closest(".planning-machine-grid")) planningMachineScrollActiveUntil = Date.now() + 900;
+      }, { passive: true });
+      zone.addEventListener("dragover", ev => {
+        ev.preventDefault();
+        if(!zone.classList.contains("drag-over")) zone.classList.add("drag-over");
+      });
+      zone.addEventListener("dragleave", ev => {
+        const rect = zone.getBoundingClientRect();
+        const stillInside = ev.clientX >= rect.left && ev.clientX <= rect.right && ev.clientY >= rect.top && ev.clientY <= rect.bottom;
+        if(stillInside || zone.contains(ev.relatedTarget)) return;
+        zone.classList.remove("drag-over");
+      });
       zone.addEventListener("drop", ev => {
         ev.preventDefault();
         zone.classList.remove("drag-over");
         const cardId = ev.dataTransfer.getData("text/plain");
         const lane = zone.getAttribute("data-lane") || "BACKLOG";
+        planningDragActive = false;
+        planningDropCompleted = true;
         if(findAndMovePlanningCard(cardId, lane)){
           renderPlanningBoard({ ...latestState, planning_board: planningBoard });
           schedulePlanningSave();
         }
+        clearPlanningDragState();
       });
     });
     document.querySelectorAll(".planning-remove").forEach(btn => {
@@ -7349,7 +7608,7 @@ DASHBOARD_HTML = """
       if(planningJobInput) planningJobInput.value = "";
       renderPlanningBoard({ ...latestState, planning_board: planningBoard });
       schedulePlanningSave();
-      planningSetStatus(`Added ${card.job_ref || card.job_id || value} to backlog.`);
+      planningSetStatus(`Added ${card.job_ref || card.job_id || value} to the top of the planning list.`);
     }catch(e){
       planningSetStatus(`Planning lookup failed: ${e}`, true);
     }
@@ -7498,22 +7757,36 @@ DASHBOARD_HTML = """
       ? (s.job_code ? `${s.job_name} (${s.job_code})` : s.job_name)
       : (s.job_code || "No Job Set");
     const seenLabel = s.last_seen_utc ? new Date(s.last_seen_utc).toLocaleString() : "-";
+    const statusText = statusLabel || css.toUpperCase();
+    const operatorText = displayNameForId(s.operator_id || "-");
+    const clientText = displayNameForId(s.client_id || "-");
     return `
       ${hasLinkage ? `<div class="machine-linkage-flag">LINKED JOBS: ${esc(linkageJobs.length)}</div>` : ""}
-      <h3>${esc(s.machine_name || s.machine_code)}</h3>
-      <p>Machine: <strong>${esc(s.machine_code || code)}</strong></p>
-      <p>Job: <strong>${esc(jobLabel)}</strong></p>
-      <p>Operator: <strong>${esc(displayNameForId(s.operator_id || "-"))}</strong></p>
-      <p>Client: <strong>${esc(displayNameForId(s.client_id || "-"))}</strong></p>
-      <p>Status: <strong>${esc(statusLabel || css.toUpperCase())}</strong></p>
-      <p>Pack: <strong>${esc(s.pack_total)}</strong></p>
-      <p>Good: <strong>${esc(s.good_total)}</strong></p>
-      <p>Butal: <strong>${esc(s.butal_total)}</strong></p>
-      <p>Reject: <strong>${esc(s.reject_total)}</strong></p>
-      <p>No Shot: <strong>${esc(s.no_shot_total || 0)}</strong></p>
-      <p>Total: <strong>${esc(total)}</strong></p>
-      <p class="muted">Last Seen: ${esc(seenLabel)}</p>
-      <p class="muted">Last Event: ${esc(s.last_event || "-")}</p>
+      <div class="machine-card-head">
+        <div class="machine-card-title">
+          <h3>${esc(s.machine_name || s.machine_code)}</h3>
+        </div>
+        <span class="machine-status-badge ${esc(css)}">${esc(statusText)}</span>
+      </div>
+      <div class="machine-job-block">
+        <div class="machine-job-name">${esc(jobLabel)}</div>
+        <div class="machine-job-meta">
+          <span>Operator: <strong>${esc(operatorText)}</strong></span>
+          <span>Client: <strong>${esc(clientText)}</strong></span>
+        </div>
+      </div>
+      <div class="machine-metrics">
+        <div class="machine-metric"><div class="k">Pack</div><div class="v">${esc(s.pack_total || 0)}</div></div>
+        <div class="machine-metric good"><div class="k">Good</div><div class="v">${esc(s.good_total || 0)}</div></div>
+        <div class="machine-metric"><div class="k">Butal</div><div class="v">${esc(s.butal_total || 0)}</div></div>
+        <div class="machine-metric bad"><div class="k">Reject</div><div class="v">${esc(s.reject_total || 0)}</div></div>
+        <div class="machine-metric"><div class="k">No Shot</div><div class="v">${esc(s.no_shot_total || 0)}</div></div>
+        <div class="machine-metric good"><div class="k">Total</div><div class="v">${esc(total)}</div></div>
+      </div>
+      <div class="machine-card-foot">
+        <div>Last seen: ${esc(seenLabel)}</div>
+        <div>Last event: ${esc(s.last_event || "-")}</div>
+      </div>
     `;
   }
 
@@ -7534,6 +7807,10 @@ DASHBOARD_HTML = """
   }
 
   function render(state){
+    if(planningDragActive || Date.now() < planningMachineScrollActiveUntil){
+      planningDeferredState = state || null;
+      return;
+    }
     latestState = state || { sessions: [] };
     machineStatusOverridesState = (state && state.machine_status_overrides && typeof state.machine_status_overrides === "object") ? state.machine_status_overrides : {};
     machineStatusArchiveState = (state && Array.isArray(state.machine_status_archive)) ? state.machine_status_archive : [];
@@ -7586,6 +7863,8 @@ DASHBOARD_HTML = """
     renderMachineStatusArchive(machineStatusArchiveState);
     renderDowntimeArchive(state.finished_jobs || [], state.archived_jobs || []);
     renderMaintenanceTab(state || {});
+    renderPlanningOpsSummary(state || {}, state.job_queue || []);
+    renderPlanningQueue(state.job_queue || []);
     renderPlanningBoard(state || {});
   }
 
@@ -7621,7 +7900,7 @@ DASHBOARD_HTML = """
   }
   if(planningClearBtn){
     planningClearBtn.addEventListener("click", () => {
-      if(!confirm("Clear all jobs from the planning backlog?")) return;
+      if(!confirm("Clear all scanned/queued jobs from the planning list?")) return;
       planningBoard = normalizePlanningBoard(planningBoard);
       planningBoard.lanes.BACKLOG = [];
       renderPlanningBoard({ ...latestState, planning_board: planningBoard });
