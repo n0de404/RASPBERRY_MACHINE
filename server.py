@@ -1062,12 +1062,17 @@ class MachineSession:
     downtime_started_at: Optional[float] = None
     downtime_last_seconds: Optional[int] = None
     downtime_active: bool = False
+    pdr_operator_reason_code: Optional[str] = None
+    pdr_operator_reason_text: Optional[str] = None
     downtime_wait_started_at: Optional[float] = None
     downtime_wait_last_seconds: Optional[int] = None
     waiting_downtime_start_maintenance: bool = False
     waiting_pdr_maintenance_reason: bool = False
     waiting_downtime_end_maintenance: bool = False
     waiting_maintenance_qr: bool = False
+    waiting_supervisor_qr: bool = False
+    supervisor_downtime_confirmation_started_at: Optional[Any] = None
+    cycle_time_new_input: Optional[str] = None
     cycle_time_current: Optional[str] = None
     live_cycle_avg_seconds: Optional[float] = None
     maintenance_name: Optional[str] = None
@@ -1129,12 +1134,17 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         downtime_started_at=raw.get("downtime_started_at"),
         downtime_last_seconds=raw.get("downtime_last_seconds"),
         downtime_active=bool(raw.get("downtime_active", False)),
+        pdr_operator_reason_code=raw.get("pdr_operator_reason_code"),
+        pdr_operator_reason_text=raw.get("pdr_operator_reason_text"),
         downtime_wait_started_at=raw.get("downtime_wait_started_at"),
         downtime_wait_last_seconds=raw.get("downtime_wait_last_seconds"),
         waiting_downtime_start_maintenance=bool(raw.get("waiting_downtime_start_maintenance", False)),
         waiting_pdr_maintenance_reason=bool(raw.get("waiting_pdr_maintenance_reason", False)),
         waiting_downtime_end_maintenance=bool(raw.get("waiting_downtime_end_maintenance", False)),
         waiting_maintenance_qr=bool(raw.get("waiting_maintenance_qr", False)),
+        waiting_supervisor_qr=bool(raw.get("waiting_supervisor_qr", False)),
+        supervisor_downtime_confirmation_started_at=raw.get("supervisor_downtime_confirmation_started_at"),
+        cycle_time_new_input=raw.get("cycle_time_new_input"),
         cycle_time_current=raw.get("cycle_time_current"),
         live_cycle_avg_seconds=raw.get("live_cycle_avg_seconds"),
         maintenance_name=raw.get("maintenance_name"),
@@ -1252,6 +1262,23 @@ WS_CLIENTS: List[WebSocket] = []
 STATE_TICK_TASK: Optional[asyncio.Task] = None
 MACHINE_STATUS_OVERRIDES: Dict[str, Dict[str, Any]] = {}
 MACHINE_STATUS_ARCHIVE: List[Dict[str, Any]] = []
+ACTIVE_SESSIONS_FILE_MTIME: Optional[float] = None
+
+
+def refresh_active_sessions_from_file() -> None:
+    global ACTIVE_SESSIONS_FILE_MTIME
+    try:
+        stat = ACTIVE_MACHINE_SESSIONS_FILE.stat()
+    except Exception:
+        return
+    mtime = float(stat.st_mtime or 0)
+    if ACTIVE_SESSIONS_FILE_MTIME == mtime:
+        return
+    ACTIVE_SESSIONS_FILE_MTIME = mtime
+    for code, sess in load_active_sessions_seed().items():
+        if not code:
+            continue
+        SESSIONS[code] = sess
 
 
 def load_machine_status_overrides() -> Dict[str, Dict[str, Any]]:
@@ -3225,6 +3252,7 @@ def prune_dead_sessions():
 
 
 async def broadcast_state():
+    refresh_active_sessions_from_file()
     payload = {
         "type": "STATE",
         "active_ttl_seconds": ACTIVE_TTL_SECONDS,
@@ -3310,7 +3338,7 @@ DASHBOARD_HTML = """
     .sub-tab-content { display:none; }
     .sub-tab-content.active { display:block; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(clamp(150px, 11vw, 190px), 1fr)); gap: clamp(10px, 1.2vw, 18px); }
-    #machineGrid { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); align-items:stretch; }
+    #machineGrid { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); align-items:stretch; perspective:1200px; }
     .card { min-width:0; background: #fff; border-radius: 12px; padding: clamp(10px, 1vw, 16px); border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform .12s ease, box-shadow .12s ease; }
     .card:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(0,0,0,0.12); }
     .card.active { border-color: #4CAF50; animation: cardPulseGreen 1.5s ease-in-out infinite; }
@@ -3318,23 +3346,36 @@ DASHBOARD_HTML = """
     .card.maintenance { border-color: #FF9800; animation: cardPulseOrange 1.5s ease-in-out infinite; }
     .card h3 { margin: 0 0 10px; font-size: clamp(.9rem, .9vw, 1.05rem); border-bottom: 1px solid #eee; padding-bottom: 8px; overflow-wrap:anywhere; }
     .card p { margin: 6px 0; font-size: 0.9rem; overflow-wrap:break-word; word-break:normal; }
-    #machineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); gap:10px; min-height:0; padding:12px; border:1px solid #d8e2ef; border-top:4px solid #94a3b8; border-radius:10px; background:#fff; box-shadow:0 8px 20px rgba(15,23,42,.06); overflow:hidden; }
+    #machineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); gap:10px; min-height:0; padding:12px; border:1px solid #d8e2ef; border-top:4px solid #94a3b8; border-radius:10px; background:#fff; box-shadow:0 8px 20px rgba(15,23,42,.06); overflow:hidden; transform-style:preserve-3d; backface-visibility:hidden; will-change:transform, box-shadow; }
     #machineGrid .card:hover { transform:translateY(-1px); box-shadow:0 14px 28px rgba(15,23,42,.10); }
     #machineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
-    #machineGrid .card.disconnected { border-color:#d8e2ef; border-top-color:#ef4444; background:#fff; }
+    #machineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; animation:none; background:#fffafa; }
     #machineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; animation:none; background:#fffdf8; }
     .machine-card-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; }
     .machine-card-title { min-width:0; display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
     #machineGrid .card .machine-card-title h3 { margin:0; padding:0; border:0; color:#0f172a; font-size:1.16rem; line-height:1.15; }
     .machine-card-code { display:none; }
-    .machine-status-badge { flex:0 0 auto; border-radius:6px; padding:6px 9px; font-size:.74rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; background:#f1f5f9; color:#475569; border:1px solid #e2e8f0; }
+    .machine-status-badge { flex:0 0 auto; display:inline-flex; align-items:center; gap:7px; border-radius:6px; padding:6px 9px; font-size:.74rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; background:#f1f5f9; color:#475569; border:1px solid #e2e8f0; }
+    .machine-status-badge::before { content:""; flex:0 0 auto; width:9px; height:9px; border-radius:999px; background:#94a3b8; box-shadow:0 0 0 3px rgba(148,163,184,.16); }
     .machine-status-badge.active { background:#dcfce7; color:#047857; border-color:#86efac; }
     .machine-status-badge.disconnected { background:#fef2f2; color:#b91c1c; border-color:#fecaca; }
     .machine-status-badge.maintenance { background:#ffedd5; color:#b45309; border-color:#fed7aa; }
+    .machine-status-badge.active::before { background:#22c55e; animation:statusBeatGreen 1.25s ease-in-out infinite; }
+    .machine-status-badge.disconnected::before { background:#ef4444; animation:statusBeatRed 1.25s ease-in-out infinite; }
+    .machine-status-badge.maintenance::before { background:#f59e0b; animation:statusBeatOrange 1.25s ease-in-out infinite; }
     .machine-job-block { padding:0 0 9px; border-bottom:1px solid #edf2f7; }
     .machine-job-name { color:#0f172a; font-size:1rem; line-height:1.3; font-weight:900; overflow-wrap:anywhere; }
     .machine-job-meta { margin-top:5px; display:grid; grid-template-columns:1fr 1fr; gap:4px 10px; color:#64748b; font-size:.86rem; line-height:1.3; }
     .machine-job-meta span { min-width:0; overflow-wrap:anywhere; }
+    #machineGrid .card.linkage-flip-out { animation:linkageCardFlipOut .24s cubic-bezier(.45,0,.7,.2) forwards; transform-origin:center center; pointer-events:none; }
+    #machineGrid .card.linkage-flip-in { animation:linkageCardFlipIn .34s cubic-bezier(.18,.82,.28,1) forwards; transform-origin:center center; pointer-events:none; }
+    .machine-linkage-panel { display:grid; gap:7px; padding:9px 10px; border:1px solid #bfdbfe; border-radius:8px; background:#eff6ff; }
+    .machine-linkage-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    .machine-linkage-label { color:#1d4ed8; font-size:.68rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
+    .machine-linkage-job { color:#0f172a; font-size:.92rem; line-height:1.2; font-weight:900; overflow-wrap:anywhere; }
+    .machine-linkage-switch { flex:0 0 auto; border:1px solid #93c5fd; border-radius:7px; background:#fff; color:#1d4ed8; padding:5px 8px; font-size:.68rem; line-height:1; font-weight:900; letter-spacing:0; cursor:pointer; transition:transform .12s ease, box-shadow .14s ease, background-color .14s ease; }
+    .machine-linkage-switch:hover { transform:translateY(-1px); box-shadow:0 6px 14px rgba(37,99,235,.14); background:#f8fbff; }
+    .machine-linkage-switch:active { transform:translateY(0) scale(.98); }
     .machine-metrics { display:flex; flex-wrap:wrap; gap:6px; }
     .machine-metric { min-width:64px; flex:1 1 64px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; padding:6px 8px; }
     .machine-metric .k { color:#64748b; font-size:.72rem; font-weight:900; text-transform:uppercase; letter-spacing:.04em; }
@@ -3342,7 +3383,9 @@ DASHBOARD_HTML = """
     .machine-metric.good .v { color:#047857; }
     .machine-metric.bad .v { color:#b91c1c; }
     .machine-card-foot { margin-top:0; padding-top:8px; border-top:1px solid #edf2f7; color:#64748b; font-size:.8rem; line-height:1.4; display:grid; gap:2px; }
-    .machine-linkage-flag { border:1px solid #bfdbfe; background:#eff6ff; color:#1d4ed8; border-radius:6px; padding:5px 8px; font-size:.64rem; font-weight:900; letter-spacing:.04em; width:max-content; max-width:100%; }
+    #machineGrid .machine-linkage-flag { display:inline-flex; align-items:center; gap:8px; border:1px solid #bfdbfe; background:#eff6ff; color:#1d4ed8; border-radius:6px; padding:5px 6px 5px 8px; font-size:.64rem; font-weight:900; letter-spacing:.04em; width:max-content; max-width:100%; }
+    .machine-notif-wrap { position:absolute; right:12px; bottom:12px; z-index:4; }
+    .machine-notif-badge { width:30px; height:30px; border-radius:999px; border:1px solid #fdba74; background:#f59e0b; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:900; font-size:.78rem; box-shadow:0 0 0 3px rgba(245,158,11,.14), 0 8px 18px rgba(146,64,14,.20); cursor:help; }
     .panel { margin-top: 14px; background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     .panel h3 { margin: 0 0 6px; }
     .muted { color: #666; font-size: 0.9rem; }
@@ -3423,6 +3466,19 @@ DASHBOARD_HTML = """
     #maintenanceTab .maintenance-metric .s { color:#64748b; font-size:.82rem; margin-top:8px; }
     #maintenanceTab .maintenance-live-grid { grid-template-columns:1fr; gap:14px; margin-top:16px; }
     #maintenanceTab .maintenance-section-title, #maintenanceTab .maintenance-performance-title { color:#0f172a; font-size:1.05rem; font-weight:800; }
+    #maintenanceTab .maintenance-call-board { margin-top:12px; border:1px solid #d5e1ed; border-radius:10px; background:rgba(255,255,255,.92); box-shadow:0 8px 18px rgba(15,23,42,.06); padding:10px; }
+    #maintenanceTab .maintenance-call-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin-bottom:8px; }
+    #maintenanceTab .maintenance-call-count { border:1px solid #fecaca; background:#fef2f2; color:#b91c1c; border-radius:999px; padding:4px 8px; font-size:.7rem; font-weight:900; white-space:nowrap; }
+    #maintenanceTab .maintenance-call-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 220px), max-content)); gap:8px; align-items:start; }
+    #maintenanceTab .maintenance-call-card { width:min(100%, 260px); border:1px solid #fed7aa; border-left:4px solid #f59e0b; border-radius:9px; background:#fffbeb; padding:8px 9px; display:grid; gap:5px; box-shadow:0 6px 14px rgba(146,64,14,.07); }
+    #maintenanceTab .maintenance-call-card.active { border-color:#fdba74; background:#fff7ed; }
+    #maintenanceTab .maintenance-call-top { display:flex; align-items:flex-start; justify-content:space-between; gap:6px; }
+    #maintenanceTab .maintenance-call-machine { color:#0f172a; font-size:.9rem; font-weight:900; line-height:1.15; overflow-wrap:anywhere; }
+    #maintenanceTab .maintenance-call-status { border-radius:999px; padding:3px 7px; font-size:.6rem; font-weight:900; background:#fee2e2; color:#b91c1c; white-space:nowrap; }
+    #maintenanceTab .maintenance-call-status.active { background:#ffedd5; color:#b45309; }
+    #maintenanceTab .maintenance-call-meta { color:#64748b; font-size:.7rem; line-height:1.25; overflow-wrap:anywhere; }
+    #maintenanceTab .maintenance-call-reason { color:#7c2d12; font-size:.76rem; font-weight:900; line-height:1.2; overflow-wrap:anywhere; }
+    #maintenanceTab .maintenance-call-timer { font-family:"Consolas","Courier New",monospace; color:#9a3412; font-size:.95rem; font-weight:900; }
     #maintenanceTab .maintenance-list { grid-template-columns:repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap:14px; margin-top:12px; }
     #maintenanceTab .maintenance-person { grid-template-columns:74px minmax(0,1fr) minmax(170px,.72fr); border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.92); box-shadow:0 12px 26px rgba(15,23,42,.07); }
     #maintenanceTab .maintenance-person.busy { border-color:#f6c37a; box-shadow:0 12px 28px rgba(217,119,6,.12); }
@@ -3782,6 +3838,27 @@ DASHBOARD_HTML = """
       0% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(255,152,0,0.30); }
       50% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 8px rgba(255,152,0,0.14); }
       100% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(255,152,0,0.00); }
+    }
+    @keyframes statusBeatGreen {
+      0%, 100% { transform:scale(1); box-shadow:0 0 0 3px rgba(34,197,94,.18), 0 0 8px rgba(34,197,94,.28); }
+      50% { transform:scale(1.18); box-shadow:0 0 0 6px rgba(34,197,94,.10), 0 0 14px rgba(34,197,94,.48); }
+    }
+    @keyframes statusBeatRed {
+      0%, 100% { transform:scale(1); box-shadow:0 0 0 3px rgba(239,68,68,.18), 0 0 8px rgba(239,68,68,.28); }
+      50% { transform:scale(1.18); box-shadow:0 0 0 6px rgba(239,68,68,.10), 0 0 14px rgba(239,68,68,.48); }
+    }
+    @keyframes statusBeatOrange {
+      0%, 100% { transform:scale(1); box-shadow:0 0 0 3px rgba(245,158,11,.20), 0 0 8px rgba(245,158,11,.30); }
+      50% { transform:scale(1.18); box-shadow:0 0 0 6px rgba(245,158,11,.12), 0 0 14px rgba(245,158,11,.52); }
+    }
+    @keyframes linkageCardFlipOut {
+      0% { transform:rotateY(0deg) scale(1); opacity:1; box-shadow:0 8px 20px rgba(15,23,42,.06); }
+      100% { transform:rotateY(88deg) scale(.985); opacity:.72; box-shadow:0 18px 34px rgba(15,23,42,.16); }
+    }
+    @keyframes linkageCardFlipIn {
+      0% { transform:rotateY(-88deg) scale(.985); opacity:.72; box-shadow:0 18px 34px rgba(15,23,42,.16); }
+      58% { transform:rotateY(8deg) scale(1.002); opacity:1; box-shadow:0 14px 28px rgba(15,23,42,.12); }
+      100% { transform:rotateY(0deg) scale(1); opacity:1; box-shadow:0 8px 20px rgba(15,23,42,.06); }
     }
     .overlay-head-actions { display:flex; align-items:center; gap:8px; }
     .icon-btn {
@@ -4226,6 +4303,16 @@ DASHBOARD_HTML = """
         <div id="maintenanceCurrentDate" class="maintenance-date">Accurate current date: -</div>
       </div>
       <div id="maintenanceSummary" class="maintenance-summary"></div>
+      <div class="maintenance-call-board">
+        <div class="maintenance-call-head">
+          <div>
+            <h3 class="maintenance-section-title">Maintenance Calls</h3>
+            <div class="muted">PDR requests from operators waiting for Maintenance QR are shown here only.</div>
+          </div>
+          <div id="maintenanceCallCount" class="maintenance-call-count">0 waiting</div>
+        </div>
+        <div id="maintenanceCallBoard" class="maintenance-call-grid"></div>
+      </div>
       <div class="maintenance-live-grid">
         <div>
           <h3 class="maintenance-section-title">Maintenance Team</h3>
@@ -4663,6 +4750,8 @@ DASHBOARD_HTML = """
   const machineStatusArchiveTableWrap = document.getElementById("machineStatusArchiveTableWrap");
   const downtimeArchiveTableWrap = document.getElementById("downtimeArchiveTableWrap");
   const maintenanceSummary = document.getElementById("maintenanceSummary");
+  const maintenanceCallBoard = document.getElementById("maintenanceCallBoard");
+  const maintenanceCallCount = document.getElementById("maintenanceCallCount");
   const maintenancePeopleList = document.getElementById("maintenancePeopleList");
   const maintenancePerformanceTableWrap = document.getElementById("maintenancePerformanceTableWrap");
   const maintenanceCurrentDate = document.getElementById("maintenanceCurrentDate");
@@ -4774,6 +4863,8 @@ DASHBOARD_HTML = """
   let planningMachineScrollActiveUntil = 0;
   let operatorDirectoryState = [];
   const machineCardEls = new Map();
+  const machineLinkageDisplayIndex = new Map();
+  const machineLinkageFlipTimers = new Map();
   let finishedJobsState = [];
   let finishedShiftState = [];
   let archivedJobsState = [];
@@ -6845,6 +6936,45 @@ DASHBOARD_HTML = """
     `;
   }
 
+  function maintenanceCallReason(s){
+    const code = String(s?.pdr_operator_reason_code || s?.downtime_reason_code || "").trim();
+    const text = String(s?.pdr_operator_reason_text || s?.downtime_reason_text || "").trim();
+    if(code && text) return `${code} - ${text}`;
+    return text || code || "PDR call";
+  }
+
+  function renderMaintenanceCallBoard(calls){
+    const rows = Array.isArray(calls) ? calls : [];
+    if(maintenanceCallCount){
+      maintenanceCallCount.textContent = `${rows.filter(s => !String(s.maintenance_name || "").trim()).length} waiting`;
+    }
+    if(!maintenanceCallBoard) return;
+    if(!rows.length){
+      maintenanceCallBoard.innerHTML = '<div class="placeholder" style="margin-top:0;">No active maintenance calls.</div>';
+      return;
+    }
+    maintenanceCallBoard.innerHTML = rows.map((s) => {
+      const machineName = s.machine_name || MACHINE_NAME_MAP[s.machine_code] || s.machine_code || "-";
+      const assigned = String(s.maintenance_name || "").trim();
+      const active = Boolean(s.downtime_active);
+      const status = assigned ? (active ? "Repairing" : "Assigned") : "Waiting";
+      const duration = maintenanceMachineDurationSeconds(s);
+      return `
+        <div class="maintenance-call-card ${active ? "active" : ""}">
+          <div class="maintenance-call-top">
+            <div class="maintenance-call-machine">${esc(machineName)}</div>
+            <div class="maintenance-call-status ${active ? "active" : ""}">${esc(status)}</div>
+          </div>
+          <div class="maintenance-call-reason">${esc(maintenanceCallReason(s))}</div>
+          <div class="maintenance-call-meta">Job: <strong>${esc(s.job_name || s.job_code || "-")}</strong></div>
+          <div class="maintenance-call-meta">Operator: <strong>${esc(displayNameForId(s.operator_id || "-"))}</strong></div>
+          <div class="maintenance-call-meta">Maintenance: <strong>${esc(assigned || "Not assigned")}</strong></div>
+          <div class="maintenance-call-timer">${esc(fmtDowntimeSeconds(duration))}</div>
+        </div>
+      `;
+    }).join("");
+  }
+
   function maintenanceDateLabel(iso){
     const date = iso ? new Date(iso) : new Date();
     if(Number.isNaN(date.getTime())) return "Date unavailable";
@@ -6882,7 +7012,7 @@ DASHBOARD_HTML = """
       if(!s || typeof s !== "object") return false;
       const hasDowntime = Boolean(s.downtime_active);
       const hasWait = Number(s.downtime_wait_started_at || 0) > 0 || Number(s.downtime_wait_last_seconds || 0) > 0;
-      const hasReason = String(s.downtime_reason_code || s.downtime_reason_text || "").trim() !== "";
+      const hasReason = String(s.downtime_reason_code || s.downtime_reason_text || s.pdr_operator_reason_code || s.pdr_operator_reason_text || "").trim() !== "";
       return hasReason && (hasDowntime || hasWait);
     });
   }
@@ -6916,6 +7046,8 @@ DASHBOARD_HTML = """
         <div class="maintenance-metric red"><div><div class="k">Waiting Queue</div><div class="v">${esc(waitingCount)}</div><div class="s">Machines waiting for maintenance assignment.</div></div><div class="icon"></div></div>
       `;
     }
+
+    renderMaintenanceCallBoard(activeMachines);
 
     if(maintenancePeopleList){
       if(!maintenancePeople.length){
@@ -7749,19 +7881,119 @@ DASHBOARD_HTML = """
     setOverlayStep("review");
   }
 
-  function machineCardHtml(s, code, css, statusLabel){
+  function machineLinkageDisplay(s, code){
+    const linkedRows = Array.isArray(s.linkage_jobs) ? s.linkage_jobs : [];
+    const jobs = [
+      {
+        role: "Original Job",
+        job_code: s.job_code || "",
+        job_name: s.job_name || "",
+      },
+      ...linkedRows.map((row, idx) => ({
+        role: `Linked Job ${idx + 1}`,
+        job_code: (row && row.job_code) || "",
+        job_name: (row && row.job_name) || "",
+      })),
+    ];
+    const total = Math.max(1, jobs.length);
+    if(!machineLinkageDisplayIndex.has(code)){
+      return { jobs, index: 0, current: jobs[0], total };
+    }
+    const rawIndex = Number(machineLinkageDisplayIndex.get(code) || 0);
+    const index = ((rawIndex % total) + total) % total;
+    machineLinkageDisplayIndex.set(code, index);
+    return { jobs, index, current: jobs[index], total };
+  }
+
+  function renderMachineCardNow(code, flipLinkage = false){
+    const card = machineCardEls.get(code);
+    const s = (latestState.sessions || []).find(x => String(x.machine_code || "").trim() === code);
+    if(!card || !s) return;
+    const activeTtlSeconds = Number((latestState && latestState.active_ttl_seconds) || 30);
+    const manualStatus = machineStatusOverrideFor(code);
+    const css = statusClass(s.last_seen_utc, activeTtlSeconds, manualStatus, s) || "disconnected";
+    const statusLabel = manualStatus || css.toUpperCase();
+    const baseClassName = `card ${css}`;
+    const nextClassName = `${baseClassName}${flipLinkage ? " linkage-flip" : ""}`;
+    const nextHtml = machineCardHtml(s, code, css, statusLabel, flipLinkage);
+    card.className = baseClassName;
+    card.innerHTML = nextHtml;
+    if(flipLinkage){
+      void card.offsetWidth;
+      card.className = nextClassName;
+    }
+    card.dataset.renderSig = `${nextClassName}|${nextHtml}`;
+  }
+
+  function cycleMachineLinkageCard(code){
+    const card = machineCardEls.get(code);
+    const fresh = (latestState.sessions || []).find(x => String(x.machine_code || "").trim() === code);
+    if(!card || !fresh) return;
+    const linkedRows = Array.isArray(fresh.linkage_jobs) ? fresh.linkage_jobs : [];
+    const total = 1 + linkedRows.length;
+    if(total <= 1) return;
+
+    const existingTimers = machineLinkageFlipTimers.get(code) || [];
+    existingTimers.forEach(t => clearTimeout(t));
+    card.classList.remove("linkage-flip-out", "linkage-flip-in");
+    void card.offsetWidth;
+    card.classList.add("linkage-flip-out");
+
+    const swapTimer = setTimeout(() => {
+      const current = machineLinkageDisplayIndex.has(code) ? Number(machineLinkageDisplayIndex.get(code) || 0) : -1;
+      const next = (current + 1) % total;
+      machineLinkageDisplayIndex.set(code, next);
+      renderMachineCardNow(code, false);
+      const nextCard = machineCardEls.get(code);
+      if(!nextCard) return;
+      nextCard.classList.remove("linkage-flip-out", "linkage-flip-in");
+      void nextCard.offsetWidth;
+      nextCard.classList.add("linkage-flip-in");
+
+      const cleanupTimer = setTimeout(() => {
+        const doneCard = machineCardEls.get(code);
+        if(doneCard) doneCard.classList.remove("linkage-flip-out", "linkage-flip-in");
+        machineLinkageFlipTimers.delete(code);
+      }, 380);
+      machineLinkageFlipTimers.set(code, [cleanupTimer]);
+    }, 230);
+    machineLinkageFlipTimers.set(code, [swapTimer]);
+  }
+
+  function machineCardHtml(s, code, css, statusLabel, flipLinkage = false){
     const linkageJobs = Array.isArray(s.linkage_jobs) ? s.linkage_jobs : [];
     const hasLinkage = Boolean(s.linkage_enabled) && linkageJobs.length > 0;
+    const linkageDisplay = hasLinkage ? machineLinkageDisplay(s, code) : null;
+    const displayedJob = linkageDisplay ? linkageDisplay.current : null;
     const total = Number(s.good_total||0) + Number(s.butal_total||0);
-    const jobLabel = s.job_name
+    const currentJobLabel = s.job_name
       ? (s.job_code ? `${s.job_name} (${s.job_code})` : s.job_name)
       : (s.job_code || "No Job Set");
+    const jobLabel = displayedJob
+      ? (displayedJob.job_name ? (displayedJob.job_code ? `${displayedJob.job_name} (${displayedJob.job_code})` : displayedJob.job_name) : (displayedJob.job_code || currentJobLabel))
+      : currentJobLabel;
     const seenLabel = s.last_seen_utc ? new Date(s.last_seen_utc).toLocaleString() : "-";
     const statusText = statusLabel || css.toUpperCase();
     const operatorText = displayNameForId(s.operator_id || "-");
     const clientText = displayNameForId(s.client_id || "-");
+    const supervisorTooltip = [
+      "Supervisor QR pending",
+      "Scan Supervisor QR on the client to continue downtime resolution.",
+      s.cycle_time_new_input ? `New cycle: ${s.cycle_time_new_input}` : "",
+    ].filter(Boolean).join("\\n");
+    const supervisorNotif = s.waiting_supervisor_qr ? `
+      <div class="machine-notif-wrap">
+        <div class="machine-notif-badge" tabindex="0" title="${esc(supervisorTooltip)}">!</div>
+      </div>
+    ` : "";
     return `
-      ${hasLinkage ? `<div class="machine-linkage-flag">LINKED JOBS: ${esc(linkageJobs.length)}</div>` : ""}
+      ${supervisorNotif}
+      ${hasLinkage ? `
+        <div class="machine-linkage-flag">
+          <span>LINKED JOBS: ${esc(linkageJobs.length)}</span>
+          <button class="machine-linkage-switch" type="button" data-machine-code="${esc(code)}">Switch</button>
+        </div>
+      ` : ""}
       <div class="machine-card-head">
         <div class="machine-card-title">
           <h3>${esc(s.machine_name || s.machine_code)}</h3>
@@ -7795,14 +8027,27 @@ DASHBOARD_HTML = """
     if(!card){
       card = document.createElement("div");
       card.dataset.machineCode = code;
-      card.addEventListener("click", () => {
+      card.addEventListener("click", (ev) => {
+        const switchBtn = ev.target && ev.target.closest ? ev.target.closest(".machine-linkage-switch") : null;
+        if(switchBtn){
+          ev.preventDefault();
+          ev.stopPropagation();
+          cycleMachineLinkageCard(code);
+          return;
+        }
         const fresh = (latestState.sessions || []).find(x => String(x.machine_code || "").trim() === code) || s;
         openMachineDetail(fresh);
       });
       machineCardEls.set(code, card);
     }
-    card.className = `card ${css}`;
-    card.innerHTML = machineCardHtml(s, code, css, statusLabel);
+    const nextClassName = `card ${css}`;
+    const nextHtml = machineCardHtml(s, code, css, statusLabel);
+    const nextRenderSig = `${nextClassName}|${nextHtml}`;
+    if(card.dataset.renderSig !== nextRenderSig){
+      card.className = nextClassName;
+      card.innerHTML = nextHtml;
+      card.dataset.renderSig = nextRenderSig;
+    }
     return card;
   }
 
@@ -8992,8 +9237,8 @@ async def api_event(req: Request):
       "job_code": "101245",
       "job_name": "J024-0305",
       "operator_id": "1000001",F
-      "event": { ... },   # e.g. {"type":"PACK","qty":6}
-      "last_event": "PACK +6"
+      "event": { ... },   # e.g. {"type":"PACK","pack_qty":1,"qty":6}
+      "last_event": "PACK +1"
     }
     """
     data = await req.json()
@@ -9067,6 +9312,20 @@ async def api_event(req: Request):
         if not _insert_pdr_report_sql(pdr_row):
             return JSONResponse({"ok": False, "error": "pdr_reports SQL storage is unavailable"}, status_code=503)
             _remove_persisted_active_session(machine_code)
+    elif ev_type == "PRODUCTION_DAILY_REPORT":
+        mode = str(ev.get("mode") or "").strip().upper()
+        if mode == "WAITING_FOR_MAINTENANCE":
+            sess.pdr_operator_reason_code = str(ev.get("operator_reason_code") or "").strip() or sess.pdr_operator_reason_code
+            sess.pdr_operator_reason_text = str(ev.get("operator_reason") or "").strip() or sess.pdr_operator_reason_text
+            sess.downtime_reason_code = None
+            sess.downtime_reason_text = None
+            sess.downtime_active = False
+            sess.maintenance_name = None
+            sess.waiting_downtime_start_maintenance = True
+            sess.waiting_pdr_maintenance_reason = False
+            sess.waiting_downtime_end_maintenance = False
+            if not sess.downtime_wait_started_at:
+                sess.downtime_wait_started_at = time.time()
     elif ev_type == "JOB_LINKAGE_SET":
         sess.linkage_enabled = True
         linked_code = str(ev.get("linked_job_code", "")).strip()
@@ -9107,12 +9366,17 @@ async def api_event(req: Request):
             sess.downtime_started_at = snap.get("downtime_started_at", sess.downtime_started_at)
             sess.downtime_last_seconds = snap.get("downtime_last_seconds", sess.downtime_last_seconds)
             sess.downtime_active = bool(snap.get("downtime_active", sess.downtime_active))
+            sess.pdr_operator_reason_code = snap.get("pdr_operator_reason_code", sess.pdr_operator_reason_code)
+            sess.pdr_operator_reason_text = snap.get("pdr_operator_reason_text", sess.pdr_operator_reason_text)
             sess.downtime_wait_started_at = snap.get("downtime_wait_started_at", sess.downtime_wait_started_at)
             sess.downtime_wait_last_seconds = snap.get("downtime_wait_last_seconds", sess.downtime_wait_last_seconds)
             sess.waiting_downtime_start_maintenance = bool(snap.get("waiting_downtime_start_maintenance", sess.waiting_downtime_start_maintenance))
             sess.waiting_pdr_maintenance_reason = bool(snap.get("waiting_pdr_maintenance_reason", sess.waiting_pdr_maintenance_reason))
             sess.waiting_downtime_end_maintenance = bool(snap.get("waiting_downtime_end_maintenance", sess.waiting_downtime_end_maintenance))
             sess.waiting_maintenance_qr = bool(snap.get("waiting_maintenance_qr", sess.waiting_maintenance_qr))
+            sess.waiting_supervisor_qr = bool(snap.get("waiting_supervisor_qr", sess.waiting_supervisor_qr))
+            sess.supervisor_downtime_confirmation_started_at = snap.get("supervisor_downtime_confirmation_started_at", sess.supervisor_downtime_confirmation_started_at)
+            sess.cycle_time_new_input = snap.get("cycle_time_new_input", sess.cycle_time_new_input)
             sess.cycle_time_current = snap.get("cycle_time_current", sess.cycle_time_current)
             live_avg = snap.get("live_cycle_avg_seconds", sess.live_cycle_avg_seconds)
             try:
@@ -9140,7 +9404,8 @@ async def api_event(req: Request):
             _persist_active_sessions_state()
     elif ev_type == "PACK":
         qty = int(ev.get("qty", 0) or 0)
-        sess.pack_total += qty
+        pack_qty = int(ev.get("pack_qty", 1) or 1)
+        sess.pack_total += pack_qty
         sess.good_total += qty
     elif ev_type == "LAST_SHIFT_BUTAL_PACK":
         sess.pack_total += int(ev.get("pack_qty", 1) or 1)

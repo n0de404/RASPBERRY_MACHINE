@@ -1,5 +1,5 @@
 {
-  "server_url": "http://192.168.11.26:8000",
+  "server_url": "http://192.168.10.49:8000",
   "client_id": "RPI-CLIENT-01",
   "scanner_mode": "auto",
   "scanner_com_port": "/dev/ttyACM0",
