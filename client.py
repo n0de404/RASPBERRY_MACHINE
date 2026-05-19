@@ -3679,24 +3679,6 @@ QWidget#ClientUIRoot {{
         linkageLeft.layout().setSpacing(5)
         linkageLeft.setMinimumWidth(0)
 
-        linkageSwitchRow = QFrame()
-        linkageSwitchRow.setObjectName("LinkageMirrorSwitchRow")
-        linkageSwitchRow.setLayout(QHBoxLayout())
-        linkageSwitchRow.layout().setContentsMargins(16, 5, 16, 5)
-        linkageSwitchRow.layout().setSpacing(8)
-        self.linkageMirrorSelectedJob = QLabel("-")
-        self.linkageMirrorSelectedJob.setObjectName("LinkageMirrorSelectedJob")
-        self.linkageMirrorSelectedJob.setWordWrap(False)
-        self.linkageMirrorSelectedJob.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        self.linkageMirrorSelectedJob.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.linkageMirrorSwitchBtn = QPushButton("Switch")
-        self.linkageMirrorSwitchBtn.setObjectName("LinkageMirrorSwitchButton")
-        self.linkageMirrorSwitchBtn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.linkageMirrorSwitchBtn.clicked.connect(self._cycle_linkage_mirror_job)
-        linkageSwitchRow.layout().addWidget(self.linkageMirrorSelectedJob, 1)
-        linkageSwitchRow.layout().addWidget(self.linkageMirrorSwitchBtn, 0)
-        linkageLeft.layout().addWidget(linkageSwitchRow)
-
         def _make_linked_job_row(title: str):
             row = QFrame()
             row.setObjectName("LinkageMirrorJobRow")
@@ -3787,26 +3769,6 @@ QWidget#ClientUIRoot {{
             "QFrame#LinkageMirrorHeader QLabel#RightTitle { color: #edf0f4; }"
             "QFrame#LinkageMirrorHeader QLabel { color: #edf0f4; }"
             "QWidget#LinkageMirrorContent { background: transparent; border: none; }"
-            "QFrame#LinkageMirrorSwitchRow {"
-            " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
-            "                             stop:0 rgba(76,120,190,225),"
-            "                             stop:1 rgba(46,72,118,232));"
-            " border: 1px solid #9ebcf4;"
-            " border-radius: 14px;"
-            " min-height: 34px;"
-            " max-height: 34px;"
-            "}"
-            "QLabel#LinkageMirrorSelectedJob { color: #ffffff; font-size: 16px; font-weight: 900; }"
-            "QPushButton#LinkageMirrorSwitchButton {"
-            " background: #ffffff;"
-            " color: #1d4ed8;"
-            " border: 1px solid #bfdbfe;"
-            " border-radius: 9px;"
-            " padding: 5px 10px;"
-            " font-size: 12px;"
-            " font-weight: 900;"
-            "}"
-            "QPushButton#LinkageMirrorSwitchButton:disabled { color: #94a3b8; background: rgba(255,255,255,150); }"
             "QFrame#LinkageMirrorJobRow {"
             " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
             "                             stop:0 rgba(103,107,115,220),"
@@ -8623,71 +8585,11 @@ QWidget#ClientUIRoot {{
         fitted.setPixelSize(best_px)
         widget.setFont(fitted)
 
-    def _linkage_display_rows(self) -> List[Dict[str, Any]]:
-        s = self.state
-        rows: List[Dict[str, Any]] = [
-            {
-                "role": "Current Job",
-                "job_code": s.job_code,
-                "job_name": s.job_name,
-            }
-        ]
-        for idx, row in enumerate(list(s.linkage_jobs or [])):
-            if not isinstance(row, dict):
-                continue
-            rows.append(
-                {
-                    "role": f"Linked Job {idx + 1}",
-                    "job_code": row.get("job_code"),
-                    "job_name": row.get("job_name"),
-                }
-            )
-        return rows
-
-    def _cycle_linkage_mirror_job(self):
-        rows = self._linkage_display_rows()
-        if len(rows) <= 1:
-            return
-        self._linkage_mirror_index = (int(getattr(self, "_linkage_mirror_index", 0) or 0) + 1) % len(rows)
-        self._refresh_linkage_panel(flip_selected=True)
-
-    def _animate_linkage_mirror_selected(self):
-        widget = getattr(self, "linkageMirrorSelectedJob", None)
-        if widget is None or not bool(getattr(self, "_animations_enabled", True)):
-            return
-        fx = widget.graphicsEffect()
-        if not isinstance(fx, QGraphicsOpacityEffect):
-            fx = QGraphicsOpacityEffect(widget)
-            widget.setGraphicsEffect(fx)
-        anim = QPropertyAnimation(fx, b"opacity", widget)
-        anim.setDuration(260)
-        anim.setStartValue(0.25)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._linkage_mirror_flip_anim = anim
-        anim.start()
-
-    def _refresh_linkage_panel(self, flip_selected: bool = False):
+    def _refresh_linkage_panel(self):
         s = self.state
         if getattr(self, "linkageMirrorOuter", None) is None:
             return
         linked_rows = list(s.linkage_jobs or [])
-        display_rows = self._linkage_display_rows()
-        display_total = max(1, len(display_rows))
-        display_index = int(getattr(self, "_linkage_mirror_index", 0) or 0) % display_total
-        self._linkage_mirror_index = display_index
-        selected = display_rows[display_index] if display_rows else {}
-        selected_name = str(selected.get("job_name") or selected.get("job_code") or "-").strip() or "-"
-        selected_code = str(selected.get("job_code") or "").strip()
-        selected_role = str(selected.get("role") or "Current Job").strip()
-        selected_text = f"{selected_role}: {selected_name}"
-        if selected_code and selected_code not in selected_text:
-            selected_text = f"{selected_text} ({selected_code})"
-        self._set_linkage_job_label_text(getattr(self, "linkageMirrorSelectedJob", None), selected_text if linked_rows else "-")
-        if getattr(self, "linkageMirrorSwitchBtn", None) is not None:
-            self.linkageMirrorSwitchBtn.setEnabled(len(display_rows) > 1 and bool(linked_rows))
-        if flip_selected:
-            self._animate_linkage_mirror_selected()
         linked_names = [
             f"{str(r.get('job_name') or r.get('job_code') or '-')}  |  B:{self._butal_qty_for_job(r.get('job_code'))}"
             for r in linked_rows[:3]
@@ -15271,3 +15173,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+               

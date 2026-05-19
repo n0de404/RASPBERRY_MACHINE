@@ -2667,7 +2667,7 @@
     "last_shift_butal_job_name": null,
     "last_shift_butal_by_job": {},
     "last_event": "HEARTBEAT",
-    "last_seen_utc": "2026-05-18T09:08:34.736234+00:00"
+    "last_seen_utc": "2026-05-18T09:09:09.716653+00:00"
   },
   "M00012": {
     "client_id": "RPI-CLIENT-02",
@@ -3455,6 +3455,6 @@
     "last_shift_butal_job_name": null,
     "last_shift_butal_by_job": {},
     "last_event": "HEARTBEAT",
-    "last_seen_utc": "2026-05-18T09:08:32.585893+00:00"
+    "last_seen_utc": "2026-05-18T09:09:07.588977+00:00"
   }
 }
