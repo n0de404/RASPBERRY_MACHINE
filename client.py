@@ -72,7 +72,9 @@ IMAGES_DIR = os.path.join(BASE_DIR, "Images")
 PDR_ICON_DIR = os.path.join(BASE_DIR, "PDR_Icon")
 DATABASE_DIR = os.path.join(BASE_DIR, "Database")
 JOB_API_CONFIG_FILE = os.path.join(DATABASE_DIR, "job_api_config.json")
-ACTIVE_MACHINE_SESSIONS_FILE = os.path.join(DATABASE_DIR, "active_machine_sessions.json")
+CLIENT_ACTIVE_MACHINE_SESSIONS_FILE = os.path.join(DATABASE_DIR, "client_active_machine_sessions.json")
+SERVER_ACTIVE_MACHINE_SESSIONS_FILE = os.path.join(DATABASE_DIR, "active_machine_sessions.json")
+ACTIVE_MACHINE_SESSIONS_FILE = CLIENT_ACTIVE_MACHINE_SESSIONS_FILE
 SERVER_EVENT_QUEUE_FILE = os.path.join(DATABASE_DIR, "server_event_queue.json")
 INVALID_SCAN_GIF = os.environ.get(
     "MACHINE_INVALID_SCAN_GIF",
@@ -108,7 +110,7 @@ HEARTBEAT_INTERVAL_MS = int(os.environ.get("MACHINE_HEARTBEAT_INTERVAL_MS", "500
 IDENTITY_SYNC_INTERVAL_MS = int(os.environ.get("MACHINE_IDENTITY_SYNC_INTERVAL_MS", "15000"))
 SERVER_EVENT_QUEUE_MAXSIZE = int(os.environ.get("MACHINE_SERVER_EVENT_QUEUE_MAXSIZE", "256"))
 JOB_API_PENDING_RETRY_INTERVAL_MS = int(os.environ.get("MACHINE_JOB_API_PENDING_RETRY_INTERVAL_MS", "3000"))
-JOB_API_PENDING_MAX_RETRIES = int(os.environ.get("MACHINE_JOB_API_PENDING_MAX_RETRIES", "10"))
+JOB_API_PENDING_MAX_RETRIES = int(os.environ.get("MACHINE_JOB_API_PENDING_MAX_RETRIES", "0"))
 SCANNER_MIN_TIMEOUT_SECONDS = float(os.environ.get("MACHINE_SCANNER_MIN_TIMEOUT", "0.2"))
 UI_REFRESH_DEBOUNCE_MS = int(os.environ.get("MACHINE_UI_REFRESH_DEBOUNCE_MS", "60"))
 MOTION_TIMER_INTERVAL_MS = int(os.environ.get("MACHINE_MOTION_TIMER_INTERVAL_MS", "250"))
@@ -379,14 +381,44 @@ def _load_active_sessions_sql() -> Dict[str, Any]:
         conn.close()
 
 
-def _load_active_sessions_json() -> Dict[str, Any]:
+def _read_active_sessions_payload(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    with open(path, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _active_sessions_backup_path(path: str) -> str:
+    return f"{path}.bak"
+
+
+def _backup_active_sessions_file(path: str) -> None:
+    if not os.path.exists(path):
+        return
+    backup_path = _active_sessions_backup_path(path)
+    with open(path, "rb") as src, open(backup_path, "wb") as dst:
+        dst.write(src.read())
+        dst.flush()
+        os.fsync(dst.fileno())
+
+
+def _read_active_sessions_json_file(path: str) -> Dict[str, Any]:
+    rows, _source = _read_active_sessions_json_file_with_source(path)
+    return rows
+
+
+def _read_active_sessions_json_file_with_source(path: str) -> tuple[Dict[str, Any], str]:
     try:
-        if not os.path.exists(ACTIVE_MACHINE_SESSIONS_FILE):
-            return {}
-        with open(ACTIVE_MACHINE_SESSIONS_FILE, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        if not isinstance(loaded, dict):
-            return {}
+        loaded = _read_active_sessions_payload(path)
+        source = "main"
+    except Exception:
+        try:
+            loaded = _read_active_sessions_payload(_active_sessions_backup_path(path))
+            source = "bak"
+        except Exception:
+            return {}, ""
+    try:
         out: Dict[str, Any] = {}
         for machine_code, row in loaded.items():
             code = str(machine_code or "").strip()
@@ -394,9 +426,13 @@ def _load_active_sessions_json() -> Dict[str, Any]:
                 item = dict(row)
                 item["machine_code"] = str(item.get("machine_code") or code).strip()
                 out[code] = item
-        return out
+        return out, source
     except Exception:
-        return {}
+        return {}, ""
+
+
+def _load_active_sessions_json() -> Dict[str, Any]:
+    return _read_active_sessions_json_file(CLIENT_ACTIVE_MACHINE_SESSIONS_FILE)
 
 
 def _save_active_sessions_json(rows: Dict[str, Any]) -> bool:
@@ -409,8 +445,14 @@ def _save_active_sessions_json(rows: Dict[str, Any]) -> bool:
                 item = dict(row)
                 item["machine_code"] = str(item.get("machine_code") or code).strip()
                 payload[code] = item
-        with open(ACTIVE_MACHINE_SESSIONS_FILE, "w", encoding="utf-8") as f:
+        target = CLIENT_ACTIVE_MACHINE_SESSIONS_FILE
+        tmp = f"{target}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        _backup_active_sessions_file(target)
+        os.replace(tmp, target)
         return True
     except Exception as e:
         print(f"[JSON] Active session save failed: {e}")
@@ -2735,6 +2777,8 @@ class ClientUI(QWidget):
         self._animation_burst_until = 0.0
         self._marquee_frame_skip = False
         self._server_event_queue_lock = threading.Lock()
+        self._server_was_offline = False
+        self._server_recovery_snapshot_queued = False
         self._event_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max(16, SERVER_EVENT_QUEUE_MAXSIZE))
         self._load_persisted_server_events()
         self._event_worker_stop = threading.Event()
@@ -4034,6 +4078,38 @@ QWidget#ClientUIRoot {{
 
         self.invalidOverlay.raise_()
 
+        self.packGapWarning = QFrame(self)
+        self.packGapWarning.setObjectName("PackGapWarning")
+        self.packGapWarning.setLayout(QVBoxLayout())
+        self.packGapWarning.layout().setContentsMargins(16, 12, 16, 12)
+        self.packGapWarning.layout().setSpacing(4)
+        self.packGapWarningTitle = QLabel("MISSING PACK QR")
+        self.packGapWarningTitle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.packGapWarningTitle.setStyleSheet("background: transparent; border: none; color: #7f1d1d; font-size: 18px; font-weight: 900;")
+        self.packGapWarningMessage = QLabel("")
+        self.packGapWarningMessage.setWordWrap(True)
+        self.packGapWarningMessage.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.packGapWarningMessage.setStyleSheet("background: transparent; border: none; color: #111827; font-size: 13px; font-weight: 800;")
+        self.packGapWarningHint = QLabel("Scan the missing PACK QR to clear this warning.")
+        self.packGapWarningHint.setWordWrap(True)
+        self.packGapWarningHint.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.packGapWarningHint.setStyleSheet("background: transparent; border: none; color: #7c2d12; font-size: 11px; font-weight: 800;")
+        self.packGapWarning.layout().addWidget(self.packGapWarningTitle)
+        self.packGapWarning.layout().addWidget(self.packGapWarningMessage)
+        self.packGapWarning.layout().addWidget(self.packGapWarningHint)
+        self.packGapWarning.hide()
+        self._pack_gap_warning_key = ""
+        self._pack_gap_warning_flash_on = False
+        self._pack_gap_warning_shadow = QGraphicsDropShadowEffect(self.packGapWarning)
+        self._pack_gap_warning_shadow.setBlurRadius(22)
+        self._pack_gap_warning_shadow.setOffset(0, 4)
+        self._pack_gap_warning_shadow.setColor(QColor(127, 29, 29, 150))
+        self.packGapWarning.setGraphicsEffect(self._pack_gap_warning_shadow)
+        self.packGapWarningBlinkTimer = QTimer(self)
+        self.packGapWarningBlinkTimer.timeout.connect(self._tick_pack_gap_warning)
+        self._apply_pack_gap_warning_style()
+        self.packGapWarning.raise_()
+
         self.bmsLoadingOverlay = QFrame(self)
         self.bmsLoadingOverlay.setObjectName("BmsLoadingOverlay")
         self.bmsLoadingOverlay.setStyleSheet(
@@ -5007,6 +5083,7 @@ QWidget#ClientUIRoot {{
         self._operator_shift_flash_timer.setSingleShot(True)
         self._operator_shift_flash_timer.timeout.connect(self._hide_operator_shift_overlay)
         self._pending_shift_review_payload: Optional[Dict[str, Any]] = None
+        self._pending_shift_review_linked_payloads: List[Dict[str, Any]] = []
         self._pending_final_review_payload: Optional[Dict[str, Any]] = None
         self._pending_final_review_linked_payloads: List[Dict[str, Any]] = []
         self._app_log_ready = False
@@ -5306,9 +5383,9 @@ QWidget#ClientUIRoot {{
         self.apiJobApiPasswordInput.setEchoMode(QLineEdit.EchoMode.Password)
         self.apiJobApiPasswordInput.setPlaceholderText("Password")
 
-        self.apiJobApiTestBtn = QPushButton("Test Job API (GET)")
+        self.apiJobApiTestBtn = QPushButton("Test Server Job Lookup")
         self.apiJobApiTestBtn.setObjectName("SettingToggle")
-        self.apiJobApiTestBtn.setProperty("app_log_name", "Test Job API")
+        self.apiJobApiTestBtn.setProperty("app_log_name", "Test Server Job Lookup")
         self.apiApplyBtn = QPushButton("Apply API Config")
         self.apiApplyBtn.setObjectName("SettingToggle")
         self.apiApplyBtn.setProperty("app_log_name", "Apply API Config")
@@ -5352,6 +5429,17 @@ QWidget#ClientUIRoot {{
         self.settingsApiSection.layout().addWidget(self.apiJobApiTestBtn, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsApiSection.layout().addWidget(self.apiApplyBtn, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsApiSection.layout().addStretch(1)
+        for w in (
+            self.apiJobApiBaseUrlLabel,
+            self.apiJobApiBaseUrlInput,
+            self.apiJobApiUserLabel,
+            self.apiJobApiUserInput,
+            self.apiJobApiTokenLabel,
+            self.apiJobApiTokenInput,
+            self.apiJobApiPasswordLabel,
+            self.apiJobApiPasswordInput,
+        ):
+            w.setVisible(False)
 
         self.settingsLogsSection = QWidget()
         self.settingsLogsSection.setObjectName("SettingsPage")
@@ -5665,6 +5753,7 @@ QWidget#ClientUIRoot {{
         super().resizeEvent(event)
         self._sync_right_panel_top_alignment()
         self._position_invalid_overlay()
+        self._position_pack_gap_warning()
         self._position_production_overlay()
         self._position_resolve_overlay()
         self._position_raw_mats_overlay()
@@ -6010,6 +6099,151 @@ QWidget#ClientUIRoot {{
         if self._invalid_movie is not None:
             self._invalid_movie.stop()
         self.invalidOverlay.hide()
+
+    def _position_pack_gap_warning(self):
+        if not hasattr(self, "packGapWarning") or self.packGapWarning is None:
+            return
+        margin = 18
+        w = min(520, max(360, int(self.width() * 0.34)))
+        h = min(142, max(108, self.packGapWarning.sizeHint().height() + 8))
+        header_bottom = 0
+        try:
+            header_bottom = self.headerCard.mapTo(self, self.headerCard.rect().bottomLeft()).y()
+        except Exception:
+            header_bottom = 0
+        x = max(margin, self.width() - w - margin)
+        y = max(margin, int(header_bottom) + 10)
+        self.packGapWarning.setGeometry(x, y, w, h)
+
+    def _apply_pack_gap_warning_style(self):
+        if not hasattr(self, "packGapWarning") or self.packGapWarning is None:
+            return
+        flash = bool(getattr(self, "_pack_gap_warning_flash_on", False))
+        border = "#dc2626" if flash else "#f97316"
+        bg_top = "#fff7ed" if flash else "#fffbeb"
+        bg_bottom = "#fed7aa" if flash else "#fde68a"
+        self.packGapWarning.setStyleSheet(
+            "QFrame#PackGapWarning {"
+            f" background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {bg_top}, stop:1 {bg_bottom});"
+            f" border: 3px solid {border};"
+            " border-radius: 12px;"
+            "}"
+        )
+
+    def _tick_pack_gap_warning(self):
+        self._pack_gap_warning_flash_on = not bool(getattr(self, "_pack_gap_warning_flash_on", False))
+        self._apply_pack_gap_warning_style()
+
+    @staticmethod
+    def _compress_index_ranges(values: List[int]) -> str:
+        nums = sorted({int(v) for v in values if int(v) > 0})
+        if not nums:
+            return ""
+        ranges: List[str] = []
+        start = prev = nums[0]
+        for n in nums[1:]:
+            if n == prev + 1:
+                prev = n
+                continue
+            ranges.append(str(start) if start == prev else f"{start}-{prev}")
+            start = prev = n
+        ranges.append(str(start) if start == prev else f"{start}-{prev}")
+        return ", ".join(ranges)
+
+    def _pack_gap_series_key(self, row: Dict[str, Any]) -> str:
+        if not isinstance(row, dict):
+            return ""
+        parts = [
+            str(row.get("product_p") or row.get("product_id") or "").strip(),
+            self._normalize_job_code(row.get("po_number")),
+            str(row.get("lot_number") or "").strip(),
+            str(row.get("total_labels") or "").strip(),
+        ]
+        key = "|".join(parts).strip("|")
+        return key
+
+    def _detect_pack_gap_warning(self) -> Optional[Dict[str, Any]]:
+        groups: Dict[str, Dict[str, Any]] = {}
+        for pos, row in enumerate(list(self.state.product_pack_history_logs or [])):
+            if not isinstance(row, dict) or bool(row.get("voided")):
+                continue
+            try:
+                idx = int(str(row.get("index") or "").strip())
+            except Exception:
+                continue
+            if idx <= 0:
+                continue
+            key = self._pack_gap_series_key(row)
+            if not key:
+                continue
+            group = groups.setdefault(
+                key,
+                {
+                    "key": key,
+                    "indexes": set(),
+                    "latest_pos": -1,
+                    "latest_index": idx,
+                    "latest_row": row,
+                },
+            )
+            group["indexes"].add(idx)
+            if pos >= int(group.get("latest_pos", -1)):
+                group["latest_pos"] = pos
+                group["latest_index"] = idx
+                group["latest_row"] = row
+        candidates: List[Dict[str, Any]] = []
+        for group in groups.values():
+            indexes = sorted(group.get("indexes") or [])
+            if len(indexes) < 2:
+                continue
+            low = min(indexes)
+            high = max(indexes)
+            scanned = set(indexes)
+            missing = [n for n in range(low, high + 1) if n not in scanned]
+            if missing:
+                group["missing"] = missing
+                candidates.append(group)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda g: int(g.get("latest_pos", -1)), reverse=True)
+        return candidates[0]
+
+    def _refresh_pack_gap_warning(self):
+        if not hasattr(self, "packGapWarning") or self.packGapWarning is None:
+            return
+        gap = self._detect_pack_gap_warning()
+        if not gap:
+            self._pack_gap_warning_key = ""
+            self.packGapWarning.hide()
+            self.packGapWarningBlinkTimer.stop()
+            return
+        missing = list(gap.get("missing") or [])
+        missing_text = self._compress_index_ranges(missing)
+        latest_index = int(gap.get("latest_index") or 0)
+        row = gap.get("latest_row") if isinstance(gap.get("latest_row"), dict) else {}
+        total_text = str(row.get("total_labels") or "").strip()
+        lot_text = str(row.get("lot_number") or "").strip()
+        if total_text:
+            latest_label = f"{latest_index} of {total_text}"
+        else:
+            latest_label = str(latest_index)
+        self.packGapWarningMessage.setText(
+            f"Last scanned pack index: {latest_label}\nMissing pack index: {missing_text}"
+        )
+        self.packGapWarningHint.setText(
+            f"Scan PACK QR {missing_text} to clear this warning."
+            + (f" Lot: {lot_text}" if lot_text else "")
+        )
+        warning_key = f"{gap.get('key')}|{missing_text}"
+        if warning_key != getattr(self, "_pack_gap_warning_key", ""):
+            self._pack_gap_warning_key = warning_key
+            self._pack_gap_warning_flash_on = True
+            self._apply_pack_gap_warning_style()
+        self._position_pack_gap_warning()
+        self.packGapWarning.show()
+        self.packGapWarning.raise_()
+        if not self.packGapWarningBlinkTimer.isActive():
+            self.packGapWarningBlinkTimer.start(550)
 
     def _position_bms_loading_overlay(self):
         if not hasattr(self, "bmsLoadingOverlay") or self.bmsLoadingOverlay is None:
@@ -6785,38 +7019,16 @@ QWidget#ClientUIRoot {{
             return False
         self._product_catalog_last_refresh_attempt = now_ts
         try:
-            jcfg = getattr(self, "job_api_config", {}) or _load_job_api_config()
-            self.job_api_config = jcfg
-            bms = jcfg.get("bms") if isinstance(jcfg.get("bms"), dict) else {}
-            base = str(jcfg.get("base_url") or bms.get("base_url") or "").strip().rstrip("/")
-            token = str(jcfg.get("bearer_token", "") or "").strip()
-            user = str(jcfg.get("user") or bms.get("username") or bms.get("user") or "").strip()
-            password = str(jcfg.get("password") or bms.get("password") or "").strip()
-            if not base:
+            server_url = str((self.client_config or {}).get("server_url", SERVER_URL) or SERVER_URL).strip().rstrip("/")
+            if not server_url:
                 return False
-            if not token and user and password:
-                token = self._get_job_api_bearer_token(base=base, user=user, password=password) or ""
-            if not token:
-                return False
-            url = self._job_api_url(base, "/products")
-            resp = requests.get(
-                url,
-                headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
-                timeout=5,
-            )
+            resp = requests.get(f"{server_url}/api/products?refresh=1", headers={"Accept": "application/json"}, timeout=5)
             if resp.status_code != 200:
                 return False
             payload = resp.json()
-            items = []
-            if isinstance(payload, dict):
-                data = payload.get("data")
-                if isinstance(data, list):
-                    items = data
-                elif isinstance(data, dict):
-                    if isinstance(data.get("items"), list):
-                        items = data.get("items") or []
-                    elif isinstance(data.get("products"), list):
-                        items = data.get("products") or []
+            if not isinstance(payload, dict) or not payload.get("ok"):
+                return False
+            items = payload.get("items") if isinstance(payload.get("items"), list) else []
             if not isinstance(items, list) or not items:
                 return False
             out = []
@@ -7339,8 +7551,11 @@ QWidget#ClientUIRoot {{
         self.finishOverlay.raise_()
         self._finish_anim_timer.start()
 
-    def _show_operator_shift_overlay(self, shift_payload: Dict[str, Any]):
+    def _show_operator_shift_overlay(self, shift_payload: Dict[str, Any], linked_payloads: Optional[List[Dict[str, Any]]] = None):
         self._pending_shift_review_payload = dict(shift_payload or {})
+        self._pending_shift_review_linked_payloads = [
+            dict(row) for row in (linked_payloads or []) if isinstance(row, dict)
+        ]
         self._operator_shift_flash_active = True
         self._position_finish_overlay()
         self._set_background_blur(True)
@@ -7363,6 +7578,7 @@ QWidget#ClientUIRoot {{
             return
         self._operator_shift_flash_active = False
         self._pending_shift_review_payload = None
+        self._pending_shift_review_linked_payloads = []
         self.finishTitle.setText("FINISHING JOB")
         self.finishStatus.setText("Processing...")
         self.finishReviewHint.hide()
@@ -7427,24 +7643,45 @@ QWidget#ClientUIRoot {{
         shift_payload = dict(self._pending_shift_review_payload or {})
         if not shift_payload:
             return
+        linked_payloads = [
+            dict(row) for row in (self._pending_shift_review_linked_payloads or []) if isinstance(row, dict)
+        ]
+        all_shift_payloads = [shift_payload] + linked_payloads
         self._show_bms_loading("Finishing Partial Shift...")
         try:
             self._request_with_ui_events(time.sleep, 2.5)
             remarks = f"Approved on client finish-shift review by {self._safe_text(reviewer.get('name'))}"
-            local_ok = self._request_with_ui_events(
-                self._approve_local_finished_shift,
-                shift_payload,
-                reviewer,
-                remarks,
-            )
-            server_ok = self._approve_server_finished_shift(shift_payload, reviewer_badge, remarks)
-            self._pending_shift_review_payload = shift_payload
-            if local_ok and not server_ok:
-                self.push_event(
-                    {"type": "FINISH_SHIFT", "finished_job": shift_payload},
-                    f"FINISH SHIFT {shift_payload.get('job_name') or shift_payload.get('job_code') or ''}".strip(),
-                    silent=False,
+            local_ok = True
+            server_ok = True
+            approved_rows: List[Dict[str, Any]] = []
+            server_failed_rows: List[Dict[str, Any]] = []
+            for row in all_shift_payloads:
+                row_local_ok = self._request_with_ui_events(
+                    self._approve_local_finished_shift,
+                    row,
+                    reviewer,
+                    remarks,
                 )
+                row_server_ok = self._approve_server_finished_shift(row, reviewer_badge, remarks)
+                local_ok = bool(row_local_ok) and local_ok
+                server_ok = bool(row_server_ok) and server_ok
+                approved_rows.append(row)
+                if row_local_ok and not row_server_ok:
+                    server_failed_rows.append(row)
+            self._pending_shift_review_payload = shift_payload
+            self._pending_shift_review_linked_payloads = approved_rows[1:]
+            if local_ok and server_failed_rows:
+                for row in server_failed_rows:
+                    is_main_shift = self._finish_shift_row_key(row) == self._finish_shift_row_key(shift_payload)
+                    self.push_event(
+                        {"type": "FINISH_SHIFT", "finished_job": row},
+                        (
+                            f"FINISH SHIFT {row.get('job_name') or row.get('job_code') or ''}"
+                            if is_main_shift
+                            else f"FINISH LINKED SHIFT {row.get('job_name') or row.get('job_code') or ''}"
+                        ).strip(),
+                        silent=not is_main_shift,
+                    )
             self._populate_finish_shift_summary(shift_payload)
             self.finishTitle.setText("FINISH SHIFT APPROVED")
             self.finishReviewHint.setText(
@@ -8206,6 +8443,7 @@ QWidget#ClientUIRoot {{
         self._refresh_downtime_panel()
         self._refresh_linkage_panel()
         self._maybe_show_fulfilled_notice()
+        self._refresh_pack_gap_warning()
 
     def _session_is_running(self) -> bool:
         s = self.state
@@ -8799,7 +9037,10 @@ QWidget#ClientUIRoot {{
         review_from = max(0, int(s.operator_shift_baseline_reject_review_logs_len or 0))
         pack_count = max(0, int(s.pack_count or 0) - int(s.operator_shift_baseline_pack_count or 0))
         good_total = max(0, int(s.good_total or 0) - int(s.operator_shift_baseline_good_total or 0))
-        butal_total = max(0, int(s.butal_total or 0) - int(s.operator_shift_baseline_butal_total or 0))
+        if s.linkage_enabled and (s.linkage_jobs or []):
+            butal_total = self._shift_butal_qty_for_job(s.job_code, fallback_current=True)
+        else:
+            butal_total = max(0, int(s.butal_total or 0) - int(s.operator_shift_baseline_butal_total or 0))
         reject_total = max(0, int(s.reject_total or 0) - int(s.operator_shift_baseline_reject_total or 0))
         startup_reject_total = max(0, int(s.startup_reject_total or 0) - int(s.operator_shift_baseline_startup_reject_total or 0))
         no_shot_total = max(0, int(s.no_shot_total or 0) - int(s.operator_shift_baseline_no_shot_total or 0))
@@ -8834,7 +9075,7 @@ QWidget#ClientUIRoot {{
                 or 1
             )
         shift_qty_per_shift = self._qty_per_shift_from_cycle(shift_avg_cycle_seconds, cavity_count)
-        return {
+        shift_payload = {
             "record_type": RECORD_TYPE_SHIFT_PARTIAL,
             "shift_index": int(s.operator_shift_index or (len(s.operator_shift_logs or []) + 1)),
             "reason": str(reason or "SHIFT_CHANGE"),
@@ -8883,6 +9124,19 @@ QWidget#ClientUIRoot {{
             "review_status": REVIEW_STATUS_PENDING,
             "review_history": [],
         }
+        if s.linkage_enabled and (s.linkage_jobs or []):
+            total_jobs_in_group = 1 + len(s.linkage_jobs or [])
+            shift_payload["linkage_enabled"] = True
+            shift_payload["linkage_role"] = "MAIN"
+            shift_payload["linkage_group_total_jobs"] = total_jobs_in_group
+            shift_payload["linkage_job_code"] = s.linkage_job_code
+            shift_payload["linkage_job_name"] = s.linkage_job_name
+            shift_payload["linkage_job_payload"] = s.linkage_job_payload or {}
+            shift_payload["linkage_jobs"] = list(s.linkage_jobs or [])
+            shift_payload["linkage_note"] = (
+                f"Main shift partial (1 of {total_jobs_in_group}) with {len(s.linkage_jobs or [])} linked job(s)."
+            )
+        return shift_payload
 
     def _finalize_current_operator_shift(self, reason: str, emit_event: bool = True) -> Optional[Dict[str, Any]]:
         payload = self._build_operator_shift_payload(reason=reason)
@@ -8899,6 +9153,40 @@ QWidget#ClientUIRoot {{
                 f"OPERATOR SHIFT SAVE {payload.get('operator_name') or payload.get('operator_id') or ''}".strip(),
             )
         return payload
+
+    def _build_linked_operator_shift_payloads(self, main_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        s = self.state
+        linked_rows = list(s.linkage_jobs or [])
+        if not (s.linkage_enabled and linked_rows):
+            return []
+        total_jobs_in_group = 1 + len(linked_rows)
+        out: List[Dict[str, Any]] = []
+        for idx, row in enumerate(linked_rows, start=2):
+            linked_payload = dict(main_payload)
+            linked_payload["job_code"] = row.get("job_code") or linked_payload.get("job_code")
+            linked_payload["job_name"] = row.get("job_name") or linked_payload.get("job_name")
+            linked_payload["job_payload"] = dict(row.get("job_payload") or {})
+            linked_butal_total = self._shift_butal_qty_for_job(row.get("job_code"))
+            linked_payload["pack_count"] = int(main_payload.get("pack_count") or 0)
+            linked_payload["good_total"] = int(main_payload.get("good_total") or 0)
+            linked_payload["butal_total"] = int(linked_butal_total or 0)
+            linked_payload["reject_total"] = 0
+            linked_payload["reject_breakdown"] = {}
+            linked_payload["startup_reject_total"] = 0
+            linked_payload["no_shot_total"] = 0
+            linked_payload["total_good"] = int(main_payload.get("good_total") or 0) + int(linked_butal_total or 0)
+            linked_payload["partial_qty"] = int(main_payload.get("good_total") or 0) + int(linked_butal_total or 0)
+            linked_payload["linkage_enabled"] = True
+            linked_payload["linkage_role"] = "LINKED"
+            linked_payload["linkage_group_total_jobs"] = total_jobs_in_group
+            linked_payload["linkage_main_job_code"] = main_payload.get("job_code")
+            linked_payload["linkage_main_job_name"] = main_payload.get("job_name")
+            linked_payload["linkage_note"] = (
+                f"Linked shift partial {idx} of {total_jobs_in_group}. "
+                f"Main job is {main_payload.get('job_name') or main_payload.get('job_code') or '-'} (1 of {total_jobs_in_group})."
+            )
+            out.append(linked_payload)
+        return out
 
     def _state_to_active_snapshot(self) -> Dict[str, Any]:
         s = self.state
@@ -9057,7 +9345,7 @@ QWidget#ClientUIRoot {{
             serialized = ""
         if not force and serialized and serialized == self._last_active_session_snapshot_serialized:
             return
-        self._enqueue_active_session_file_persist({"op": "upsert", "snapshot": snapshot})
+        _upsert_active_session_json(snapshot)
         if serialized:
             self._last_active_session_snapshot_serialized = serialized
         self._trigger_active_session_sql_sync(force=False)
@@ -9082,21 +9370,211 @@ QWidget#ClientUIRoot {{
             return
         self._save_active_session_snapshot(force=False)
 
+    def _snapshot_is_recoverable(self, snap: Dict[str, Any]) -> bool:
+        if not isinstance(snap, dict):
+            return False
+        if not str(snap.get("machine_code") or "").strip():
+            return False
+        if str(snap.get("job_code") or snap.get("job_name") or snap.get("operator_id") or "").strip():
+            return True
+        numeric_keys = (
+            "pack_count",
+            "pack_total",
+            "good_total",
+            "butal_total",
+            "reject_total",
+            "raw_sacks_count",
+            "startup_reject_total",
+            "no_shot_total",
+        )
+        for key in numeric_keys:
+            try:
+                if int(float(snap.get(key) or 0)) > 0:
+                    return True
+            except Exception:
+                pass
+        list_keys = (
+            "product_pack_history_logs",
+            "raw_material_logs",
+            "raw_material_scans",
+            "butal_scan_logs",
+            "reject_review_logs",
+            "operator_shift_logs",
+        )
+        if any(isinstance(snap.get(key), list) and len(snap.get(key) or []) > 0 for key in list_keys):
+            return True
+        flag_keys = (
+            "waiting_reject_reason",
+            "waiting_production_report_reason",
+            "waiting_downtime_start_maintenance",
+            "waiting_pdr_maintenance_reason",
+            "waiting_downtime_end_maintenance",
+            "waiting_maintenance_qr",
+            "waiting_supervisor_qr",
+            "waiting_operator_downtime_confirm",
+            "downtime_active",
+            "waiting_initial_cycle_time_input",
+            "waiting_initial_machine_counter_input",
+            "waiting_shift_end_machine_counter_input",
+            "waiting_cycle_time_confirm_popup",
+            "supervisor_review_open",
+            "reject_review_open",
+        )
+        return any(bool(snap.get(key)) for key in flag_keys)
+
+    def _snapshot_sort_key(self, snap: Dict[str, Any]) -> str:
+        if not isinstance(snap, dict):
+            return ""
+        return str(snap.get("saved_at_utc") or snap.get("last_seen_utc") or "")
+
+    def _snapshot_timestamp_value(self, snap: Dict[str, Any]) -> Optional[float]:
+        if not isinstance(snap, dict):
+            return None
+        raw = str(snap.get("saved_at_utc") or snap.get("last_seen_utc") or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return float(dt.timestamp())
+        except Exception:
+            return None
+
+    def _snapshot_richness_score(self, snap: Dict[str, Any]) -> int:
+        if not isinstance(snap, dict):
+            return 0
+        score = 0
+        if str(snap.get("job_code") or snap.get("job_name") or "").strip():
+            score += 20
+        if str(snap.get("operator_id") or "").strip():
+            score += 20
+        list_weights = {
+            "product_pack_history_logs": 8,
+            "raw_material_logs": 5,
+            "raw_material_scans": 3,
+            "butal_scan_logs": 5,
+            "reject_review_logs": 5,
+            "operator_shift_logs": 4,
+            "production_adjustment_logs": 4,
+        }
+        for key, weight in list_weights.items():
+            rows = snap.get(key)
+            if isinstance(rows, list):
+                score += len(rows) * weight
+        flag_keys = (
+            "waiting_reject_reason",
+            "waiting_production_report_reason",
+            "waiting_downtime_start_maintenance",
+            "waiting_pdr_maintenance_reason",
+            "waiting_downtime_end_maintenance",
+            "waiting_maintenance_qr",
+            "waiting_supervisor_qr",
+            "waiting_operator_downtime_confirm",
+            "downtime_active",
+            "waiting_initial_cycle_time_input",
+            "waiting_initial_machine_counter_input",
+            "waiting_shift_end_machine_counter_input",
+            "waiting_cycle_time_confirm_popup",
+            "supervisor_review_open",
+            "reject_review_open",
+        )
+        score += sum(3 for key in flag_keys if bool(snap.get(key)))
+        return score
+
+    def _choose_recovery_snapshot(
+        self,
+        local_snap: Optional[Dict[str, Any]],
+        local_source: str,
+        server_snap: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        local_ok = isinstance(local_snap, dict) and self._snapshot_is_recoverable(local_snap)
+        server_ok = isinstance(server_snap, dict) and self._snapshot_is_recoverable(server_snap)
+        if local_ok and str(local_source or "").lower() == "main":
+            return local_snap
+        if local_ok and not server_ok:
+            return local_snap
+        if server_ok and not local_ok:
+            return server_snap
+        if not (local_ok and server_ok):
+            return None
+
+        local_ts = self._snapshot_timestamp_value(local_snap)
+        server_ts = self._snapshot_timestamp_value(server_snap)
+        if local_ts is not None and server_ts is not None and abs(local_ts - server_ts) > 1.0:
+            return local_snap if local_ts > server_ts else server_snap
+        if local_ts is not None and server_ts is None:
+            return local_snap
+        if server_ts is not None and local_ts is None:
+            return server_snap
+
+        local_score = self._snapshot_richness_score(local_snap)
+        server_score = self._snapshot_richness_score(server_snap)
+        if server_score > local_score:
+            return server_snap
+        return local_snap
+
+    def _recoverable_snapshots_from_rows(self, rows: Dict[str, Any], *, require_current_client: bool) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in (rows or {}).values():
+            if not isinstance(row, dict):
+                continue
+            if require_current_client and not self._belongs_to_current_client(row):
+                continue
+            if self._snapshot_is_recoverable(row):
+                out.append(row)
+        out.sort(key=self._snapshot_sort_key, reverse=True)
+        return out
+
+    def _fetch_active_session_snapshot_from_server(self, machine_code: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        server_url = str((self.client_config or {}).get("server_url", SERVER_URL) or SERVER_URL).strip().rstrip("/")
+        if not server_url:
+            return None
+        params = {"client_id": self._current_client_id()}
+        code = str(machine_code or "").strip()
+        if code:
+            params["machine_code"] = code
+        try:
+            resp = self._request_with_ui_events(
+                requests.get,
+                f"{server_url}/api/active-sessions",
+                params=params,
+                headers={"Accept": "application/json"},
+                timeout=2.5,
+            )
+            if resp.status_code != 200:
+                return None
+            payload = resp.json()
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                return None
+            snaps = [
+                dict(row)
+                for row in items
+                if isinstance(row, dict) and self._belongs_to_current_client(row) and self._snapshot_is_recoverable(row)
+            ]
+            snaps.sort(key=self._snapshot_sort_key, reverse=True)
+            return snaps[0] if snaps else None
+        except Exception as e:
+            self._append_app_log("RECOVERY", f"Server active-session recovery failed: {e}")
+            return None
+
     def _load_active_session_snapshot(self, machine_code: str) -> Optional[Dict[str, Any]]:
         code = str(machine_code or "").strip()
         if not code:
             return None
-        rows = _load_active_sessions_json()
-        snap = rows.get(code)
-        if isinstance(snap, dict) and self._belongs_to_current_client(snap):
+        local_rows, local_source = _read_active_sessions_json_file_with_source(CLIENT_ACTIVE_MACHINE_SESSIONS_FILE)
+        snap = local_rows.get(code)
+        if isinstance(snap, dict) and self._snapshot_is_recoverable(snap) and local_source == "main":
             return snap
-        return None
+        server_snap = self._fetch_active_session_snapshot_from_server(code)
+        return self._choose_recovery_snapshot(snap if isinstance(snap, dict) else None, local_source, server_snap)
 
     def _clear_active_session_snapshot(self, machine_code: Optional[str]):
         code = str(machine_code or "").strip()
         if not code:
             return
-        self._enqueue_active_session_file_persist({"op": "delete", "machine_code": code})
+        _delete_active_session_json(code)
         self._last_active_session_snapshot_serialized = ""
 
     def _sync_active_session_snapshots_to_sql(self):
@@ -10096,15 +10574,9 @@ QWidget#ClientUIRoot {{
         self.status.setText(f"API/Scanner configuration applied. Client ID: {client_id}")
 
     def _test_job_api_settings(self):
-        base = self.apiJobApiBaseUrlInput.text().strip().rstrip("/")
-        user = self.apiJobApiUserInput.text().strip()
-        token = self.apiJobApiTokenInput.text().strip()
-        password = self.apiJobApiPasswordInput.text()
-        if not base:
-            self.status.setText("Job API test failed: Job API Base URL is required.")
-            return
-        if not token and not user:
-            self.status.setText("Job API test failed: Bearer token or username is required.")
+        server_url = self.apiServerUrlInput.text().strip().rstrip("/") or str(self.client_config.get("server_url", SERVER_URL)).strip().rstrip("/")
+        if not server_url:
+            self.status.setText("Job API test failed: Server URL is required.")
             return
         job_id, ok = QInputDialog.getText(self, "Test Job API", "Enter Job ID to test (GET /v1/jobs/{id}):")
         if not ok:
@@ -10115,53 +10587,37 @@ QWidget#ClientUIRoot {{
             self.status.setText("Job API test failed: Job ID is required.")
             return
         try:
-            if not token and user and password:
-                token = self._get_job_api_bearer_token(base=base, user=user, password=password) or ""
-                if not token:
-                    self.status.setText("Job API test failed: login did not return a bearer token.")
-                    self._append_job_api_log("TEST FAIL: login did not return bearer token")
-                    return
-            elif token:
-                self.job_api_config.update({
-                    "base_url": base,
-                    "user": user,
-                    "username": user,
-                    "password": password,
-                    "bearer_token": token,
-                })
-                _save_job_api_config(self.job_api_config)
-            headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
             resp = self._request_with_ui_events(
-                requests.get,
-                self._job_api_url(base, f"/jobs/{job_id}"),
-                headers=headers,
+                requests.post,
+                f"{server_url}/api/jobs/lookup",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                json={"job_identifier": job_id},
                 timeout=5,
             )
-            self._append_job_api_log(f"TEST GET {self._job_api_url(base, f'/jobs/{job_id}')} -> HTTP {resp.status_code}")
-            print(f"[JobAPI] TEST GET {self._job_api_url(base, f'/jobs/{job_id}')} -> HTTP {resp.status_code}")
+            self._append_job_api_log(f"TEST SERVER JOB LOOKUP {job_id} -> HTTP {resp.status_code}")
+            print(f"[JobAPI] TEST SERVER JOB LOOKUP {job_id} -> HTTP {resp.status_code}")
             if resp.status_code != 200:
                 self.status.setText(
-                    f"Job API test failed HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}"
+                    f"Server job lookup failed HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}"
                 )
                 self._append_job_api_log(f"TEST FAIL: {self._http_error_snippet(resp) or 'No response body'}")
-                print(f"[JobAPI] TEST FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
                 return
-            data = resp.json()
-            if self._job_api_body_is_unauthorized(data):
-                self.status.setText("Job API test failed: bearer token unauthorized. Clear the token or save settings to force a fresh login.")
-                self._append_job_api_log("TEST FAIL: response body reported unauthorized bearer token")
-                print("[JobAPI] TEST FAIL: response body reported unauthorized bearer token")
+            out = resp.json()
+            payload = out.get("payload") if isinstance(out, dict) else {}
+            if not isinstance(payload, dict):
+                self.status.setText("Server job lookup failed: no payload returned.")
                 return
             job = {}
-            if isinstance(data, dict) and isinstance(data.get("data"), dict):
-                job = data["data"].get("job") or {}
+            if isinstance(payload.get("data"), dict):
+                job = payload["data"].get("job") or {}
+            elif isinstance(payload.get("job"), dict):
+                job = payload.get("job") or {}
             ref = str((job or {}).get("ref_no", "")).strip()
             jid = str((job or {}).get("id", "")).strip() or job_id
-            self.status.setText(f"Job API test OK (GET): {jid}{' / ' + ref if ref else ''}")
-            self._append_job_api_log(f"TEST OK: {jid}{' / ' + ref if ref else ''}")
-            print(f"[JobAPI] TEST OK: {jid}{' / ' + ref if ref else ''}")
+            self.status.setText(f"Server job lookup OK: {jid}{' / ' + ref if ref else ''}")
+            self._append_job_api_log(f"TEST SERVER OK: {jid}{' / ' + ref if ref else ''}")
         except Exception as e:
-            self.status.setText(f"Job API test failed: {e}")
+            self.status.setText(f"Server job lookup test failed: {e}")
             self._append_job_api_log(f"TEST ERROR: {e}")
             print(f"[JobAPI] TEST ERROR: {e}")
 
@@ -11297,92 +11753,6 @@ QWidget#ClientUIRoot {{
             return payload["job"]
         return payload if isinstance(payload, dict) else {}
 
-    def _get_job_api_bearer_token(self, *, base: str, user: str, password: str) -> Optional[str]:
-        base_url = str(base or "").strip().rstrip("/")
-        username = str(user or "").strip()
-        pwd = str(password or "")
-        if not (base_url and username and pwd):
-            self._append_job_api_log(
-                f"LOGIN skipped: missing config (base={'set' if base_url else 'empty'}, user={'set' if username else 'empty'}, pass={'set' if pwd else 'empty'})"
-            )
-            print(
-                f"[JobAPI] LOGIN skipped: missing config (base={'set' if base_url else 'empty'}, user={'set' if username else 'empty'}, pass={'set' if pwd else 'empty'})"
-            )
-            return None
-        cfg = getattr(self, "job_api_config", {}) or {}
-        cached_base = str(cfg.get("base_url", "")).strip().rstrip("/")
-        cached_user = str(cfg.get("user", "")).strip()
-        cached_token = str(cfg.get("bearer_token", "")).strip()
-        try:
-            cached_exp = int(float(cfg.get("token_expires_at_epoch", 0) or 0))
-        except Exception:
-            cached_exp = 0
-        now_epoch = int(time.time())
-        if cached_token and cached_base == base_url and cached_user == username and cached_exp > (now_epoch + 30):
-            self._append_job_api_log("LOGIN skipped (cached bearer token reused)")
-            return cached_token
-        login_url = f"{base_url}/auth/login"
-        self._append_job_api_log(f"LOGIN preparing {login_url} (user={username}, ttl={cfg.get('ttl_seconds', 604800) if isinstance(cfg, dict) else 604800})")
-        print(f"[JobAPI] LOGIN preparing {login_url} (user={username})")
-        try:
-            ttl_seconds = int(cfg.get("ttl_seconds", 604800) or 604800) if isinstance(cfg, dict) else 604800
-            force_new_token = bool(cfg.get("force_new_token", True)) if isinstance(cfg, dict) else True
-            resp = self._request_with_ui_events(
-                requests.post,
-                login_url,
-                headers={"Content-Type": "application/json", "Accept": "application/json"},
-                json={
-                    "identity": username,
-                    "password": pwd,
-                    "ttlSeconds": ttl_seconds,
-                    "forceNewToken": force_new_token,
-                },
-                timeout=5,
-            )
-            self._append_job_api_log(f"LOGIN POST {login_url} -> HTTP {resp.status_code}")
-            print(f"[JobAPI] LOGIN POST {login_url} -> HTTP {resp.status_code}")
-            if resp.status_code != 200:
-                self.status.setText(
-                    f"Job API login failed HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}"
-                )
-                self._append_job_api_log(f"LOGIN FAIL: {self._http_error_snippet(resp) or 'No response body'}")
-                print(f"[JobAPI] LOGIN FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
-                return None
-            data = resp.json()
-            if isinstance(data, dict) and isinstance(data.get("data"), dict):
-                token = str(data["data"].get("token", "") or "").strip()
-                if token and isinstance(cfg, dict):
-                    cfg["base_url"] = base_url
-                    cfg["user"] = username
-                    cfg["password"] = pwd
-                    cfg["bearer_token"] = token
-                    cfg["token_expires_at_epoch"] = int(time.time()) + max(60, ttl_seconds)
-                    self.job_api_config = cfg
-                    _save_job_api_config(cfg)
-                self._append_job_api_log("LOGIN OK (bearer token received)")
-                print("[JobAPI] LOGIN OK (bearer token received)")
-                return token or None
-            self._append_job_api_log("LOGIN FAIL: response JSON has no data.token")
-            print(f"[JobAPI] LOGIN FAIL: response JSON has no data.token payload={self._http_error_snippet(resp)}")
-        except Exception as e:
-            self._append_job_api_log(f"LOGIN ERROR: {e}")
-            print(f"[JobAPI] LOGIN ERROR: {e}")
-            pass
-        return None
-
-    def _job_api_url(self, base: str, path: str) -> str:
-        base_url = str(base or "").strip().rstrip("/")
-        p = "/" + str(path or "").lstrip("/")
-        if base_url.endswith("/jobs"):
-            base_url = base_url[:-5].rstrip("/")
-        if base_url.endswith("/v1"):
-            if p.startswith("/v1/"):
-                return f"{base_url}{p[3:]}"
-            return f"{base_url}{p}"
-        if p.startswith("/v1/"):
-            return f"{base_url}{p}"
-        return f"{base_url}/v1{p}"
-
     def _job_api_body_is_unauthorized(self, data: Any) -> bool:
         if not isinstance(data, dict):
             return False
@@ -11425,8 +11795,8 @@ QWidget#ClientUIRoot {{
             return
         existing = self._pending_job_api_retry if isinstance(self._pending_job_api_retry, dict) else {}
         attempts = int(existing.get("attempts") or 0) if str(existing.get("job_identifier") or "") == job_id else 0
-        max_retries = max(1, int(JOB_API_PENDING_MAX_RETRIES or 10))
-        if attempts >= max_retries:
+        max_retries = int(JOB_API_PENDING_MAX_RETRIES or 0)
+        if max_retries > 0 and attempts >= max_retries:
             self.status.setText(f"Job API details not ready for {display_name or job_id}. Please rescan the JOB QR or check BMS.")
             self._append_job_api_log(f"PENDING stopped after {attempts} retries")
             self._clear_pending_job_api_retry()
@@ -11439,9 +11809,10 @@ QWidget#ClientUIRoot {{
             "started_at": existing.get("started_at") or time.time(),
         }
         interval = max(500, int(JOB_API_PENDING_RETRY_INTERVAL_MS or 3000))
+        retry_label = f"retry {attempts + 1}/{max_retries}" if max_retries > 0 else f"retry {attempts + 1}"
         self.status.setText(
-            f"Job API details are still loading for {self._pending_job_api_retry['display_name']} "
-            f"(retry {attempts + 1}/{max_retries})."
+            f"Job details are still loading from server for {self._pending_job_api_retry['display_name']} "
+            f"({retry_label})."
         )
         self._append_job_api_log(f"PENDING job {job_id}; retry scheduled in {interval} ms")
         self._pending_job_api_retry_timer.start(interval)
@@ -11454,8 +11825,8 @@ QWidget#ClientUIRoot {{
             self._clear_pending_job_api_retry()
             return
         attempts = int(pending.get("attempts") or 0)
-        max_retries = max(1, int(JOB_API_PENDING_MAX_RETRIES or 10))
-        if attempts >= max_retries:
+        max_retries = int(JOB_API_PENDING_MAX_RETRIES or 0)
+        if max_retries > 0 and attempts >= max_retries:
             name = str(pending.get("display_name") or pending.get("job_identifier") or "").strip()
             self.status.setText(f"Job API details not ready for {name}. Please rescan the JOB QR or check BMS.")
             self._append_job_api_log(f"PENDING stopped after {attempts} retries")
@@ -11465,145 +11836,65 @@ QWidget#ClientUIRoot {{
         self._pending_job_api_retry = pending
         self.status.setText(
             f"Retrying Job API for {pending.get('display_name') or pending.get('job_identifier')} "
-            f"({pending['attempts']}/{max_retries})..."
+            f"({pending['attempts']}{('/' + str(max_retries)) if max_retries > 0 else ''})..."
         )
-        self.on_scanned(str(pending.get("raw_scan") or ""))
+        fetched_payload = self._fetch_job_payload_from_api(str(pending.get("job_identifier") or ""))
+        if isinstance(fetched_payload, dict):
+            api_job = {}
+            if isinstance(fetched_payload.get("data"), dict) and isinstance(fetched_payload["data"].get("job"), dict):
+                api_job = fetched_payload["data"]["job"]
+            elif isinstance(fetched_payload.get("job"), dict):
+                api_job = fetched_payload["job"]
+            self.state.job_payload = fetched_payload
+            self.state.job_code = (
+                self._safe_text(api_job.get("id"), "")
+                or self._safe_text(api_job.get("ref_no"), "")
+                or self.state.job_code
+                or str(pending.get("job_identifier") or "")
+            )
+            self.state.job_name = (
+                self._safe_text(api_job.get("ref_no"), "")
+                or self.state.job_name
+                or str(pending.get("display_name") or pending.get("job_identifier") or "")
+            )
+            self.status.setText(f"Job details loaded from server: {self.state.job_name}")
+            self._append_job_api_log(f"PENDING resolved via server for {pending.get('job_identifier')}")
+            self._clear_pending_job_api_retry()
+            self._refresh_ui()
+            self._save_active_session_snapshot()
+            self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (JOB API READY)")
+            return
+        self._start_pending_job_api_retry(
+            str(pending.get("job_identifier") or ""),
+            str(pending.get("raw_scan") or ""),
+            str(pending.get("display_name") or pending.get("job_identifier") or ""),
+        )
 
     def _fetch_job_payload_from_api(self, job_identifier: str) -> Optional[Dict[str, Any]]:
-        # Reload from disk so config edits apply without restarting the client.
-        try:
-            self.job_api_config = _load_job_api_config()
-            try:
-                _dbg_cfg = self.job_api_config if isinstance(self.job_api_config, dict) else {}
-                print(
-                    "[JobAPI] FETCH reload cfg "
-                    f"keys={list(_dbg_cfg.keys())} "
-                    f"base={str(_dbg_cfg.get('base_url', ''))!r} "
-                    f"bms_base={str((_dbg_cfg.get('bms') or {}).get('base_url', '')) if isinstance(_dbg_cfg.get('bms'), dict) else ''!r}"
-                )
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"[JobAPI] FETCH reload config error: {e}")
+        server_url = str((self.client_config or {}).get("server_url", SERVER_URL) or SERVER_URL).strip().rstrip("/")
         raw_job_id = str(job_identifier or "").strip()
-        print(f"[JobAPI] FETCH requested job_identifier={raw_job_id!r}")
-        m_job_url = re.search(r"/v1/jobs/(\d+)\s*$", raw_job_id, flags=re.IGNORECASE)
-        job_id = (m_job_url.group(1) if m_job_url else raw_job_id).strip()
-        if not job_id:
-            print("[JobAPI] FETCH skipped: empty job_id after parsing")
+        if not (server_url and raw_job_id):
             return None
-        jcfg = getattr(self, "job_api_config", {}) or {}
-        bms = jcfg.get("bms") if isinstance(jcfg.get("bms"), dict) else {}
-        base = str(jcfg.get("base_url") or bms.get("base_url") or "").strip().rstrip("/")
-        token = str(jcfg.get("bearer_token", "")).strip()
-        user = str(jcfg.get("user") or bms.get("username") or bms.get("user") or "").strip()
-        password = str(jcfg.get("password") or bms.get("password") or "")
-        print(f"[JobAPI] FETCH config base={base!r} user={'set' if user else 'empty'} token={'set' if token else 'empty'}")
-        if not base or (not token and not user):
-            print("[JobAPI] FETCH skipped: missing base_url or auth config")
-            return None
-        url = self._job_api_url(base, f"/jobs/{job_id}")
-
-        def _payload_has_useful_job_details(payload_obj: Any) -> bool:
-            if not isinstance(payload_obj, dict):
-                return False
-            jd = payload_obj.get("job_details") if isinstance(payload_obj.get("job_details"), dict) else {}
-            if not isinstance(jd, dict):
-                jd = {}
-            keys = ("product_id", "mold", "color", "no_of_cavity", "std_cycle_time", "qty_per_shift")
-            if any(str(jd.get(k, "") or "").strip() for k in keys):
-                return True
-            part_ids = jd.get("part_ids")
-            parts = jd.get("parts")
-            if isinstance(part_ids, list) and len(part_ids) > 0:
-                return True
-            if isinstance(part_ids, dict) and len(part_ids.keys()) > 0:
-                return True
-            if isinstance(parts, list) and len(parts) > 0:
-                return True
-            data_parts = payload_obj.get("parts")
-            data_part_ids = payload_obj.get("parts_ids")
-            if isinstance(data_parts, list) and len(data_parts) > 0:
-                return True
-            if isinstance(data_part_ids, list) and len(data_part_ids) > 0:
-                return True
-            return False
-
-        best_partial_wrapped: Optional[Dict[str, Any]] = None
-        max_attempts = 3
         try:
-            if not token and user and password:
-                print("[JobAPI] FETCH no cached token; requesting new token via login")
-                token = self._get_job_api_bearer_token(base=base, user=user, password=password) or ""
-                if not token:
-                    self.status.setText("Job API login failed; waiting for valid job details.")
-                    return None
-            for attempt in range(1, max_attempts + 1):
-                if attempt > 1:
-                    self._request_with_ui_events(time.sleep, 0.18)
-                headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
-                resp = self._request_with_ui_events(
-                    requests.get,
-                    url,
-                    headers=headers,
-                    timeout=5,
-                )
-                self._append_job_api_log(f"GET {url} -> HTTP {resp.status_code} (try {attempt}/{max_attempts})")
-                print(f"[JobAPI] GET {url} -> HTTP {resp.status_code} (try {attempt}/{max_attempts})")
-                if resp.status_code == 401 and user and password:
-                    self._append_job_api_log("GET unauthorized; refreshing bearer token")
-                    token = self._get_job_api_bearer_token(base=base, user=user, password=password) or token
-                    continue
-                if resp.status_code != 200:
-                    if attempt < max_attempts:
-                        continue
-                    self.status.setText(
-                        f"Job API GET failed HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}"
-                    )
-                    self._append_job_api_log(f"GET FAIL: {self._http_error_snippet(resp) or 'No response body'}")
-                    print(f"[JobAPI] GET FAIL HTTP {resp.status_code}: {self._http_error_snippet(resp) or 'No response body'}")
-                    return None
-                data = resp.json()
-                if self._job_api_body_is_unauthorized(data):
-                    if user and password:
-                        self._append_job_api_log("GET body unauthorized; refreshing bearer token")
-                        print("[JobAPI] GET body unauthorized; refreshing bearer token")
-                        token = self._get_job_api_bearer_token(base=base, user=user, password=password) or token
-                        if attempt < max_attempts:
-                            continue
-                    self.status.setText("Job API bearer token unauthorized; waiting for valid job details.")
-                    self._append_job_api_log("GET FAIL: response body reported unauthorized bearer token")
-                    return None
-                if not isinstance(data, dict):
-                    if attempt < max_attempts:
-                        continue
-                    self.status.setText("Job API fetch returned invalid response; waiting for valid job details.")
-                    return None
-                payload = data.get("data")
-                if not isinstance(payload, dict):
-                    if attempt < max_attempts:
-                        continue
-                    self.status.setText("Job API fetch has no job payload; waiting for valid job details.")
-                    return None
-
-                wrapped = {"code": data.get("code"), "message": data.get("message"), "data": payload}
-                if _payload_has_useful_job_details(payload):
-                    self._append_job_api_log(f"GET OK: job {job_id}")
-                    print(f"[JobAPI] GET OK: job {job_id}")
-                    return wrapped
-                best_partial_wrapped = wrapped
-                self._append_job_api_log(f"GET partial/blank job_details; retrying ({attempt}/{max_attempts})")
-                print(f"[JobAPI] GET partial/blank job_details; retrying ({attempt}/{max_attempts})")
-
-            if best_partial_wrapped is not None:
-                self.status.setText("Job API returned partial job details after retries; waiting for full details.")
+            url = f"{server_url}/api/jobs/lookup"
+            self._append_job_api_log(f"SERVER JOB LOOKUP {raw_job_id}")
+            resp = self._request_with_ui_events(
+                requests.post,
+                url,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                json={"job_identifier": raw_job_id},
+                timeout=2.0,
+            )
+            if resp.status_code != 200:
+                self._append_job_api_log(f"SERVER JOB LOOKUP unavailable HTTP {resp.status_code}")
                 return None
-            self.status.setText("Job API fetch failed after retries; waiting for valid job details.")
+            out = resp.json()
+            payload = out.get("payload") if isinstance(out, dict) else None
+            if isinstance(payload, dict):
+                return payload
             return None
         except Exception as e:
-            self.status.setText(f"Job API fetch error: {e}; waiting for valid job details.")
-            self._append_job_api_log(f"GET ERROR: {e}")
-            print(f"[JobAPI] GET ERROR: {e}")
+            self._append_job_api_log(f"SERVER JOB LOOKUP unavailable: {e}")
             return None
 
     def _refresh_job_details(self):
@@ -12098,6 +12389,31 @@ QWidget#ClientUIRoot {{
             return max(0, int(s.butal_total or 0))
         return 0
 
+    def _shift_butal_qty_for_job(self, job_code: Optional[str], *, fallback_current: bool = False) -> int:
+        s = self.state
+        job_key = self._normalize_job_code(job_code)
+        if not job_key:
+            return 0
+        shift_start = self._parse_utc_iso_datetime(s.operator_shift_started_at)
+        total = 0
+        matched_assigned_rows = False
+        for row in (s.butal_scan_logs or []):
+            if not isinstance(row, dict) or bool(row.get("voided")):
+                continue
+            assigned_key = self._normalize_job_code(row.get("assigned_job_code"))
+            if assigned_key != job_key:
+                continue
+            scanned_at = self._parse_utc_iso_datetime(row.get("scanned_at"))
+            if shift_start is not None and scanned_at is not None and scanned_at < shift_start:
+                continue
+            total += max(0, int(row.get("qty") or 0))
+            matched_assigned_rows = True
+        if matched_assigned_rows or total > 0:
+            return total
+        if fallback_current:
+            return max(0, int(s.butal_total or 0) - int(s.operator_shift_baseline_butal_total or 0))
+        return 0
+
     def _butal_assignment_candidates(self) -> List[Dict[str, Any]]:
         s = self.state
         rows: List[Dict[str, Any]] = []
@@ -12230,7 +12546,49 @@ QWidget#ClientUIRoot {{
     def _store_last_shift_butal_from_current_shift(self):
         s = self.state
         if isinstance(s.butal_by_job, dict) and s.butal_by_job:
-            butal_delta = self._butal_qty_for_job(s.job_code)
+            saved_at = datetime.now(timezone.utc).isoformat()
+            raw_by_job: Dict[str, str] = {}
+            excluded_sources = {"BUTAL_COMPLETION", "LAST_SHIFT_BUTAL_COMPLETION"}
+            for row in reversed(list(s.butal_scan_logs or [])):
+                if not isinstance(row, dict) or bool(row.get("voided")):
+                    continue
+                source = str(row.get("source") or "").strip().upper()
+                if source in excluded_sources:
+                    continue
+                assigned_key = self._normalize_job_code(row.get("assigned_job_code") or s.job_code)
+                if assigned_key and assigned_key not in raw_by_job:
+                    raw_by_job[assigned_key] = str(row.get("raw_scan") or "")
+            names_by_job = {
+                self._normalize_job_code(row.get("job_code")): str(row.get("job_name") or row.get("job_code") or "").strip()
+                for row in self._butal_assignment_candidates()
+                if self._normalize_job_code(row.get("job_code"))
+            }
+            rows = dict(s.last_shift_butal_by_job or {})
+            first_carryover: Optional[Dict[str, Any]] = None
+            for job_key, qty_raw in dict(s.butal_by_job or {}).items():
+                norm_key = self._normalize_job_code(job_key)
+                qty = max(0, int(qty_raw or 0))
+                if not norm_key or qty <= 0:
+                    continue
+                carryover = {
+                    "qty": qty,
+                    "raw": raw_by_job.get(norm_key, ""),
+                    "saved_at": saved_at,
+                    "job_code": str(job_key or norm_key),
+                    "job_name": names_by_job.get(norm_key, str(job_key or norm_key)),
+                }
+                rows[norm_key] = carryover
+                if first_carryover is None or norm_key == self._normalize_job_code(s.job_code):
+                    first_carryover = carryover
+            if not first_carryover:
+                return
+            s.last_shift_butal_by_job = rows
+            s.last_shift_butal_qty = int(first_carryover.get("qty") or 0)
+            s.last_shift_butal_raw = str(first_carryover.get("raw") or "")
+            s.last_shift_butal_saved_at = first_carryover.get("saved_at")
+            s.last_shift_butal_job_code = first_carryover.get("job_code")
+            s.last_shift_butal_job_name = first_carryover.get("job_name")
+            return
         else:
             butal_delta = max(0, int(s.butal_total or 0) - int(s.operator_shift_baseline_butal_total or 0))
         if butal_delta <= 0 or not str(s.job_code or "").strip():
@@ -12265,9 +12623,9 @@ QWidget#ClientUIRoot {{
             s.last_shift_butal_job_name = s.job_name
             return
 
-    def _current_job_last_shift_butal(self) -> Dict[str, Any]:
+    def _current_job_last_shift_butal(self, job_code: Optional[str] = None) -> Dict[str, Any]:
         s = self.state
-        job_key = self._normalize_job_code(s.job_code)
+        job_key = self._normalize_job_code(job_code or s.job_code)
         if not job_key:
             return {}
         row = (s.last_shift_butal_by_job or {}).get(job_key)
@@ -12289,9 +12647,9 @@ QWidget#ClientUIRoot {{
     def _last_shift_butal_matches_current_job(self) -> bool:
         return bool(self._current_job_last_shift_butal())
 
-    def _clear_last_shift_butal_carryover(self):
+    def _clear_last_shift_butal_carryover(self, job_code: Optional[str] = None):
         s = self.state
-        job_key = self._normalize_job_code(s.job_code)
+        job_key = self._normalize_job_code(job_code or s.job_code)
         if job_key and isinstance(s.last_shift_butal_by_job, dict):
             rows = dict(s.last_shift_butal_by_job or {})
             rows.pop(job_key, None)
@@ -13126,7 +13484,10 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Operator shift handoff failed: no active operator data.")
                     self._show_invalid_overlay("No active operator shift to save.")
                     return
+                linked_shift_payloads = self._build_linked_operator_shift_payloads(shift_payload)
                 saved_shift_ok = self._save_finished_job_local(shift_payload)
+                for linked_shift_payload in linked_shift_payloads:
+                    saved_shift_ok = self._save_finished_job_local(linked_shift_payload) and saved_shift_ok
                 if not saved_shift_ok:
                     self.status.setText("Finish shift save failed: active session kept for recovery.")
                     self._show_invalid_overlay("Unable to save shift partial locally.")
@@ -13136,7 +13497,13 @@ QWidget#ClientUIRoot {{
                     f"FINISH SHIFT {shift_payload.get('job_name') or shift_payload.get('job_code') or ''}".strip(),
                     silent=False,
                 )
-                self._show_operator_shift_overlay(shift_payload)
+                for linked_shift_payload in linked_shift_payloads:
+                    self.push_event(
+                        {"type": "FINISH_SHIFT", "finished_job": linked_shift_payload},
+                        f"FINISH LINKED SHIFT {linked_shift_payload.get('job_name') or linked_shift_payload.get('job_code') or ''}".strip(),
+                        silent=True,
+                    )
+                self._show_operator_shift_overlay(shift_payload, linked_shift_payloads)
                 self.status.setText("Finish shift saved. Waiting for Supervisor QR approval.")
                 self._save_active_session_snapshot()
                 return
@@ -14307,14 +14674,18 @@ QWidget#ClientUIRoot {{
                         or requested_job_id
                     )
                 else:
+                    s.job_payload = {}
+                    s.job_code = requested_job_id
+                    s.job_name = res.value or requested_job_id
                     self._start_pending_job_api_retry(requested_job_id, raw_s, res.value or requested_job_id)
-                    self._show_invalid_overlay("Waiting for complete job details from BMS.")
-                    return
-                s.job_name = (
-                    self._safe_text(api_job.get("ref_no"), "")
-                    or res.value
-                )
-                self.status.setText(f"Job set (API): {s.job_name}")
+                    self.status.setText(f"Job set: {s.job_name}. Waiting for server job details.")
+                if isinstance(fetched_payload, dict):
+                    s.job_name = (
+                        self._safe_text(api_job.get("ref_no"), "")
+                        or res.value
+                        or requested_job_id
+                    )
+                    self.status.setText(f"Job set (server): {s.job_name}")
             else:
                 payload = res.meta or {}
                 s.job_payload = payload if isinstance(payload, dict) else {}
@@ -14645,7 +15016,7 @@ QWidget#ClientUIRoot {{
                         self._show_invalid_overlay("PACK QR index and lot number already scanned.")
                         return
                     pack_hist["scanned_at"] = datetime.now(timezone.utc).isoformat()
-                    carryover = self._current_job_last_shift_butal()
+                    carryover = self._current_job_last_shift_butal(scanned_job_code or s.job_code)
                     carried_butal_qty = int(carryover.get("qty") or 0)
                     if carried_butal_qty > 0:
                         new_butal_qty = int(qty or 0) - carried_butal_qty
@@ -14659,66 +15030,44 @@ QWidget#ClientUIRoot {{
                         pack_hist["source"] = "LAST_SHIFT_BUTAL_COMPLETION"
                         pack_hist["carried_butal_qty"] = carried_butal_qty
                         pack_hist["carried_butal_raw"] = str(carryover.get("raw") or "")
-                        pack_hist["new_butal_qty"] = new_butal_qty
+                        pack_hist["new_good_qty"] = new_butal_qty
                         pack_hist["completed_pack_qty"] = int(qty or 0)
-                        pack_hist["good_qty"] = 0
-                        pack_hist["qty_q"] = 0
+                        pack_hist["good_qty"] = new_butal_qty
+                        pack_hist["qty_q"] = new_butal_qty
                         s.product_pack_history_logs.append(pack_hist)
                         if pack_key:
                             s.product_pack_history_keys.add(pack_key)
                         s.pack_count += 1
-                        s.butal_total += new_butal_qty
-                        job_key = self._normalize_job_code(s.job_code)
-                        if job_key:
-                            rows = dict(s.butal_by_job or {})
-                            rows[job_key] = int(rows.get(job_key, 0) or 0) + new_butal_qty
-                            s.butal_by_job = rows
-                        s.butal_scan_logs.append(
-                            {
-                                "raw_scan": raw_s,
-                                "qty": new_butal_qty,
-                                "base_qty": new_butal_qty,
-                                "multiplier": 1,
-                                "scanned_at": datetime.now(timezone.utc).isoformat(),
-                                "operator": str(s.operator_id or "").strip() or "-",
-                                "operator_name": self._operator_display_name(s.operator_id),
-                                "voided": False,
-                                "source": "LAST_SHIFT_BUTAL_COMPLETION",
-                                "carried_qty": carried_butal_qty,
-                                "carried_raw_scan": str(carryover.get("raw") or ""),
-                                "pack_qty": int(qty or 0),
-                                "assigned_job_code": s.job_code,
-                                "assigned_job_name": s.job_name,
-                            }
-                        )
-                        self._clear_last_shift_butal_carryover()
+                        s.good_total += new_butal_qty
+                        self._clear_last_shift_butal_carryover(scanned_job_code or s.job_code)
                         self._mark_live_cycle_scan_event(units=1)
                         self.status.setText(
-                            f"Last shift Butal completed: Pack +1, Good +0, Butal +{new_butal_qty}."
+                            f"Last shift Butal completed: Pack +1, Good +{new_butal_qty}, Butal +0."
                         )
                         self.lblPack.add_points(1)
-                        self.lblButal.add_points(new_butal_qty)
+                        self.lblGood.add_points(new_butal_qty)
                         self.lblTotalGood.add_points(new_butal_qty)
                         self._refresh_ui()
                         self._pulse_card(self.cardStatPack)
-                        self._pulse_card(self.cardStatButal)
+                        self._pulse_card(self.cardStatGood)
                         self._pulse_card(self.cardStatTotalGood)
                         self.push_event(
                             {
                                 "type": "LAST_SHIFT_BUTAL_PACK",
                                 "pack_qty": 1,
-                                "good_qty": 0,
-                                "butal_qty": new_butal_qty,
+                                "good_qty": new_butal_qty,
+                                "butal_qty": 0,
                                 "carried_qty": carried_butal_qty,
+                                "carryover_job_code": scanned_job_code or s.job_code,
                             },
-                            f"LAST SHIFT BUTAL PACK +1 BUTAL +{new_butal_qty}",
+                            f"LAST SHIFT BUTAL PACK +1 GOOD +{new_butal_qty}",
                             defer_snapshot=True,
                         )
                         return
                     s.product_pack_history_logs.append(pack_hist)
                     if pack_key:
                         s.product_pack_history_keys.add(pack_key)
-                carryover = self._current_job_last_shift_butal()
+                carryover = self._current_job_last_shift_butal(scanned_job_code or s.job_code)
                 carried_butal_qty = int(carryover.get("qty") or 0)
                 if carried_butal_qty > 0:
                     new_butal_qty = int(qty or 0) - carried_butal_qty
@@ -14729,51 +15078,29 @@ QWidget#ClientUIRoot {{
                         self._show_invalid_overlay("Pack qty must be greater than last shift Butal.")
                         return
                     s.pack_count += 1
-                    s.butal_total += new_butal_qty
-                    job_key = self._normalize_job_code(s.job_code)
-                    if job_key:
-                        rows = dict(s.butal_by_job or {})
-                        rows[job_key] = int(rows.get(job_key, 0) or 0) + new_butal_qty
-                        s.butal_by_job = rows
-                    s.butal_scan_logs.append(
-                        {
-                            "raw_scan": raw_s,
-                            "qty": new_butal_qty,
-                            "base_qty": new_butal_qty,
-                            "multiplier": 1,
-                            "scanned_at": datetime.now(timezone.utc).isoformat(),
-                            "operator": str(s.operator_id or "").strip() or "-",
-                            "operator_name": self._operator_display_name(s.operator_id),
-                            "voided": False,
-                            "source": "LAST_SHIFT_BUTAL_COMPLETION",
-                            "carried_qty": carried_butal_qty,
-                            "carried_raw_scan": str(carryover.get("raw") or ""),
-                            "pack_qty": int(qty or 0),
-                            "assigned_job_code": s.job_code,
-                            "assigned_job_name": s.job_name,
-                        }
-                    )
-                    self._clear_last_shift_butal_carryover()
+                    s.good_total += new_butal_qty
+                    self._clear_last_shift_butal_carryover(scanned_job_code or s.job_code)
                     self._mark_live_cycle_scan_event(units=1)
                     self.status.setText(
-                        f"Last shift Butal completed: Pack +1, Good +0, Butal +{new_butal_qty}."
+                        f"Last shift Butal completed: Pack +1, Good +{new_butal_qty}, Butal +0."
                     )
                     self.lblPack.add_points(1)
-                    self.lblButal.add_points(new_butal_qty)
+                    self.lblGood.add_points(new_butal_qty)
                     self.lblTotalGood.add_points(new_butal_qty)
                     self._refresh_ui()
                     self._pulse_card(self.cardStatPack)
-                    self._pulse_card(self.cardStatButal)
+                    self._pulse_card(self.cardStatGood)
                     self._pulse_card(self.cardStatTotalGood)
                     self.push_event(
                         {
                             "type": "LAST_SHIFT_BUTAL_PACK",
                             "pack_qty": 1,
-                            "good_qty": 0,
-                            "butal_qty": new_butal_qty,
+                            "good_qty": new_butal_qty,
+                            "butal_qty": 0,
                             "carried_qty": carried_butal_qty,
+                            "carryover_job_code": scanned_job_code or s.job_code,
                         },
-                        f"LAST SHIFT BUTAL PACK +1 BUTAL +{new_butal_qty}",
+                        f"LAST SHIFT BUTAL PACK +1 GOOD +{new_butal_qty}",
                         defer_snapshot=True,
                     )
                     return
@@ -14846,11 +15173,9 @@ QWidget#ClientUIRoot {{
         self.status.setText(f"Scan handled: {res.kind}")
         self._refresh_ui()
     def send_heartbeat(self):
-        # heartbeat carries a full session snapshot so server can recover after restart
         if self.state.machine_code:
-            snapshot = self._state_to_active_snapshot()
             self.push_event(
-                {"type": "HEARTBEAT", "session_snapshot": snapshot},
+                {"type": "HEARTBEAT"},
                 "HEARTBEAT",
                 silent=True,
             )
@@ -14858,8 +15183,30 @@ QWidget#ClientUIRoot {{
     def sync_session_snapshot_to_server(self, note: str = "SESSION SYNC"):
         if not self.state.machine_code:
             return
+        # Client-owned recovery snapshots stay local so a reset/empty client state
+        # cannot overwrite a richer server active-session row.
+        self.push_event({"type": "SESSION_SYNC"}, note)
+
+    def _enqueue_reconnect_session_snapshot_sync(self, note: str = "SESSION SNAPSHOT SYNC (RECONNECT)"):
+        if bool(getattr(self, "_server_recovery_snapshot_queued", False)):
+            return
+        if not str(self.state.machine_code or "").strip():
+            return
         snapshot = self._state_to_active_snapshot()
-        self.push_event({"type": "SESSION_SYNC", "session_snapshot": snapshot}, note)
+        if not self._snapshot_is_recoverable(snapshot):
+            return
+        self._server_recovery_snapshot_queued = True
+        payload = {
+            "client_id": self._current_client_id(),
+            "machine_code": self.state.machine_code,
+            "machine_name": self.state.machine_name or self.state.machine_code,
+            "job_code": self.state.job_code,
+            "job_name": self.state.job_name,
+            "operator_id": self.state.operator_id,
+            "event": {"type": "SESSION_SYNC", "session_snapshot": snapshot},
+            "last_event": note,
+        }
+        self._enqueue_server_event(payload, silent=True)
 
     def sync_local_finish_shifts_to_server(self, force: bool = False):
         rows = [row for row in _load_finish_shift_json() if isinstance(row, dict)]
@@ -15017,12 +15364,21 @@ QWidget#ClientUIRoot {{
             except Exception as e:
                 retry_item = True
                 last_error = e
+                self._server_was_offline = True
                 if not bool(item.get("silent")):
                     self.scanner_status.emit(f"Server send failed: {e}")
             finally:
                 self._event_queue.task_done()
             if not retry_item:
                 self._remove_persisted_server_event(str(item.get("id") or ""))
+                if bool(getattr(self, "_server_was_offline", False)):
+                    self._server_was_offline = False
+                    self._enqueue_reconnect_session_snapshot_sync()
+                event_type = self._server_event_type_from_item(item)
+                event_payload = item.get("payload") if isinstance(item, dict) else {}
+                event_body = event_payload.get("event") if isinstance(event_payload, dict) else {}
+                if event_type == "SESSION_SYNC" and isinstance(event_body, dict) and isinstance(event_body.get("session_snapshot"), dict):
+                    self._server_recovery_snapshot_queued = False
             else:
                 self._mark_persisted_server_event_failed(item, last_error)
             if retry_item and not self._event_worker_stop.is_set():

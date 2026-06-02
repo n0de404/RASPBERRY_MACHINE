@@ -60,7 +60,7 @@ PRODUCT_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "product_cat
 LOW_STOCK_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "low_stock_recommendations.json"
 ACTIVE_MACHINE_SESSIONS_FILE = Path(__file__).resolve().parent / "Database" / "active_machine_sessions.json"
 PLANNING_BOARD_FILE = Path(__file__).resolve().parent / "Database" / "planning_board.json"
-PROFILE_REPRINT_ADMIN_PASSWORD = "0t1docmtl$tm"
+PROFILE_REPRINT_ADMIN_PASSWORD = "adminphiltop"
 QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.11.173:5000").strip().rstrip("/")
 RAW_QR_O_SEGMENT = "O000000000240000010237800000000000"
 RAW_QR_REMARK = "V2"
@@ -1038,6 +1038,15 @@ def _machine_display_name(machine_code: str, machine_name: Any = "") -> str:
     return name or code
 
 
+def _parse_int_or_none(value: Any) -> Optional[int]:
+    try:
+        if value in (None, ""):
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
 @dataclass
 class MachineSession:
     client_id: str
@@ -1056,6 +1065,7 @@ class MachineSession:
     raw_sacks_count: int = 0
     raw_material_scans: List[str] = None
     raw_material_logs: List[Dict[str, Any]] = None
+    product_pack_history_logs: List[Dict[str, Any]] = None
     startup_reject_total: int = 0
     downtime_reason_code: Optional[str] = None
     downtime_reason_text: Optional[str] = None
@@ -1075,6 +1085,9 @@ class MachineSession:
     cycle_time_new_input: Optional[str] = None
     cycle_time_current: Optional[str] = None
     live_cycle_avg_seconds: Optional[float] = None
+    machine_counter_current: Optional[int] = None
+    machine_counter_shift_start: Optional[int] = None
+    machine_counter_shift_end: Optional[int] = None
     maintenance_name: Optional[str] = None
     supervisor_name: Optional[str] = None
     job_payload: Dict[str, Any] = None
@@ -1096,6 +1109,7 @@ class MachineSession:
         d["reject_breakdown"] = d["reject_breakdown"] or {}
         d["raw_material_scans"] = d["raw_material_scans"] or []
         d["raw_material_logs"] = d["raw_material_logs"] or []
+        d["product_pack_history_logs"] = d["product_pack_history_logs"] or []
         d["job_payload"] = d["job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
         d["operator_shift_logs"] = d["operator_shift_logs"] or []
@@ -1128,6 +1142,7 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         raw_sacks_count=int(raw.get("raw_sacks_count", 0) or 0),
         raw_material_scans=list(raw.get("raw_material_scans") or []),
         raw_material_logs=list(raw.get("raw_material_logs") or []),
+        product_pack_history_logs=list(raw.get("product_pack_history_logs") or []),
         startup_reject_total=int(raw.get("startup_reject_total", 0) or 0),
         downtime_reason_code=raw.get("downtime_reason_code"),
         downtime_reason_text=raw.get("downtime_reason_text"),
@@ -1147,6 +1162,9 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         cycle_time_new_input=raw.get("cycle_time_new_input"),
         cycle_time_current=raw.get("cycle_time_current"),
         live_cycle_avg_seconds=raw.get("live_cycle_avg_seconds"),
+        machine_counter_current=_parse_int_or_none(raw.get("machine_counter_current")),
+        machine_counter_shift_start=_parse_int_or_none(raw.get("machine_counter_shift_start")),
+        machine_counter_shift_end=_parse_int_or_none(raw.get("machine_counter_shift_end")),
         maintenance_name=raw.get("maintenance_name"),
         supervisor_name=raw.get("supervisor_name"),
         job_payload=dict(raw.get("job_payload") or {}),
@@ -1165,14 +1183,36 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
     )
 
 
+def _active_sessions_backup_file() -> Path:
+    return Path(f"{ACTIVE_MACHINE_SESSIONS_FILE}.bak")
+
+
+def _read_active_sessions_payload(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return raw if isinstance(raw, dict) else {}
+
+
+def _backup_active_sessions_file() -> None:
+    if not ACTIVE_MACHINE_SESSIONS_FILE.exists():
+        return
+    backup = _active_sessions_backup_file()
+    with ACTIVE_MACHINE_SESSIONS_FILE.open("rb") as src, backup.open("wb") as dst:
+        dst.write(src.read())
+        dst.flush()
+        os.fsync(dst.fileno())
+
+
 def load_active_sessions_seed() -> Dict[str, MachineSession]:
     try:
-        if not ACTIVE_MACHINE_SESSIONS_FILE.exists():
-            return {}
-        raw = json.loads(ACTIVE_MACHINE_SESSIONS_FILE.read_text(encoding="utf-8"))
+        raw = _read_active_sessions_payload(ACTIVE_MACHINE_SESSIONS_FILE)
     except Exception:
-        return {}
-    if not isinstance(raw, dict):
+        try:
+            raw = _read_active_sessions_payload(_active_sessions_backup_file())
+        except Exception:
+            return {}
+    if not raw:
         return {}
     out: Dict[str, MachineSession] = {}
     for machine_code, row in raw.items():
@@ -1191,10 +1231,14 @@ def _save_active_sessions_json(rows: Dict[str, MachineSession]) -> bool:
         for machine_code, sess in (rows or {}).items():
             if isinstance(sess, MachineSession):
                 payload[str(machine_code or sess.machine_code).strip()] = sess.to_dict()
-        ACTIVE_MACHINE_SESSIONS_FILE.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        ACTIVE_MACHINE_SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(f"{ACTIVE_MACHINE_SESSIONS_FILE}.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        _backup_active_sessions_file()
+        tmp.replace(ACTIVE_MACHINE_SESSIONS_FILE)
         return True
     except Exception:
         return False
@@ -2736,6 +2780,28 @@ def fetch_planning_job_from_bms(identifier: str) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise RuntimeError("BMS job response is invalid")
     return _planning_job_card_from_payload(job_id, parsed)
+
+
+def fetch_job_payload_from_bms(identifier: str) -> Dict[str, Any]:
+    raw_id = str(identifier or "").strip()
+    m_job_url = re.search(r"/v1/jobs/(\d+)\s*$", raw_id, flags=re.IGNORECASE)
+    job_id = (m_job_url.group(1) if m_job_url else raw_id).strip()
+    if not job_id:
+        raise ValueError("job_id is required")
+    cfg = _load_product_source_config()
+    bms = cfg.get("bms") if isinstance(cfg.get("bms"), dict) else {}
+    base_url = str(bms.get("base_url", "")).strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("BMS config is missing base_url")
+    token = _bms_login_token(bms)
+    req_job = urllib_request.Request(url=f"{base_url}/jobs/{job_id}", method="GET")
+    req_job.add_header("Authorization", f"Bearer {token}")
+    req_job.add_header("Accept", "application/json")
+    with urllib_request.urlopen(req_job, timeout=8) as resp:
+        parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("BMS job response is invalid")
+    return parsed
 
 
 def _fetch_products_from_source() -> List[Dict[str, str]]:
@@ -4946,11 +5012,67 @@ DASHBOARD_HTML = """
     return `${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
   }
 
+  function machineCounterStartValue(session){
+    const value = firstValue(
+      session?.machine_counter_shift_start,
+      session?.machine_counter_start,
+      session?.operator_shift_baseline_machine_counter_start
+    );
+    return value === "" ? "-" : value;
+  }
+
   function extractJobRecord(session){
     const payload = (session && typeof session.job_payload === "object" && session.job_payload) || {};
     if(payload.data && payload.data.job && typeof payload.data.job === "object") return payload.data.job;
     if(payload.job && typeof payload.job === "object") return payload.job;
     return payload;
+  }
+
+  function extractJobDetailsRecord(session){
+    const payload = (session && typeof session.job_payload === "object" && session.job_payload) || {};
+    const data = (payload.data && typeof payload.data === "object") ? payload.data : {};
+    if(data.job_details && typeof data.job_details === "object") return data.job_details;
+    if(payload.job_details && typeof payload.job_details === "object") return payload.job_details;
+    return {};
+  }
+
+  function productCatalogSku(productId){
+    const id = String(productId || "").trim();
+    if(!id || !Array.isArray(productItems)) return "";
+    const normalized = id.replace(/^0+/, "") || id;
+    const found = productItems.find(p => {
+      const pid = String(p?.id || p?.product_id || "").trim();
+      return pid === id || ((pid.replace(/^0+/, "") || pid) === normalized);
+    });
+    return String(found?.sku || found?.product_sku || "").trim();
+  }
+
+  function jobSku(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const payload = (item.job_payload && typeof item.job_payload === "object") ? item.job_payload : {};
+    const data = (payload.data && typeof payload.data === "object") ? payload.data : {};
+    const job = (data.job && typeof data.job === "object") ? data.job : ((payload.job && typeof payload.job === "object") ? payload.job : {});
+    const details = (data.job_details && typeof data.job_details === "object") ? data.job_details : ((payload.job_details && typeof payload.job_details === "object") ? payload.job_details : {});
+    const explicitSku = firstValue(
+      item.product_sku, item.sku,
+      details.product_sku, details.sku,
+      job.product_sku, job.sku
+    );
+    if(explicitSku) return String(explicitSku).trim();
+    const productId = firstValue(item.product_id, details.product_id, job.product_id);
+    return productCatalogSku(productId);
+  }
+
+  function jobDisplayName(row, fallback = "Job"){
+    const item = (row && typeof row === "object") ? row : {};
+    return firstValue(jobSku(item), item.job_name, item.job_code, fallback);
+  }
+
+  function jobSecondaryLabel(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const sku = jobSku(item);
+    if(sku) return `SKU ${sku}`;
+    return item.job_code ? `Job ${item.job_code}` : "-";
   }
 
   function detailItem(label, value){
@@ -5045,6 +5167,130 @@ DASHBOARD_HTML = """
       });
     }
     return rows;
+  }
+
+  function productPackHistoryRows(session){
+    const logs = Array.isArray(session?.product_pack_history_logs) ? session.product_pack_history_logs : [];
+    return logs.map((row, idx) => {
+      const x = (row && typeof row === "object") ? row : {};
+      return {
+        index: idx + 1,
+        source: firstValue(x.source, x.type, x.status, "PACK"),
+        qty: firstValue(x.good_qty, x.qty_q, x.qty, x.completed_pack_qty, "-"),
+        pack_qty: firstValue(x.completed_pack_qty, x.pack_qty, x.qty, "-"),
+        series: firstValue(x.series, x.index, x.label_index, "-"),
+        total_labels: firstValue(x.total_labels, x.total, "-"),
+        lot: firstValue(x.lot_number, x.lot, "-"),
+        po: firstValue(x.po_number, x.po, "-"),
+        operator: firstValue(x.operator_name, x.operator, "-"),
+        time: firstValue(x.scanned_at, x.timestamp_utc, ""),
+        raw_scan: String(x.raw_scan || ""),
+      };
+    });
+  }
+
+  function compressNumberRanges(values){
+    const nums = [...new Set(values.map(v => Number(v)).filter(v => Number.isFinite(v) && v > 0))]
+      .sort((a, b) => a - b);
+    if(!nums.length) return "-";
+    const ranges = [];
+    let start = nums[0];
+    let prev = nums[0];
+    for(let i = 1; i < nums.length; i += 1){
+      const n = nums[i];
+      if(n === prev + 1){
+        prev = n;
+        continue;
+      }
+      ranges.push(start === prev ? String(start) : `${start}-${prev}`);
+      start = n;
+      prev = n;
+    }
+    ranges.push(start === prev ? String(start) : `${start}-${prev}`);
+    return ranges.join(", ");
+  }
+
+  function productPackMissingSeriesRows(session){
+    const rows = productPackHistoryRows(session);
+    const groups = new Map();
+    rows.forEach(row => {
+      const key = [row.po || "-", row.lot || "-", row.total_labels || "-"].join("|");
+      if(!groups.has(key)){
+        groups.set(key, {
+          po: row.po || "-",
+          lot: row.lot || "-",
+          total: Number(row.total_labels || 0) || 0,
+          scanned: [],
+        });
+      }
+      const group = groups.get(key);
+      const series = Number(row.series || 0) || 0;
+      if(series > 0) group.scanned.push(series);
+      if(!group.total && Number(row.total_labels || 0) > 0) group.total = Number(row.total_labels || 0);
+    });
+    return Array.from(groups.values()).map(group => {
+      const scannedSet = new Set(group.scanned);
+      const sortedScanned = [...scannedSet].sort((a, b) => a - b);
+      const minScanned = sortedScanned.length ? sortedScanned[0] : 0;
+      const maxScanned = sortedScanned.length ? sortedScanned[sortedScanned.length - 1] : 0;
+      const missing = [];
+      for(let i = minScanned; i <= maxScanned; i += 1){
+        if(!scannedSet.has(i)) missing.push(i);
+      }
+      return {
+        po: group.po,
+        lot: group.lot,
+        expected: group.total || maxScanned || "-",
+        scanned: group.scanned.length,
+        scanned_series: compressNumberRanges(group.scanned),
+        missing_series: missing.length ? compressNumberRanges(missing) : "None",
+      };
+    });
+  }
+
+  function productPackHistoryHtml(session, limit=12){
+    const rows = productPackHistoryRows(session);
+    const missingRows = productPackMissingSeriesRows(session);
+    const visible = rows.slice().reverse();
+    const missingTable = tableFromRows(missingRows, [
+      { label: "PO", value: x => x.po },
+      { label: "Lot", value: x => x.lot },
+      { label: "Expected Series", value: x => x.expected },
+      { label: "Scanned", value: x => x.scanned },
+      { label: "Scanned Series", value: x => x.scanned_series },
+      { label: "Missing Series", value: x => x.missing_series },
+    ], "No pack QR scans recorded.", 6);
+    const table = tableFromRows(visible, [
+      { label: "#", value: x => x.index },
+      { label: "Source", value: x => x.source },
+      { label: "Good Qty", value: x => x.qty },
+      { label: "Pack Qty", value: x => x.pack_qty },
+      { label: "Series", value: x => x.series },
+      { label: "Total", value: x => x.total_labels },
+      { label: "Lot", value: x => x.lot },
+      { label: "PO", value: x => x.po },
+      { label: "Operator", value: x => x.operator },
+      { label: "Scanned At", value: x => fmtDateLocal(x.time || "") || "-" },
+    ], "No pack QR scans recorded.", limit);
+    const rawRows = rows.filter(x => x.raw_scan).map(x => `${x.index}. ${x.raw_scan}`);
+    const rawDetails = rawRows.length ? `
+      <details class="archive-raw-details">
+        <summary>Show raw scanned pack QR values</summary>
+        <div class="machine-detail-code" style="margin-top:8px;">${esc(rawRows.join("\\n"))}</div>
+      </details>
+    ` : "";
+    return `
+      <div class="review-group-list">
+        <div class="review-group-card wide">
+          <div class="review-group-head">Missing Series</div>
+          <div class="review-group-body">${missingTable}</div>
+        </div>
+        <div class="review-group-card wide">
+          <div class="review-group-head">Scanned Pack QR</div>
+          <div class="review-group-body">${table}${rawDetails}</div>
+        </div>
+      </div>
+    `;
   }
 
   function rawPartRows(row){
@@ -5182,6 +5428,7 @@ DASHBOARD_HTML = """
       .sort((a,b) => String(a[0]).localeCompare(String(b[0])))
       .map(([reason, qty]) => ({reason, qty}));
     const materialRows = archivedMaterialRows(session);
+    const packHistoryRows = productPackHistoryRows(session);
     const scannedRawQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
     const part = primaryRawPart(row);
     const perUnit = Number(part.part_qty_per_unit || 0);
@@ -5196,8 +5443,8 @@ DASHBOARD_HTML = """
     machineDetailBody.innerHTML = `
       <div class="archive-detail-hero">
         <div>
-          <h3>${esc(session.job_name || session.job_code || "Archived Job")}</h3>
-          <div class="sub">${esc(session.machine_name || session.machine_code || "-")} | Job ${esc(session.job_code || "-")}</div>
+          <h3>${esc(jobDisplayName(session, "Archived Job"))}</h3>
+          <div class="sub">${esc(session.machine_name || session.machine_code || "-")} | ${esc(jobSecondaryLabel(session))}</div>
           <div class="archive-pill-row">
             <span class="archive-pill">${esc(row.archive_status || "Archived")}</span>
             <span class="archive-pill">Printed ${esc(fmtDateLocal(row.printed_at_utc || ""))}</span>
@@ -5217,7 +5464,7 @@ DASHBOARD_HTML = """
           ${detailItem("Machine", session.machine_code || "-")}
           ${detailItem("Machine Name", session.machine_name || "-")}
           ${detailItem("Archive Status", row.archive_status || "Archived")}
-          ${detailItem("Job Code", session.job_code || "-")}
+          ${detailItem("SKU", jobSku(session) || "-")}
           ${detailItem("Job Name", session.job_name || "-")}
           ${detailItem("Job Ref", job.ref_no || job.reference || job.id || "-")}
           ${detailItem("Product ID", job.product_id || "-")}
@@ -5241,6 +5488,7 @@ DASHBOARD_HTML = """
           ${archiveMetric("No Shot", Number(session.no_shot_total || 0))}
           ${archiveMetric("Total Good", totalGood, "good")}
           ${archiveMetric("Startup Reject", Number(session.startup_reject_total || 0))}
+          ${archiveMetric("Pack QR Scans", Number(packHistoryRows.length || 0))}
           ${archiveMetric("Cycle Time", session.cycle_time_current || "-")}
         </div>
         ${productionVisualHtml(session)}
@@ -5248,6 +5496,10 @@ DASHBOARD_HTML = """
       <div class="machine-detail-section">
         <h4>Raw Materials</h4>
         ${rawMaterialInsightsHtml(row)}
+      </div>
+      <div class="machine-detail-section">
+        <h4>Product Pack History</h4>
+        ${productPackHistoryHtml(session, 12)}
       </div>
       <div class="machine-detail-section">
         <h4>Transfer / Print Records</h4>
@@ -5326,12 +5578,13 @@ DASHBOARD_HTML = """
     const rawScans = Array.isArray(session.raw_material_scans) ? session.raw_material_scans : [];
     const rawLogs = Array.isArray(session.raw_material_logs) ? session.raw_material_logs : [];
     const materialRows = archivedMaterialRows(session);
+    const packHistoryRows = productPackHistoryRows(session);
     const scannedRawQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
     const activeJobSummaryHtml = session.job_code || session.job_name ? `
       <div class="archive-detail-hero">
         <div>
-          <h3>${esc(session.job_name || session.job_code || "Active Job")}</h3>
-          <div class="sub">${esc(session.machine_name || session.machine_code || "-")} | Job ${esc(session.job_code || "-")}</div>
+          <h3>${esc(jobDisplayName(session, "Active Job"))}</h3>
+          <div class="sub">${esc(session.machine_name || session.machine_code || "-")} | ${esc(jobSecondaryLabel(session))}</div>
           <div class="archive-pill-row">
             <span class="archive-pill">${esc(status)}</span>
             <span class="archive-pill">Operator ${esc(displayNameForId(session.operator_id || "-"))}</span>
@@ -5376,9 +5629,11 @@ DASHBOARD_HTML = """
           ${detailItem("Status Set By", (manual && manual.set_by_name) ? `${manual.set_by_name}${manual.set_by_role ? ` (${manual.set_by_role})` : ""}` : "-")}
           ${detailItem("Status Set At", fmtDateLocal((manual && (manual.started_at_utc || manual.updated_at_utc)) || ""))}
           ${detailItem("Client", displayNameForId(session.client_id || "-"))}
-          ${detailItem("Job Code", session.job_code || "-")}
+          ${detailItem("SKU", jobSku(session) || "-")}
           ${detailItem("Job Name", session.job_name || "-")}
           ${detailItem("Operator", displayNameForId(session.operator_id || "-"))}
+          ${detailItem("Machine Counter Start", machineCounterStartValue(session))}
+          ${detailItem("Machine Counter Current", session.machine_counter_current ?? "-")}
           ${detailItem("Last Seen", fmtDateLocal(session.last_seen_utc))}
           ${detailItem("Last Event", session.last_event || "-")}
         </div>
@@ -5394,12 +5649,19 @@ DASHBOARD_HTML = """
           ${archiveMetric("Total Good", totalGood, "good")}
           ${archiveMetric("Startup Reject", Number(session.startup_reject_total || 0))}
           ${archiveMetric("Raw Sacks", Number(session.raw_sacks_count || 0))}
+          ${archiveMetric("Pack QR Scans", Number(packHistoryRows.length || 0))}
           ${archiveMetric("Scanned Raw Qty", scannedRawQty || "-")}
+          ${archiveMetric("Counter Start", machineCounterStartValue(session))}
+          ${archiveMetric("Counter Current", session.machine_counter_current ?? "-")}
           ${archiveMetric("Cycle Time", session.cycle_time_current || "-")}
           ${archiveMetric("Maintenance", maintenanceMode ? "YES" : "NO")}
           ${archiveMetric("Downtime Active", session.downtime_active ? "YES" : "NO")}
         </div>
         ${productionVisualHtml(session)}
+      </div>
+      <div class="machine-detail-section">
+        <h4>Product Pack History</h4>
+        ${productPackHistoryHtml(session, 12)}
       </div>
       <div class="machine-detail-section">
         <h4>Downtime</h4>
@@ -5947,7 +6209,7 @@ DASHBOARD_HTML = """
   function reviewSummaryText(row){
     if(!row) return "";
     return [
-      `Finished Job: ${row.job_name || row.job_code || "-"}`,
+      `Finished Job: ${jobDisplayName(row, "-")}`,
       `Pack: ${row.pack_count ?? 0}`,
       `Good: ${row.good_total ?? 0}`,
       `Butal: ${row.butal_total ?? 0}`,
@@ -6182,7 +6444,7 @@ DASHBOARD_HTML = """
     const shiftHero = `
       <div class="archive-detail-hero">
         <div>
-          <h3>${esc(item.job_name || item.job_code || "Shift Review")}</h3>
+          <h3>${esc(jobDisplayName(item, "Shift Review"))}</h3>
           <div class="sub">${esc(item.machine_name || item.machine_code || "-")} | Shift ${esc(item.shift_index ?? "-")} | ${esc(item.reason || "Shift handoff")}</div>
           <div class="archive-pill-row">
             <span class="archive-pill">${esc(item.review_status || "Pending Review")}</span>
@@ -6288,7 +6550,7 @@ DASHBOARD_HTML = """
           record_type: item.record_type || "SHIFT_PARTIAL",
           reason: item.reason || "-",
           machine: `${item.machine_name || item.machine_code || "-"} (${item.machine_code || "-"})`,
-          job: `${item.job_name || "-"} (${item.job_code || "-"})`,
+          job: `${jobDisplayName(item, "-")} (${jobSecondaryLabel(item)})`,
           shift_index: item.shift_index ?? "-",
           started: fmtDateLocal(item.started_at_utc || ""),
           ended: fmtDateLocal(item.ended_at_utc || item.finished_at_utc || ""),
@@ -6320,11 +6582,12 @@ DASHBOARD_HTML = """
           { label: "Target Qty", value: x => x.request_part_qty || x.qty || x.quantity || x.required_qty || "-" },
           { label: "Scanned Qty", value: x => scannedQtyForPart(x) || 0 },
         ], "No target raw materials from Job API.", 8) },
-        { title: "Product Pack History", kind: "html", content: tableFromRows(packHistory, [
-          { label: "Type", value: x => x.type || x.source || "Pack" },
-          { label: "Qty", value: x => x.qty || x.qty_q || x.good_qty || "-" },
-          { label: "Time", value: x => fmtDateLocal(x.timestamp_utc || x.scanned_at || "") || "-" },
-        ], "No product pack history recorded.", 8) },
+        {
+          title: "Product Pack History",
+          kind: "html",
+          wide: true,
+          content: productPackHistoryHtml(item, Math.max(1, packHistory.length)),
+        },
       ],
       rawCycle: [
         { title: "Job Details", kind: "html", wide: true, content: `
@@ -6368,7 +6631,11 @@ DASHBOARD_HTML = """
         }) },
         { title: "Linked Job / Records", kind: "metrics", content: [
           { label: "Linked", value: item.linkage_enabled ? "YES" : "NO", tone: item.linkage_enabled ? "warn" : "" },
-          { label: "Linked Job", value: item.linkage_job_name || item.linkage_job_code || "-" },
+          { label: "Linked Job", value: jobDisplayName({
+            job_code: item.linkage_job_code,
+            job_name: item.linkage_job_name,
+            job_payload: item.linkage_job_payload,
+          }, "-") },
           { label: "Raw Logs", value: rawLogs.length },
           { label: "Reject Logs", value: rejectReviews.length },
           { label: "Partials", value: partials.length },
@@ -6422,7 +6689,7 @@ DASHBOARD_HTML = """
       return `
         <div class="finished-item">
           <div class="finished-head">
-            <h4>${esc(r.job_name || r.job_code || "Shift")} - ${esc(machineName)}</h4>
+            <h4>${esc(jobDisplayName(r, "Shift"))} - ${esc(machineName)}</h4>
             <span class="finished-badge">${esc(r.review_status || "PENDING")}</span>
           </div>
           <div class="finished-grid">
@@ -6470,11 +6737,11 @@ DASHBOARD_HTML = """
       return `
         <div class="finished-item">
           <div class="finished-head">
-            <h4>${esc(first.job_name || first.job_code || key)}</h4>
+            <h4>${esc(jobDisplayName(first, key))}</h4>
             <span class="finished-badge">APPROVED PARTIALS</span>
           </div>
           <div class="finished-grid">
-            <div><strong>Job Code:</strong> ${esc(first.job_code || key)}</div>
+            <div><strong>SKU:</strong> ${esc(jobSku(first) || "-")}</div>
             <div><strong>Approved Shifts:</strong> ${esc(list.length)}</div>
             <div><strong>API Partials:</strong> ${esc(apiPartialQty)}</div>
             <div><strong>Approved Shift Qty:</strong> ${esc(approvedQty)}</div>
@@ -6619,7 +6886,7 @@ DASHBOARD_HTML = """
       return `
         <div class="finished-item">
           <div class="finished-head">
-            <h4>${esc(r.job_name || r.job_code || "Finished Job")} - ${esc(machineName)} ${linkageBadge}</h4>
+            <h4>${esc(jobDisplayName(r, "Finished Job"))} - ${esc(machineName)} ${linkageBadge}</h4>
             <span class="finished-badge">FINISHED</span>
           </div>
           <div class="finished-grid">
@@ -6725,7 +6992,7 @@ DASHBOARD_HTML = """
             return `
               <tr>
                 <td>${esc(machineName)}<br><span class="muted">${esc(machineCode)}</span></td>
-                <td>${esc(r.job_name || r.job_code || "-")}${linkageRole ? ` <span class="linkage-pill">${esc(linkageRole)}${linkageTotal ? ` (${linkageTotal})` : ""}</span>` : ""}<br><span class="muted">${esc(r.job_code || "-")}${linkageNote ? ` | ${esc(linkageNote)}` : ""}</span></td>
+                <td>${esc(jobDisplayName(r, "-"))}${linkageRole ? ` <span class="linkage-pill">${esc(linkageRole)}${linkageTotal ? ` (${linkageTotal})` : ""}</span>` : ""}<br><span class="muted">${esc(jobSecondaryLabel(r))}${linkageNote ? ` | ${esc(linkageNote)}` : ""}</span></td>
                 <td>${esc(displayNameForId(r.operator_id || "-"))}</td>
                 <td>${esc(fmtDateLocal(r.finished_at_utc || ""))}</td>
                 <td>${esc(fmtDateLocal(r.printed_at_utc || r.archived_at_utc || ""))}</td>
@@ -6867,7 +7134,7 @@ DASHBOARD_HTML = """
             return `
               <tr>
                 <td>${esc(machineName)}<br><span class="muted">${esc(r.machine_code || "-")}</span></td>
-                <td>${esc(r.job_name || r.job_code || "-")}<br><span class="muted">${esc(r.job_code || "-")}</span></td>
+                <td>${esc(jobDisplayName(r, "-"))}<br><span class="muted">${esc(jobSecondaryLabel(r))}</span></td>
                 <td>${esc(displayNameForId(r.operator_id || "-"))}</td>
                 <td>${esc(reason)}</td>
                 <td>${esc(fmtDowntimeSeconds(r.duration_seconds))}</td>
@@ -6966,7 +7233,7 @@ DASHBOARD_HTML = """
             <div class="maintenance-call-status ${active ? "active" : ""}">${esc(status)}</div>
           </div>
           <div class="maintenance-call-reason">${esc(maintenanceCallReason(s))}</div>
-          <div class="maintenance-call-meta">Job: <strong>${esc(s.job_name || s.job_code || "-")}</strong></div>
+          <div class="maintenance-call-meta">Job: <strong>${esc(jobDisplayName(s, "-"))}</strong></div>
           <div class="maintenance-call-meta">Operator: <strong>${esc(displayNameForId(s.operator_id || "-"))}</strong></div>
           <div class="maintenance-call-meta">Maintenance: <strong>${esc(assigned || "Not assigned")}</strong></div>
           <div class="maintenance-call-timer">${esc(fmtDowntimeSeconds(duration))}</div>
@@ -7246,7 +7513,7 @@ DASHBOARD_HTML = """
             const cycle = row?.live_cycle_seconds ? `${Number(row.live_cycle_seconds).toFixed(2)}s pack` : (row?.act_cycle_seconds ? `${Number(row.act_cycle_seconds).toFixed(2)}s act` : "-");
             return `<tr>
               <td>${esc(row?.machine_name || row?.machine_code || "-")}<br><span class="muted">${esc(row?.machine_code || "-")}</span></td>
-              <td>${esc(row?.job_name || row?.job_code || "-")}<br><span class="muted">${esc(row?.job_code || "-")}</span></td>
+              <td>${esc(jobDisplayName(row, "-"))}<br><span class="muted">${esc(jobSecondaryLabel(row))}</span></td>
               <td>${esc(row?.job_started_at ? fmtDateLocal(row.job_started_at) : "-")}</td>
               <td>${esc(finish ? fmtDateLocal(finish) : "-")}</td>
               <td>${esc(remaining != null ? fmtDowntimeSeconds(remaining) : "-")}</td>
@@ -7340,7 +7607,7 @@ DASHBOARD_HTML = """
             return `
               <tr>
                 <td>${esc(row?.machine_name || row?.machine_code || "-")}<br><span class="muted">${esc(row?.machine_code || "-")}</span></td>
-                <td>${esc(row?.job_name || row?.job_code || "-")}<br><span class="muted">${esc(row?.job_code || "-")}</span></td>
+                <td>${esc(jobDisplayName(row, "-"))}<br><span class="muted">${esc(jobSecondaryLabel(row))}</span></td>
                 <td>${esc(displayNameForId(row?.operator_id || "-"))}${row?.last_seen_utc ? `<br><span class="muted">Last seen ${esc(fmtDateLocal(row.last_seen_utc))}</span>` : ""}</td>
                 <td>${esc(startText)}</td>
                 <td>${queueStatusBadge(row?.status || "RUNNING")}</td>
@@ -7404,8 +7671,8 @@ DASHBOARD_HTML = """
   }
 
   function livePlanningCardHtml(session){
-    const title = session.job_name || session.job_code || "Running Job";
-    return `<div class="planning-card live"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip ongoing">ONGOING</span></div><div class="planning-meta">Status: running now<br>Operator: ${esc(session.operator_id || "-")}<br>Pack: ${esc(session.pack_total || 0)} | Good: ${esc(session.good_total || 0)} | Reject: ${esc(session.reject_total || 0)}</div></div>`;
+    const title = jobDisplayName(session, "Running Job");
+    return `<div class="planning-card live"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip ongoing">ONGOING</span></div><div class="planning-meta">Status: running now<br>Operator: ${esc(session.operator_id || "-")}<br>Counter Start: ${esc(machineCounterStartValue(session))}<br>Pack: ${esc(session.pack_total || 0)} | Good: ${esc(session.good_total || 0)} | Reject: ${esc(session.reject_total || 0)}</div></div>`;
   }
 
   function renderLowStockRecommendations(items, meta = {}){
@@ -7782,7 +8049,7 @@ DASHBOARD_HTML = """
     if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = overlayReviewMode === "shift" ? "Approve & Continue" : "Save Review";
     if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = overlayReviewMode === "shift" ? "none" : "";
     const title = activeJobRow
-      ? `${activeJobRow.job_name || activeJobRow.job_code || "Finished Job"} | ${activeJobRow.machine_name || activeJobRow.machine_code || "-"}`
+      ? `${jobDisplayName(activeJobRow, "Finished Job")} | ${activeJobRow.machine_name || activeJobRow.machine_code || "-"}`
       : "Finished Job";
     const key = jobKeyOf(activeJobRow);
     overlayJobInfo.value = title;
@@ -7888,11 +8155,13 @@ DASHBOARD_HTML = """
         role: "Original Job",
         job_code: s.job_code || "",
         job_name: s.job_name || "",
+        job_payload: s.job_payload || {},
       },
       ...linkedRows.map((row, idx) => ({
         role: `Linked Job ${idx + 1}`,
         job_code: (row && row.job_code) || "",
         job_name: (row && row.job_name) || "",
+        job_payload: (row && row.job_payload) || {},
       })),
     ];
     const total = Math.max(1, jobs.length);
@@ -7966,12 +8235,8 @@ DASHBOARD_HTML = """
     const linkageDisplay = hasLinkage ? machineLinkageDisplay(s, code) : null;
     const displayedJob = linkageDisplay ? linkageDisplay.current : null;
     const total = Number(s.good_total||0) + Number(s.butal_total||0);
-    const currentJobLabel = s.job_name
-      ? (s.job_code ? `${s.job_name} (${s.job_code})` : s.job_name)
-      : (s.job_code || "No Job Set");
-    const jobLabel = displayedJob
-      ? (displayedJob.job_name ? (displayedJob.job_code ? `${displayedJob.job_name} (${displayedJob.job_code})` : displayedJob.job_name) : (displayedJob.job_code || currentJobLabel))
-      : currentJobLabel;
+    const currentJobLabel = jobDisplayName(s, "No Job Set");
+    const jobLabel = displayedJob ? jobDisplayName(displayedJob, currentJobLabel) : currentJobLabel;
     const seenLabel = s.last_seen_utc ? new Date(s.last_seen_utc).toLocaleString() : "-";
     const statusText = statusLabel || css.toUpperCase();
     const operatorText = displayNameForId(s.operator_id || "-");
@@ -8014,6 +8279,7 @@ DASHBOARD_HTML = """
         <div class="machine-metric bad"><div class="k">Reject</div><div class="v">${esc(s.reject_total || 0)}</div></div>
         <div class="machine-metric"><div class="k">No Shot</div><div class="v">${esc(s.no_shot_total || 0)}</div></div>
         <div class="machine-metric good"><div class="k">Total</div><div class="v">${esc(total)}</div></div>
+        <div class="machine-metric"><div class="k">Counter Start</div><div class="v">${esc(machineCounterStartValue(s))}</div></div>
       </div>
       <div class="machine-card-foot">
         <div>Last seen: ${esc(seenLabel)}</div>
@@ -8540,7 +8806,7 @@ DASHBOARD_HTML = """
       quantity: quantity,
       total: total,
       po_number: poNumber,
-      product_desc: (activeJobRow && (activeJobRow.job_name || activeJobRow.job_code)) || "",
+      product_desc: (activeJobRow && jobDisplayName(activeJobRow, "")) || "",
       requested_at_ph: "",
       lot_number: lotNumber,
       qr_stage_label: generatedQrState.stageLabel || "",
@@ -8647,7 +8913,7 @@ DASHBOARD_HTML = """
       return;
     }
     activeJobRow = out.item || activeJobRow;
-    overlayReviewJobInfo.value = `${activeJobRow.job_name || activeJobRow.job_code || "Finished Job"} | ${activeJobRow.machine_name || activeJobRow.machine_code || "-"}`;
+    overlayReviewJobInfo.value = `${jobDisplayName(activeJobRow, "Finished Job")} | ${activeJobRow.machine_name || activeJobRow.machine_code || "-"}`;
     if(overlayReviewJobInfoDisplay) overlayReviewJobInfoDisplay.textContent = overlayReviewJobInfo.value;
     const shiftPanels = overlayReviewMode === "shift" ? buildShiftPreviewPanels(activeJobRow) : null;
     overlayReviewSummary.value = shiftPanels ? safeJsonPretty(shiftPanels.summary) : reviewSummaryText(activeJobRow) + `\\n\\nStatus: ${activeJobRow.review_status || "-"}`;
@@ -8937,13 +9203,30 @@ PROFILE_CREATOR_HTML = """
     setStatus('Profile removed.');
     await loadProfiles();
   }
-  async function openPrintWindow(imageSrc, printSize){
+  function preparePrintWindow(){
+    const w = window.open('', '_blank');
+    if(!w){
+      setStatus('Popup blocked. Allow popups for this server, then try again.');
+      return null;
+    }
+    w.document.write(`<!doctype html><html><head><title>Print QR</title>
+      <style>html,body{margin:0;padding:16px;font-family:Arial,sans-serif;background:#fff;color:#111;}</style>
+      </head><body>Preparing QR...</body></html>`);
+    w.document.close();
+    try { w.focus(); } catch(_e) {}
+    return w;
+  }
+  function closePreparedPrintWindow(w){
+    if(!w) return;
+    try { w.close(); } catch(_e) {}
+  }
+  async function openPrintWindow(imageSrc, printSize, printWindow=null){
     if(!imageSrc){ return; }
     const sizeCss = (printSize === 'normal_2x2')
       ? 'width:2in;height:2in;'
       : 'width:1.333in;height:1.25in;';
-    const w = window.open('', '_blank');
-    if(!w){ setStatus('Popup blocked.'); return; }
+    const w = printWindow || preparePrintWindow();
+    if(!w){ return; }
     w.document.write(`<!doctype html><html><head><title>Print QR</title>
       <style>
         @page { margin: 0; }
@@ -8955,10 +9238,10 @@ PROFILE_CREATOR_HTML = """
     try { w.focus(); } catch(_e) {}
     setTimeout(() => { try { w.print(); } catch(_e) {} }, 180);
   }
-  async function printExistingProfile(idNumber, name, role){
-    if(!idNumber){ return; }
+  async function printExistingProfile(idNumber, name, role, printWindow=null){
+    if(!idNumber){ closePreparedPrintWindow(printWindow); return; }
     const allowed = await authorizeProfilePrint(idNumber);
-    if(!allowed) return;
+    if(!allowed){ closePreparedPrintWindow(printWindow); return; }
     const payload = {
       name: (name || '').trim(),
       id_number: (idNumber || '').trim(),
@@ -8967,10 +9250,10 @@ PROFILE_CREATOR_HTML = """
     };
     const r = await fetch('/api/profile-qr-preview', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     const out = await r.json();
-    if(!r.ok || !out.ok){ setStatus(out.error || 'Preview failed.'); return; }
+    if(!r.ok || !out.ok){ closePreparedPrintWindow(printWindow); setStatus(out.error || 'Preview failed.'); return; }
     pfPreviewImg.src = out.image_data_url || '';
     pfPayloadPreview.textContent = out.qr_payload || '';
-    await openPrintWindow(out.image_data_url || '', payload.print_size);
+    await openPrintWindow(out.image_data_url || '', payload.print_size, printWindow);
     await loadProfiles();
     setStatus('Profile print opened.');
   }
@@ -8986,27 +9269,33 @@ PROFILE_CREATOR_HTML = """
     setStatus('Preview generated.');
     return true;
   }
-  async function saveProfile(andPrint=false){
+  async function saveProfile(andPrint=false, printWindow=null){
     const form = getForm();
-    if(!form.name || !form.id_number || !form.role){ setStatus('Complete Name, ID Number, and Role first.'); return; }
+    if(!form.name || !form.id_number || !form.role){ closePreparedPrintWindow(printWindow); setStatus('Complete Name, ID Number, and Role first.'); return; }
     const r = await fetch('/api/profiles', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(form) });
     const out = await r.json();
-    if(!out.ok){ setStatus(out.error || 'Save failed.'); return; }
+    if(!out.ok){ closePreparedPrintWindow(printWindow); setStatus(out.error || 'Save failed.'); return; }
     setStatus('Profile saved.');
     await loadProfiles();
     if(andPrint){
       const allowed = await authorizeProfilePrint(form.id_number);
-      if(!allowed) return;
+      if(!allowed){ closePreparedPrintWindow(printWindow); return; }
       const ok = await previewQr();
       if(ok && pfPreviewImg.src){
-        await openPrintWindow(pfPreviewImg.src, form.print_size);
+        await openPrintWindow(pfPreviewImg.src, form.print_size, printWindow);
+      } else {
+        closePreparedPrintWindow(printWindow);
       }
       await loadProfiles();
     }
   }
   pfPreviewBtn.addEventListener('click', previewQr);
   pfSaveBtn.addEventListener('click', () => saveProfile(false));
-  pfSavePrintBtn.addEventListener('click', () => saveProfile(true));
+  pfSavePrintBtn.addEventListener('click', () => {
+    const printWindow = preparePrintWindow();
+    if(!printWindow) return;
+    saveProfile(true, printWindow);
+  });
   pfTableBody.addEventListener('click', async (ev) => {
     const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-act]') : null;
     if(!btn) return;
@@ -9017,7 +9306,9 @@ PROFILE_CREATOR_HTML = """
       return;
     }
     if(act === 'print'){
-      await printExistingProfile(id, btn.getAttribute('data-name') || '', btn.getAttribute('data-role') || '');
+      const printWindow = preparePrintWindow();
+      if(!printWindow) return;
+      await printExistingProfile(id, btn.getAttribute('data-name') || '', btn.getAttribute('data-role') || '', printWindow);
     }
   });
   loadProfilePageTheme();
@@ -9257,6 +9548,7 @@ async def api_event(req: Request):
             reject_breakdown={},
             raw_material_scans=[],
             raw_material_logs=[],
+            product_pack_history_logs=[],
             job_payload={},
             operator_shift_logs=[],
         )
@@ -9265,9 +9557,15 @@ async def api_event(req: Request):
     # update common fields
     sess.client_id = client_id
     sess.machine_name = _machine_display_name(machine_code, data.get("machine_name", sess.machine_name))
-    sess.job_code = data.get("job_code", sess.job_code)
-    sess.job_name = data.get("job_name", sess.job_name)
-    sess.operator_id = data.get("operator_id", sess.operator_id)
+    incoming_job_code = data.get("job_code")
+    incoming_job_name = data.get("job_name")
+    incoming_operator_id = data.get("operator_id")
+    if str(incoming_job_code or "").strip():
+        sess.job_code = incoming_job_code
+    if str(incoming_job_name or "").strip():
+        sess.job_name = incoming_job_name
+    if str(incoming_operator_id or "").strip():
+        sess.operator_id = incoming_operator_id
     sess.last_seen_utc = utc_now().isoformat()
     sess.last_event = str(data.get("last_event", sess.last_event))
 
@@ -9360,6 +9658,8 @@ async def api_event(req: Request):
                 sess.raw_material_scans = list(snap.get("raw_material_scans") or [])
             if isinstance(snap.get("raw_material_logs"), list):
                 sess.raw_material_logs = list(snap.get("raw_material_logs") or [])
+            if isinstance(snap.get("product_pack_history_logs"), list):
+                sess.product_pack_history_logs = list(snap.get("product_pack_history_logs") or [])
             sess.startup_reject_total = int(snap.get("startup_reject_total", sess.startup_reject_total) or 0)
             sess.downtime_reason_code = snap.get("downtime_reason_code", sess.downtime_reason_code)
             sess.downtime_reason_text = snap.get("downtime_reason_text", sess.downtime_reason_text)
@@ -9378,6 +9678,9 @@ async def api_event(req: Request):
             sess.supervisor_downtime_confirmation_started_at = snap.get("supervisor_downtime_confirmation_started_at", sess.supervisor_downtime_confirmation_started_at)
             sess.cycle_time_new_input = snap.get("cycle_time_new_input", sess.cycle_time_new_input)
             sess.cycle_time_current = snap.get("cycle_time_current", sess.cycle_time_current)
+            sess.machine_counter_current = _parse_int_or_none(snap.get("machine_counter_current"))
+            sess.machine_counter_shift_start = _parse_int_or_none(snap.get("machine_counter_shift_start"))
+            sess.machine_counter_shift_end = _parse_int_or_none(snap.get("machine_counter_shift_end"))
             live_avg = snap.get("live_cycle_avg_seconds", sess.live_cycle_avg_seconds)
             try:
                 sess.live_cycle_avg_seconds = float(live_avg) if live_avg is not None else sess.live_cycle_avg_seconds
@@ -9409,7 +9712,9 @@ async def api_event(req: Request):
         sess.good_total += qty
     elif ev_type == "LAST_SHIFT_BUTAL_PACK":
         sess.pack_total += int(ev.get("pack_qty", 1) or 1)
+        good_qty = int(ev.get("good_qty", 0) or 0)
         butal_qty = int(ev.get("butal_qty", 0) or 0)
+        sess.good_total += good_qty
         sess.butal_total += butal_qty
         job_key = str(sess.job_code or "").strip()
         if job_key and butal_qty > 0:
@@ -9422,7 +9727,7 @@ async def api_event(req: Request):
         sess.last_shift_butal_job_code = None
         sess.last_shift_butal_job_name = None
         if isinstance(sess.last_shift_butal_by_job, dict):
-            key = str(sess.job_code or "").strip()
+            key = str(ev.get("carryover_job_code") or sess.job_code or "").strip()
             if key:
                 sess.last_shift_butal_by_job.pop(key, None)
     elif ev_type == "BUTAL":
@@ -9453,6 +9758,22 @@ async def api_event(req: Request):
 @APP.get("/api/finished-jobs")
 def api_finished_jobs():
     return {"ok": True, "items": FINISHED_JOBS}
+
+
+@APP.get("/api/active-sessions")
+def api_active_sessions(client_id: str = "", machine_code: str = ""):
+    refresh_active_sessions_from_file()
+    cid = str(client_id or "").strip()
+    code_filter = str(machine_code or "").strip()
+    rows = []
+    for sess in SESSIONS.values():
+        if code_filter and str(sess.machine_code or "").strip() != code_filter:
+            continue
+        if cid and str(sess.client_id or "").strip() != cid:
+            continue
+        rows.append(sess.to_dict())
+    rows.sort(key=lambda r: str(r.get("last_seen_utc") or r.get("saved_at_utc") or ""), reverse=True)
+    return {"ok": True, "items": rows}
 
 
 @APP.get("/api/planning/board")
@@ -9486,6 +9807,25 @@ async def api_planning_lookup(req: Request):
         return JSONResponse({"ok": False, "error": f"BMS HTTP {e.code}", "body": body[:500]}, status_code=502)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=502)
+
+
+@APP.post("/api/jobs/lookup")
+async def api_jobs_lookup(req: Request):
+    data = await req.json()
+    job_identifier = str(data.get("job_identifier") or data.get("job_id") or data.get("work_order") or "").strip()
+    if not job_identifier:
+        return JSONResponse({"ok": False, "error": "job_identifier is required"}, status_code=400)
+    try:
+        payload = fetch_job_payload_from_bms(job_identifier)
+        return {"ok": True, "found": True, "job_identifier": job_identifier, "payload": payload}
+    except urllib_error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        return JSONResponse(
+            {"ok": False, "found": False, "error": f"BMS HTTP {e.code}", "body": body[:500]},
+            status_code=502,
+        )
+    except Exception as e:
+        return JSONResponse({"ok": False, "found": False, "error": str(e)}, status_code=502)
 
 
 @APP.get("/api/planning/low-stock")

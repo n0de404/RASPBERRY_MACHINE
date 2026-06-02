@@ -1,6 +1,6 @@
 {
-  "saved_at_utc": "2026-05-18T08:39:48.964136+00:00",
-  "count": 2808,
+  "saved_at_utc": "2026-06-02T09:37:09.707158+00:00",
+  "count": 2809,
   "items": [
     {
       "id": "15",
@@ -16185,6 +16185,12 @@
       "tonnage": ""
     },
     {
+      "id": "13527",
+      "name": "PP Block Copolymer IZOD-8-FM-1290 (25 KGS)",
+      "sku": "Z-RM-PP-B-MF30-SUMITOMO-AZ564",
+      "tonnage": ""
+    },
+    {
       "id": "5499",
       "name": "PP Block Copolymer (25 KGS)",
       "sku": "Z-RM-PP-B-MF4-TITAN-SM340",
@@ -16222,7 +16228,7 @@
     },
     {
       "id": "8312",
-      "name": "PP Block Copolymer IZOD- (25 KGS)",
+      "name": "PP Block Copolymer IZOD-10-FM-1530 (25 KGS)",
       "sku": "Z-RM-PP-B-MF9-SUMITOMO-AW564",
       "tonnage": ""
     },
