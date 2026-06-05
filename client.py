@@ -219,6 +219,9 @@ def _normalized_finished_job_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out.setdefault("started_at_utc", out.get("finished_at_utc"))
     out.setdefault("ended_at_utc", out.get("finished_at_utc"))
     out.setdefault("operator_name", "")
+    out.setdefault("product_id", "")
+    out.setdefault("product_sku", "")
+    out.setdefault("product_name", "")
     out["pack_count"] = int(out.get("pack_count", 0) or 0)
     out["good_total"] = int(out.get("good_total", 0) or 0)
     out["butal_total"] = int(out.get("butal_total", 0) or 0)
@@ -228,6 +231,9 @@ def _normalized_finished_job_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out["startup_reject_total"] = int(out.get("startup_reject_total", 0) or 0)
     out["no_shot_total"] = int(out.get("no_shot_total", 0) or 0)
     out["raw_sacks_count"] = int(out.get("raw_sacks_count", 0) or 0)
+    out["product_id"] = str(out.get("product_id") or "")
+    out["product_sku"] = str(out.get("product_sku") or "")
+    out["product_name"] = str(out.get("product_name") or "")
     for key in (
         "machine_counter_start",
         "machine_counter_end",
@@ -252,6 +258,10 @@ def _normalized_finished_job_row(row: Dict[str, Any]) -> Dict[str, Any]:
         ("reject_breakdown", {}),
         ("raw_material_scans", []),
         ("raw_material_logs", []),
+        ("product_pack_history_logs", []),
+        ("butal_scan_logs", []),
+        ("production_adjustment_logs", []),
+        ("action_logs", []),
         ("job_payload", {}),
         ("reject_review_logs", []),
         ("review_history", []),
@@ -1168,6 +1178,8 @@ class ClientState:
     reject_review_logs: List[Dict[str, Any]] = None
     production_adjustment_logs: List[Dict[str, Any]] = None
     waiting_linkage_job_scan: bool = False
+    waiting_color_change_job_scan: bool = False
+    pending_color_change_reason: str = ""
     linkage_enabled: bool = False
     linkage_job_code: Optional[str] = None
     linkage_job_name: Optional[str] = None
@@ -1189,6 +1201,8 @@ class ClientState:
     operator_shift_baseline_raw_material_logs_len: int = 0
     operator_shift_baseline_product_pack_history_logs_len: int = 0
     operator_shift_baseline_reject_review_logs_len: int = 0
+    operator_shift_baseline_butal_scan_logs_len: int = 0
+    operator_shift_baseline_production_adjustment_logs_len: int = 0
     external_average_weight_grams: Optional[float] = None
     external_average_weight_unit: Optional[str] = None
     external_average_weight_received_at: Optional[str] = None
@@ -8368,6 +8382,9 @@ QWidget#ClientUIRoot {{
             self._set_banner_text("Scan JOB QR")
         elif not s.operator_id:
             self._set_banner_text("Scan OPERATOR badge")
+        elif s.waiting_color_change_job_scan:
+            reason_label = "mold change" if str(s.pending_color_change_reason or "").upper() == "MOLD_CHANGE" else "color change"
+            self._set_banner_text(f"{reason_label.upper()} MODE: Scan NEW JOB QR")
         elif s.showing_reject_summary:
             if s.supervisor_review_open:
                 self._set_banner_text("Supervisor review: reject summary and cycle time")
@@ -9008,6 +9025,8 @@ QWidget#ClientUIRoot {{
         s.operator_shift_baseline_raw_material_logs_len = len(s.raw_material_logs or [])
         s.operator_shift_baseline_product_pack_history_logs_len = len(s.product_pack_history_logs or [])
         s.operator_shift_baseline_reject_review_logs_len = len(s.reject_review_logs or [])
+        s.operator_shift_baseline_butal_scan_logs_len = len(s.butal_scan_logs or [])
+        s.operator_shift_baseline_production_adjustment_logs_len = len(s.production_adjustment_logs or [])
 
     def _current_client_id(self) -> str:
         return str(self.client_config.get("client_id", CLIENT_ID)).strip() or CLIENT_ID
@@ -9035,6 +9054,8 @@ QWidget#ClientUIRoot {{
         raw_from = max(0, int(s.operator_shift_baseline_raw_material_logs_len or 0))
         pack_from = max(0, int(s.operator_shift_baseline_product_pack_history_logs_len or 0))
         review_from = max(0, int(s.operator_shift_baseline_reject_review_logs_len or 0))
+        butal_from = max(0, int(s.operator_shift_baseline_butal_scan_logs_len or 0))
+        adjustment_from = max(0, int(s.operator_shift_baseline_production_adjustment_logs_len or 0))
         pack_count = max(0, int(s.pack_count or 0) - int(s.operator_shift_baseline_pack_count or 0))
         good_total = max(0, int(s.good_total or 0) - int(s.operator_shift_baseline_good_total or 0))
         if s.linkage_enabled and (s.linkage_jobs or []):
@@ -9064,6 +9085,7 @@ QWidget#ClientUIRoot {{
         )
         shift_avg_cycle_seconds = self._compute_current_shift_avg_cycle_seconds()
         payload = s.job_payload or {}
+        product_identity = self._job_product_identity_from_payload(payload if isinstance(payload, dict) else {})
         data_obj = payload.get("data") if isinstance(payload, dict) else {}
         job = data_obj.get("job") if isinstance(data_obj, dict) else {}
         job_details = data_obj.get("job_details") if isinstance(data_obj, dict) else {}
@@ -9087,6 +9109,9 @@ QWidget#ClientUIRoot {{
             "client_id": self._current_client_id(),
             "job_code": s.job_code,
             "job_name": s.job_name,
+            "product_id": product_identity.get("product_id", ""),
+            "product_sku": product_identity.get("product_sku", ""),
+            "product_name": product_identity.get("product_name", ""),
             "operator_id": s.operator_id,
             "operator_name": self._operator_display_name(s.operator_id),
             "pack_count": pack_count,
@@ -9107,7 +9132,10 @@ QWidget#ClientUIRoot {{
             "raw_material_logs": list((s.raw_material_logs or [])[raw_from:]),
             "raw_material_scans": list(s.raw_material_scans or []),
             "product_pack_history_logs": list((s.product_pack_history_logs or [])[pack_from:]),
+            "butal_scan_logs": list((s.butal_scan_logs or [])[butal_from:]),
             "reject_review_logs": list((s.reject_review_logs or [])[review_from:]),
+            "production_adjustment_logs": list((s.production_adjustment_logs or [])[adjustment_from:]),
+            "action_logs": list(getattr(self, "_action_logs", []) or []),
             "downtime_active": bool(s.downtime_active),
             "downtime_reason_code": s.downtime_reason_code,
             "downtime_reason_text": s.downtime_reason_text,
@@ -9166,6 +9194,10 @@ QWidget#ClientUIRoot {{
             linked_payload["job_code"] = row.get("job_code") or linked_payload.get("job_code")
             linked_payload["job_name"] = row.get("job_name") or linked_payload.get("job_name")
             linked_payload["job_payload"] = dict(row.get("job_payload") or {})
+            linked_identity = self._job_product_identity_from_payload(linked_payload["job_payload"])
+            linked_payload["product_id"] = linked_identity.get("product_id", "")
+            linked_payload["product_sku"] = linked_identity.get("product_sku", "")
+            linked_payload["product_name"] = linked_identity.get("product_name", "")
             linked_butal_total = self._shift_butal_qty_for_job(row.get("job_code"))
             linked_payload["pack_count"] = int(main_payload.get("pack_count") or 0)
             linked_payload["good_total"] = int(main_payload.get("good_total") or 0)
@@ -9190,6 +9222,7 @@ QWidget#ClientUIRoot {{
 
     def _state_to_active_snapshot(self) -> Dict[str, Any]:
         s = self.state
+        product_identity = self._job_product_identity_from_payload(s.job_payload or {})
         return {
             "saved_at_utc": datetime.now(timezone.utc).isoformat(),
             "client_id": self._current_client_id(),
@@ -9197,6 +9230,9 @@ QWidget#ClientUIRoot {{
             "machine_name": s.machine_name,
             "job_code": s.job_code,
             "job_name": s.job_name,
+            "product_id": product_identity.get("product_id", ""),
+            "product_sku": product_identity.get("product_sku", ""),
+            "product_name": product_identity.get("product_name", ""),
             "job_started_at": s.job_started_at,
             "operator_id": s.operator_id,
             "pack_count": int(s.pack_count or 0),
@@ -9306,6 +9342,8 @@ QWidget#ClientUIRoot {{
             "reject_review_logs": list(s.reject_review_logs or []),
             "production_adjustment_logs": list(s.production_adjustment_logs or []),
             "waiting_linkage_job_scan": bool(s.waiting_linkage_job_scan),
+            "waiting_color_change_job_scan": bool(s.waiting_color_change_job_scan),
+            "pending_color_change_reason": str(s.pending_color_change_reason or ""),
             "linkage_enabled": bool(s.linkage_enabled),
             "linkage_job_code": s.linkage_job_code,
             "linkage_job_name": s.linkage_job_name,
@@ -9327,6 +9365,8 @@ QWidget#ClientUIRoot {{
             "operator_shift_baseline_raw_material_logs_len": int(s.operator_shift_baseline_raw_material_logs_len or 0),
             "operator_shift_baseline_product_pack_history_logs_len": int(s.operator_shift_baseline_product_pack_history_logs_len or 0),
             "operator_shift_baseline_reject_review_logs_len": int(s.operator_shift_baseline_reject_review_logs_len or 0),
+            "operator_shift_baseline_butal_scan_logs_len": int(s.operator_shift_baseline_butal_scan_logs_len or 0),
+            "operator_shift_baseline_production_adjustment_logs_len": int(s.operator_shift_baseline_production_adjustment_logs_len or 0),
             "external_average_weight_grams": s.external_average_weight_grams,
             "external_average_weight_unit": s.external_average_weight_unit,
             "external_average_weight_received_at": s.external_average_weight_received_at,
@@ -9706,6 +9746,8 @@ QWidget#ClientUIRoot {{
         s.reject_review_logs = list(snap.get("reject_review_logs") or [])
         s.production_adjustment_logs = list(snap.get("production_adjustment_logs") or [])
         s.waiting_linkage_job_scan = bool(snap.get("waiting_linkage_job_scan"))
+        s.waiting_color_change_job_scan = bool(snap.get("waiting_color_change_job_scan"))
+        s.pending_color_change_reason = str(snap.get("pending_color_change_reason") or "")
         s.linkage_enabled = bool(snap.get("linkage_enabled"))
         s.linkage_job_code = snap.get("linkage_job_code")
         s.linkage_job_name = snap.get("linkage_job_name")
@@ -9729,6 +9771,8 @@ QWidget#ClientUIRoot {{
         s.operator_shift_baseline_raw_material_logs_len = int(snap.get("operator_shift_baseline_raw_material_logs_len") or 0)
         s.operator_shift_baseline_product_pack_history_logs_len = int(snap.get("operator_shift_baseline_product_pack_history_logs_len") or 0)
         s.operator_shift_baseline_reject_review_logs_len = int(snap.get("operator_shift_baseline_reject_review_logs_len") or 0)
+        s.operator_shift_baseline_butal_scan_logs_len = int(snap.get("operator_shift_baseline_butal_scan_logs_len") or 0)
+        s.operator_shift_baseline_production_adjustment_logs_len = int(snap.get("operator_shift_baseline_production_adjustment_logs_len") or 0)
         avg_weight = snap.get("external_average_weight_grams")
         s.external_average_weight_grams = float(avg_weight) if avg_weight is not None else None
         s.external_average_weight_unit = snap.get("external_average_weight_unit")
@@ -9796,6 +9840,7 @@ QWidget#ClientUIRoot {{
     def _build_finished_job_payload(self) -> Dict[str, Any]:
         s = self.state
         main_butal_total = self._butal_qty_for_job(s.job_code, fallback_current=not bool(s.linkage_enabled and (s.linkage_jobs or [])))
+        product_identity = self._job_product_identity_from_payload(s.job_payload or {})
         return {
             "record_type": RECORD_TYPE_FINAL_JOB,
             "finished_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -9804,6 +9849,9 @@ QWidget#ClientUIRoot {{
             "machine_name": _machine_display_name(s.machine_code, s.machine_name),
             "job_code": s.job_code,
             "job_name": s.job_name,
+            "product_id": product_identity.get("product_id", ""),
+            "product_sku": product_identity.get("product_sku", ""),
+            "product_name": product_identity.get("product_name", ""),
             "operator_id": s.operator_id,
             "pack_count": int(s.pack_count or 0),
             "good_total": int(s.good_total or 0),
@@ -9879,6 +9927,10 @@ QWidget#ClientUIRoot {{
             linked_payload["job_code"] = row.get("job_code") or linked_payload.get("job_code")
             linked_payload["job_name"] = row.get("job_name") or linked_payload.get("job_name")
             linked_payload["job_payload"] = dict(row.get("job_payload") or {})
+            linked_identity = self._job_product_identity_from_payload(linked_payload["job_payload"])
+            linked_payload["product_id"] = linked_identity.get("product_id", "")
+            linked_payload["product_sku"] = linked_identity.get("product_sku", "")
+            linked_payload["product_name"] = linked_identity.get("product_name", "")
             # Linked jobs mirror only finish-goods counters, not rejects.
             linked_payload["pack_count"] = int(s.pack_count or 0)
             linked_payload["good_total"] = int(s.good_total or 0)
@@ -9993,6 +10045,8 @@ QWidget#ClientUIRoot {{
         s.reject_review_logs = []
         s.production_adjustment_logs = []
         s.waiting_linkage_job_scan = False
+        s.waiting_color_change_job_scan = False
+        s.pending_color_change_reason = ""
         s.linkage_enabled = False
         s.linkage_job_code = None
         s.linkage_job_name = None
@@ -10014,6 +10068,8 @@ QWidget#ClientUIRoot {{
         s.operator_shift_baseline_raw_material_logs_len = 0
         s.operator_shift_baseline_product_pack_history_logs_len = 0
         s.operator_shift_baseline_reject_review_logs_len = 0
+        s.operator_shift_baseline_butal_scan_logs_len = 0
+        s.operator_shift_baseline_production_adjustment_logs_len = 0
         self._clear_external_average_weight()
         self._reset_live_cycle_tracking()
         self._reset_downtime_resolution_state()
@@ -11209,6 +11265,59 @@ QWidget#ClientUIRoot {{
             parts = [r for r in payload.get("part_ids") or [] if isinstance(r, dict)]
         return {"job": job, "job_details": job_details, "parts": parts}
 
+    def _job_product_identity_from_payload(self, payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
+        src = payload if isinstance(payload, dict) else {}
+        ctx = self._extract_job_payload_context(src)
+        candidates = [src, ctx.get("job_details"), ctx.get("job")]
+        product_id = ""
+        product_sku = ""
+        product_name = ""
+        for row in candidates:
+            if not isinstance(row, dict):
+                continue
+            if not product_id:
+                product_id = str(
+                    row.get("product_id")
+                    or row.get("product")
+                    or row.get("item_id")
+                    or ""
+                ).strip()
+            if not product_sku:
+                product_sku = str(
+                    row.get("product_sku")
+                    or row.get("sku")
+                    or row.get("item_sku")
+                    or ""
+                ).strip()
+            if not product_name:
+                product_name = str(
+                    row.get("product_name")
+                    or row.get("name")
+                    or row.get("item_name")
+                    or ""
+                ).strip()
+        if product_id and not product_sku:
+            product_sku = self._lookup_product_sku(product_id)
+        if product_id and not product_name:
+            product_name = self._lookup_product_name(product_id)
+        if not product_sku:
+            job = ctx.get("job") if isinstance(ctx.get("job"), dict) else {}
+            product_sku = str(
+                src.get("product_sku")
+                or src.get("sku")
+                or src.get("job_name")
+                or src.get("job_code")
+                or job.get("product_sku")
+                or job.get("sku")
+                or job.get("ref_no")
+                or ""
+            ).strip()
+        return {
+            "product_id": product_id,
+            "product_sku": product_sku,
+            "product_name": product_name,
+        }
+
     def _finish_shift_row_key(self, row: Dict[str, Any]) -> str:
         return "|".join([
             str(row.get("record_type") or "").strip().upper(),
@@ -11752,6 +11861,204 @@ QWidget#ClientUIRoot {{
         if isinstance(payload.get("job"), dict):
             return payload["job"]
         return payload if isinstance(payload, dict) else {}
+
+    def _extract_job_record_from_payload(self, payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        src = payload if isinstance(payload, dict) else {}
+        if isinstance(src.get("data"), dict) and isinstance(src["data"].get("job"), dict):
+            return src["data"]["job"]
+        if isinstance(src.get("job"), dict):
+            return src["job"]
+        return src
+
+    def _resolve_scanned_job_data(self, res: Any, raw_s: str, loading_text: str) -> Optional[Dict[str, Any]]:
+        if res.kind == "JOB":
+            po_from_meta = ""
+            if isinstance(res.meta, dict):
+                po_from_meta = self._safe_text(res.meta.get("po_number"), "")
+            requested_job_id = po_from_meta or raw_s
+            self._show_bms_loading(loading_text)
+            try:
+                fetched_payload = self._fetch_job_payload_from_api(requested_job_id)
+            finally:
+                self._hide_bms_loading()
+            if isinstance(fetched_payload, dict):
+                job = self._extract_job_record_from_payload(fetched_payload)
+                return {
+                    "job_code": (
+                        self._safe_text(job.get("id"), "")
+                        or self._safe_text(job.get("ref_no"), "")
+                        or requested_job_id
+                    ),
+                    "job_name": (
+                        self._safe_text(job.get("ref_no"), "")
+                        or self._safe_text(res.value, "")
+                        or requested_job_id
+                    ),
+                    "job_payload": fetched_payload,
+                    "requested_job_id": requested_job_id,
+                }
+            return {
+                "job_code": requested_job_id,
+                "job_name": res.value or requested_job_id,
+                "job_payload": {},
+                "requested_job_id": requested_job_id,
+            }
+        payload = res.meta or {}
+        job_payload = payload if isinstance(payload, dict) else {}
+        job = self._extract_job_record_from_payload(job_payload)
+        return {
+            "job_code": (
+                self._safe_text(job.get("id"), "")
+                or self._safe_text(job.get("ref_no"), "")
+                or self._safe_text(job_payload.get("job_code"), "")
+                or res.value
+                or "QR-STUB"
+            ),
+            "job_name": (
+                self._safe_text(job.get("ref_no"), "")
+                or self._safe_text(job_payload.get("job_name"), "")
+                or res.value
+                or "Job Stub"
+            ),
+            "job_payload": job_payload,
+            "requested_job_id": "",
+        }
+
+    def _reset_production_for_color_change_segment(self):
+        s = self.state
+        s.pack_count = 0
+        s.good_total = 0
+        s.butal_total = 0
+        s.reject_total = 0
+        s.reject_breakdown = {}
+        s.no_shot_total = 0
+        s.startup_reject_total = 0
+        s.raw_sacks_count = 0
+        s.raw_material_scans = []
+        s.raw_material_logs = []
+        s.raw_material_unique_keys = set()
+        s.product_pack_history_logs = []
+        s.product_pack_history_keys = set()
+        s.butal_scan_logs = []
+        s.butal_by_job = {}
+        s.reject_review_logs = []
+        s.production_adjustment_logs = []
+        s.showing_reject_summary = False
+        s.reject_summary_last_scanned_at = None
+        s.waiting_reject_reason = False
+        s.reject_multiplier_input = ""
+        s.waiting_void_scan = False
+        s.waiting_production_report_reason = False
+        s.waiting_void_pack_scan = False
+        s.waiting_void_butal_scan = False
+        s.waiting_void_reject_scan = False
+        self._clear_butal_completion_mode()
+        self._clear_pending_butal_assignment()
+        s.downtime_reason_code = None
+        s.downtime_reason_text = None
+        s.pdr_operator_reason_code = None
+        s.pdr_operator_reason_text = None
+        s.waiting_pdr_maintenance_reason = False
+        s.pdr_reason_segments = []
+        s.pdr_current_segment_start_seconds = None
+        s.pdr_followup_reasons_remaining = 0
+        s.downtime_started_at = None
+        s.downtime_last_seconds = None
+        s.downtime_active = False
+        s.downtime_wait_started_at = None
+        s.downtime_wait_last_seconds = None
+        s.cycle_time_current = None
+        s.cycle_time_temporary = None
+        s.cycle_time_supervisor_confirmed = None
+        s.cycle_time_pending_supervisor = False
+        s.cycle_time_change_logs = []
+        s.cycle_time_confirmed_by = None
+        s.waiting_initial_cycle_time_input = False
+        s.waiting_initial_cycle_qc_confirm = False
+        s.waiting_cycle_time_confirm_popup = False
+        s.cycle_time_confirm_phase = 0
+        s.machine_counter_input = ""
+        s.machine_counter_current = None
+        s.machine_counter_shift_start = None
+        s.machine_counter_shift_end = None
+        s.waiting_initial_machine_counter_input = False
+        s.waiting_shift_end_machine_counter_input = False
+        s.waiting_linkage_job_scan = False
+        s.waiting_color_change_job_scan = False
+        s.pending_color_change_reason = ""
+        s.linkage_enabled = False
+        s.linkage_job_code = None
+        s.linkage_job_name = None
+        s.linkage_job_payload = {}
+        s.linkage_jobs = []
+        setattr(self, "_action_logs", [])
+        self._clear_external_average_weight()
+        self._reset_live_cycle_tracking(start_now=True)
+        self._reset_downtime_resolution_state()
+        self._hide_resolve_overlay()
+        self._hide_production_overlay()
+        self._hide_raw_mats_overlay()
+        self._hide_reject_summary_overlay()
+        self._hide_product_history_overlay()
+        self._hide_reject_review_overlay()
+
+    def _change_color_to_job(self, job_data: Dict[str, Any], reason: str = "COLOR_CHANGE") -> bool:
+        s = self.state
+        reason_key = str(reason or "COLOR_CHANGE").strip().upper()
+        if reason_key not in ("COLOR_CHANGE", "MOLD_CHANGE"):
+            reason_key = "COLOR_CHANGE"
+        label = "Mold change" if reason_key == "MOLD_CHANGE" else "Color change"
+        shift_payload = self._finalize_current_operator_shift(reason_key, emit_event=True)
+        if shift_payload is None:
+            self.status.setText(f"{label} failed: no active operator shift to save.")
+            self._show_invalid_overlay("No active operator shift to save.")
+            return False
+        linked_shift_payloads = self._build_linked_operator_shift_payloads(shift_payload)
+        saved_ok = self._save_finished_job_local(shift_payload)
+        for linked_shift_payload in linked_shift_payloads:
+            saved_ok = self._save_finished_job_local(linked_shift_payload) and saved_ok
+        if not saved_ok:
+            self.status.setText(f"{label} save failed: current job kept for recovery.")
+            self._show_invalid_overlay("Unable to save current job segment locally.")
+            return False
+        self.push_event(
+            {"type": "FINISH_SHIFT", "finished_job": shift_payload},
+            f"{label.upper()} SAVE {shift_payload.get('job_name') or shift_payload.get('job_code') or ''}".strip(),
+            silent=True,
+        )
+        for linked_shift_payload in linked_shift_payloads:
+            self.push_event(
+                {"type": "FINISH_SHIFT", "finished_job": linked_shift_payload},
+                f"{label.upper()} LINKED SAVE {linked_shift_payload.get('job_name') or linked_shift_payload.get('job_code') or ''}".strip(),
+                silent=True,
+            )
+
+        operator_id = s.operator_id
+        s.job_code = str(job_data.get("job_code") or "").strip()
+        s.job_name = str(job_data.get("job_name") or s.job_code or "").strip()
+        s.job_payload = job_data.get("job_payload") if isinstance(job_data.get("job_payload"), dict) else {}
+        s.job_started_at = datetime.now(timezone.utc).isoformat()
+        s.operator_id = operator_id
+        self._reset_production_for_color_change_segment()
+        s.waiting_color_change_job_scan = False
+        s.pending_color_change_reason = ""
+        self._start_operator_shift_tracking()
+        if not str(s.cycle_time_current or "").strip():
+            self._begin_initial_cycle_time_setup()
+            status_tail = " Enter cycle time now."
+        else:
+            status_tail = ""
+        self.status.setText(f"{label}: new job set for same operator: {s.job_name or s.job_code}.{status_tail}")
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        self.sync_local_finish_shifts_to_server(force=True)
+        self.push_event(
+            {"type": "COLOR_CHANGE_JOB_SET", "job_payload": s.job_payload},
+            f"{label.upper()} JOB {s.job_name or s.job_code}",
+            silent=False,
+        )
+        self.sync_session_snapshot_to_server(f"SESSION SNAPSHOT SYNC ({label.upper()})")
+        return True
 
     def _job_api_body_is_unauthorized(self, data: Any) -> bool:
         if not isinstance(data, dict):
@@ -12849,6 +13156,8 @@ QWidget#ClientUIRoot {{
             return "Reject summary requested"
         if res.kind == "OPERATOR_SHIFT_TRIGGER":
             return "Operator shift handoff requested"
+        if res.kind == "COLOR_CHANGE_TRIGGER":
+            return str(res.value or "Change job segment")
         if res.kind == "PRODUCTION_DAILY_REPORT_TRIGGER":
             return "Production daily report mode enabled"
         if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
@@ -13910,6 +14219,12 @@ QWidget#ClientUIRoot {{
         if res.kind != "VOID_TRIGGER" and not suppress_scan_log:
             self.log_last(self._scan_display_text(res, raw_s))
 
+        if s.waiting_color_change_job_scan and res.kind not in ("JOB", "JOB_STUB", "COLOR_CHANGE_TRIGGER"):
+            mode_label = "MOLD CHANGE" if str(s.pending_color_change_reason or "").upper() == "MOLD_CHANGE" else "COLOR CHANGE"
+            self.status.setText(f"{mode_label} mode active. Scan NEW JOB QR now.")
+            self._show_invalid_overlay("Scan the new JOB QR to continue.")
+            return
+
         if s.waiting_production_report_reason:
             code = self._extract_production_reason_code(raw_s)
             if not code:
@@ -14191,6 +14506,40 @@ QWidget#ClientUIRoot {{
             self.status.setText("Input machine counter before finish preview.")
             return
 
+        if res.kind == "COLOR_CHANGE_TRIGGER":
+            if not self.can_accept_production_scans():
+                msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
+                self.status.setText(msg[:1].upper() + msg[1:])
+                self._show_invalid_overlay(msg)
+                return
+            if (
+                s.waiting_reject_reason
+                or s.waiting_production_report_reason
+                or s.waiting_downtime_start_maintenance
+                or s.waiting_pdr_maintenance_reason
+                or s.waiting_downtime_end_maintenance
+                or s.waiting_cycle_time_input
+                or s.waiting_maintenance_qr
+                or s.waiting_supervisor_qr
+                or s.waiting_operator_downtime_confirm
+                or s.waiting_initial_cycle_time_input
+                or s.waiting_cycle_time_confirm_popup
+                or s.downtime_active
+            ):
+                self.status.setText("Cannot change job segment while reject/downtime flow is active.")
+                self._show_invalid_overlay("Finish the active reject/downtime flow first.")
+                return
+            reason_key = "MOLD_CHANGE" if isinstance(res.meta, dict) and str(res.meta.get("reason") or "").upper() == "MOLD_CHANGE" else "COLOR_CHANGE"
+            s.waiting_color_change_job_scan = True
+            s.pending_color_change_reason = reason_key
+            s.waiting_linkage_job_scan = False
+            self._clear_pending_butal_assignment()
+            mode_label = "MOLD CHANGE" if reason_key == "MOLD_CHANGE" else "COLOR CHANGE"
+            self.status.setText(f"{mode_label} mode active. Scan NEW JOB QR now.")
+            self._refresh_ui()
+            self._save_active_session_snapshot()
+            return
+
         if res.kind == "FINISH_JOB":
             if not self.can_accept_production_scans():
                 self.status.setText("Cannot finish yet: complete MACHINE -> JOB -> OPERATOR first.")
@@ -14261,6 +14610,8 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Cannot start linkage while reject/downtime flow is active.")
                 return
             s.waiting_linkage_job_scan = True
+            s.waiting_color_change_job_scan = False
+            s.pending_color_change_reason = ""
             s.linkage_enabled = False
             s.linkage_job_code = None
             s.linkage_job_name = None
@@ -14535,6 +14886,8 @@ QWidget#ClientUIRoot {{
             s.operator_shift_baseline_raw_material_logs_len = 0
             s.operator_shift_baseline_product_pack_history_logs_len = 0
             s.operator_shift_baseline_reject_review_logs_len = 0
+            s.operator_shift_baseline_butal_scan_logs_len = 0
+            s.operator_shift_baseline_production_adjustment_logs_len = 0
             s.machine_counter_input = ""
             s.machine_counter_current = None
             s.machine_counter_shift_start = None
@@ -14558,6 +14911,27 @@ QWidget#ClientUIRoot {{
 
         if res.kind in ("JOB", "JOB_STUB"):
             print(f"[SCAN] Job-like scan detected kind={res.kind} raw={raw_s!r} value={res.value!r}")
+            if s.waiting_color_change_job_scan:
+                if not (s.machine_code and s.job_code and s.operator_id):
+                    s.waiting_color_change_job_scan = False
+                    s.pending_color_change_reason = ""
+                    self.status.setText("Change cancelled: complete current session first.")
+                    self._refresh_ui()
+                    self._save_active_session_snapshot()
+                    return
+                job_data = self._resolve_scanned_job_data(res, raw_s, "Getting next job data from BMS...")
+                if not isinstance(job_data, dict):
+                    self.status.setText("Change cancelled: unable to read new job.")
+                    self._show_invalid_overlay("Unable to read new job QR.")
+                    return
+                new_job_code = str(job_data.get("job_code") or "").strip()
+                if self._normalize_job_code(new_job_code) == self._normalize_job_code(s.job_code):
+                    self.status.setText("Change cancelled: this job is already active.")
+                    self._show_invalid_overlay("This QR is for the current job. Scan a different JOB QR.")
+                    return
+                reason_key = str(s.pending_color_change_reason or "COLOR_CHANGE").strip().upper()
+                self._change_color_to_job(job_data, reason=reason_key)
+                return
             if s.waiting_linkage_job_scan:
                 if not (s.machine_code and s.job_code and s.operator_id):
                     s.waiting_linkage_job_scan = False
@@ -14642,7 +15016,8 @@ QWidget#ClientUIRoot {{
                 self._save_active_session_snapshot()
                 return
             if s.machine_code and s.job_code and s.operator_id:
-                self.status.setText("Finish your current job first before changing machine or job.")
+                self.status.setText('Scan "changecolor~1" or "changemold~1" before scanning the next job.')
+                self._show_invalid_overlay("Use change color/change mold QR first.")
                 return
             if s.machine_code and s.job_code and not s.operator_id:
                 self.status.setText("Invalid scan: scan OPERATOR badge for the current job first.")
@@ -14705,6 +15080,17 @@ QWidget#ClientUIRoot {{
                 )
             s.job_started_at = datetime.now(timezone.utc).isoformat()
             s.operator_id = None
+            s.pack_count = 0
+            s.good_total = 0
+            s.butal_total = 0
+            s.reject_total = 0
+            s.reject_breakdown = {}
+            s.machine_counter_input = ""
+            s.machine_counter_current = None
+            s.machine_counter_shift_start = None
+            s.machine_counter_shift_end = None
+            s.waiting_initial_machine_counter_input = False
+            s.waiting_shift_end_machine_counter_input = False
             s.showing_reject_summary = False
             s.waiting_production_report_reason = False
             s.reject_summary_last_scanned_at = None
@@ -14762,6 +15148,8 @@ QWidget#ClientUIRoot {{
             s.no_shot_total = 0
             s.reject_review_logs = []
             s.waiting_linkage_job_scan = False
+            s.waiting_color_change_job_scan = False
+            s.pending_color_change_reason = ""
             s.linkage_enabled = False
             s.linkage_job_code = None
             s.linkage_job_name = None
@@ -14783,6 +15171,8 @@ QWidget#ClientUIRoot {{
             s.operator_shift_baseline_raw_material_logs_len = 0
             s.operator_shift_baseline_product_pack_history_logs_len = 0
             s.operator_shift_baseline_reject_review_logs_len = 0
+            s.operator_shift_baseline_butal_scan_logs_len = 0
+            s.operator_shift_baseline_production_adjustment_logs_len = 0
             s.machine_counter_input = ""
             s.machine_counter_current = None
             s.machine_counter_shift_start = None
@@ -15183,9 +15573,14 @@ QWidget#ClientUIRoot {{
     def sync_session_snapshot_to_server(self, note: str = "SESSION SYNC"):
         if not self.state.machine_code:
             return
-        # Client-owned recovery snapshots stay local so a reset/empty client state
-        # cannot overwrite a richer server active-session row.
-        self.push_event({"type": "SESSION_SYNC"}, note)
+        snapshot = self._state_to_active_snapshot()
+        event: Dict[str, Any] = {"type": "SESSION_SYNC"}
+        # Only attach a full snapshot when the client has recoverable session data.
+        # This keeps empty/reset states from wiping richer server rows, while still
+        # letting explicit syncs (job set, color change, resume) push fresh totals.
+        if self._snapshot_is_recoverable(snapshot):
+            event["session_snapshot"] = snapshot
+        self.push_event(event, note)
 
     def _enqueue_reconnect_session_snapshot_sync(self, note: str = "SESSION SNAPSHOT SYNC (RECONNECT)"):
         if bool(getattr(self, "_server_recovery_snapshot_queued", False)):

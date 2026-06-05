@@ -204,6 +204,10 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="FINISH_JOB", raw=raw, value="Finish current job session")
     if s_l == "joblinkage~1":
         return ScanResult(kind="JOB_LINKAGE_TRIGGER", raw=raw, value="Linkage mode")
+    if s_l in ("changecolor~1", "change_color~1", "colorchange~1", "color_change~1"):
+        return ScanResult(kind="COLOR_CHANGE_TRIGGER", raw=raw, value="Color change")
+    if s_l in ("changemold~1", "change_mold~1", "moldchange~1", "mold_change~1"):
+        return ScanResult(kind="COLOR_CHANGE_TRIGGER", raw=raw, value="Mold change", meta={"reason": "MOLD_CHANGE"})
 
     # Reject summary trigger
     if s_l == "rejectsummary":

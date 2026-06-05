@@ -13,7 +13,7 @@ This guide is for building and running the `client.py` PyQt fullscreen machine c
 Example:
 
 ```bash
-scp -r Raspberry_Machine pi@<pi-ip>:/home/pi/
+scp -r Raspberry_Machine user@<pi-ip>:/home/user/
 ```
 
 Or copy it with a USB drive / shared folder.
@@ -43,8 +43,8 @@ Note:
 ## 4. Create a virtual environment
 
 ```bash
-cd ~/Raspberry_Machine
-python3 -m venv .venv
+cd /home/user/Raspberry_Machine
+python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 ```
@@ -219,10 +219,90 @@ If the client cannot reach the server:
 - open the server URL in the Pi browser
 - make sure the server host allows connections on port `8000`
 
-## 14. Next step after basic test
+## 14. Install desktop shortcut and boot autostart
+
+After the client runs correctly, install the shortcut and autostart entry:
+
+```bash
+cd /home/user/Raspberry_Machine
+chmod +x install_pi_client_autostart.sh
+./install_pi_client_autostart.sh --server-url http://<server-ip>:8000
+```
+
+If your scanner is on `/dev/ttyUSB0`:
+
+```bash
+./install_pi_client_autostart.sh --server-url http://<server-ip>:8000 --scanner-port /dev/ttyUSB0
+```
+
+If you want to build the packaged app first and make the shortcut use it:
+
+```bash
+./install_pi_client_autostart.sh --build --server-url http://<server-ip>:8000
+```
+
+What this creates:
+
+- launcher: `~/.local/bin/raspberry-machine-client`
+- desktop shortcut: `~/Desktop/RaspberryMachineClient.desktop`
+- boot/login autostart: `~/.config/autostart/RaspberryMachineClient.desktop`
+- log file: `~/.local/state/raspberry-machine-client/client.log`
+
+The launcher uses `dist/RaspberryMachineClient` when it exists. If there is no packaged build, it runs `run_client_pi.sh` from source.
+
+To remove boot autostart:
+
+```bash
+rm ~/.config/autostart/RaspberryMachineClient.desktop
+```
+
+To keep the desktop shortcut but skip boot autostart:
+
+```bash
+./install_pi_client_autostart.sh --no-autostart --server-url http://<server-ip>:8000
+```
+
+## 15. Update an existing Pi build
+
+After copying or pulling the latest project files into `/home/user/Raspberry_Machine`, rebuild and restart the client with:
+
+```bash
+cd /home/user/Raspberry_Machine
+chmod +x update_pi_client.sh
+./update_pi_client.sh
+```
+
+This stops the currently running client, rebuilds `dist/RaspberryMachineClient`, and starts the rebuilt app.
+
+If the Pi folder is a git checkout, pull and rebuild in one command:
+
+```bash
+./update_pi_client.sh --pull
+```
+
+If you also need to refresh the shortcut/autostart server URL:
+
+```bash
+./update_pi_client.sh --server-url http://<server-ip>:8000
+```
+
+To rebuild without starting the app:
+
+```bash
+./update_pi_client.sh --no-start
+```
+
+If the app still looks old, confirm the Pi has the latest files:
+
+```bash
+grep -n "Scan NEW JOB QR" /home/user/Raspberry_Machine/client.py
+grep -n "changecolor" /home/user/Raspberry_Machine/mappings.py
+ls -lh /home/user/Raspberry_Machine/dist/RaspberryMachineClient
+```
+
+## 16. Next step after basic test
 
 Once the client works on the Pi, the next sensible step is:
 
-- add desktop autostart for `client.py`
 - tune graphics mode for the Pi screen
 - create a client-only Pi requirements file

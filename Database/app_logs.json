@@ -70,5 +70,203 @@
     "source": "UI",
     "actor": "-",
     "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:01:42.914818+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:02:30.384201+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:02:30.384709+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:02:31.278025+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: api"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:02:31.280026+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings API Config [ON]"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:02:37.927800+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Input updated: Scanner COM Port = COM6"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:02:38.002341+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "API/Scanner configuration applied. Client ID: RPI-CLIENT-01"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:02:38.002341+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply API Config"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:02:38.789102+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:02:38.789102+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:20.712116+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:20.712116+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:26.972489+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Input updated: Scanner COM Port = COM 6"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:27.047333+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "API/Scanner configuration applied. Client ID: RPI-CLIENT-01"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:27.047333+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply API Config"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:31.680397+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Input updated: Scanner COM Port = COM5"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:31.775422+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "API/Scanner configuration applied. Client ID: RPI-CLIENT-01"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:31.775422+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply API Config"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:38.701394+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:38.701394+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:45.769312+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:45.769312+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:46.920337+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings section opened: api"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:46.920337+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings API Config [ON]"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:03:52.521384+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Input updated: Scanner COM Port = COM4"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:04:11.013976+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Input updated: Scanner COM Port = COM3"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:04:11.083212+00:00",
+    "source": "STATUS",
+    "actor": "-",
+    "message": "API/Scanner configuration applied. Client ID: RPI-CLIENT-01"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:04:11.083212+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Apply API Config"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:04:11.875289+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay closed"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:04:11.875289+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: X"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:13:09.547656+00:00",
+    "source": "SETTINGS",
+    "actor": "-",
+    "message": "Settings overlay opened"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:13:09.547656+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Button clicked: Settings Button"
+  },
+  {
+    "timestamp_utc": "2026-06-05T09:13:45.924770+00:00",
+    "source": "UI",
+    "actor": "-",
+    "message": "Input updated: Scanner COM Port = /dev/ttyACM0"
   }
 ]

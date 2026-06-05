@@ -1054,6 +1054,9 @@ class MachineSession:
     machine_name: str
     job_code: Optional[str] = None
     job_name: Optional[str] = None
+    product_id: str = ""
+    product_sku: str = ""
+    product_name: str = ""
     job_started_at: Optional[str] = None
     operator_id: Optional[str] = None
     pack_total: int = 0
@@ -1118,6 +1121,50 @@ class MachineSession:
         return d
 
 
+def _reset_active_session_for_new_job_segment(sess: MachineSession) -> None:
+    sess.product_id = ""
+    sess.product_sku = ""
+    sess.product_name = ""
+    sess.pack_total = 0
+    sess.good_total = 0
+    sess.butal_total = 0
+    sess.reject_total = 0
+    sess.reject_breakdown = {}
+    sess.no_shot_total = 0
+    sess.raw_sacks_count = 0
+    sess.raw_material_scans = []
+    sess.raw_material_logs = []
+    sess.product_pack_history_logs = []
+    sess.startup_reject_total = 0
+    sess.downtime_reason_code = None
+    sess.downtime_reason_text = None
+    sess.downtime_started_at = None
+    sess.downtime_last_seconds = None
+    sess.downtime_active = False
+    sess.pdr_operator_reason_code = None
+    sess.pdr_operator_reason_text = None
+    sess.downtime_wait_started_at = None
+    sess.downtime_wait_last_seconds = None
+    sess.waiting_downtime_start_maintenance = False
+    sess.waiting_pdr_maintenance_reason = False
+    sess.waiting_downtime_end_maintenance = False
+    sess.waiting_maintenance_qr = False
+    sess.waiting_supervisor_qr = False
+    sess.supervisor_downtime_confirmation_started_at = None
+    sess.cycle_time_new_input = None
+    sess.cycle_time_current = None
+    sess.live_cycle_avg_seconds = None
+    sess.machine_counter_current = None
+    sess.machine_counter_shift_start = None
+    sess.machine_counter_shift_end = None
+    sess.maintenance_name = None
+    sess.supervisor_name = None
+    sess.linkage_enabled = False
+    sess.linkage_jobs = []
+    sess.operator_shift_logs = []
+    sess.butal_by_job = {}
+
+
 def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSession]:
     if not isinstance(raw, dict):
         return None
@@ -1131,6 +1178,9 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         machine_name=_machine_display_name(machine_code, raw.get("machine_name", machine_code)),
         job_code=str(raw.get("job_code") or "").strip() or None,
         job_name=str(raw.get("job_name") or "").strip() or None,
+        product_id=str(raw.get("product_id") or "").strip(),
+        product_sku=str(raw.get("product_sku") or "").strip(),
+        product_name=str(raw.get("product_name") or "").strip(),
         job_started_at=str(raw.get("job_started_at") or "").strip() or None,
         operator_id=str(raw.get("operator_id") or "").strip() or None,
         pack_total=int(raw.get("pack_total", raw.get("pack_count", 0)) or 0),
@@ -5053,14 +5103,22 @@ DASHBOARD_HTML = """
     const data = (payload.data && typeof payload.data === "object") ? payload.data : {};
     const job = (data.job && typeof data.job === "object") ? data.job : ((payload.job && typeof payload.job === "object") ? payload.job : {});
     const details = (data.job_details && typeof data.job_details === "object") ? data.job_details : ((payload.job_details && typeof payload.job_details === "object") ? payload.job_details : {});
+    const cleanSku = value => {
+      const text = String(value || "").trim();
+      if(!text) return "";
+      if(/^Z-RM-/i.test(text)) return "";
+      return text;
+    };
     const explicitSku = firstValue(
-      item.product_sku, item.sku,
-      details.product_sku, details.sku,
-      job.product_sku, job.sku
+      cleanSku(item.product_sku), cleanSku(item.sku),
+      cleanSku(details.product_sku), cleanSku(details.sku),
+      cleanSku(job.product_sku), cleanSku(job.sku)
     );
     if(explicitSku) return String(explicitSku).trim();
     const productId = firstValue(item.product_id, details.product_id, job.product_id);
-    return productCatalogSku(productId);
+    const catalogSku = cleanSku(productCatalogSku(productId));
+    if(catalogSku) return catalogSku;
+    return firstValue(item.job_name, item.job_code, job.ref_no, payload.job_name, payload.job_code, "-");
   }
 
   function jobDisplayName(row, fallback = "Job"){
@@ -8455,6 +8513,7 @@ DASHBOARD_HTML = """
   }
   if(profileCreatorBtn){
     profileCreatorBtn.addEventListener("click", async () => {
+      const profileUrl = new URL("/profiles", window.location.href).href;
       const pw = window.prompt("Admin password required to open Profile Creation:", "");
       if(pw === null) return;
       try{
@@ -8468,7 +8527,10 @@ DASHBOARD_HTML = """
           alert(j.error || 'Invalid admin password');
           return;
         }
-        window.open("/profiles", "_blank");
+        const profileWindow = window.open(profileUrl, "_blank");
+        if(!profileWindow){
+          window.location.href = profileUrl;
+        }
       }catch(err){
         alert(`Failed to authorize profile creation: ${err}`);
       }
@@ -9173,25 +9235,28 @@ PROFILE_CREATOR_HTML = """
   async function authorizeProfilePrint(idNumber){
     const firstResp = await fetch('/api/profiles/authorize-print', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id_number: idNumber }) });
     if(firstResp.ok){
-      return true;
+      return { ok: true, message: '' };
     }
     const firstOut = await firstResp.json().catch(() => ({}));
     if(!firstOut.requires_password){
-      setStatus(firstOut.error || 'Print authorization failed.');
-      return false;
+      const msg = firstOut.error || 'Print authorization failed.';
+      setStatus(msg);
+      return { ok: false, message: msg };
     }
     const pw = window.prompt('Admin password required for reprint:', '');
     if(pw === null){
-      setStatus('Reprint cancelled.');
-      return false;
+      const msg = 'Reprint cancelled.';
+      setStatus(msg);
+      return { ok: false, message: msg };
     }
     const secondResp = await fetch('/api/profiles/authorize-print', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id_number: idNumber, admin_password: pw }) });
     const secondOut = await secondResp.json();
     if(!secondResp.ok || !secondOut.ok){
-      setStatus(secondOut.error || 'Invalid admin password.');
-      return false;
+      const msg = secondOut.error || 'Invalid admin password.';
+      setStatus(msg);
+      return { ok: false, message: msg };
     }
-    return true;
+    return { ok: true, message: '' };
   }
   async function removeProfile(idNumber){
     if(!idNumber){ return; }
@@ -9216,9 +9281,15 @@ PROFILE_CREATOR_HTML = """
     try { w.focus(); } catch(_e) {}
     return w;
   }
-  function closePreparedPrintWindow(w){
+  function closePreparedPrintWindow(w, message='Print cancelled or failed. Check the Profile Creator page for details.'){
     if(!w) return;
-    try { w.close(); } catch(_e) {}
+    try {
+      w.document.write(`<!doctype html><html><head><title>Print QR</title>
+        <style>html,body{margin:0;padding:16px;font-family:Arial,sans-serif;background:#fff;color:#111;}</style>
+        </head><body>${esc(message)}</body></html>`);
+      w.document.close();
+      w.focus();
+    } catch(_e) {}
   }
   async function openPrintWindow(imageSrc, printSize, printWindow=null){
     if(!imageSrc){ return; }
@@ -9239,9 +9310,9 @@ PROFILE_CREATOR_HTML = """
     setTimeout(() => { try { w.print(); } catch(_e) {} }, 180);
   }
   async function printExistingProfile(idNumber, name, role, printWindow=null){
-    if(!idNumber){ closePreparedPrintWindow(printWindow); return; }
-    const allowed = await authorizeProfilePrint(idNumber);
-    if(!allowed){ closePreparedPrintWindow(printWindow); return; }
+    if(!idNumber){ closePreparedPrintWindow(printWindow, 'Missing profile ID number.'); return; }
+    const auth = await authorizeProfilePrint(idNumber);
+    if(!auth.ok){ closePreparedPrintWindow(printWindow, auth.message || 'Reprint was not authorized.'); return; }
     const payload = {
       name: (name || '').trim(),
       id_number: (idNumber || '').trim(),
@@ -9250,7 +9321,12 @@ PROFILE_CREATOR_HTML = """
     };
     const r = await fetch('/api/profile-qr-preview', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     const out = await r.json();
-    if(!r.ok || !out.ok){ closePreparedPrintWindow(printWindow); setStatus(out.error || 'Preview failed.'); return; }
+    if(!r.ok || !out.ok){
+      const msg = out.error || 'Preview failed.';
+      closePreparedPrintWindow(printWindow, msg);
+      setStatus(msg);
+      return;
+    }
     pfPreviewImg.src = out.image_data_url || '';
     pfPayloadPreview.textContent = out.qr_payload || '';
     await openPrintWindow(out.image_data_url || '', payload.print_size, printWindow);
@@ -9271,20 +9347,20 @@ PROFILE_CREATOR_HTML = """
   }
   async function saveProfile(andPrint=false, printWindow=null){
     const form = getForm();
-    if(!form.name || !form.id_number || !form.role){ closePreparedPrintWindow(printWindow); setStatus('Complete Name, ID Number, and Role first.'); return; }
+    if(!form.name || !form.id_number || !form.role){ closePreparedPrintWindow(printWindow, 'Complete Name, ID Number, and Role first.'); setStatus('Complete Name, ID Number, and Role first.'); return; }
     const r = await fetch('/api/profiles', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(form) });
     const out = await r.json();
-    if(!out.ok){ closePreparedPrintWindow(printWindow); setStatus(out.error || 'Save failed.'); return; }
+    if(!out.ok){ closePreparedPrintWindow(printWindow, out.error || 'Save failed.'); setStatus(out.error || 'Save failed.'); return; }
     setStatus('Profile saved.');
     await loadProfiles();
     if(andPrint){
-      const allowed = await authorizeProfilePrint(form.id_number);
-      if(!allowed){ closePreparedPrintWindow(printWindow); return; }
+      const auth = await authorizeProfilePrint(form.id_number);
+      if(!auth.ok){ closePreparedPrintWindow(printWindow, auth.message || 'Print was not authorized.'); return; }
       const ok = await previewQr();
       if(ok && pfPreviewImg.src){
         await openPrintWindow(pfPreviewImg.src, form.print_size, printWindow);
       } else {
-        closePreparedPrintWindow(printWindow);
+        closePreparedPrintWindow(printWindow, 'QR preview failed.');
       }
       await loadProfiles();
     }
@@ -9306,9 +9382,7 @@ PROFILE_CREATOR_HTML = """
       return;
     }
     if(act === 'print'){
-      const printWindow = preparePrintWindow();
-      if(!printWindow) return;
-      await printExistingProfile(id, btn.getAttribute('data-name') || '', btn.getAttribute('data-role') || '', printWindow);
+      await printExistingProfile(id, btn.getAttribute('data-name') || '', btn.getAttribute('data-role') || '', null);
     }
   });
   loadProfilePageTheme();
@@ -9632,6 +9706,12 @@ async def api_event(req: Request):
             rows = list(sess.linkage_jobs or [])
             rows.append({"job_code": linked_code, "job_name": linked_name})
             sess.linkage_jobs = rows
+    elif ev_type in ("JOB_SET", "JOB_STUB_SET", "COLOR_CHANGE_JOB_SET"):
+        _reset_active_session_for_new_job_segment(sess)
+        job_payload = ev.get("job_payload") or ev.get("stub")
+        if isinstance(job_payload, dict):
+            sess.job_payload = dict(job_payload or {})
+        sess.job_started_at = utc_now().isoformat()
     elif ev_type == "OPERATOR_SHIFT_SAVE":
         shift_payload = ev.get("operator_shift")
         if isinstance(shift_payload, dict):
@@ -9644,6 +9724,9 @@ async def api_event(req: Request):
             sess.machine_name = _machine_display_name(machine_code, snap.get("machine_name") or sess.machine_name or machine_code)
             sess.job_code = snap.get("job_code", sess.job_code)
             sess.job_name = snap.get("job_name", sess.job_name)
+            sess.product_id = str(snap.get("product_id", sess.product_id) or "")
+            sess.product_sku = str(snap.get("product_sku", sess.product_sku) or "")
+            sess.product_name = str(snap.get("product_name", sess.product_name) or "")
             sess.job_started_at = snap.get("job_started_at", sess.job_started_at)
             sess.operator_id = snap.get("operator_id", sess.operator_id)
             sess.pack_total = int(snap.get("pack_total", snap.get("pack_count", sess.pack_total)) or 0)
