@@ -52,7 +52,7 @@ except Exception:
 SERVER_URL = os.environ.get("MACHINE_SERVER_URL", "http://192.168.1.178:8000")
 CLIENT_ID = os.environ.get("MACHINE_CLIENT_ID", socket.gethostname())
 SCANNER_MODE = os.environ.get("MACHINE_SCANNER_MODE", "auto").strip().lower()
-SCANNER_COM_PORT = os.environ.get("MACHINE_SCANNER_COM_PORT", "/dev/ttyACM0").strip()
+SCANNER_COM_PORT = os.environ.get("MACHINE_SCANNER_COM_PORT", "/dev`/ttyACM0").strip()
 SCANNER_BAUDRATE = int(os.environ.get("MACHINE_SCANNER_BAUDRATE", "9600"))
 SCANNER_TIMEOUT = float(os.environ.get("MACHINE_SCANNER_TIMEOUT", "1.0"))
 
@@ -76,6 +76,7 @@ CLIENT_ACTIVE_MACHINE_SESSIONS_FILE = os.path.join(DATABASE_DIR, "client_active_
 SERVER_ACTIVE_MACHINE_SESSIONS_FILE = os.path.join(DATABASE_DIR, "active_machine_sessions.json")
 ACTIVE_MACHINE_SESSIONS_FILE = CLIENT_ACTIVE_MACHINE_SESSIONS_FILE
 SERVER_EVENT_QUEUE_FILE = os.path.join(DATABASE_DIR, "server_event_queue.json")
+SCANNED_PACK_QR_KEYS_FILE = os.path.join(DATABASE_DIR, "scanned_pack_qr_keys.json")
 INVALID_SCAN_GIF = os.environ.get(
     "MACHINE_INVALID_SCAN_GIF",
     os.path.join(ANIMATIONS_DIR, "slap-virtual-slap.gif"),
@@ -113,6 +114,7 @@ JOB_API_PENDING_RETRY_INTERVAL_MS = int(os.environ.get("MACHINE_JOB_API_PENDING_
 JOB_API_PENDING_MAX_RETRIES = int(os.environ.get("MACHINE_JOB_API_PENDING_MAX_RETRIES", "0"))
 SCANNER_MIN_TIMEOUT_SECONDS = float(os.environ.get("MACHINE_SCANNER_MIN_TIMEOUT", "0.2"))
 UI_REFRESH_DEBOUNCE_MS = int(os.environ.get("MACHINE_UI_REFRESH_DEBOUNCE_MS", "60"))
+SCAN_DEDUP_WINDOW_MS = int(os.environ.get("MACHINE_SCAN_DEDUP_WINDOW_MS", "900"))
 MOTION_TIMER_INTERVAL_MS = int(os.environ.get("MACHINE_MOTION_TIMER_INTERVAL_MS", "250"))
 OVERLAY_PULSE_INTERVAL_MS = int(os.environ.get("MACHINE_OVERLAY_PULSE_INTERVAL_MS", "160"))
 ACTIVE_SESSION_AUTOSAVE_INTERVAL_MS = int(os.environ.get("MACHINE_AUTOSAVE_INTERVAL_MS", "10000"))
@@ -505,11 +507,67 @@ def _load_server_event_queue_json() -> List[Dict[str, Any]]:
 def _save_server_event_queue_json(rows: List[Dict[str, Any]]) -> bool:
     try:
         os.makedirs(DATABASE_DIR, exist_ok=True)
-        with open(SERVER_EVENT_QUEUE_FILE, "w", encoding="utf-8") as f:
+        # The queue is the offline source of truth.  Write it atomically so a
+        # power loss cannot leave a partially-written JSON file and discard
+        # scans that have not reached the server yet.
+        tmp = f"{SERVER_EVENT_QUEUE_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(list(rows or []), f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SERVER_EVENT_QUEUE_FILE)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(f"{SERVER_EVENT_QUEUE_FILE}.tmp"):
+                os.remove(f"{SERVER_EVENT_QUEUE_FILE}.tmp")
+        except Exception:
+            pass
+        return False
+
+
+def _load_scanned_pack_qr_keys_json() -> Dict[str, Dict[str, Any]]:
+    try:
+        if not os.path.exists(SCANNED_PACK_QR_KEYS_FILE):
+            return {}
+        with open(SCANNED_PACK_QR_KEYS_FILE, "r", encoding="utf-8") as f:
+            rows = json.load(f)
+        if not isinstance(rows, dict):
+            return {}
+        return {
+            str(key): dict(value)
+            for key, value in rows.items()
+            if str(key).strip() and isinstance(value, dict)
+        }
+    except Exception:
+        return {}
+
+
+def _save_scanned_pack_qr_keys_json(rows: Dict[str, Dict[str, Any]]) -> bool:
+    try:
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        tmp = f"{SCANNED_PACK_QR_KEYS_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(dict(rows or {}), f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, SCANNED_PACK_QR_KEYS_FILE)
         return True
     except Exception:
         return False
+
+
+def _upsert_scanned_pack_qr_key(key: str, row: Dict[str, Any]) -> bool:
+    k = str(key or "").strip()
+    if not k:
+        return False
+    rows = _load_scanned_pack_qr_keys_json()
+    existing = rows.get(k)
+    if isinstance(existing, dict):
+        return True
+    rows[k] = dict(row or {})
+    rows[k]["key"] = k
+    return _save_scanned_pack_qr_keys_json(rows)
 
 
 def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
@@ -2790,6 +2848,8 @@ class ClientUI(QWidget):
         self._raw_mats_overlay_refresh_key = ""
         self._animation_burst_until = 0.0
         self._marquee_frame_skip = False
+        self._recent_scan_seen: Dict[str, float] = {}
+        self._used_pack_qr_keys: Set[str] = set(_load_scanned_pack_qr_keys_json().keys())
         self._server_event_queue_lock = threading.Lock()
         self._server_was_offline = False
         self._server_recovery_snapshot_queued = False
@@ -6492,6 +6552,37 @@ QWidget#ClientUIRoot {{
         self.finishSummaryStack.addWidget(page)
         self._finish_review_extra_pages.append(page)
 
+    def _add_shift_jobs_review_page_if_needed(self):
+        rows_src = []
+        if isinstance(getattr(self, "_pending_shift_review_payload", None), dict):
+            rows_src.append(dict(self._pending_shift_review_payload or {}))
+            rows_src.extend(
+                dict(row)
+                for row in (getattr(self, "_pending_shift_review_linked_payloads", []) or [])
+                if isinstance(row, dict)
+            )
+        if len(rows_src) <= 1:
+            return
+        rows: List[List[str]] = []
+        for idx, row in enumerate(rows_src, start=1):
+            rows.append([
+                str(idx),
+                self._safe_text(row.get("reason"), "-"),
+                self._safe_text(row.get("job_name") or row.get("job_code"), "-"),
+                str(int(row.get("pack_count") or 0)),
+                str(int(row.get("good_total") or 0)),
+                str(int(row.get("butal_total") or 0)),
+                str(int(row.get("reject_total") or 0)),
+                self._safe_text(row.get("cycle_time_current"), "-"),
+            ])
+        self._add_finish_review_extra_page(
+            "Shift Jobs",
+            ["#", "Reason", "Job", "Pack", "Good", "Butal", "Reject", "Cycle"],
+            rows,
+            section_height=max(520, self._finish_review_available_content_height() - 2),
+            stretch_rows=False,
+        )
+
     def _rebuild_finish_review_pages(self, include_second_page: bool, include_third_page: bool = False, include_fourth_page: bool = False):
         self.finishSummaryStack.widget(1).setVisible(include_second_page)
         self.finishSummaryStack.widget(2).setVisible(include_third_page)
@@ -7369,6 +7460,23 @@ QWidget#ClientUIRoot {{
         if str(person.get("can_operator", "0")) != "1":
             return None
         return person
+
+    def _offline_operator_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
+        """Accept a profile QR while the profile cache/server is unavailable.
+
+        Profile QR codes intentionally contain only the numeric employee ID.
+        Keep this narrow so an arbitrary, unrecognised production QR cannot be
+        used as an operator identity.  The exact QR payload is included in the
+        durable event queue and sent unchanged when the server recovers.
+        """
+        payload = self._clean_badge_scan_code(raw)
+        if not re.fullmatch(r"\d{4,64}", payload):
+            return None
+        return {
+            "code": payload,
+            "name": "Pending server validation",
+            "raw_payload": payload,
+        }
 
     def _get_non_zero_rejects(self) -> List[tuple]:
         rows = []
@@ -9028,6 +9136,30 @@ QWidget#ClientUIRoot {{
         s.operator_shift_baseline_butal_scan_logs_len = len(s.butal_scan_logs or [])
         s.operator_shift_baseline_production_adjustment_logs_len = len(s.production_adjustment_logs or [])
 
+    def _reset_operator_shift_baseline_to_full_segment(self, existing_segment: Dict[str, Any]) -> None:
+        """Track a resumed color/mold segment as cumulative, not only new scans."""
+        s = self.state
+        started = str((existing_segment or {}).get("started_at_utc") or "").strip()
+        if started:
+            s.operator_shift_started_at = started
+        s.operator_shift_baseline_pack_count = 0
+        s.operator_shift_baseline_good_total = 0
+        s.operator_shift_baseline_butal_total = 0
+        s.operator_shift_baseline_reject_total = 0
+        s.operator_shift_baseline_startup_reject_total = 0
+        s.operator_shift_baseline_no_shot_total = 0
+        s.operator_shift_baseline_raw_sacks_count = 0
+        s.operator_shift_baseline_reject_breakdown = {}
+        s.operator_shift_baseline_raw_material_logs_len = 0
+        s.operator_shift_baseline_product_pack_history_logs_len = 0
+        s.operator_shift_baseline_reject_review_logs_len = 0
+        s.operator_shift_baseline_butal_scan_logs_len = 0
+        s.operator_shift_baseline_production_adjustment_logs_len = 0
+        machine_start = self._parse_int_value((existing_segment or {}).get("machine_counter_start"))
+        if machine_start is not None:
+            s.operator_shift_baseline_machine_counter_start = machine_start
+            s.machine_counter_shift_start = machine_start
+
     def _current_client_id(self) -> str:
         return str(self.client_config.get("client_id", CLIENT_ID)).strip() or CLIENT_ID
 
@@ -9171,9 +9303,7 @@ QWidget#ClientUIRoot {{
         if payload is None:
             return None
         s = self.state
-        rows = list(s.operator_shift_logs or [])
-        rows.append(payload)
-        s.operator_shift_logs = rows
+        self._upsert_pending_operator_shift_segment(payload)
         self._store_last_shift_butal_from_current_shift()
         if emit_event:
             self.push_event(
@@ -9219,6 +9349,70 @@ QWidget#ClientUIRoot {{
             )
             out.append(linked_payload)
         return out
+
+    def _operator_shift_segment_key(self, row: Dict[str, Any]) -> str:
+        if not isinstance(row, dict):
+            return ""
+        job_key = self._normalize_job_code(row.get("job_code"))
+        if not job_key:
+            job_key = str(row.get("job_name") or "").strip().upper()
+        return "|".join([
+            str(row.get("client_id") or self._current_client_id()).strip(),
+            str(row.get("machine_code") or self.state.machine_code or "").strip(),
+            str(row.get("operator_id") or self.state.operator_id or "").strip(),
+            job_key,
+        ])
+
+    def _upsert_pending_operator_shift_segment(self, payload: Dict[str, Any]) -> None:
+        key = self._operator_shift_segment_key(payload)
+        rows: List[Dict[str, Any]] = [
+            dict(row)
+            for row in (self.state.operator_shift_logs or [])
+            if isinstance(row, dict) and (not key or self._operator_shift_segment_key(row) != key)
+        ]
+        rows.append(dict(payload))
+        self.state.operator_shift_logs = rows
+
+    def _dedupe_pending_operator_shift_segments(self) -> None:
+        rows: List[Dict[str, Any]] = []
+        index_by_key: Dict[str, int] = {}
+        for row in (self.state.operator_shift_logs or []):
+            if not isinstance(row, dict):
+                continue
+            item = dict(row)
+            key = self._operator_shift_segment_key(item)
+            if key and key in index_by_key:
+                rows[index_by_key[key]] = item
+                continue
+            if key:
+                index_by_key[key] = len(rows)
+            rows.append(item)
+        self.state.operator_shift_logs = rows
+
+    def _remove_pending_operator_shift_segment(self, payload: Dict[str, Any]) -> None:
+        key = self._operator_shift_segment_key(payload)
+        if not key:
+            return
+        self.state.operator_shift_logs = [
+            dict(row)
+            for row in (self.state.operator_shift_logs or [])
+            if isinstance(row, dict) and self._operator_shift_segment_key(row) != key
+        ]
+
+    def _pending_shift_review_payloads_for_current_operator(self) -> List[Dict[str, Any]]:
+        self._dedupe_pending_operator_shift_segments()
+        rows: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for row in (self.state.operator_shift_logs or []):
+            if not isinstance(row, dict):
+                continue
+            key = self._operator_shift_segment_key(row)
+            if key and key in seen:
+                continue
+            rows.append(dict(row))
+            if key:
+                seen.add(key)
+        return rows
 
     def _state_to_active_snapshot(self) -> Dict[str, Any]:
         s = self.state
@@ -9603,12 +9797,16 @@ QWidget#ClientUIRoot {{
         code = str(machine_code or "").strip()
         if not code:
             return None
-        local_rows, local_source = _read_active_sessions_json_file_with_source(CLIENT_ACTIVE_MACHINE_SESSIONS_FILE)
-        snap = local_rows.get(code)
-        if isinstance(snap, dict) and self._snapshot_is_recoverable(snap) and local_source == "main":
-            return snap
+        for path in (
+            CLIENT_ACTIVE_MACHINE_SESSIONS_FILE,
+            _active_sessions_backup_path(CLIENT_ACTIVE_MACHINE_SESSIONS_FILE),
+        ):
+            rows = _read_active_sessions_json_file(path)
+            snap = rows.get(code)
+            if isinstance(snap, dict) and self._snapshot_is_recoverable(snap):
+                return snap
         server_snap = self._fetch_active_session_snapshot_from_server(code)
-        return self._choose_recovery_snapshot(snap if isinstance(snap, dict) else None, local_source, server_snap)
+        return server_snap if isinstance(server_snap, dict) and self._snapshot_is_recoverable(server_snap) else None
 
     def _clear_active_session_snapshot(self, machine_code: Optional[str]):
         code = str(machine_code or "").strip()
@@ -9735,6 +9933,12 @@ QWidget#ClientUIRoot {{
             for row in (s.product_pack_history_logs or [])
             if isinstance(row, dict) and self._pack_history_key(row)
         }
+        for row in (s.product_pack_history_logs or []):
+            if not isinstance(row, dict):
+                continue
+            pack_key = self._pack_history_key(row)
+            if pack_key:
+                self._mark_pack_qr_used_permanently(pack_key, row)
         s.butal_scan_logs = list(snap.get("butal_scan_logs") or [])
         self._action_logs = list(snap.get("action_logs") or [])
         s.startup_reject_total = int(snap.get("startup_reject_total") or 0)
@@ -9754,6 +9958,7 @@ QWidget#ClientUIRoot {{
         s.linkage_job_payload = dict(snap.get("linkage_job_payload") or {})
         s.linkage_jobs = list(snap.get("linkage_jobs") or [])
         s.operator_shift_logs = list(snap.get("operator_shift_logs") or [])
+        self._dedupe_pending_operator_shift_segments()
         s.operator_shift_index = int(snap.get("operator_shift_index") or 0)
         s.operator_shift_started_at = snap.get("operator_shift_started_at")
         s.operator_shift_baseline_cycle_time = snap.get("operator_shift_baseline_cycle_time")
@@ -11415,7 +11620,18 @@ QWidget#ClientUIRoot {{
         self.finishSummaryOverviewSection.setMinimumHeight(overview_h)
         self.finishSummaryOverviewSection.setMaximumHeight(overview_h)
         self.finishSummaryCards["Machine"].setText(self._safe_text(shift_payload.get("machine_name") or shift_payload.get("machine_code")))
-        self.finishSummaryCards["Job"].setText(self._safe_text(shift_payload.get("job_name") or shift_payload.get("job_code")))
+        pending_shift_jobs = []
+        if isinstance(getattr(self, "_pending_shift_review_payload", None), dict):
+            pending_shift_jobs.append(dict(self._pending_shift_review_payload or {}))
+            pending_shift_jobs.extend(
+                dict(row)
+                for row in (getattr(self, "_pending_shift_review_linked_payloads", []) or [])
+                if isinstance(row, dict)
+            )
+        if len(pending_shift_jobs) > 1:
+            self.finishSummaryCards["Job"].setText(f"{len(pending_shift_jobs)} jobs in shift")
+        else:
+            self.finishSummaryCards["Job"].setText(self._safe_text(shift_payload.get("job_name") or shift_payload.get("job_code")))
         self.finishSummaryCards["Operator"].setText(
             f"{self._safe_text(shift_payload.get('operator_name'))} ({self._safe_text(shift_payload.get('operator_id'))})"
         )
@@ -11578,6 +11794,8 @@ QWidget#ClientUIRoot {{
                 section_height=full_page_section_h,
                 stretch_rows=False,
             )
+
+        self._add_shift_jobs_review_page_if_needed()
 
         include_second_page = bool(partial_payload_rows or visible_part_table_rows)
         include_third_page = bool(visible_raw_rows)
@@ -12008,30 +12226,11 @@ QWidget#ClientUIRoot {{
         if reason_key not in ("COLOR_CHANGE", "MOLD_CHANGE"):
             reason_key = "COLOR_CHANGE"
         label = "Mold change" if reason_key == "MOLD_CHANGE" else "Color change"
-        shift_payload = self._finalize_current_operator_shift(reason_key, emit_event=True)
+        shift_payload = self._finalize_current_operator_shift(reason_key, emit_event=False)
         if shift_payload is None:
             self.status.setText(f"{label} failed: no active operator shift to save.")
             self._show_invalid_overlay("No active operator shift to save.")
             return False
-        linked_shift_payloads = self._build_linked_operator_shift_payloads(shift_payload)
-        saved_ok = self._save_finished_job_local(shift_payload)
-        for linked_shift_payload in linked_shift_payloads:
-            saved_ok = self._save_finished_job_local(linked_shift_payload) and saved_ok
-        if not saved_ok:
-            self.status.setText(f"{label} save failed: current job kept for recovery.")
-            self._show_invalid_overlay("Unable to save current job segment locally.")
-            return False
-        self.push_event(
-            {"type": "FINISH_SHIFT", "finished_job": shift_payload},
-            f"{label.upper()} SAVE {shift_payload.get('job_name') or shift_payload.get('job_code') or ''}".strip(),
-            silent=True,
-        )
-        for linked_shift_payload in linked_shift_payloads:
-            self.push_event(
-                {"type": "FINISH_SHIFT", "finished_job": linked_shift_payload},
-                f"{label.upper()} LINKED SAVE {linked_shift_payload.get('job_name') or linked_shift_payload.get('job_code') or ''}".strip(),
-                silent=True,
-            )
 
         operator_id = s.operator_id
         s.job_code = str(job_data.get("job_code") or "").strip()
@@ -12051,13 +12250,69 @@ QWidget#ClientUIRoot {{
         self.status.setText(f"{label}: new job set for same operator: {s.job_name or s.job_code}.{status_tail}")
         self._refresh_ui()
         self._save_active_session_snapshot()
-        self.sync_local_finish_shifts_to_server(force=True)
         self.push_event(
             {"type": "COLOR_CHANGE_JOB_SET", "job_payload": s.job_payload},
             f"{label.upper()} JOB {s.job_name or s.job_code}",
             silent=False,
         )
         self.sync_session_snapshot_to_server(f"SESSION SNAPSHOT SYNC ({label.upper()})")
+        return True
+
+    def _change_color_to_existing_shift_segment(self, existing_segment: Dict[str, Any], reason: str = "COLOR_CHANGE") -> bool:
+        if not isinstance(existing_segment, dict):
+            return False
+        job_code = str(existing_segment.get("job_code") or "").strip()
+        if not job_code:
+            return False
+        s = self.state
+        reason_key = str(reason or "COLOR_CHANGE").strip().upper()
+        if reason_key not in ("COLOR_CHANGE", "MOLD_CHANGE"):
+            reason_key = "COLOR_CHANGE"
+        label = "Mold change" if reason_key == "MOLD_CHANGE" else "Color change"
+        current_segment = self._finalize_current_operator_shift(reason_key, emit_event=False)
+        if current_segment is None:
+            self.status.setText(f"{label} failed: no active operator shift to save.")
+            self._show_invalid_overlay("No active operator shift to save.")
+            return False
+        operator_id = s.operator_id
+        s.job_code = job_code
+        s.job_name = str(existing_segment.get("job_name") or job_code).strip()
+        s.job_payload = dict(existing_segment.get("job_payload") or {})
+        s.job_started_at = datetime.now(timezone.utc).isoformat()
+        self._reset_production_for_color_change_segment()
+        s.operator_id = operator_id
+        s.pack_count = int(existing_segment.get("pack_count") or 0)
+        s.good_total = int(existing_segment.get("good_total") or 0)
+        s.butal_total = int(existing_segment.get("butal_total") or 0)
+        s.reject_total = int(existing_segment.get("reject_total") or 0)
+        s.reject_breakdown = dict(existing_segment.get("reject_breakdown") or {})
+        s.no_shot_total = int(existing_segment.get("no_shot_total") or 0)
+        s.startup_reject_total = int(existing_segment.get("startup_reject_total") or 0)
+        s.raw_sacks_count = int(existing_segment.get("raw_sacks_count") or 0)
+        s.raw_material_logs = list(existing_segment.get("raw_material_logs") or [])
+        s.raw_material_scans = list(existing_segment.get("raw_material_scans") or [])
+        s.product_pack_history_logs = list(existing_segment.get("product_pack_history_logs") or [])
+        s.product_pack_history_keys = {
+            self._pack_history_key(row)
+            for row in (s.product_pack_history_logs or [])
+            if isinstance(row, dict) and self._pack_history_key(row)
+        }
+        s.butal_scan_logs = list(existing_segment.get("butal_scan_logs") or [])
+        s.production_adjustment_logs = list(existing_segment.get("production_adjustment_logs") or [])
+        s.cycle_time_current = existing_segment.get("cycle_time_current")
+        s.waiting_color_change_job_scan = False
+        s.pending_color_change_reason = ""
+        self._start_operator_shift_tracking()
+        self._reset_operator_shift_baseline_to_full_segment(existing_segment)
+        self.status.setText(f"{label}: resumed existing job {s.job_name or s.job_code}.")
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        self.push_event(
+            {"type": "COLOR_CHANGE_JOB_SET", "job_payload": s.job_payload},
+            f"{label.upper()} RESUME {s.job_name or s.job_code}",
+            silent=False,
+        )
+        self.sync_session_snapshot_to_server(f"SESSION SNAPSHOT SYNC ({label.upper()} RESUME)")
         return True
 
     def _job_api_body_is_unauthorized(self, data: Any) -> bool:
@@ -12546,13 +12801,59 @@ QWidget#ClientUIRoot {{
     def _pack_history_key(self, row: Dict[str, Any]) -> str:
         if not isinstance(row, dict):
             return ""
+        fields = row
         raw_scan = str(row.get("raw_scan") or "").strip()
         if raw_scan:
-            return raw_scan
-        idx = str(row.get("index") or "").strip()
-        lot = str(row.get("lot_number") or "").strip()
-        pid = str(row.get("product_p") or row.get("product_id") or "").strip()
-        return f"{pid}|{idx}|{lot}".strip("|")
+            parsed = self._extract_pack_history_fields(raw_scan)
+            if isinstance(parsed, dict):
+                fields = parsed
+        idx = str(fields.get("index") or "").strip()
+        lot = str(fields.get("lot_number") or "").strip()
+        pid = str(fields.get("product_p") or fields.get("product_id") or "").strip()
+        po = str(fields.get("po_number") or "").strip()
+        if idx and lot:
+            return f"{pid}|{idx}|{lot}|{po}".strip("|")
+        return raw_scan
+
+    def _should_ignore_duplicate_transport_scan(self, raw: str) -> bool:
+        key = re.sub(r"\s+", "", str(raw or "")).strip()
+        if not key:
+            return True
+        now = time.monotonic()
+        window = max(0.1, SCAN_DEDUP_WINDOW_MS / 1000.0)
+        for seen_key, seen_at in list(self._recent_scan_seen.items()):
+            if now - seen_at > max(window * 4.0, 5.0):
+                self._recent_scan_seen.pop(seen_key, None)
+        last_seen = self._recent_scan_seen.get(key)
+        self._recent_scan_seen[key] = now
+        return last_seen is not None and (now - last_seen) <= window
+
+    def _pack_qr_was_used_permanently(self, pack_key: str) -> bool:
+        key = str(pack_key or "").strip()
+        if not key:
+            return False
+        if key in (self._used_pack_qr_keys or set()):
+            return True
+        rows = _load_scanned_pack_qr_keys_json()
+        if key in rows:
+            self._used_pack_qr_keys.add(key)
+            return True
+        return False
+
+    def _mark_pack_qr_used_permanently(self, pack_key: str, pack_row: Dict[str, Any]) -> None:
+        key = str(pack_key or "").strip()
+        if not key:
+            return
+        row = dict(pack_row or {})
+        row.setdefault("first_scanned_at", row.get("scanned_at") or datetime.now(timezone.utc).isoformat())
+        row.setdefault("machine_code", self.state.machine_code)
+        row.setdefault("machine_name", self.state.machine_name)
+        row.setdefault("job_code", self.state.job_code)
+        row.setdefault("job_name", self.state.job_name)
+        row.setdefault("operator_id", self.state.operator_id)
+        row.setdefault("client_id", self._current_client_id())
+        if _upsert_scanned_pack_qr_key(key, row):
+            self._used_pack_qr_keys.add(key)
 
     def _append_adjustment_log(self, item_type: str, action: str, payload: Dict[str, Any]):
         row = {
@@ -13485,9 +13786,11 @@ QWidget#ClientUIRoot {{
         return time.time() < float(self._animation_burst_until or 0.0)
 
     def on_scanned(self, raw: str):
+        raw_s = str(raw or "").strip()
+        if self._should_ignore_duplicate_transport_scan(raw_s):
+            return
         self._mark_animation_burst()
         if self._pending_final_review_payload:
-            raw_s = str(raw).strip()
             raw_l = raw_s.lower()
             if raw_l in ("next", "prev", "previous", "preview"):
                 self._change_finish_review_page(1 if raw_l == "next" else -1)
@@ -13788,15 +14091,31 @@ QWidget#ClientUIRoot {{
             if raw_l == "confirm":
                 if not self._commit_machine_counter_input("shift_end"):
                     return
-                shift_payload = self._finalize_current_operator_shift("QR_SHIFT_HANDOFF", emit_event=True)
+                shift_payload = self._finalize_current_operator_shift("QR_SHIFT_HANDOFF", emit_event=False)
                 if shift_payload is None:
                     self.status.setText("Operator shift handoff failed: no active operator data.")
                     self._show_invalid_overlay("No active operator shift to save.")
                     return
-                linked_shift_payloads = self._build_linked_operator_shift_payloads(shift_payload)
-                saved_shift_ok = self._save_finished_job_local(shift_payload)
-                for linked_shift_payload in linked_shift_payloads:
-                    saved_shift_ok = self._save_finished_job_local(linked_shift_payload) and saved_shift_ok
+                review_payloads = self._pending_shift_review_payloads_for_current_operator()
+                if not review_payloads:
+                    review_payloads = [shift_payload]
+                existing_review_keys = {
+                    self._finish_shift_row_key(row)
+                    for row in review_payloads
+                    if isinstance(row, dict) and self._finish_shift_row_key(row)
+                }
+                for linked_row in self._build_linked_operator_shift_payloads(shift_payload):
+                    linked_key = self._finish_shift_row_key(linked_row)
+                    if linked_key and linked_key in existing_review_keys:
+                        continue
+                    review_payloads.append(linked_row)
+                    if linked_key:
+                        existing_review_keys.add(linked_key)
+                linked_shift_payloads = review_payloads[1:]
+                shift_payload = review_payloads[0]
+                saved_shift_ok = True
+                for row in review_payloads:
+                    saved_shift_ok = self._save_finished_job_local(row) and saved_shift_ok
                 if not saved_shift_ok:
                     self.status.setText("Finish shift save failed: active session kept for recovery.")
                     self._show_invalid_overlay("Unable to save shift partial locally.")
@@ -14188,17 +14507,33 @@ QWidget#ClientUIRoot {{
         op_auth = self._operator_from_scan(raw_s) if needs_operator_lookup else None
         if op_auth is not None:
             res = ScanResult(kind="OPERATOR", raw=raw_s, value=f"{op_auth.get('code', raw_s)} - {op_auth.get('name', raw_s)}")
-        elif res is not None and res.kind == "OPERATOR":
-            # Reject legacy/static operator QR unless it exists in the server profile data with Operator role.
-            self.status.setText("Invalid operator QR: badge is not registered as Operator.")
-            self._show_invalid_overlay("Operator badge is not registered on server.")
-            return
-        elif res is None and s.machine_code and s.job_code and not s.operator_id:
+        elif s.machine_code and s.job_code and not s.operator_id:
+            # A locally known non-operator must remain blocked, even while the
+            # server is unavailable.  An unknown numeric profile QR is kept as
+            # a pending operator instead, allowing the machine to continue and
+            # preserving the original payload for later server delivery.
             known_auth = self._authorized_person_from_scan(raw_s)
             if known_auth is not None:
                 self.status.setText("Invalid operator QR: scanned badge is not an Operator role.")
                 self._show_invalid_overlay("Only Operator role can be used as operator on client.")
                 return
+            offline_operator = self._offline_operator_from_scan(raw_s)
+            if offline_operator is not None:
+                res = ScanResult(
+                    kind="OFFLINE_OPERATOR",
+                    raw=raw_s,
+                    value=f"{offline_operator['code']} - {offline_operator['name']}",
+                    meta={"operator_qr_payload": offline_operator["raw_payload"], "pending_server_validation": True},
+                )
+            elif res is not None and res.kind == "OPERATOR":
+                self.status.setText("Invalid operator QR: badge is not registered as Operator.")
+                self._show_invalid_overlay("Operator badge is not registered on server.")
+                return
+        elif res is not None and res.kind == "OPERATOR":
+            # Reject legacy/static operator QR unless it exists in the server profile data with Operator role.
+            self.status.setText("Invalid operator QR: badge is not registered as Operator.")
+            self._show_invalid_overlay("Operator badge is not registered on server.")
+            return
         if res is None and str(s.reject_multiplier_input or "").strip() and raw_l != "backspace" and not (raw_l.startswith("num_") and raw_l[-1:].isdigit()):
             self._clear_reject_multiplier()
             self._refresh_ui()
@@ -14219,7 +14554,15 @@ QWidget#ClientUIRoot {{
         if res.kind != "VOID_TRIGGER" and not suppress_scan_log:
             self.log_last(self._scan_display_text(res, raw_s))
 
-        if s.waiting_color_change_job_scan and res.kind not in ("JOB", "JOB_STUB", "COLOR_CHANGE_TRIGGER"):
+        if s.waiting_color_change_job_scan and res.kind == "COLOR_CHANGE_TRIGGER":
+            s.waiting_color_change_job_scan = False
+            s.pending_color_change_reason = ""
+            self.status.setText("Change color/mold cancelled. Continue current job.")
+            self._refresh_ui()
+            self._save_active_session_snapshot()
+            return
+
+        if s.waiting_color_change_job_scan and res.kind not in ("JOB", "JOB_STUB"):
             mode_label = "MOLD CHANGE" if str(s.pending_color_change_reason or "").upper() == "MOLD_CHANGE" else "COLOR CHANGE"
             self.status.setText(f"{mode_label} mode active. Scan NEW JOB QR now.")
             self._show_invalid_overlay("Scan the new JOB QR to continue.")
@@ -14453,9 +14796,14 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Invalid PACK QR: duplicate index and lot.")
                     self._show_invalid_overlay("PACK QR index and lot number already scanned.")
                     return
+                if pack_key and self._pack_qr_was_used_permanently(pack_key):
+                    self.status.setText("Invalid PACK QR: label was already used.")
+                    self._show_invalid_overlay("PACK QR was already scanned before.")
+                    return
                 s.product_pack_history_logs.append(pack_hist)
                 if pack_key:
                     s.product_pack_history_keys.add(pack_key)
+                    self._mark_pack_qr_used_permanently(pack_key, pack_hist)
             s.pack_count += 1
             carried_qty = int(s.butal_completion_carried_qty or 0)
             new_qty = int(s.butal_completion_new_qty or 0)
@@ -14926,10 +15274,24 @@ QWidget#ClientUIRoot {{
                     return
                 new_job_code = str(job_data.get("job_code") or "").strip()
                 if self._normalize_job_code(new_job_code) == self._normalize_job_code(s.job_code):
-                    self.status.setText("Change cancelled: this job is already active.")
-                    self._show_invalid_overlay("This QR is for the current job. Scan a different JOB QR.")
+                    s.waiting_color_change_job_scan = False
+                    s.pending_color_change_reason = ""
+                    self.status.setText("Change cancelled. Continuing current job.")
+                    self._refresh_ui()
+                    self._save_active_session_snapshot()
                     return
                 reason_key = str(s.pending_color_change_reason or "COLOR_CHANGE").strip().upper()
+                existing_segment = None
+                normalized_new_job = self._normalize_job_code(new_job_code)
+                for row in reversed(list(s.operator_shift_logs or [])):
+                    if not isinstance(row, dict):
+                        continue
+                    if self._normalize_job_code(row.get("job_code")) == normalized_new_job:
+                        existing_segment = row
+                        break
+                if isinstance(existing_segment, dict):
+                    self._change_color_to_existing_shift_segment(existing_segment, reason=reason_key)
+                    return
                 self._change_color_to_job(job_data, reason=reason_key)
                 return
             if s.waiting_linkage_job_scan:
@@ -15230,7 +15592,7 @@ QWidget#ClientUIRoot {{
             self.push_event({"type": "REJECT_SUMMARY_VIEW"}, "REJECT SUMMARY")
             return
 
-        if res.kind == "OPERATOR":
+        if res.kind in ("OPERATOR", "OFFLINE_OPERATOR"):
             if not s.machine_code or not s.job_code:
                 if not s.machine_code:
                     self.status.setText("Scan MACHINE QR first.")
@@ -15250,16 +15612,32 @@ QWidget#ClientUIRoot {{
                 return
             s.operator_id = res.value
             self._start_operator_shift_tracking()
+            pending_server_validation = bool(
+                res.kind == "OFFLINE_OPERATOR"
+                or (isinstance(res.meta, dict) and res.meta.get("pending_server_validation"))
+            )
             if not str(s.cycle_time_current or "").strip():
                 self._begin_initial_cycle_time_setup()
-                self.status.setText(f"Operator set: {s.operator_id}. Enter cycle time now.")
+                if pending_server_validation:
+                    self.status.setText(f"Operator saved offline: {s.operator_id}. Enter cycle time now.")
+                else:
+                    self.status.setText(f"Operator set: {s.operator_id}. Enter cycle time now.")
             else:
-                self.status.setText(f"Operator set: {s.operator_id}. Job resumed.")
+                self.status.setText(
+                    f"Operator {'saved offline' if pending_server_validation else 'set'}: {s.operator_id}. Job resumed."
+                )
             self._refresh_ui()
             self._save_active_session_snapshot()
             self.push_event(
-                {"type": "OPERATOR_SET", "shift_index": int(s.operator_shift_index or 0)},
-                f"OPERATOR {s.operator_id}",
+                {
+                    "type": "OPERATOR_SET",
+                    "shift_index": int(s.operator_shift_index or 0),
+                    "operator_qr_payload": str(
+                        (res.meta or {}).get("operator_qr_payload") if isinstance(res.meta, dict) else raw_s
+                    ).strip() or raw_s,
+                    "pending_server_validation": pending_server_validation,
+                },
+                f"OPERATOR {'OFFLINE ' if pending_server_validation else ''}{s.operator_id}",
             )
             return
 
@@ -15405,6 +15783,12 @@ QWidget#ClientUIRoot {{
                         )
                         self._show_invalid_overlay("PACK QR index and lot number already scanned.")
                         return
+                    if pack_key and self._pack_qr_was_used_permanently(pack_key):
+                        self.status.setText(
+                            f"Invalid PACK QR: index {scan_idx} and lot {scan_lot} were already used."
+                        )
+                        self._show_invalid_overlay("PACK QR was already scanned before.")
+                        return
                     pack_hist["scanned_at"] = datetime.now(timezone.utc).isoformat()
                     carryover = self._current_job_last_shift_butal(scanned_job_code or s.job_code)
                     carried_butal_qty = int(carryover.get("qty") or 0)
@@ -15427,6 +15811,7 @@ QWidget#ClientUIRoot {{
                         s.product_pack_history_logs.append(pack_hist)
                         if pack_key:
                             s.product_pack_history_keys.add(pack_key)
+                            self._mark_pack_qr_used_permanently(pack_key, pack_hist)
                         s.pack_count += 1
                         s.good_total += new_butal_qty
                         self._clear_last_shift_butal_carryover(scanned_job_code or s.job_code)
@@ -15457,6 +15842,7 @@ QWidget#ClientUIRoot {{
                     s.product_pack_history_logs.append(pack_hist)
                     if pack_key:
                         s.product_pack_history_keys.add(pack_key)
+                        self._mark_pack_qr_used_permanently(pack_key, pack_hist)
                 carryover = self._current_job_last_shift_butal(scanned_job_code or s.job_code)
                 carried_butal_qty = int(carryover.get("qty") or 0)
                 if carried_butal_qty > 0:
@@ -15601,7 +15987,8 @@ QWidget#ClientUIRoot {{
             "event": {"type": "SESSION_SYNC", "session_snapshot": snapshot},
             "last_event": note,
         }
-        self._enqueue_server_event(payload, silent=True)
+        if not self._enqueue_server_event(payload, silent=True):
+            self._server_recovery_snapshot_queued = False
 
     def sync_local_finish_shifts_to_server(self, force: bool = False):
         rows = [row for row in _load_finish_shift_json() if isinstance(row, dict)]
@@ -15769,6 +16156,7 @@ QWidget#ClientUIRoot {{
                 if bool(getattr(self, "_server_was_offline", False)):
                     self._server_was_offline = False
                     self._enqueue_reconnect_session_snapshot_sync()
+                    self._load_persisted_server_events()
                 event_type = self._server_event_type_from_item(item)
                 event_payload = item.get("payload") if isinstance(item, dict) else {}
                 event_body = event_payload.get("event") if isinstance(event_payload, dict) else {}
@@ -15786,6 +16174,7 @@ QWidget#ClientUIRoot {{
 
     def _enqueue_server_event(self, payload: Dict[str, Any], *, silent: bool) -> bool:
         item = self._normalize_server_event_item({"payload": payload, "silent": bool(silent)}, silent=silent)
+        persistent = self._should_persist_server_event(item)
         self._persist_server_event_item(item)
         while not self._event_worker_stop.is_set():
             try:
@@ -15793,7 +16182,17 @@ QWidget#ClientUIRoot {{
                 return True
             except queue.Full:
                 if silent:
-                    QTimer.singleShot(5000, self._load_persisted_server_events)
+                    # Silent events include reconnect/session recovery syncs. If the
+                    # queue is full of retrying heartbeats, make room; persisted
+                    # dropped events remain on disk and will be retried.
+                    if persistent:
+                        try:
+                            self._event_queue.get_nowait()
+                        except queue.Empty:
+                            return False
+                        else:
+                            self._event_queue.task_done()
+                            continue
                     return False
                 try:
                     dropped = self._event_queue.get_nowait()

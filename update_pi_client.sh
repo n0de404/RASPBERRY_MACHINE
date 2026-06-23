@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_URL="${MACHINE_SERVER_URL:-}"
 SCANNER_PORT="${MACHINE_SCANNER_COM_PORT:-}"
+SCANNER_MODE="${MACHINE_SCANNER_MODE:-}"
 DO_PULL=0
 DO_START=1
 DO_INSTALL_LAUNCHER=1
@@ -19,6 +20,7 @@ Options:
   --pull                 Run git pull before rebuilding
   --server-url URL       Update shortcut/autostart launcher server URL
   --scanner-port PATH    Update shortcut/autostart scanner port
+  --scanner-mode MODE    Update shortcut/autostart scanner mode: serial, keyboard, or auto
   --no-start             Rebuild only; do not start the client after build
   --no-launcher-install  Do not refresh desktop/autostart launcher
   -h, --help             Show this help
@@ -42,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --scanner-port)
       SCANNER_PORT="${2:?Missing value for --scanner-port}"
+      shift 2
+      ;;
+    --scanner-mode)
+      SCANNER_MODE="${2:?Missing value for --scanner-mode}"
       shift 2
       ;;
     --no-start)
@@ -112,6 +118,9 @@ if [[ "$DO_INSTALL_LAUNCHER" -eq 1 && -x "$PROJECT_DIR/install_pi_client_autosta
   fi
   if [[ -n "$SCANNER_PORT" ]]; then
     install_args+=(--scanner-port "$SCANNER_PORT")
+  fi
+  if [[ -n "$SCANNER_MODE" ]]; then
+    install_args+=(--scanner-mode "$SCANNER_MODE")
   fi
   "$PROJECT_DIR/install_pi_client_autostart.sh" "${install_args[@]}"
 fi

@@ -1059,6 +1059,10 @@ class MachineSession:
     product_name: str = ""
     job_started_at: Optional[str] = None
     operator_id: Optional[str] = None
+    # Keep the original badge payload for operator scans accepted by a client
+    # while it was offline.  The display/operator_id is derived from it, but
+    # this provides an auditable, lossless record after the queue is replayed.
+    operator_qr_payload: Optional[str] = None
     pack_total: int = 0
     good_total: int = 0
     butal_total: int = 0
@@ -1121,7 +1125,7 @@ class MachineSession:
         return d
 
 
-def _reset_active_session_for_new_job_segment(sess: MachineSession) -> None:
+def _reset_active_session_for_new_job_segment(sess: MachineSession, preserve_operator_shift_logs: bool = False) -> None:
     sess.product_id = ""
     sess.product_sku = ""
     sess.product_name = ""
@@ -1161,8 +1165,34 @@ def _reset_active_session_for_new_job_segment(sess: MachineSession) -> None:
     sess.supervisor_name = None
     sess.linkage_enabled = False
     sess.linkage_jobs = []
-    sess.operator_shift_logs = []
+    if not preserve_operator_shift_logs:
+        sess.operator_shift_logs = []
     sess.butal_by_job = {}
+
+
+def _clear_active_session_job_keep_machine(sess: MachineSession) -> None:
+    sess.job_code = None
+    sess.job_name = None
+    sess.product_id = ""
+    sess.product_sku = ""
+    sess.product_name = ""
+    sess.job_started_at = None
+    sess.operator_id = None
+    sess.job_payload = {}
+    _reset_active_session_for_new_job_segment(sess, preserve_operator_shift_logs=False)
+    sess.last_event = "NO JOB RUNNING"
+
+
+def _active_shift_segment_key(row: Dict[str, Any], fallback_session: Optional[MachineSession] = None) -> str:
+    if not isinstance(row, dict):
+        return ""
+    job_key = str(row.get("job_code") or row.get("job_name") or "").strip().upper()
+    return "|".join([
+        str(row.get("client_id") or getattr(fallback_session, "client_id", "") or "").strip(),
+        str(row.get("machine_code") or getattr(fallback_session, "machine_code", "") or "").strip(),
+        str(row.get("operator_id") or getattr(fallback_session, "operator_id", "") or "").strip(),
+        job_key,
+    ])
 
 
 def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSession]:
@@ -1183,6 +1213,7 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         product_name=str(raw.get("product_name") or "").strip(),
         job_started_at=str(raw.get("job_started_at") or "").strip() or None,
         operator_id=str(raw.get("operator_id") or "").strip() or None,
+        operator_qr_payload=str(raw.get("operator_qr_payload") or "").strip() or None,
         pack_total=int(raw.get("pack_total", raw.get("pack_count", 0)) or 0),
         good_total=int(raw.get("good_total", 0) or 0),
         butal_total=int(raw.get("butal_total", 0) or 0),
@@ -2020,7 +2051,6 @@ def _operator_activity_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_operator_activity_directory() -> List[Dict[str, Any]]:
-    operators = [p for p in PROFILES if isinstance(p, dict) and str(p.get("role") or "").strip().casefold() == "operator"]
     items = [_operator_activity_summary(p) for p in operators]
     items.sort(key=lambda row: str(row.get("name") or "").casefold())
     items.sort(key=lambda row: _parse_iso_utc(row.get("last_activity_at_utc")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
@@ -4002,6 +4032,18 @@ DASHBOARD_HTML = """
     .machine-detail-item .v { font-size: .92rem; font-weight: 600; color: #0f172a; overflow-wrap: anywhere; }
     .machine-detail-section { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px; }
     .machine-detail-section h4 { margin: 0 0 10px; color: #0f172a; font-size: .98rem; }
+    .shift-job-tabs { background:#fff; border:1px solid #dbe4f0; border-radius:12px; overflow:hidden; }
+    .shift-job-tabs-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:11px 12px; border-bottom:1px solid #e5edf5; background:#f8fafc; }
+    .shift-job-tabs-title { font-size:.92rem; font-weight:900; color:#0f172a; }
+    .shift-job-tabs-meta { font-size:.76rem; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:.04em; }
+    .shift-job-tabbar { display:flex; gap:7px; padding:10px 12px; overflow-x:auto; border-bottom:1px solid #edf2f7; }
+    .shift-job-tab-button { flex:0 0 auto; border:1px solid #cbd5e1; border-radius:999px; background:#fff; color:#334155; padding:7px 11px; font-size:.78rem; font-weight:900; cursor:pointer; max-width:220px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .shift-job-tab-button.active { background:#1d4ed8; border-color:#1d4ed8; color:#fff; }
+    .shift-job-tab-panel { display:none; padding:12px; }
+    .shift-job-tab-panel.active { display:grid; gap:10px; }
+    .shift-job-summary-line { display:flex; flex-wrap:wrap; gap:7px; }
+    .shift-job-pill { display:inline-flex; align-items:center; border:1px solid #dbe4f0; border-radius:999px; background:#f8fafc; color:#475569; padding:4px 8px; font-size:.72rem; font-weight:800; }
+    .shift-job-pill.change { border-color:#fdba74; background:#fff7ed; color:#9a3412; }
     .machine-detail-code { font-family: "Consolas","Courier New",monospace; font-size: .82rem; white-space: pre-wrap; overflow-wrap: anywhere; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px; max-height: 220px; overflow: auto; }
     .machine-detail-list { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
     .machine-detail-list li { font-size: .88rem; color: #1f2937; }
@@ -5133,6 +5175,182 @@ DASHBOARD_HTML = """
     return item.job_code ? `Job ${item.job_code}` : "-";
   }
 
+  function shiftReasonLabel(reason){
+    const key = String(reason || "").trim().toUpperCase();
+    if(key === "COLOR_CHANGE") return "Color Change";
+    if(key === "MOLD_CHANGE") return "Mold Change";
+    if(key === "JOB_FINISH") return "Finish Shift";
+    if(key === "QR_SHIFT_HANDOFF") return "Shift Handoff";
+    if(key === "CURRENT") return "Current Job";
+    return key ? key.replaceAll("_", " ").toLowerCase().split(" ").map(part => part ? part.charAt(0).toUpperCase() + part.slice(1) : part).join(" ") : "Shift Segment";
+  }
+
+  function operatorShiftJobRows(session){
+    const logs = Array.isArray(session?.operator_shift_logs) ? session.operator_shift_logs : [];
+    const rows = [];
+    const indexByKey = new Map();
+    logs
+      .filter(x => x && typeof x === "object")
+      .forEach(x => {
+        const jobKey = String(x.job_code || x.job_name || "").trim().toUpperCase();
+        const key = [
+          String(x.client_id || session?.client_id || "").trim(),
+          String(x.machine_code || session?.machine_code || "").trim(),
+          String(x.operator_id || session?.operator_id || "").trim(),
+          jobKey,
+        ].join("|");
+        const row = {...x, _is_current_segment: false};
+        if(key && indexByKey.has(key)){
+          rows[indexByKey.get(key)] = row;
+          return;
+        }
+        if(key) indexByKey.set(key, rows.length);
+        rows.push(row);
+      });
+    if(rows.length && (String(session?.job_code || "").trim() || String(session?.job_name || "").trim())){
+      const currentJobKey = String(session.job_code || session.job_name || "").trim().toUpperCase();
+      const currentKey = [
+        String(session.client_id || "").trim(),
+        String(session.machine_code || "").trim(),
+        String(session.operator_id || "").trim(),
+        currentJobKey,
+      ].join("|");
+      const currentRow = {
+        _is_current_segment: true,
+        reason: "CURRENT",
+        started_at_utc: session.operator_shift_started_at || session.job_started_at || "",
+        ended_at_utc: "",
+        machine_code: session.machine_code || "",
+        machine_name: session.machine_name || "",
+        client_id: session.client_id || "",
+        job_code: session.job_code || "",
+        job_name: session.job_name || "",
+        product_id: session.product_id || "",
+        product_sku: session.product_sku || "",
+        product_name: session.product_name || "",
+        operator_id: session.operator_id || "",
+        pack_count: Number(session.pack_total || 0),
+        good_total: Number(session.good_total || 0),
+        butal_total: Number(session.butal_total || 0),
+        reject_total: Number(session.reject_total || 0),
+        no_shot_total: Number(session.no_shot_total || 0),
+        startup_reject_total: Number(session.startup_reject_total || 0),
+        raw_sacks_count: Number(session.raw_sacks_count || 0),
+        total_good: Number(session.good_total || 0) + Number(session.butal_total || 0),
+        machine_counter_start: machineCounterStartValue(session),
+        machine_counter_end: session.machine_counter_current ?? "-",
+        cycle_time_current: session.cycle_time_current || "-",
+        reject_breakdown: session.reject_breakdown || {},
+        raw_material_logs: session.raw_material_logs || [],
+        product_pack_history_logs: session.product_pack_history_logs || [],
+        job_payload: session.job_payload || {},
+      };
+      if(currentKey && indexByKey.has(currentKey)){
+        rows[indexByKey.get(currentKey)] = currentRow;
+      } else {
+        rows.push(currentRow);
+      }
+    }
+    rows.forEach((row, idx) => { row._tab_index = idx + 1; });
+    return rows;
+  }
+
+  function shiftJobTabLabel(row){
+    const index = Number(row?._tab_index || 0);
+    const prefix = row?._is_current_segment ? "Current" : `Job ${index || ""}`.trim();
+    const name = jobDisplayName(row, row?.job_name || row?.job_code || "Job");
+    return `${prefix}: ${name}`;
+  }
+
+  function shiftJobDetailHtml(row){
+    const item = row || {};
+    const job = extractJobRecord(item) || {};
+    const jobDetails = extractJobDetailsRecord(item) || {};
+    const reason = shiftReasonLabel(item.reason);
+    const isChange = ["COLOR_CHANGE", "MOLD_CHANGE"].includes(String(item.reason || "").trim().toUpperCase());
+    const rejectMap = (item.reject_breakdown && typeof item.reject_breakdown === "object") ? item.reject_breakdown : {};
+    const rejectRows = Object.entries(rejectMap)
+      .sort((a,b) => String(a[0]).localeCompare(String(b[0])))
+      .map(([reasonText, qty]) => ({reason: reasonText, qty}));
+    const rawRows = archivedMaterialRows(item);
+    const packRows = productPackHistoryRows(item);
+    return `
+      <div class="shift-job-summary-line">
+        <span class="shift-job-pill${isChange ? " change" : ""}">${esc(reason)}</span>
+        <span class="shift-job-pill">Started ${esc(fmtDateLocal(item.started_at_utc || ""))}</span>
+        <span class="shift-job-pill">Ended ${esc(item._is_current_segment ? "Running" : fmtDateLocal(item.ended_at_utc || item.finished_at_utc || ""))}</span>
+        <span class="shift-job-pill">Operator ${esc(item.operator_name || displayNameForId(item.operator_id || "-"))}</span>
+      </div>
+      <div class="machine-detail-grid">
+        ${detailItem("SKU", jobSku(item) || "-")}
+        ${detailItem("Job Name", item.job_name || "-")}
+        ${detailItem("Job Code", item.job_code || "-")}
+        ${detailItem("Product", item.product_name || job.product_name || "-")}
+        ${detailItem("Mold", jobDetails.mold || jobDetails.mold_no || job.custom_05 || "-")}
+        ${detailItem("Color", jobDetails.color || job.custom_06 || "-")}
+        ${detailItem("Machine Counter Start", item.machine_counter_start ?? "-")}
+        ${detailItem("Machine Counter End", item.machine_counter_end ?? "-")}
+        ${detailItem("Cycle Time", item.cycle_time_current || item.cycle_time_shift_avg_seconds || "-")}
+      </div>
+      <div class="archive-metric-grid">
+        ${archiveMetric("Pack", Number(item.pack_count || 0))}
+        ${archiveMetric("Good", Number(item.good_total || 0), "good")}
+        ${archiveMetric("Butal", Number(item.butal_total || 0), Number(item.butal_total || 0) > 0 ? "warn" : "")}
+        ${archiveMetric("Reject", Number(item.reject_total || 0), Number(item.reject_total || 0) > 0 ? "bad" : "")}
+        ${archiveMetric("No Shot", Number(item.no_shot_total || 0))}
+        ${archiveMetric("Startup Reject", Number(item.startup_reject_total || 0))}
+        ${archiveMetric("Total Good", Number(item.total_good ?? (Number(item.good_total || 0) + Number(item.butal_total || 0))), "good")}
+        ${archiveMetric("Raw Sacks", Number(item.raw_sacks_count || rawRows.length || 0))}
+      </div>
+      <div class="review-group-list">
+        <div class="review-group-card">
+          <div class="review-group-head">Reject Breakdown</div>
+          <div class="review-group-body">${tableFromRows(rejectRows, [
+            { label: "Reason", value: x => x.reason },
+            { label: "Qty", value: x => x.qty },
+          ], "No reject details recorded.", 8)}</div>
+        </div>
+        <div class="review-group-card">
+          <div class="review-group-head">Raw Materials</div>
+          <div class="review-group-body">${tableFromRows(rawRows, [
+            { label: "#", value: x => x.index },
+            { label: "Material", value: x => x.material },
+            { label: "Qty", value: x => x.qty },
+            { label: "Lot", value: x => x.lot },
+          ], "No raw materials scanned for this job.", 8)}</div>
+        </div>
+        <div class="review-group-card wide">
+          <div class="review-group-head">Pack History</div>
+          <div class="review-group-body">${tableFromRows(packRows, [
+            { label: "#", value: x => x.index },
+            { label: "Source", value: x => x.source },
+            { label: "Qty", value: x => x.qty },
+            { label: "Scanned At", value: x => fmtDateLocal(x.time || "") },
+          ], "No pack QR scans for this job.", 8)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function operatorShiftTabsHtml(session){
+    const rows = operatorShiftJobRows(session);
+    if(!rows.length) return "";
+    const activeIdx = rows.length - 1;
+    const groupId = `shiftJobs-${String(session?.machine_code || "machine").replace(/[^A-Za-z0-9_-]/g, "") || "machine"}`;
+    return `
+      <div class="shift-job-tabs" data-shift-tabs="${esc(groupId)}">
+        <div class="shift-job-tabs-head">
+          <div class="shift-job-tabs-title">Jobs This Shift</div>
+          <div class="shift-job-tabs-meta">${esc(rows.length)} tab${rows.length === 1 ? "" : "s"}</div>
+        </div>
+        <div class="shift-job-tabbar">
+          ${rows.map((row, idx) => `<button type="button" class="shift-job-tab-button${idx === activeIdx ? " active" : ""}" data-shift-tab="${esc(groupId)}-${idx}">${esc(shiftJobTabLabel(row))}</button>`).join("")}
+        </div>
+        ${rows.map((row, idx) => `<div class="shift-job-tab-panel${idx === activeIdx ? " active" : ""}" data-shift-panel="${esc(groupId)}-${idx}">${shiftJobDetailHtml(row)}</div>`).join("")}
+      </div>
+    `;
+  }
+
   function detailItem(label, value){
     return `<div class="machine-detail-item"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
   }
@@ -5487,6 +5705,7 @@ DASHBOARD_HTML = """
       .map(([reason, qty]) => ({reason, qty}));
     const materialRows = archivedMaterialRows(session);
     const packHistoryRows = productPackHistoryRows(session);
+    const shiftJobRows = operatorShiftJobRows(session);
     const scannedRawQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
     const part = primaryRawPart(row);
     const perUnit = Number(part.part_qty_per_unit || 0);
@@ -5637,6 +5856,7 @@ DASHBOARD_HTML = """
     const rawLogs = Array.isArray(session.raw_material_logs) ? session.raw_material_logs : [];
     const materialRows = archivedMaterialRows(session);
     const packHistoryRows = productPackHistoryRows(session);
+    const shiftJobRows = operatorShiftJobRows(session);
     const scannedRawQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
     const activeJobSummaryHtml = session.job_code || session.job_name ? `
       <div class="archive-detail-hero">
@@ -5646,6 +5866,7 @@ DASHBOARD_HTML = """
           <div class="archive-pill-row">
             <span class="archive-pill">${esc(status)}</span>
             <span class="archive-pill">Operator ${esc(displayNameForId(session.operator_id || "-"))}</span>
+            ${shiftJobRows.length > 1 ? `<span class="archive-pill">${esc(shiftJobRows.length)} jobs in shift</span>` : ""}
             <span class="archive-pill">Raw Bags ${esc(session.raw_sacks_count || materialRows.length || 0)}</span>
           </div>
         </div>
@@ -5677,6 +5898,7 @@ DASHBOARD_HTML = """
     if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
     machineDetailBody.innerHTML = `
       ${activeJobSummaryHtml}
+      ${operatorShiftTabsHtml(session)}
       <div class="machine-detail-section">
         <h4>Overview</h4>
         <div class="machine-detail-grid">
@@ -5774,6 +5996,18 @@ DASHBOARD_HTML = """
     if(machineStatusSaveCheck) machineStatusSaveCheck.classList.remove("done");
     if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "";
   }
+
+  document.addEventListener("click", (ev) => {
+    const btn = ev.target && ev.target.closest ? ev.target.closest(".shift-job-tab-button") : null;
+    if(!btn) return;
+    const host = btn.closest(".shift-job-tabs");
+    if(!host) return;
+    const target = btn.dataset.shiftTab || "";
+    host.querySelectorAll(".shift-job-tab-button").forEach(x => x.classList.toggle("active", x === btn));
+    host.querySelectorAll(".shift-job-tab-panel").forEach(panel => {
+      panel.classList.toggle("active", panel.dataset.shiftPanel === target);
+    });
+  });
 
   function applyDashboardTheme(themeName){
     const t = String(themeName || "Default").trim() || "Default";
@@ -9646,6 +9880,10 @@ async def api_event(req: Request):
     # apply event counters if provided
     ev = data.get("event") or {}
     ev_type = str(ev.get("type", "")).upper()
+    if ev_type == "OPERATOR_SET":
+        raw_operator_qr = str(ev.get("operator_qr_payload") or "").strip()
+        if raw_operator_qr:
+            sess.operator_qr_payload = raw_operator_qr
     if ev_type == "FINISH_SHIFT":
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
@@ -9661,6 +9899,20 @@ async def api_event(req: Request):
                 save_finished_jobs(FINISHED_JOBS)
             except Exception as e:
                 return JSONResponse({"ok": False, "error": str(e)}, status_code=503)
+            finished_segment_key = _active_shift_segment_key(finished_job, sess)
+            if finished_segment_key:
+                sess.operator_shift_logs = [
+                    row for row in (sess.operator_shift_logs or [])
+                    if not (isinstance(row, dict) and _active_shift_segment_key(row, sess) == finished_segment_key)
+                ]
+            current_segment_key = _active_shift_segment_key({
+                "client_id": sess.client_id,
+                "machine_code": sess.machine_code,
+                "job_code": sess.job_code,
+                "operator_id": sess.operator_id,
+            }, sess)
+            if finished_segment_key and finished_segment_key == current_segment_key and not (sess.operator_shift_logs or []):
+                _clear_active_session_job_keep_machine(sess)
     elif ev_type == "FINISH_JOB":
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
@@ -9707,7 +9959,7 @@ async def api_event(req: Request):
             rows.append({"job_code": linked_code, "job_name": linked_name})
             sess.linkage_jobs = rows
     elif ev_type in ("JOB_SET", "JOB_STUB_SET", "COLOR_CHANGE_JOB_SET"):
-        _reset_active_session_for_new_job_segment(sess)
+        _reset_active_session_for_new_job_segment(sess, preserve_operator_shift_logs=(ev_type == "COLOR_CHANGE_JOB_SET"))
         job_payload = ev.get("job_payload") or ev.get("stub")
         if isinstance(job_payload, dict):
             sess.job_payload = dict(job_payload or {})
@@ -9716,8 +9968,21 @@ async def api_event(req: Request):
         shift_payload = ev.get("operator_shift")
         if isinstance(shift_payload, dict):
             rows = list(sess.operator_shift_logs or [])
+            key = _active_shift_segment_key(shift_payload, sess)
+            rows = [
+                row for row in rows
+                if not (
+                    isinstance(row, dict)
+                    and key
+                    and _active_shift_segment_key(row, sess) == key
+                )
+            ]
             rows.append(shift_payload)
             sess.operator_shift_logs = rows[-40:]
+    elif ev_type == "MACHINE_STATUS":
+        status = str(ev.get("status") or "").strip().upper()
+        if status == "NO_JOB_RUNNING":
+            _clear_active_session_job_keep_machine(sess)
     elif ev_type in ("SESSION_SYNC", "HEARTBEAT"):
         snap = ev.get("session_snapshot")
         if isinstance(snap, dict):

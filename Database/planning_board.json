@@ -3,55 +3,6 @@
     "BACKLOG": [],
     "M00001": [
       {
-        "id": "low-stock-1780552269249-f4af8c648525",
-        "job_id": "",
-        "job_ref": "-H-002-BLUE",
-        "job_name": "-H-002-BLUE",
-        "product_id": "25",
-        "product_name": "Goblet Crate - 25 Goblets Blue",
-        "product_sku": "-H-002-BLUE",
-        "tonnage": "",
-        "request_qty": "",
-        "source": "LOW STOCK",
-        "low_stock_total": 0,
-        "low_stock_unit": "",
-        "low_stock_qty_source": "stock",
-        "low_stock_threshold": 100,
-        "warehouses": [
-          {
-            "warehouse_id": "3",
-            "warehouse_name": "Dock 1",
-            "qty": 0,
-            "unit": ""
-          },
-          {
-            "warehouse_id": "5",
-            "warehouse_name": "Dock 2",
-            "qty": 0,
-            "unit": ""
-          },
-          {
-            "warehouse_id": "14",
-            "warehouse_name": "Dock 3",
-            "qty": 0,
-            "unit": ""
-          },
-          {
-            "warehouse_id": "18",
-            "warehouse_name": "C5",
-            "qty": 0,
-            "unit": ""
-          },
-          {
-            "warehouse_id": "2",
-            "warehouse_name": "6116",
-            "qty": 0,
-            "unit": ""
-          }
-        ],
-        "created_at_utc": "2026-06-04T05:51:09.249Z"
-      },
-      {
         "id": "low-stock-1780552294615-b6f70089183bd8",
         "job_id": "",
         "job_ref": "870-MOCHA",
@@ -246,9 +197,7 @@
           }
         ],
         "created_at_utc": "2026-06-04T05:51:37.798Z"
-      }
-    ],
-    "M00002": [
+      },
       {
         "id": "low-stock-1780552292399-6b32bf9d572b08",
         "job_id": "",
@@ -297,8 +246,58 @@
           }
         ],
         "created_at_utc": "2026-06-04T05:51:32.399Z"
+      },
+      {
+        "id": "low-stock-1780552269249-f4af8c648525",
+        "job_id": "",
+        "job_ref": "-H-002-BLUE",
+        "job_name": "-H-002-BLUE",
+        "product_id": "25",
+        "product_name": "Goblet Crate - 25 Goblets Blue",
+        "product_sku": "-H-002-BLUE",
+        "tonnage": "",
+        "request_qty": "",
+        "source": "LOW STOCK",
+        "low_stock_total": 0,
+        "low_stock_unit": "",
+        "low_stock_qty_source": "stock",
+        "low_stock_threshold": 100,
+        "warehouses": [
+          {
+            "warehouse_id": "3",
+            "warehouse_name": "Dock 1",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "5",
+            "warehouse_name": "Dock 2",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "14",
+            "warehouse_name": "Dock 3",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "18",
+            "warehouse_name": "C5",
+            "qty": 0,
+            "unit": ""
+          },
+          {
+            "warehouse_id": "2",
+            "warehouse_name": "6116",
+            "qty": 0,
+            "unit": ""
+          }
+        ],
+        "created_at_utc": "2026-06-04T05:51:09.249Z"
       }
     ],
+    "M00002": [],
     "M00003": [],
     "M00004": [],
     "M00005": [],
@@ -319,5 +318,5 @@
     "M00020": [],
     "M00021": []
   },
-  "updated_at_utc": "2026-06-04T05:51:38.711421+00:00"
+  "updated_at_utc": "2026-06-23T00:52:09.558819+00:00"
 }
