@@ -1063,6 +1063,12 @@ class MachineSession:
     # while it was offline.  The display/operator_id is derived from it, but
     # this provides an auditable, lossless record after the queue is replayed.
     operator_qr_payload: Optional[str] = None
+    external_average_weight_grams: Optional[float] = None
+    external_average_weight_unit: Optional[str] = None
+    external_average_weight_received_at: Optional[str] = None
+    external_average_weight_sent_at: Optional[str] = None
+    external_average_weight_source: Optional[str] = None
+    external_average_weight_sender: Optional[str] = None
     pack_total: int = 0
     good_total: int = 0
     butal_total: int = 0
@@ -1201,6 +1207,12 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
     machine_code = str(raw.get("machine_code") or "").strip()
     if not machine_code:
         return None
+    external_weight = None
+    try:
+        raw_external_weight = raw.get("external_average_weight_grams")
+        external_weight = float(raw_external_weight) if raw_external_weight not in (None, "") else None
+    except Exception:
+        external_weight = None
     last_seen_utc = str(raw.get("last_seen_utc") or raw.get("saved_at_utc") or "").strip()
     return MachineSession(
         client_id=str(raw.get("client_id") or "SNAPSHOT").strip() or "SNAPSHOT",
@@ -1214,6 +1226,12 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         job_started_at=str(raw.get("job_started_at") or "").strip() or None,
         operator_id=str(raw.get("operator_id") or "").strip() or None,
         operator_qr_payload=str(raw.get("operator_qr_payload") or "").strip() or None,
+        external_average_weight_grams=external_weight,
+        external_average_weight_unit=str(raw.get("external_average_weight_unit") or "").strip() or None,
+        external_average_weight_received_at=str(raw.get("external_average_weight_received_at") or "").strip() or None,
+        external_average_weight_sent_at=str(raw.get("external_average_weight_sent_at") or "").strip() or None,
+        external_average_weight_source=str(raw.get("external_average_weight_source") or "").strip() or None,
+        external_average_weight_sender=str(raw.get("external_average_weight_sender") or "").strip() or None,
         pack_total=int(raw.get("pack_total", raw.get("pack_count", 0)) or 0),
         good_total=int(raw.get("good_total", 0) or 0),
         butal_total=int(raw.get("butal_total", 0) or 0),
@@ -2056,6 +2074,222 @@ def build_operator_activity_directory() -> List[Dict[str, Any]]:
     items.sort(key=lambda row: _parse_iso_utc(row.get("last_activity_at_utc")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     items.sort(key=lambda row: 0 if row.get("is_active") else 1)
     return items
+
+
+def _profile_identity(profile: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "id_number": str((profile or {}).get("id_number") or "").strip(),
+        "name": str((profile or {}).get("name") or "").strip(),
+        "role": str((profile or {}).get("role") or (profile or {}).get("company_role") or "").strip(),
+    }
+
+
+def _profile_matches_person_value(value: Any, profile: Dict[str, Any]) -> bool:
+    raw = str(value or "").strip()
+    if not raw or not isinstance(profile, dict):
+        return False
+    ident = _profile_identity(profile)
+    profile_id = ident["id_number"]
+    profile_name = ident["name"].casefold()
+    code_part = raw.split(" - ", 1)[0].strip()
+    name_part = raw.split(" - ", 1)[1].strip().casefold() if " - " in raw else ""
+    if profile_id and (raw == profile_id or code_part == profile_id):
+        return True
+    if profile_name and (raw.casefold() == profile_name or name_part == profile_name):
+        return True
+    return False
+
+
+def _profile_has_role(profile: Dict[str, Any], role: str) -> bool:
+    target = str(role or "").strip().casefold()
+    if not target:
+        return False
+    company_role = _normalize_company_role((profile or {}).get("company_role") or (profile or {}).get("role") or "")
+    extra = str((profile or {}).get("extra_privilege") or "").strip().casefold()
+    role_text = str((profile or {}).get("role") or "").strip().casefold()
+    return target in {company_role, extra, role_text}
+
+
+def _row_label(row: Dict[str, Any]) -> str:
+    machine = str((row or {}).get("machine_name") or (row or {}).get("machine_code") or "-").strip()
+    job = str((row or {}).get("job_name") or (row or {}).get("job_code") or "-").strip()
+    return f"{machine} / {job}"
+
+
+def _count_voided(rows: Any) -> int:
+    if not isinstance(rows, list):
+        return 0
+    return len([r for r in rows if isinstance(r, dict) and bool(r.get("voided"))])
+
+
+def _reject_scan_count(row: Dict[str, Any]) -> int:
+    logs = row.get("reject_review_logs") if isinstance(row.get("reject_review_logs"), list) else []
+    count = 0
+    for item in logs:
+        if not isinstance(item, dict):
+            continue
+        entry_type = str(item.get("entry_type") or item.get("type") or "").strip().upper()
+        if entry_type in ("REJECT_SCAN", "STARTUP_REJECT_SCAN") or item.get("reason_code") or item.get("reason"):
+            count += 1
+    return count
+
+
+def _kpi_issue(issue_type: str, row: Dict[str, Any], detail: str) -> Dict[str, Any]:
+    return {
+        "type": issue_type,
+        "detail": detail,
+        "machine_code": row.get("machine_code", ""),
+        "machine_name": row.get("machine_name", ""),
+        "job_code": row.get("job_code", ""),
+        "job_name": row.get("job_name", ""),
+        "at_utc": row.get("finished_at_utc") or row.get("ended_at_utc") or row.get("last_seen_utc") or "",
+    }
+
+
+def _kpi_add_issue(out: Dict[str, Any], issue_type: str, row: Dict[str, Any], detail: str) -> None:
+    issues = out.setdefault("issues", [])
+    issues.append(_kpi_issue(issue_type, row, detail))
+    out.setdefault("missed_breakdown", {})
+    out["missed_breakdown"][issue_type] = int(out["missed_breakdown"].get(issue_type, 0) or 0) + 1
+
+
+def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
+    """Build conservative per-user KPIs from existing server records.
+
+    These metrics only count items visible in active/finished/archive data.  They
+    are not disciplinary proof; they identify follow-up points the system can
+    infer from missing scans, pending reviews, voided scans, and waiting states.
+    """
+    role_filter_key = str(role_filter or "all").strip().casefold()
+    history_rows = [r for r in [*FINISHED_JOBS, *ARCHIVED_JOBS] if isinstance(r, dict)]
+    active_rows = [s.to_dict() for s in SESSIONS.values()]
+    profiles = [p for p in PROFILES if isinstance(p, dict)]
+    if role_filter_key in ("operator", "operators"):
+        profiles = [p for p in profiles if _profile_has_role(p, "operator")]
+    elif role_filter_key in ("supervisor", "supervisors"):
+        profiles = [p for p in profiles if _profile_has_role(p, "supervisor")]
+
+    unassigned_supervisor_issues: List[Dict[str, Any]] = []
+    if role_filter_key not in ("operator", "operators"):
+        for row in history_rows:
+            review_status = str(row.get("review_status") or "").strip().upper()
+            has_rejects = int(row.get("reject_total", 0) or 0) + int(row.get("startup_reject_total", 0) or 0) + int(row.get("no_shot_total", 0) or 0) > 0
+            has_supervisor_owner = any(
+                str(row.get(field) or "").strip()
+                for field in ("approved_by", "approved_by_code", "supervisor_name")
+            )
+            if review_status and review_status != "APPROVED" and not has_supervisor_owner:
+                unassigned_supervisor_issues.append(
+                    _kpi_issue("unassigned_pending_shift_approval", row, f"Shift still has review status {review_status} for {_row_label(row)}, but no supervisor is assigned yet.")
+                )
+            if has_rejects and not has_supervisor_owner:
+                unassigned_supervisor_issues.append(
+                    _kpi_issue("unassigned_supervisor_reject_review", row, f"Rejects exist for {_row_label(row)}, but no supervisor/approval is recorded yet.")
+                )
+        for row in active_rows:
+            if bool(row.get("waiting_supervisor_qr")) and not str(row.get("supervisor_name") or "").strip():
+                unassigned_supervisor_issues.append(
+                    _kpi_issue("unassigned_waiting_supervisor", row, f"{_row_label(row)} is currently waiting for supervisor QR.")
+                )
+
+    items: List[Dict[str, Any]] = []
+    for profile in profiles:
+        ident = _profile_identity(profile)
+        is_operator = _profile_has_role(profile, "operator")
+        is_supervisor = _profile_has_role(profile, "supervisor")
+        user_rows = [
+            row for row in history_rows
+            if _operator_record_matches_profile(row.get("operator_id"), profile)
+        ]
+        active_user_rows = [
+            row for row in active_rows
+            if _operator_record_matches_profile(row.get("operator_id"), profile)
+        ]
+        approved_rows = [
+            row for row in history_rows
+            if _profile_matches_person_value(row.get("approved_by_code"), profile)
+            or _profile_matches_person_value(row.get("approved_by"), profile)
+            or _profile_matches_person_value(row.get("supervisor_name"), profile)
+        ]
+        active_supervisor_rows = [
+            row for row in active_rows
+            if _profile_matches_person_value(row.get("supervisor_name"), profile)
+        ]
+
+        out: Dict[str, Any] = {
+            "id_number": ident["id_number"],
+            "name": ident["name"],
+            "role": ident["role"],
+            "is_operator": is_operator,
+            "is_supervisor": is_supervisor,
+            "handled_records": len(user_rows),
+            "active_records": len(active_user_rows),
+            "approved_records": len(approved_rows),
+            "raw_material_scans": 0,
+            "pack_qr_scans": 0,
+            "reject_scans": 0,
+            "wrong_or_voided_scans": 0,
+            "missed_total": 0,
+            "missed_breakdown": {},
+            "issues": [],
+        }
+
+        if is_operator:
+            for row in user_rows:
+                raw_logs = row.get("raw_material_logs") if isinstance(row.get("raw_material_logs"), list) else []
+                pack_logs = row.get("product_pack_history_logs") if isinstance(row.get("product_pack_history_logs"), list) else []
+                reject_total = int(row.get("reject_total", 0) or 0) + int(row.get("startup_reject_total", 0) or 0) + int(row.get("no_shot_total", 0) or 0)
+                pack_count = int(row.get("pack_count", row.get("pack_total", 0)) or 0)
+                out["raw_material_scans"] += len(raw_logs)
+                out["pack_qr_scans"] += len(pack_logs)
+                out["reject_scans"] += _reject_scan_count(row)
+                out["wrong_or_voided_scans"] += _count_voided(pack_logs) + _count_voided(row.get("butal_scan_logs"))
+                if not raw_logs:
+                    _kpi_add_issue(out, "missing_raw_material_scan", row, f"No raw material scan recorded for {_row_label(row)}.")
+                if pack_count > 0 and not pack_logs:
+                    _kpi_add_issue(out, "missing_pack_qr_scan", row, f"Pack count exists but no pack QR history for {_row_label(row)}.")
+                if reject_total > 0 and _reject_scan_count(row) <= 0:
+                    _kpi_add_issue(out, "missing_reject_scan_review", row, f"Reject totals exist but no reject scan/review log for {_row_label(row)}.")
+
+        if is_supervisor:
+            for row in history_rows:
+                review_status = str(row.get("review_status") or "").strip().upper()
+                has_rejects = int(row.get("reject_total", 0) or 0) + int(row.get("startup_reject_total", 0) or 0) + int(row.get("no_shot_total", 0) or 0) > 0
+                supervisor_matches = (
+                    _profile_matches_person_value(row.get("approved_by_code"), profile)
+                    or _profile_matches_person_value(row.get("approved_by"), profile)
+                    or _profile_matches_person_value(row.get("supervisor_name"), profile)
+                )
+                if not supervisor_matches:
+                    continue
+                if review_status and review_status != "APPROVED":
+                    _kpi_add_issue(out, "pending_shift_approval", row, f"Shift still has review status {review_status} for {_row_label(row)}.")
+                if has_rejects and not row.get("approved_by") and not row.get("supervisor_name"):
+                    _kpi_add_issue(out, "missing_supervisor_reject_review", row, f"Rejects exist but no supervisor/approval recorded for {_row_label(row)}.")
+            for row in active_rows:
+                if bool(row.get("waiting_supervisor_qr")) and _profile_matches_person_value(row.get("supervisor_name"), profile):
+                    _kpi_add_issue(out, "active_waiting_supervisor", row, f"{_row_label(row)} is currently waiting for supervisor QR.")
+            out["active_supervisor_records"] = len(active_supervisor_rows)
+
+        out["missed_total"] = len(out.get("issues") or [])
+        denominator = max(1, out["handled_records"] + out["approved_records"] + out["active_records"] + int(out.get("active_supervisor_records", 0) or 0))
+        out["issue_rate_percent"] = round(min(100.0, (out["missed_total"] / denominator) * 100.0), 2)
+        out["issues"] = out["issues"][:50]
+        items.append(out)
+
+    items.sort(key=lambda x: (int(x.get("missed_total", 0) or 0), int(x.get("wrong_or_voided_scans", 0) or 0)), reverse=True)
+    return {
+        "generated_at_utc": utc_now().isoformat() if "utc_now" in globals() else datetime.now(timezone.utc).isoformat(),
+        "role_filter": role_filter_key,
+        "items": items,
+        "summary": {
+            "users": len(items),
+            "missed_total": sum(int(x.get("missed_total", 0) or 0) for x in items),
+            "wrong_or_voided_scans": sum(int(x.get("wrong_or_voided_scans", 0) or 0) for x in items),
+            "unassigned_supervisor_issues": len(unassigned_supervisor_issues),
+        },
+        "unassigned_supervisor_issues": unassigned_supervisor_issues[:50],
+    }
 
 
 def _today_key_local() -> str:
@@ -3477,6 +3711,31 @@ DASHBOARD_HTML = """
     .main-tab-button.active { background: #1f8ef1; color: #fff; }
     .main-tab-content { display: none; padding: 0 clamp(10px, 1.6vw, 20px) clamp(12px, 1.6vw, 20px); min-width:0; }
     .main-tab-content.active { display: block; }
+    .kpi-filter-row { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
+    .kpi-filter-btn { border:1px solid #dbe4f0; background:#fff; color:#334155; border-radius:999px; padding:7px 14px; font-weight:800; cursor:pointer; }
+    .kpi-filter-btn.active { background:#1f8ef1; border-color:#1f8ef1; color:#fff; }
+    .kpi-issue-list { display:grid; gap:6px; margin-top:6px; min-width:220px; }
+    .kpi-issue-item { border:1px solid #dbe4f0; border-radius:10px; background:#f8fbff; padding:7px 8px; font-size:.78rem; line-height:1.35; }
+    .kpi-issue-type { font-weight:900; color:#0f172a; }
+    .kpi-issue-meta { color:#64748b; font-weight:700; margin-top:2px; }
+    .kpi-table-wrap { max-height: 68vh; overflow:auto; border:1px solid #dbe4f0; border-radius:14px; background:#fff; }
+    .kpi-table { width:100%; border-collapse:separate; border-spacing:0; min-width:1180px; }
+    .kpi-table th { position:sticky; top:0; z-index:2; background:#f8fafc; color:#475569; font-size:.72rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; text-align:left; padding:10px 12px; border-bottom:1px solid #dbe4f0; white-space:nowrap; }
+    .kpi-table td { padding:11px 12px; border-bottom:1px solid #e8eef6; vertical-align:top; font-size:.84rem; color:#0f172a; }
+    .kpi-table tr:last-child td { border-bottom:none; }
+    .kpi-table tr.warn td { background:#fffaf3; }
+    .kpi-table tr.bad td { background:#fff5f5; }
+    .kpi-table tr:hover td { background:#f8fbff; }
+    .kpi-user-cell { min-width:180px; }
+    .kpi-person-name { font-weight:900; color:#0f172a; overflow-wrap:anywhere; }
+    .kpi-person-id { margin-top:2px; color:#64748b; font-weight:800; font-size:.78rem; }
+    .kpi-role-pill { border-radius:999px; background:#e0f2fe; color:#075985; padding:5px 9px; font-size:.72rem; font-weight:900; white-space:nowrap; }
+    .kpi-number { font-weight:950; text-align:right; white-space:nowrap; }
+    .kpi-number.bad { color:#b91c1c; }
+    .kpi-number.warn { color:#b45309; }
+    .kpi-breakdown { min-width:220px; font-weight:800; color:#334155; }
+    .kpi-unassigned { border:1px solid #fed7aa; border-radius:14px; background:#fff7ed; padding:12px; margin-top:12px; }
+    .kpi-unassigned-title { font-weight:950; color:#9a3412; margin-bottom:4px; }
     .sub-tabs { display:flex; gap:8px; margin-top:12px; margin-bottom:12px; flex-wrap:wrap; }
     .sub-tab-button { background:#fff; border:1px solid #cbd5e1; border-radius:999px; padding:8px 14px; font-weight:700; color:#334155; cursor:pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .sub-tab-button:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(15,23,42,0.08); }
@@ -3953,6 +4212,8 @@ DASHBOARD_HTML = """
     .review-kv-table { width: 100%; border-collapse: collapse; table-layout: auto; }
     .review-data-table th { padding: 6px 8px; border-bottom: 1px solid #d8e3f0; text-align: left; font-size: .72rem; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
     .review-data-table td { font-size: .82rem; font-weight: 600; color: #0f172a; }
+    .scanned-pack-scroll { max-height: 420px; overflow: auto; border: 1px solid #e2e8f0; border-radius: 10px; background: #fff; }
+    .scanned-pack-scroll .review-data-table th { position: sticky; top: 0; z-index: 1; background: #f8fafc; }
     .review-kv-table td { padding: 6px 8px; border-bottom: 1px solid #e8eef6; vertical-align: top; }
     .review-kv-table tr:last-child td { border-bottom: none; }
     .review-kv-key { width: 150px; min-width: 120px; font-size: .76rem; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
@@ -4327,6 +4588,7 @@ DASHBOARD_HTML = """
     <button class="main-tab-button" data-target="archivedJobsTab">Archived Jobs</button>
     <button class="main-tab-button" data-target="machineArchiveTab">Machine Archive</button>
     <button class="main-tab-button" data-target="maintenanceTab">Maintenance</button>
+    <button class="main-tab-button" data-target="userKpiTab">User KPIs</button>
     <button class="main-tab-button" data-target="pdrTab">PDR Reports</button>
   </div>
 
@@ -4482,6 +4744,22 @@ DASHBOARD_HTML = """
         <h3 class="maintenance-performance-title">Repair Performance</h3>
         <div class="muted">Average repair speed computed from completed downtime records.</div>
         <div id="maintenancePerformanceTableWrap" class="maintenance-performance-wrap"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="userKpiTab" class="main-tab-content">
+    <div class="panel">
+      <h3>User KPIs</h3>
+      <div class="muted">Follow-up view for missed scans, wrong/voided scans, pending approvals, and active waiting items. These are based only on records saved on this server.</div>
+      <div class="kpi-filter-row">
+        <button class="kpi-filter-btn active" type="button" data-user-kpi-role="all">All Users</button>
+        <button class="kpi-filter-btn" type="button" data-user-kpi-role="operator">Operators</button>
+        <button class="kpi-filter-btn" type="button" data-user-kpi-role="supervisor">Supervisors</button>
+      </div>
+      <div id="userKpiSummary" class="job-queue-summary"></div>
+      <div id="userKpiTableWrap" class="table-wrap">
+        <div class="placeholder">Open this tab to load user KPIs.</div>
       </div>
     </div>
   </div>
@@ -4913,6 +5191,8 @@ DASHBOARD_HTML = """
   const maintenancePeopleList = document.getElementById("maintenancePeopleList");
   const maintenancePerformanceTableWrap = document.getElementById("maintenancePerformanceTableWrap");
   const maintenanceCurrentDate = document.getElementById("maintenanceCurrentDate");
+  const userKpiSummary = document.getElementById("userKpiSummary");
+  const userKpiTableWrap = document.getElementById("userKpiTableWrap");
   const approvePrintOverlay = document.getElementById("approvePrintOverlay");
   const overlayCloseBtn = document.getElementById("overlayCloseBtn");
   const overlayCancelBtn = document.getElementById("overlayCancelBtn");
@@ -5058,6 +5338,8 @@ DASHBOARD_HTML = """
   let settingsProfilesState = [];
   let machineStatusOverridesState = {};
   let activeMachineDetailCode = "";
+  let userKpiRoleState = "all";
+  let userKpiLoading = false;
 
   function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;"); }
   function escJson(v){
@@ -5547,12 +5829,19 @@ DASHBOARD_HTML = """
       { label: "PO", value: x => x.po },
       { label: "Operator", value: x => x.operator },
       { label: "Scanned At", value: x => fmtDateLocal(x.time || "") || "-" },
-    ], "No pack QR scans recorded.", limit);
-    const rawRows = rows.filter(x => x.raw_scan).map(x => `${x.index}. ${x.raw_scan}`);
-    const rawDetails = rawRows.length ? `
+    ], "No pack QR scans recorded.", Math.max(1, rows.length));
+    const scannedTable = rows.length
+      ? `<div class="scanned-pack-scroll">${table}</div>`
+      : table;
+    const scannedQrRows = rows.map(x => {
+      const raw = String(x.raw_scan || "").trim();
+      if(raw) return `${x.index}. ${raw}`;
+      return `${x.index}. Series ${x.series || "-"} / Lot ${x.lot || "-"} / PO ${x.po || "-"} / Qty ${x.qty || "-"}`;
+    });
+    const rawDetails = scannedQrRows.length ? `
       <details class="archive-raw-details">
-        <summary>Show raw scanned pack QR values</summary>
-        <div class="machine-detail-code" style="margin-top:8px;">${esc(rawRows.join("\\n"))}</div>
+        <summary>Show all scanned QR</summary>
+        <div class="machine-detail-code" style="margin-top:8px;">${esc(scannedQrRows.join("\\n"))}</div>
       </details>
     ` : "";
     return `
@@ -5563,7 +5852,7 @@ DASHBOARD_HTML = """
         </div>
         <div class="review-group-card wide">
           <div class="review-group-head">Scanned Pack QR</div>
-          <div class="review-group-body">${table}${rawDetails}</div>
+          <div class="review-group-body">${scannedTable}${rawDetails}</div>
         </div>
       </div>
     `;
@@ -5912,6 +6201,11 @@ DASHBOARD_HTML = """
           ${detailItem("SKU", jobSku(session) || "-")}
           ${detailItem("Job Name", session.job_name || "-")}
           ${detailItem("Operator", displayNameForId(session.operator_id || "-"))}
+          ${detailItem("Average Weight", Number(session.external_average_weight_grams || 0) > 0 ? `${(Number(session.external_average_weight_grams) / 1000).toFixed(4)} kg` : "-")}
+          ${detailItem("Weight Source", session.external_average_weight_source || "-")}
+          ${detailItem("Weight Sender", session.external_average_weight_sender || "-")}
+          ${detailItem("Weight Sent At", fmtDateLocal(session.external_average_weight_sent_at || ""))}
+          ${detailItem("Weight Received At", fmtDateLocal(session.external_average_weight_received_at || ""))}
           ${detailItem("Machine Counter Start", machineCounterStartValue(session))}
           ${detailItem("Machine Counter Current", session.machine_counter_current ?? "-")}
           ${detailItem("Last Seen", fmtDateLocal(session.last_seen_utc))}
@@ -7918,6 +8212,148 @@ DASHBOARD_HTML = """
     `;
   }
 
+  function kpiIssueLabel(type){
+    const labels = {
+      missing_raw_material_scan: "Missing raw material scan",
+      missing_pack_qr_scan: "Missing pack QR scan",
+      missing_reject_scan_review: "Missing reject scan/review",
+      pending_shift_approval: "Pending shift approval",
+      missing_supervisor_reject_review: "Missing supervisor reject review",
+      active_waiting_supervisor: "Active waiting for supervisor",
+      unassigned_pending_shift_approval: "Unassigned pending approval",
+      unassigned_supervisor_reject_review: "Unassigned reject review",
+      unassigned_waiting_supervisor: "Unassigned waiting supervisor",
+    };
+    return labels[String(type || "")] || String(type || "Issue").replaceAll("_", " ");
+  }
+
+  function renderKpiBreakdown(breakdown){
+    const entries = Object.entries((breakdown && typeof breakdown === "object") ? breakdown : {})
+      .filter(([, count]) => Number(count || 0) > 0)
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0));
+    if(!entries.length) return "-";
+    return entries.map(([type, count]) => `${esc(kpiIssueLabel(type))}: ${esc(count)}`).join("<br>");
+  }
+
+  function renderKpiIssues(issues){
+    const list = Array.isArray(issues) ? issues.slice(0, 8) : [];
+    if(!list.length) return '<span class="muted">No issues</span>';
+    return `
+      <details>
+        <summary>View ${esc(list.length)} recent</summary>
+        <div class="kpi-issue-list">
+          ${list.map(issue => `
+            <div class="kpi-issue-item">
+              <div class="kpi-issue-type">${esc(kpiIssueLabel(issue?.type))}</div>
+              <div>${esc(issue?.detail || "-")}</div>
+              <div class="kpi-issue-meta">${esc(issue?.machine_code || "-")} | ${esc(jobDisplayName(issue, issue?.job_code || "-"))} | ${esc(issue?.at_utc ? fmtDateLocal(issue.at_utc) : "-")}</div>
+            </div>
+          `).join("")}
+        </div>
+      </details>
+    `;
+  }
+
+  function renderUserKpis(payload){
+    const data = (payload && typeof payload === "object") ? payload : {};
+    const items = Array.isArray(data.items) ? data.items : [];
+    const unassigned = Array.isArray(data.unassigned_supervisor_issues) ? data.unassigned_supervisor_issues : [];
+    const summary = (data.summary && typeof data.summary === "object") ? data.summary : {};
+    const operators = items.filter(row => row?.is_operator).length;
+    const supervisors = items.filter(row => row?.is_supervisor).length;
+    const handled = items.reduce((sum, row) => sum + Number(row?.handled_records || 0), 0);
+    const approved = items.reduce((sum, row) => sum + Number(row?.approved_records || 0), 0);
+
+    if(userKpiSummary){
+      userKpiSummary.innerHTML = `
+        <div class="job-queue-metric"><div class="k">Users</div><div class="v">${esc(summary.users ?? items.length)}</div></div>
+        <div class="job-queue-metric"><div class="k">Operators</div><div class="v">${esc(operators)}</div></div>
+        <div class="job-queue-metric"><div class="k">Supervisors</div><div class="v">${esc(supervisors)}</div></div>
+        <div class="job-queue-metric"><div class="k">Missed Items</div><div class="v">${esc(summary.missed_total ?? 0)}</div></div>
+        <div class="job-queue-metric"><div class="k">Wrong / Voided</div><div class="v">${esc(summary.wrong_or_voided_scans ?? 0)}</div></div>
+        <div class="job-queue-metric"><div class="k">Unassigned Supervisor</div><div class="v">${esc(summary.unassigned_supervisor_issues ?? unassigned.length)}</div></div>
+        <div class="job-queue-metric"><div class="k">Handled / Approved</div><div class="v">${esc(handled)} / ${esc(approved)}</div></div>
+      `;
+    }
+
+    if(!userKpiTableWrap) return;
+    if(!items.length && !unassigned.length){
+      userKpiTableWrap.innerHTML = '<div class="placeholder">No user KPI records found for this filter.</div>';
+      return;
+    }
+
+    const unassignedHtml = unassigned.length ? `
+      <div class="kpi-unassigned">
+        <div class="kpi-unassigned-title">Unassigned supervisor follow-ups</div>
+        <div class="muted">These records are not counted against a specific supervisor because no supervisor/approval owner is saved on the record yet.</div>
+        ${renderKpiIssues(unassigned)}
+      </div>
+    ` : "";
+
+    userKpiTableWrap.innerHTML = `
+      ${unassignedHtml}
+      <div class="kpi-card-grid">
+        ${items.map(row => {
+          const roles = [
+            row?.is_operator ? "Operator" : "",
+            row?.is_supervisor ? "Supervisor" : "",
+          ].filter(Boolean).join(" / ") || row?.role || "-";
+          const activeRecords = Number(row?.active_records || 0) + Number(row?.active_supervisor_records || 0);
+          const missed = Number(row?.missed_total || 0);
+          const wrong = Number(row?.wrong_or_voided_scans || 0);
+          const cardClass = missed >= 10 ? "bad" : (missed > 0 || wrong > 0 ? "warn" : "");
+          return `
+            <div class="kpi-user-card ${esc(cardClass)}">
+              <div class="kpi-card-head">
+                <div class="kpi-person">
+                  <div class="kpi-person-name">${esc(row?.name || row?.id_number || "-")}</div>
+                  <div class="kpi-person-id">${esc(row?.id_number || "-")}</div>
+                </div>
+                <div class="kpi-role-pill">${esc(roles)}</div>
+              </div>
+              <div class="kpi-big-row">
+                <div class="kpi-big"><div class="v">${esc(missed)}</div><div class="k">Missed</div></div>
+                <div class="kpi-big"><div class="v">${esc(wrong)}</div><div class="k">Wrong / Voided</div></div>
+                <div class="kpi-big"><div class="v">${esc(row?.issue_rate_percent ?? 0)}%</div><div class="k">Issue Rate</div></div>
+              </div>
+              <div class="kpi-mini-grid">
+                <div class="kpi-mini"><div class="k">Handled</div><div class="v">${esc(row?.handled_records ?? 0)}</div></div>
+                <div class="kpi-mini"><div class="k">Approved</div><div class="v">${esc(row?.approved_records ?? 0)}</div></div>
+                <div class="kpi-mini"><div class="k">Active</div><div class="v">${esc(activeRecords)}</div></div>
+                <div class="kpi-mini"><div class="k">Raw Scans</div><div class="v">${esc(row?.raw_material_scans ?? 0)}</div></div>
+                <div class="kpi-mini"><div class="k">Pack QR</div><div class="v">${esc(row?.pack_qr_scans ?? 0)}</div></div>
+                <div class="kpi-mini"><div class="k">Reject Scans</div><div class="v">${esc(row?.reject_scans ?? 0)}</div></div>
+              </div>
+              <div class="kpi-breakdown">
+                <div>Top missing: ${renderKpiBreakdown(row?.missed_breakdown)}</div>
+                <div style="margin-top:8px;">${renderKpiIssues(row?.issues)}</div>
+              </div>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    `;
+  }
+
+  async function loadUserKpis(role = userKpiRoleState){
+    if(!userKpiTableWrap || userKpiLoading) return;
+    userKpiRoleState = role || "all";
+    userKpiLoading = true;
+    userKpiTableWrap.innerHTML = '<div class="placeholder">Loading user KPIs...</div>';
+    try{
+      const r = await fetch(`/api/user-kpis?role=${encodeURIComponent(userKpiRoleState)}`);
+      const data = await r.json().catch(() => ({}));
+      if(!r.ok || data.ok === false){
+        throw new Error(data.error || data.detail || `HTTP ${r.status}`);
+      }
+      renderUserKpis(data);
+    }catch(err){
+      userKpiTableWrap.innerHTML = `<div class="placeholder">Failed to load user KPIs: ${esc(err?.message || err)}</div>`;
+    }finally{
+      userKpiLoading = false;
+    }
+  }
+
   function normalizePlanningBoard(board){
     const lanes = (board && typeof board.lanes === "object") ? board.lanes : {};
     const out = { lanes: {}, updated_at_utc: String(board?.updated_at_utc || "") };
@@ -8679,6 +9115,15 @@ DASHBOARD_HTML = """
       document.querySelectorAll(".main-tab-content").forEach(c => c.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById(target)?.classList.add("active");
+      if(target === "userKpiTab") loadUserKpis();
+    });
+  });
+  document.querySelectorAll("[data-user-kpi-role]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const role = btn.getAttribute("data-user-kpi-role") || "all";
+      document.querySelectorAll("[data-user-kpi-role]").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      loadUserKpis(role);
     });
   });
   document.querySelectorAll(".sub-tab-button").forEach(btn => {
@@ -9648,6 +10093,11 @@ def api_profiles_operators():
     return {"ok": True, "items": build_operator_activity_directory()}
 
 
+@APP.get("/api/user-kpis")
+def api_user_kpis(role: str = "all"):
+    return {"ok": True, **build_user_kpis(role_filter=role)}
+
+
 @APP.post("/api/profiles")
 async def api_profiles_create(req: Request):
     data = await req.json()
@@ -10052,6 +10502,16 @@ async def api_event(req: Request):
             sess.last_shift_butal_job_name = snap.get("last_shift_butal_job_name", sess.last_shift_butal_job_name)
             if isinstance(snap.get("last_shift_butal_by_job"), dict):
                 sess.last_shift_butal_by_job = dict(snap.get("last_shift_butal_by_job") or {})
+            incoming_weight = snap.get("external_average_weight_grams")
+            try:
+                sess.external_average_weight_grams = float(incoming_weight) if incoming_weight is not None else sess.external_average_weight_grams
+            except Exception:
+                pass
+            sess.external_average_weight_unit = str(snap.get("external_average_weight_unit") or sess.external_average_weight_unit or "").strip() or None
+            sess.external_average_weight_received_at = snap.get("external_average_weight_received_at") or sess.external_average_weight_received_at
+            sess.external_average_weight_sent_at = snap.get("external_average_weight_sent_at") or sess.external_average_weight_sent_at
+            sess.external_average_weight_source = str(snap.get("external_average_weight_source") or sess.external_average_weight_source or "").strip() or None
+            sess.external_average_weight_sender = str(snap.get("external_average_weight_sender") or sess.external_average_weight_sender or "").strip() or None
             _persist_active_sessions_state()
     elif ev_type == "PACK":
         qty = int(ev.get("qty", 0) or 0)
@@ -10122,6 +10582,143 @@ def api_active_sessions(client_id: str = "", machine_code: str = ""):
         rows.append(sess.to_dict())
     rows.sort(key=lambda r: str(r.get("last_seen_utc") or r.get("saved_at_utc") or ""), reverse=True)
     return {"ok": True, "items": rows}
+
+
+def _normalize_weight_to_grams(value: Any, unit: Any = "g") -> tuple[float, str]:
+    weight = float(value or 0.0)
+    unit_text = str(unit or "g").strip() or "g"
+    unit_key = unit_text.casefold().replace(".", "")
+    if unit_key in ("kg", "kgs", "kilogram", "kilograms"):
+        return weight * 1000.0, "g"
+    if unit_key in ("mg", "milligram", "milligrams"):
+        return weight / 1000.0, "g"
+    return weight, "g" if unit_key in ("g", "gram", "grams") else unit_text
+
+
+@APP.post("/api/active-sessions/discard")
+async def api_active_session_discard(req: Request):
+    """Explicitly remove a stale recovery candidate for one client machine."""
+    data = await req.json()
+    machine_code = str(data.get("machine_code") or "").strip()
+    client_id = str(data.get("client_id") or "").strip()
+    if not machine_code or not client_id:
+        return JSONResponse({"ok": False, "error": "client_id and machine_code are required"}, status_code=400)
+    sess = SESSIONS.get(machine_code)
+    if sess is None:
+        return {"ok": True, "discarded": False}
+    if str(sess.client_id or "").strip() != client_id:
+        return JSONResponse({"ok": False, "error": "session belongs to another client"}, status_code=403)
+    del SESSIONS[machine_code]
+    _remove_persisted_active_session(machine_code)
+    await broadcast_state()
+    return {"ok": True, "discarded": True}
+
+
+@APP.post("/api/average-weight")
+@APP.post("/average-weight")
+async def api_average_weight(req: Request):
+    """Route a weighing-scale result to one active machine after SKU validation."""
+    data = await req.json()
+    machine_code = str(
+        data.get("machine_code")
+        or data.get("machine")
+        or data.get("machine_no")
+        or data.get("machine_number")
+        or data.get("machine_id")
+        or ""
+    ).strip()
+    sku = str(data.get("sku") or data.get("product_sku") or data.get("item_sku") or data.get("part_sku") or "").strip()
+    product_id = str(
+        data.get("product_id")
+        or data.get("productId")
+        or data.get("item_id")
+        or data.get("itemId")
+        or data.get("part_id")
+        or data.get("partId")
+        or ""
+    ).strip()
+    source = str(data.get("source") or data.get("app") or data.get("app_name") or "external_app").strip() or "external_app"
+    sender = str(data.get("sender") or data.get("sent_by") or data.get("device") or data.get("scale_id") or "").strip()
+    sent_at = str(data.get("sent_at") or data.get("sent_at_utc") or data.get("timestamp") or "").strip()
+    raw_weight = None
+    raw_weight_key = ""
+    for key in ("average_grams", "grams", "average_kg", "kilograms", "kg", "average_weight", "weight", "current_weight"):
+        if data.get(key) is not None:
+            raw_weight = data.get(key)
+            raw_weight_key = key
+            break
+    explicit_unit = data.get("unit") or data.get("weight_unit") or data.get("weightUnit")
+    default_unit = "g" if raw_weight_key in ("average_grams", "grams") else "kg"
+    if raw_weight_key in ("average_kg", "kilograms", "kg"):
+        default_unit = "kg"
+    unit = str(explicit_unit if explicit_unit not in (None, "") else default_unit).strip() or default_unit
+    try:
+        raw_average = float(raw_weight)
+        average_grams, normalized_unit = _normalize_weight_to_grams(raw_average, unit)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "average_grams/weight must be numeric"}, status_code=400)
+    if not machine_code or not (sku or product_id):
+        return JSONResponse({"ok": False, "error": "machine_code and product_id or sku are required"}, status_code=400)
+    if average_grams <= 0:
+        return JSONResponse({"ok": False, "error": "average_grams must be greater than zero"}, status_code=400)
+
+    sess = SESSIONS.get(machine_code)
+    if sess is None or not str(sess.job_code or "").strip():
+        return JSONResponse({"ok": False, "error": "machine has no active job"}, status_code=404)
+    active_product_id = str(sess.product_id or "").strip()
+    active_sku = str(sess.product_sku or "").strip()
+    def _product_key(value: Any) -> str:
+        raw = str(value or "").strip()
+        digits = re.sub(r"\D+", "", raw)
+        if raw and digits == raw:
+            return digits.lstrip("0") or "0"
+        return raw.casefold()
+    product_match = bool(product_id and active_product_id and _product_key(active_product_id) == _product_key(product_id))
+    sku_match = bool(sku and active_sku and active_sku.casefold() == sku.casefold())
+    if product_id and not active_product_id:
+        return JSONResponse({"ok": False, "error": "active machine session has no product_id", "machine_code": machine_code}, status_code=409)
+    if sku and not active_sku and not product_id:
+        return JSONResponse({"ok": False, "error": "active machine session has no SKU", "machine_code": machine_code}, status_code=409)
+    if not (product_match or sku_match):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Product ID/SKU does not match the active machine job",
+                "machine_code": machine_code,
+                "expected_product_id": active_product_id,
+                "received_product_id": product_id,
+                "expected_sku": active_sku,
+                "received_sku": sku,
+            },
+            status_code=409,
+        )
+
+    received_at = utc_now().isoformat()
+    sess.external_average_weight_grams = average_grams
+    sess.external_average_weight_unit = normalized_unit
+    sess.external_average_weight_received_at = received_at
+    sess.external_average_weight_sent_at = sent_at or None
+    sess.external_average_weight_source = source
+    sess.external_average_weight_sender = sender or None
+    sess.last_seen_utc = received_at
+    sess.last_event = f"AVERAGE WEIGHT {average_grams:.4f} {normalized_unit} ({source})"
+    _persist_active_sessions_state()
+    await broadcast_state()
+    return {
+        "ok": True,
+        "machine_code": machine_code,
+        "product_id": active_product_id,
+        "sku": active_sku,
+        "average_grams": average_grams,
+        "average_kg": average_grams / 1000.0,
+        "unit": normalized_unit,
+        "input_weight": raw_average,
+        "input_unit": unit,
+        "source": source,
+        "sender": sender,
+        "sent_at_utc": sent_at,
+        "received_at_utc": received_at,
+    }
 
 
 @APP.get("/api/planning/board")

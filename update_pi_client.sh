@@ -134,6 +134,16 @@ fi
 echo
 echo "Starting rebuilt client..."
 mkdir -p "$HOME/.local/state/raspberry-machine-client"
+export MACHINE_DATA_DIR="$PROJECT_DIR/Database"
+if [[ -n "$SERVER_URL" ]]; then
+  export MACHINE_SERVER_URL="$SERVER_URL"
+fi
+if [[ -n "$SCANNER_PORT" ]]; then
+  export MACHINE_SCANNER_COM_PORT="$SCANNER_PORT"
+fi
+if [[ -n "$SCANNER_MODE" ]]; then
+  export MACHINE_SCANNER_MODE="$SCANNER_MODE"
+fi
 nohup "$PROJECT_DIR/dist/RaspberryMachineClient" \
   >>"$HOME/.local/state/raspberry-machine-client/client.log" 2>&1 &
 

@@ -1,5 +1,6 @@
 # client.py
 from __future__ import annotations
+import html
 import json
 import os
 import re
@@ -66,11 +67,30 @@ def _runtime_base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _runtime_data_dir() -> str:
+    """Return the writable project data directory.
+
+    PyInstaller one-file builds extract bundled files into a temporary
+    ``sys._MEIPASS`` directory.  That location is not safe for recovery JSON
+    because it can disappear after the app exits.  Keep assets in ``BASE_DIR``,
+    but always store runtime JSON in a real project/database folder.
+    """
+    env_data_dir = os.environ.get("MACHINE_DATA_DIR", "").strip()
+    if env_data_dir:
+        return os.path.abspath(env_data_dir)
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        if os.path.basename(exe_dir).lower() == "dist":
+            return os.path.join(os.path.dirname(exe_dir), "Database")
+        return os.path.join(exe_dir, "Database")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "Database")
+
+
 BASE_DIR = _runtime_base_dir()
 ANIMATIONS_DIR = os.path.join(BASE_DIR, "Animations")
 IMAGES_DIR = os.path.join(BASE_DIR, "Images")
 PDR_ICON_DIR = os.path.join(BASE_DIR, "PDR_Icon")
-DATABASE_DIR = os.path.join(BASE_DIR, "Database")
+DATABASE_DIR = _runtime_data_dir()
 JOB_API_CONFIG_FILE = os.path.join(DATABASE_DIR, "job_api_config.json")
 CLIENT_ACTIVE_MACHINE_SESSIONS_FILE = os.path.join(DATABASE_DIR, "client_active_machine_sessions.json")
 SERVER_ACTIVE_MACHINE_SESSIONS_FILE = os.path.join(DATABASE_DIR, "active_machine_sessions.json")
@@ -1127,6 +1147,8 @@ class ClientState:
     job_name: Optional[str] = None
     job_started_at: Optional[str] = None
     operator_id: Optional[str] = None
+    operator_qr_payload: str = ""
+    operator_pending_server_validation: bool = False
 
     pack_count: int = 0
     good_total: int = 0
@@ -2814,6 +2836,7 @@ class ClientUI(QWidget):
     scan_received = pyqtSignal(str)
     scanner_status = pyqtSignal(str)
     average_weight_received = pyqtSignal(float, str)
+    server_average_weight_received = pyqtSignal(str, float, str, str)
 
     @staticmethod
     def _load_digital_font_family() -> str:
@@ -2841,6 +2864,9 @@ class ClientUI(QWidget):
         self._identity_sync_inflight = False
         self._identity_sync_last_attempt = 0.0
         self._identity_sync_last_ok = 0.0
+        self._server_weight_poll_lock = threading.Lock()
+        self._server_weight_poll_inflight = False
+        self._last_server_weight_marker = ""
         self._last_active_session_snapshot_serialized = ""
         self._active_session_snapshot_deferred_pending = False
         self._ui_refresh_pending = False
@@ -2853,6 +2879,8 @@ class ClientUI(QWidget):
         self._server_event_queue_lock = threading.Lock()
         self._server_was_offline = False
         self._server_recovery_snapshot_queued = False
+        self._pending_server_recovery: Optional[Dict[str, Any]] = None
+        self._skip_server_recovery_machine = ""
         self._event_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max(16, SERVER_EVENT_QUEUE_MAXSIZE))
         self._load_persisted_server_events()
         self._event_worker_stop = threading.Event()
@@ -3199,7 +3227,7 @@ QWidget#ClientUIRoot {{
         self.jobPartsTable = QTableWidget(0, 6)
         self.jobPartsTable.setObjectName("ProductPartsTable")
         self.jobPartsTable.setHorizontalHeaderLabels(
-            ["SKU", "Name", "Part Qty/Unit", "Available", "Rqst Part Qty", "Remaining"]
+            ["SKU", "Name", "Part Qty/Unit (kg)", "Available", "Rqst Part Qty", "Remaining"]
         )
         self.jobPartsTable.setAlternatingRowColors(False)
         self.jobPartsTable.setWordWrap(True)
@@ -5067,7 +5095,7 @@ QWidget#ClientUIRoot {{
         )
         self.finishReviewParts = self._make_finish_summary_table(
             "Product Parts Used",
-            ["SKU", "Name", "Qty/Unit", "Scanned", "Requested", "Remaining"],
+            ["SKU", "Name", "Qty/Unit (kg)", "Scanned", "Requested", "Remaining"],
         )
         self.finishReviewRaw = self._make_finish_summary_table(
             "Raw Materials",
@@ -5727,6 +5755,7 @@ QWidget#ClientUIRoot {{
         self._install_app_log_hooks()
         self._app_log_ready = True
         self._append_app_log("APP", "Application UI initialized")
+        self._append_app_log("APP", f"Writable Database dir: {DATABASE_DIR}")
         self.settingsOverlay.hide()
         self.settingsOverlay.raise_()
         self._apply_graphics_mode(self.client_config.get("graphics_mode", "quality"), persist=False)
@@ -5755,6 +5784,7 @@ QWidget#ClientUIRoot {{
         self.scan_received.connect(self.on_scanned)
         self.scanner_status.connect(self._set_status_text)
         self.average_weight_received.connect(self._apply_external_average_weight)
+        self.server_average_weight_received.connect(self._apply_server_average_weight)
         self._ui_refresh_timer = QTimer(self)
         self._ui_refresh_timer.setSingleShot(True)
         self._ui_refresh_timer.timeout.connect(self._refresh_ui_now)
@@ -6152,7 +6182,21 @@ QWidget#ClientUIRoot {{
 
     def _show_invalid_overlay(self, reason: str = ""):
         msg = str(reason or "").strip()
+        self.invalidOverlay.setStyleSheet(
+            "background: rgba(220,38,38,0.60); border: 2px solid rgba(0,0,0,0.72); border-radius: 0px;"
+        )
+        self.invalidTextBand.setStyleSheet(
+            "QFrame#InvalidTextBand {"
+            "background: rgba(127, 29, 29, 0.94);"
+            "border: none;"
+            "border-radius: 2px;"
+            "}"
+        )
         self.invalidReasonLabel.setText(msg)
+        self.invalidReasonLabel.setTextFormat(Qt.TextFormat.PlainText)
+        self.invalidReasonLabel.setStyleSheet(
+            "background: transparent; border: none; color: #fde68a; font-size: 15px; font-weight: 700;"
+        )
         self._position_invalid_overlay()
         if self.enable_gif_animations and self._invalid_movie is not None:
             self._invalid_movie.stop()
@@ -6162,12 +6206,153 @@ QWidget#ClientUIRoot {{
         else:
             self.invalidGifLabel.hide()
         self.invalidTextLabel.setText("INVALID SCAN")
+        self.invalidTextLabel.setStyleSheet(
+            "background: transparent; border: none; color: #ffffff; font-size: 28px; font-weight: 900;"
+        )
         self.invalidOverlay.show()
         self.invalidOverlay.raise_()
         self.invalidOverlay.layout().activate()
         # Longer messages need more time to read.
         hide_ms = 3000 + min(5000, max(0, len(msg) - 40) * 35)
         self._invalid_hide_timer.start(hide_ms)
+
+    def _show_session_recovery_prompt(self, server_snap: Dict[str, Any], local_snap: Optional[Dict[str, Any]] = None):
+        def _esc(value: Any) -> str:
+            return html.escape(str(value if value is not None else "-"), quote=True)
+
+        def _num(snap: Optional[Dict[str, Any]], key: str, fallback: Any = 0) -> int:
+            if not isinstance(snap, dict):
+                return 0
+            try:
+                return int(float(snap.get(key, fallback) or 0))
+            except Exception:
+                return 0
+
+        def _last_pack_text(snap: Optional[Dict[str, Any]]) -> str:
+            if not isinstance(snap, dict):
+                return "No local saved session"
+            rows = snap.get("product_pack_history_logs")
+            if not isinstance(rows, list) or not rows:
+                return "No pack QR scanned yet"
+            last = rows[-1] if isinstance(rows[-1], dict) else {}
+            fields = dict(last)
+            raw = str(last.get("raw_scan") or "").strip()
+            if raw:
+                parsed = self._extract_pack_history_fields(raw)
+                if isinstance(parsed, dict):
+                    fields.update(parsed)
+            product_id = str(fields.get("product_id") or fields.get("product_p") or "").strip()
+            product_name = (
+                str(fields.get("product_name") or "").strip()
+                or self._lookup_product_name(product_id)
+                or (f"Product {product_id.lstrip('0') or product_id}" if product_id else "Product")
+            )
+            index_text = str(fields.get("index") or "-").strip() or "-"
+            pcs = (
+                fields.get("good_qty")
+                if fields.get("good_qty") not in (None, "")
+                else fields.get("completed_pack_qty")
+                if fields.get("completed_pack_qty") not in (None, "")
+                else fields.get("qty_q")
+                if fields.get("qty_q") not in (None, "")
+                else fields.get("qty")
+            )
+            pcs_text = str(pcs if pcs not in (None, "") else "-").strip()
+            return f"{product_name} | Index {index_text} | {pcs_text} pcs"
+
+        def _card(choice: str, title: str, snap: Optional[Dict[str, Any]], accent: str, dim: bool = False) -> str:
+            if not isinstance(snap, dict):
+                return f"""
+                <td width="540" height="560" style="padding:13px; vertical-align:top;">
+                  <table width="520" height="540" cellspacing="0" cellpadding="14" style="border:2px solid #6b7280; background:#2f3339;">
+                    <tr><td height="70" style="font-size:40px; font-weight:900; color:#e5e7eb;">{_esc(choice)} {_esc(title)}</td></tr>
+                    <tr><td align="center" style="font-size:22px; font-weight:900; color:#e5e7eb;">No local data</td></tr>
+                    <tr><td height="90" style="font-size:16px; color:#cbd5e1;">Use this to discard server saved session and continue current flow.</td></tr>
+                  </table>
+                </td>
+                """
+            job = str(snap.get("job_name") or snap.get("job_code") or "-").strip()
+            operator = str(snap.get("operator_id") or "-").strip()
+            saved = str(snap.get("saved_at_utc") or snap.get("last_seen_utc") or "-").strip()
+            pack = _num(snap, "pack_count", snap.get("pack_total", 0))
+            good = _num(snap, "good_total")
+            butal = _num(snap, "butal_total")
+            reject = _num(snap, "reject_total") + _num(snap, "startup_reject_total") + _num(snap, "no_shot_total")
+            raw_count = _num(snap, "raw_sacks_count")
+            raw_logs = snap.get("raw_material_logs")
+            raw_log_count = len(raw_logs) if isinstance(raw_logs, list) else 0
+            last_pack = _last_pack_text(snap)
+            bg = "#30343a" if not dim else "#2b2f35"
+            return f"""
+            <td width="540" height="560" style="padding:13px; vertical-align:top;">
+              <table width="520" height="540" cellspacing="0" cellpadding="14" style="border:2px solid {accent}; background:{bg}; color:#e5e7eb;">
+                <tr><td height="70" style="font-size:40px; font-weight:900; color:#f1f5f9;">{_esc(choice)} {_esc(title)}</td></tr>
+                <tr><td height="94" style="font-size:25px; font-weight:900; color:#e5e7eb; background:#3f444c; border:1px solid #7b8491;">{_esc(job)}<br><span style="font-size:21px; color:#e5e7eb;">Op: {_esc(operator)}</span></td></tr>
+                <tr><td height="142">
+                <table width="100%" cellspacing="8" cellpadding="8">
+                  <tr>
+                    <td width="50%" style="background:#3a3f47; border:1px solid #7b8491; color:#e5e7eb; font-size:27px;"><b>Pack {pack}</b></td>
+                    <td width="50%" style="background:#3a3f47; border:1px solid #7b8491; color:#e5e7eb; font-size:27px;"><b>Good {good}</b></td>
+                  </tr>
+                  <tr>
+                    <td width="50%" style="background:#3a3f47; border:1px solid #7b8491; color:#e5e7eb; font-size:27px;"><b>Butal {butal}</b></td>
+                    <td width="50%" style="background:#3a3f47; border:1px solid #7b8491; color:#e5e7eb; font-size:27px;"><b>Reject {reject}</b></td>
+                  </tr>
+                </table>
+                </td></tr>
+                <tr><td height="58" style="font-size:22px; font-weight:900; color:#e5e7eb; background:#3a3f47; border:1px solid #7b8491;">Raw: {_esc(raw_count)} sacks / {_esc(raw_log_count)} logs</td></tr>
+                <tr><td height="78" style="font-size:21px; font-weight:900; color:#e5e7eb; background:#3a3f47; border:1px solid #7b8491;">Last PACK: {_esc(last_pack)}</td></tr>
+                <tr><td height="38" style="font-size:17px; font-weight:800; color:#e5e7eb; background:#3a3f47; border:1px solid #7b8491;">Saved: {_esc(saved)}</td></tr>
+              </table>
+            </td>
+            """
+
+        msg = f"""
+        <div style="font-size:30px; font-weight:900; color:#e5e7eb; margin-bottom:8px;">
+          Choose saved session.
+        </div>
+        <table align="center" cellspacing="0" cellpadding="0">
+          <tr>
+            {_card("1", "SERVER", server_snap, "#6b7280")}
+            {_card("2", "LOCAL", local_snap, "#6b7280", dim=not isinstance(local_snap, dict))}
+          </tr>
+        </table>
+        <div style="font-size:26px; font-weight:900; color:#e5e7eb; background:#3f444c; margin-top:8px;">
+          Scan 1 for SERVER saved data. Scan 2 for LOCAL/current data.
+        </div>
+        """
+        self._invalid_hide_timer.stop()
+        if self._invalid_movie is not None:
+            self._invalid_movie.stop()
+        self.invalidGifLabel.hide()
+        self.invalidOverlay.setStyleSheet(
+            "background: rgba(31,36,42,0.96); border: none; border-radius: 0px;"
+        )
+        self.invalidTextBand.setStyleSheet(
+            "QFrame#InvalidTextBand {"
+            "background: rgba(31, 36, 42, 0.96);"
+            "border: none;"
+            "border-radius: 2px;"
+            "}"
+        )
+        self.invalidTextLabel.setText("SESSION RECOVERY")
+        self.invalidTextLabel.setStyleSheet(
+            "background: transparent; border: none; color: #e5e7eb; font-size: 56px; font-weight: 900;"
+        )
+        self.invalidReasonLabel.setTextFormat(Qt.TextFormat.RichText)
+        self.invalidReasonLabel.setStyleSheet(
+            "background: transparent; border: none; color: #e5e7eb; font-size: 14px; font-weight: 700;"
+        )
+        self.invalidReasonLabel.setText(msg)
+        w = min(max(1220, int(self.width() * 0.92)), max(1320, self.width() - 20))
+        h = min(max(760, int(self.height() * 0.92)), max(860, self.height() - 20))
+        self.invalidOverlay.setGeometry(max(0, (self.width() - w) // 2), max(0, (self.height() - h) // 2), w, h)
+        self.invalidTextBand.setMinimumWidth(max(1180, w - 28))
+        self.invalidReasonLabel.setMinimumWidth(max(1160, w - 44))
+        self.invalidReasonLabel.setMaximumWidth(max(1160, w - 44))
+        self.invalidOverlay.show()
+        self.invalidOverlay.raise_()
+        self.invalidOverlay.layout().activate()
 
     def _hide_invalid_overlay(self):
         if self._invalid_movie is not None:
@@ -7474,7 +7659,7 @@ QWidget#ClientUIRoot {{
             return None
         return {
             "code": payload,
-            "name": "Pending server validation",
+            "name": payload,
             "raw_payload": payload,
         }
 
@@ -9429,6 +9614,8 @@ QWidget#ClientUIRoot {{
             "product_name": product_identity.get("product_name", ""),
             "job_started_at": s.job_started_at,
             "operator_id": s.operator_id,
+            "operator_qr_payload": str(s.operator_qr_payload or ""),
+            "operator_pending_server_validation": bool(s.operator_pending_server_validation),
             "pack_count": int(s.pack_count or 0),
             "good_total": int(s.good_total or 0),
             "butal_total": int(s.butal_total or 0),
@@ -9808,6 +9995,123 @@ QWidget#ClientUIRoot {{
         server_snap = self._fetch_active_session_snapshot_from_server(code)
         return server_snap if isinstance(server_snap, dict) and self._snapshot_is_recoverable(server_snap) else None
 
+    def _load_local_active_session_snapshot(self, machine_code: str) -> Optional[Dict[str, Any]]:
+        """Return only this client's on-device recovery data."""
+        code = str(machine_code or "").strip()
+        if not code:
+            return None
+        for path in (CLIENT_ACTIVE_MACHINE_SESSIONS_FILE, _active_sessions_backup_path(CLIENT_ACTIVE_MACHINE_SESSIONS_FILE)):
+            snap = _read_active_sessions_json_file(path).get(code)
+            if isinstance(snap, dict) and self._snapshot_is_recoverable(snap):
+                return snap
+        return None
+
+    def _merge_matching_recovery_snapshots(self, server_snap: Dict[str, Any], local_snap: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge replicated copies of one job without double-counting totals.
+
+        Client counters are cumulative, so the highest value is the safe value;
+        events/logs are merged by their serialized content.
+        """
+        merged = dict(server_snap or {})
+        merged.update(dict(local_snap or {}))
+        server_pack = server_snap.get("pack_count", server_snap.get("pack_total", 0))
+        local_pack = local_snap.get("pack_count", local_snap.get("pack_total", 0))
+        try:
+            merged_pack = max(int(server_pack or 0), int(local_pack or 0))
+            merged["pack_count"] = merged_pack
+            merged["pack_total"] = merged_pack
+        except Exception:
+            pass
+        for key in ("good_total", "butal_total", "reject_total", "no_shot_total", "raw_sacks_count", "startup_reject_total"):
+            try:
+                merged[key] = max(int(server_snap.get(key, 0) or 0), int(local_snap.get(key, 0) or 0))
+            except Exception:
+                pass
+        server_rejects = server_snap.get("reject_breakdown") if isinstance(server_snap.get("reject_breakdown"), dict) else {}
+        local_rejects = local_snap.get("reject_breakdown") if isinstance(local_snap.get("reject_breakdown"), dict) else {}
+        merged["reject_breakdown"] = {
+            str(key): max(int(server_rejects.get(key, 0) or 0), int(local_rejects.get(key, 0) or 0))
+            for key in set(server_rejects) | set(local_rejects)
+        }
+        for key in ("product_pack_history_logs", "raw_material_logs", "raw_material_scans", "butal_scan_logs", "reject_review_logs", "operator_shift_logs"):
+            rows, seen = [], set()
+            for row in list(server_snap.get(key) or []) + list(local_snap.get(key) or []):
+                try:
+                    marker = json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
+                except Exception:
+                    marker = repr(row)
+                if marker not in seen:
+                    seen.add(marker)
+                    rows.append(row)
+            merged[key] = rows
+        return merged
+
+    def _job_payload_has_details(self, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        return isinstance(data_obj.get("job"), dict) or isinstance(payload.get("job"), dict)
+
+    def _ensure_recovered_job_details(self, raw_scan: str = "") -> bool:
+        s = self.state
+        if not str(s.job_code or s.job_name or "").strip():
+            return False
+        if self._job_payload_has_details(s.job_payload):
+            return True
+        job_identifier = str(s.job_code or s.job_name or "").strip()
+        self.status.setText(f"Loading recovered job details from BMS: {job_identifier}")
+        fetched_payload = self._fetch_job_payload_from_api(job_identifier)
+        if isinstance(fetched_payload, dict):
+            api_job = {}
+            if isinstance(fetched_payload.get("data"), dict) and isinstance(fetched_payload["data"].get("job"), dict):
+                api_job = fetched_payload["data"]["job"]
+            elif isinstance(fetched_payload.get("job"), dict):
+                api_job = fetched_payload["job"]
+            s.job_payload = fetched_payload
+            s.job_code = (
+                self._safe_text(api_job.get("id"), "")
+                or self._safe_text(api_job.get("ref_no"), "")
+                or s.job_code
+                or job_identifier
+            )
+            s.job_name = (
+                self._safe_text(api_job.get("ref_no"), "")
+                or s.job_name
+                or job_identifier
+            )
+            self._append_job_api_log(f"RECOVERY job details loaded for {job_identifier}")
+            return True
+        self._append_job_api_log(f"RECOVERY job details pending for {job_identifier}")
+        self._start_pending_job_api_retry(job_identifier, raw_scan or job_identifier, s.job_name or job_identifier)
+        return False
+
+    def _resume_snapshot(self, snap: Dict[str, Any], machine_name: str, note: str) -> None:
+        self._hide_invalid_overlay()
+        self._restore_state_from_snapshot(snap)
+        if not self.state.machine_name:
+            self.state.machine_name = _machine_display_name(self.state.machine_code, machine_name)
+        self._ensure_recovered_job_details(str(snap.get("job_raw_scan") or snap.get("raw_scan") or snap.get("job_code") or ""))
+        self._save_active_session_snapshot()
+        self.push_event({"type": "SESSION_RESUME"}, "SESSION RESUMED")
+        self.sync_session_snapshot_to_server(note)
+        self.status.setText(
+            f"Recovered ongoing session for {self.state.machine_name} / {self.state.job_name or self.state.job_code}."
+        )
+        self._refresh_ui()
+
+    def _discard_server_recovery(self, machine_code: str) -> bool:
+        server_url = str((self.client_config or {}).get("server_url", SERVER_URL) or SERVER_URL).strip().rstrip("/")
+        try:
+            response = requests.post(
+                f"{server_url}/api/active-sessions/discard",
+                json={"client_id": self._current_client_id(), "machine_code": machine_code},
+                timeout=3,
+            )
+            return response.status_code == 200 and bool(response.json().get("ok"))
+        except Exception as e:
+            self.status.setText(f"Could not remove saved server session: {e}")
+            return False
+
     def _clear_active_session_snapshot(self, machine_code: Optional[str]):
         code = str(machine_code or "").strip()
         if not code:
@@ -9829,6 +10133,8 @@ QWidget#ClientUIRoot {{
         s.job_name = snap.get("job_name")
         s.job_started_at = snap.get("job_started_at")
         s.operator_id = snap.get("operator_id")
+        s.operator_qr_payload = str(snap.get("operator_qr_payload") or "")
+        s.operator_pending_server_validation = bool(snap.get("operator_pending_server_validation"))
         s.pack_count = int(snap.get("pack_count", snap.get("pack_total", 0)) or 0)
         s.good_total = int(snap.get("good_total") or 0)
         s.butal_total = int(snap.get("butal_total") or 0)
@@ -10168,6 +10474,8 @@ QWidget#ClientUIRoot {{
         s.job_name = None
         s.job_started_at = None
         s.operator_id = None
+        s.operator_qr_payload = ""
+        s.operator_pending_server_validation = False
         s.pack_count = 0
         s.good_total = 0
         s.butal_total = 0
@@ -10989,11 +11297,12 @@ QWidget#ClientUIRoot {{
         ext_weight = s.external_average_weight_grams
         ext_unit = str(s.external_average_weight_unit or "g").strip() or "g"
         if ext_weight is not None and ext_weight > 0:
+            ext_kg = float(ext_weight) / 1000.0
             return {
                 "value": float(ext_weight),
                 "source": "app",
                 "unit": ext_unit,
-                "label": f"App ({float(ext_weight):.4f} {ext_unit})",
+                "label": f"App ({ext_kg:.4f} kg)",
             }
         if isinstance(part, dict):
             part_qty = self._parse_number(part.get("part_qty_per_unit"))
@@ -11217,18 +11526,67 @@ QWidget#ClientUIRoot {{
         normalized_unit = str(unit or "g").strip() or "g"
         if grams <= 0:
             return
+        kg_value = grams / 1000.0
         s = self.state
         s.external_average_weight_grams = grams
         s.external_average_weight_unit = normalized_unit
         s.external_average_weight_received_at = datetime.now(timezone.utc).isoformat()
-        self.status.setText(f"Average weight received from app: {grams:.4f} {normalized_unit}")
+        self.status.setText(f"Average weight received from app: {kg_value:.4f} kg")
         self._refresh_ui()
         if s.machine_code:
             self._save_active_session_snapshot()
         self.push_event(
-            {"type": "AVERAGE_WEIGHT_RECEIVED", "average_grams": grams, "unit": normalized_unit},
-            f"AVERAGE WEIGHT {grams:.4f} {normalized_unit}",
+            {"type": "AVERAGE_WEIGHT_RECEIVED", "average_grams": grams, "average_kg": kg_value, "unit": normalized_unit},
+            f"AVERAGE WEIGHT {kg_value:.4f} kg",
         )
+
+    def _apply_server_average_weight(self, machine_code: str, average_grams: float, unit: str, received_at: str):
+        if str(self.state.machine_code or "").strip() != str(machine_code or "").strip():
+            return
+        identity = self._job_product_identity_from_payload(self.state.job_payload)
+        current_product_id = str(identity.get("product_id") or "").strip()
+        current_sku = str(identity.get("product_sku") or "").strip()
+        # The server already validates product/SKU. This second check prevents a stale
+        # poll from applying a result after this client changed jobs locally.
+        if current_product_id or current_sku:
+            self._apply_external_average_weight(average_grams, unit)
+
+    def _poll_server_average_weight(self):
+        machine_code = str(self.state.machine_code or "").strip()
+        if not machine_code:
+            return
+        with self._server_weight_poll_lock:
+            if self._server_weight_poll_inflight:
+                return
+            self._server_weight_poll_inflight = True
+
+        def _worker():
+            try:
+                server_url = str(self.client_config.get("server_url", SERVER_URL)).strip().rstrip("/")
+                response = requests.get(
+                    f"{server_url}/api/active-sessions",
+                    params={"client_id": self._current_client_id(), "machine_code": machine_code},
+                    headers={"Accept": "application/json"},
+                    timeout=2.5,
+                )
+                payload = response.json() if response.status_code == 200 else {}
+                rows = payload.get("items") if isinstance(payload, dict) else []
+                row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
+                weight = row.get("external_average_weight_grams")
+                received_at = str(row.get("external_average_weight_received_at") or "").strip()
+                marker = f"{machine_code}|{received_at}|{weight}"
+                if weight is not None and received_at and marker != self._last_server_weight_marker:
+                    self._last_server_weight_marker = marker
+                    self.server_average_weight_received.emit(
+                        machine_code, float(weight), str(row.get("external_average_weight_unit") or "g"), received_at
+                    )
+            except Exception:
+                pass
+            finally:
+                with self._server_weight_poll_lock:
+                    self._server_weight_poll_inflight = False
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _start_average_weight_server(self):
         if self._avg_weight_server is not None:
@@ -11731,7 +12089,7 @@ QWidget#ClientUIRoot {{
         part_page_size = 8
         visible_part_table_rows = part_table_rows[:part_page_size]
         extra_part_table_rows = part_table_rows[part_page_size:]
-        self.finishReviewParts._finish_headers = ["SKU", "Name", "Qty/Unit", "Used", "Requested", "Remaining", "Scan %"]
+        self.finishReviewParts._finish_headers = ["SKU", "Name", "Qty/Unit (kg)", "Used", "Requested", "Remaining", "Scan %"]
         self.finishReviewParts._finish_stretch_rows = False
         self._set_finish_summary_table_rows(self.finishReviewParts, visible_part_table_rows)
 
@@ -11757,7 +12115,7 @@ QWidget#ClientUIRoot {{
             page_no = 2 + (idx // 14)
             self._add_finish_review_extra_page(
                 f"Product Parts Continued {page_no}",
-                ["SKU", "Name", "Qty/Unit", "Used", "Requested", "Remaining", "Scan %"],
+                ["SKU", "Name", "Qty/Unit (kg)", "Used", "Requested", "Remaining", "Scan %"],
                 chunk,
                 section_height=full_page_section_h,
                 stretch_rows=False,
@@ -12750,6 +13108,74 @@ QWidget#ClientUIRoot {{
         if len(parts) == 2:
             return parts[1] or "-"
         return str(text)
+
+    def _operator_display_value(self, code: str, name: str) -> str:
+        clean_code = self._clean_badge_scan_code(code)
+        clean_name = str(name or "").strip()
+        if clean_code and clean_name and clean_name != clean_code:
+            return f"{clean_code} - {clean_name}"
+        return clean_code or clean_name
+
+    def _update_current_operator_logs(self, old_code: str, new_operator: str, new_name: str) -> None:
+        old_code = self._operator_code_only(old_code)
+        if not old_code or not new_operator:
+            return
+        s = self.state
+        for collection_name in (
+            "raw_material_logs",
+            "product_pack_history_logs",
+            "butal_scan_logs",
+            "reject_review_logs",
+            "production_adjustment_logs",
+        ):
+            rows = getattr(s, collection_name, None)
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                for key in ("operator", "operator_id"):
+                    if self._operator_code_only(row.get(key)) == old_code:
+                        row[key] = new_operator
+                if self._operator_code_only(row.get("operator_name")) == old_code or str(row.get("operator_name") or "").strip() in ("", old_code):
+                    row["operator_name"] = new_name
+        for row in list(s.operator_shift_logs or []):
+            if not isinstance(row, dict):
+                continue
+            if self._operator_code_only(row.get("operator_id")) == old_code:
+                row["operator_id"] = new_operator
+            if self._operator_code_only(row.get("operator_name")) == old_code or str(row.get("operator_name") or "").strip() in ("", old_code):
+                row["operator_name"] = new_name
+
+    def _resolve_pending_operator_profile(self) -> bool:
+        s = self.state
+        if not s.operator_id:
+            return False
+        raw_payload = str(s.operator_qr_payload or "").strip() or self._operator_code_only(s.operator_id)
+        if not raw_payload:
+            return False
+        if not bool(s.operator_pending_server_validation) and "Pending server validation" not in str(s.operator_id or ""):
+            return False
+        person = self._operator_from_scan(raw_payload)
+        if not person:
+            return False
+        code = str(person.get("code") or raw_payload).strip()
+        name = str(person.get("name") or "").strip()
+        if not name or name == code:
+            return False
+        new_operator = self._operator_display_value(code, name)
+        if not new_operator or new_operator == s.operator_id:
+            return False
+        old_operator = str(s.operator_id or "")
+        s.operator_id = new_operator
+        s.operator_qr_payload = ""
+        s.operator_pending_server_validation = False
+        self._update_current_operator_logs(old_operator, new_operator, name)
+        self._save_active_session_snapshot()
+        self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (OPERATOR RESOLVED)")
+        self.status.setText(f"Operator resolved: {name}.")
+        self._refresh_ui()
+        return True
 
     def _normalize_job_code(self, value: Optional[str]) -> str:
         if not value:
@@ -13831,6 +14257,45 @@ QWidget#ClientUIRoot {{
         if raw_s:
             self._append_app_log("SCAN", f"QR scanned: {raw_s}")
 
+        if self._pending_server_recovery is not None:
+            pending = dict(self._pending_server_recovery)
+            machine_code = str(pending.get("machine_code") or "").strip()
+            server_snap = pending.get("server_snapshot") if isinstance(pending.get("server_snapshot"), dict) else {}
+            local_snap = pending.get("local_snapshot") if isinstance(pending.get("local_snapshot"), dict) else None
+            if raw_l in ("1", "yes", "num_1"):
+                server_job = self._normalize_job_code(server_snap.get("job_code"))
+                local_job = self._normalize_job_code(local_snap.get("job_code")) if local_snap else ""
+                if local_snap and server_job and local_job and server_job != local_job:
+                    self.status.setText(
+                        "Saved server session is for a different job. Scan 0 to remove it and use the current local session."
+                    )
+                    self._show_invalid_overlay("Saved session job does not match the current local job. Scan 0 to use current data.")
+                    return
+                self._hide_invalid_overlay()
+                QApplication.processEvents()
+                self._pending_server_recovery = None
+                snapshot = self._merge_matching_recovery_snapshots(server_snap, local_snap) if local_snap else server_snap
+                self._resume_snapshot(snapshot, str(pending.get("machine_name") or machine_code), "SESSION SNAPSHOT SYNC (RECOVERY CONFIRMED)")
+                return
+            if raw_l in ("2", "no", "num_2", "0", "num_0"):
+                self._hide_invalid_overlay()
+                QApplication.processEvents()
+                if not self._discard_server_recovery(machine_code):
+                    self._show_session_recovery_prompt(server_snap, local_snap)
+                    return
+                self._pending_server_recovery = None
+                if local_snap:
+                    self._resume_snapshot(local_snap, str(pending.get("machine_name") or machine_code), "SESSION SNAPSHOT SYNC (LOCAL RECOVERY)")
+                    return
+                # Re-enter normal machine setup but skip querying the just-discarded
+                # server record once.  This keeps an explicit No from restoring it.
+                self._skip_server_recovery_machine = machine_code
+                self.on_scanned(machine_code)
+                return
+            self.status.setText("Saved session found. Scan num_1 for server saved data, or num_2 for local/current data.")
+            self._show_session_recovery_prompt(server_snap, local_snap)
+            return
+
         if s.waiting_cycle_time_confirm_popup:
             phase = int(s.cycle_time_confirm_phase or 1)
             if phase == 1:
@@ -14522,7 +14987,7 @@ QWidget#ClientUIRoot {{
                 res = ScanResult(
                     kind="OFFLINE_OPERATOR",
                     raw=raw_s,
-                    value=f"{offline_operator['code']} - {offline_operator['name']}",
+                    value=offline_operator["code"],
                     meta={"operator_qr_payload": offline_operator["raw_payload"], "pending_server_validation": True},
                 )
             elif res is not None and res.kind == "OPERATOR":
@@ -15127,21 +15592,25 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Finish your current job first before changing machine.")
                 self._show_invalid_overlay("Cannot change machine while current job is active.")
                 return
-            snap = self._load_active_session_snapshot(raw_s)
+            local_snap = self._load_local_active_session_snapshot(raw_s)
+            server_snap = None
+            if self._skip_server_recovery_machine == raw_s:
+                self._skip_server_recovery_machine = ""
+            else:
+                server_snap = self._fetch_active_session_snapshot_from_server(raw_s)
+            if isinstance(server_snap, dict):
+                self._pending_server_recovery = {
+                    "machine_code": raw_s,
+                    "machine_name": _machine_display_name(raw_s, res.value),
+                    "server_snapshot": server_snap,
+                    "local_snapshot": local_snap,
+                }
+                self.status.setText("Saved session found. Scan num_1 for server saved data, or num_2 for local/current data.")
+                self._show_session_recovery_prompt(server_snap, local_snap)
+                return
+            snap = local_snap
             if snap is not None and str(snap.get("machine_code") or "").strip():
-                self._restore_state_from_snapshot(snap)
-                if not self.state.machine_name:
-                    self.state.machine_name = _machine_display_name(self.state.machine_code, res.value)
-                resumed_step = self._missing_session_prereq_message()
-                if resumed_step:
-                    self.status.setText(f"Recovered last state for {self.state.machine_name}. {resumed_step}")
-                else:
-                    self.status.setText(
-                        f"Recovered ongoing session for {self.state.machine_name} / {self.state.job_name or self.state.job_code}."
-                    )
-                self._save_active_session_snapshot()
-                self.push_event({"type": "SESSION_RESUME"}, "SESSION RESUMED")
-                self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (RESUME)")
+                self._resume_snapshot(snap, res.value, "SESSION SNAPSHOT SYNC (LOCAL RESUME)")
                 return
             s.machine_code = raw_s
             s.machine_name = _machine_display_name(s.machine_code, res.value)
@@ -15616,6 +16085,11 @@ QWidget#ClientUIRoot {{
                 res.kind == "OFFLINE_OPERATOR"
                 or (isinstance(res.meta, dict) and res.meta.get("pending_server_validation"))
             )
+            raw_operator_payload = str(
+                (res.meta or {}).get("operator_qr_payload") if isinstance(res.meta, dict) else raw_s
+            ).strip() or raw_s
+            s.operator_qr_payload = raw_operator_payload if pending_server_validation else ""
+            s.operator_pending_server_validation = pending_server_validation
             if not str(s.cycle_time_current or "").strip():
                 self._begin_initial_cycle_time_setup()
                 if pending_server_validation:
@@ -15632,9 +16106,7 @@ QWidget#ClientUIRoot {{
                 {
                     "type": "OPERATOR_SET",
                     "shift_index": int(s.operator_shift_index or 0),
-                    "operator_qr_payload": str(
-                        (res.meta or {}).get("operator_qr_payload") if isinstance(res.meta, dict) else raw_s
-                    ).strip() or raw_s,
+                    "operator_qr_payload": raw_operator_payload,
                     "pending_server_validation": pending_server_validation,
                 },
                 f"OPERATOR {'OFFLINE ' if pending_server_validation else ''}{s.operator_id}",
@@ -15950,11 +16422,13 @@ QWidget#ClientUIRoot {{
         self._refresh_ui()
     def send_heartbeat(self):
         if self.state.machine_code:
+            self._resolve_pending_operator_profile()
             self.push_event(
                 {"type": "HEARTBEAT"},
                 "HEARTBEAT",
                 silent=True,
             )
+            self._poll_server_average_weight()
 
     def sync_session_snapshot_to_server(self, note: str = "SESSION SYNC"):
         if not self.state.machine_code:

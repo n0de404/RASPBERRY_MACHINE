@@ -268,5 +268,29 @@
     "source": "UI",
     "actor": "-",
     "message": "Input updated: Scanner COM Port = /dev/ttyACM0"
+  },
+  {
+    "timestamp_utc": "2026-06-26T01:59:23.841638+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-06-27T06:24:25.035823+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-06-29T08:28:19.921096+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-06-29T08:28:19.921096+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Writable Database dir: c:\\Users\\IT\\Desktop\\Raspberry_Machine\\Database"
   }
 ]
