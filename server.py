@@ -2081,6 +2081,7 @@ def _profile_identity(profile: Dict[str, Any]) -> Dict[str, str]:
         "id_number": str((profile or {}).get("id_number") or "").strip(),
         "name": str((profile or {}).get("name") or "").strip(),
         "role": str((profile or {}).get("role") or (profile or {}).get("company_role") or "").strip(),
+        "photo_data_url": str((profile or {}).get("photo_data_url") or "").strip(),
     }
 
 
@@ -2108,6 +2109,17 @@ def _profile_has_role(profile: Dict[str, Any], role: str) -> bool:
     extra = str((profile or {}).get("extra_privilege") or "").strip().casefold()
     role_text = str((profile or {}).get("role") or "").strip().casefold()
     return target in {company_role, extra, role_text}
+
+
+def _clean_profile_photo_data_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) > 260_000:
+        raise ValueError("Profile photo is too large. Choose a smaller photo.")
+    if not re.match(r"^data:image/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=\s]+$", raw, re.IGNORECASE):
+        raise ValueError("Profile photo must be a PNG, JPG, or WebP image.")
+    return re.sub(r"\s+", "", raw)
 
 
 def _row_label(row: Dict[str, Any]) -> str:
@@ -2151,6 +2163,60 @@ def _kpi_add_issue(out: Dict[str, Any], issue_type: str, row: Dict[str, Any], de
     issues.append(_kpi_issue(issue_type, row, detail))
     out.setdefault("missed_breakdown", {})
     out["missed_breakdown"][issue_type] = int(out["missed_breakdown"].get(issue_type, 0) or 0) + 1
+
+
+def _kpi_row_key(row: Dict[str, Any]) -> str:
+    return "|".join(
+        str((row or {}).get(k) or "").strip()
+        for k in ("machine_code", "job_code", "finished_at_utc", "ended_at_utc", "last_seen_utc")
+    )
+
+
+def _kpi_job_summary(row: Dict[str, Any], issues: List[Dict[str, Any]], active: bool = False) -> Dict[str, Any]:
+    raw_logs = row.get("raw_material_logs") if isinstance(row.get("raw_material_logs"), list) else []
+    pack_logs = row.get("product_pack_history_logs") if isinstance(row.get("product_pack_history_logs"), list) else []
+    butal_logs = row.get("butal_scan_logs") if isinstance(row.get("butal_scan_logs"), list) else []
+    reject_total = int(row.get("reject_total", 0) or 0) + int(row.get("startup_reject_total", 0) or 0) + int(row.get("no_shot_total", 0) or 0)
+    pack_count = int(row.get("pack_count", row.get("pack_total", 0)) or 0)
+    good_total = int(row.get("good_total", 0) or 0) + int(row.get("butal_total", 0) or 0)
+    issue_count = len(issues or [])
+    success_rate = 100 if issue_count <= 0 else max(0, round((1 - (issue_count / max(1, issue_count + 1))) * 100))
+    notable: List[str] = []
+    if raw_logs:
+        notable.append(f"{len(raw_logs)} raw material scan(s) recorded")
+    if pack_logs:
+        notable.append(f"{len(pack_logs)} pack QR scan(s) recorded")
+    if _reject_scan_count(row) > 0:
+        notable.append(f"{_reject_scan_count(row)} reject scan/review log(s)")
+    review_status = str(row.get("review_status") or "").strip()
+    if review_status:
+        notable.append(f"Review status: {review_status}")
+    if active:
+        notable.append("Job is currently active")
+    if not notable:
+        notable.append("No notable activity recorded yet")
+    return {
+        "job_key": _kpi_row_key(row),
+        "active": bool(active),
+        "machine_code": str(row.get("machine_code") or "").strip(),
+        "machine_name": str(row.get("machine_name") or "").strip(),
+        "job_code": str(row.get("job_code") or "").strip(),
+        "job_name": str(row.get("job_name") or "").strip(),
+        "started_at_utc": row.get("started_at_utc") or row.get("job_started_at") or "",
+        "finished_at_utc": row.get("finished_at_utc") or row.get("ended_at_utc") or "",
+        "pack_count": pack_count,
+        "good_total": good_total,
+        "reject_total": reject_total,
+        "raw_material_scans": len(raw_logs),
+        "pack_qr_scans": len(pack_logs),
+        "reject_scans": _reject_scan_count(row),
+        "wrong_or_voided_scans": _count_voided(pack_logs) + _count_voided(butal_logs),
+        "issue_count": issue_count,
+        "success_rate": success_rate,
+        "status": "SUCCESSFUL" if issue_count <= 0 and not active else ("ONGOING" if active else "NEEDS FOLLOW-UP"),
+        "problems": issues[:8],
+        "notable_acts": notable[:8],
+    }
 
 
 def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
@@ -2220,6 +2286,7 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
             "id_number": ident["id_number"],
             "name": ident["name"],
             "role": ident["role"],
+            "photo_data_url": ident["photo_data_url"],
             "is_operator": is_operator,
             "is_supervisor": is_supervisor,
             "handled_records": len(user_rows),
@@ -2272,6 +2339,48 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
             out["active_supervisor_records"] = len(active_supervisor_rows)
 
         out["missed_total"] = len(out.get("issues") or [])
+        issues_by_job: Dict[str, List[Dict[str, Any]]] = {}
+        for issue in out.get("issues") or []:
+            issue_key = "|".join(
+                str((issue or {}).get(k) or "").strip()
+                for k in ("machine_code", "job_code", "at_utc")
+            )
+            issues_by_job.setdefault(issue_key, []).append(issue)
+
+        def _issues_for_job(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+            direct_key = _kpi_row_key(row)
+            candidates = {
+                direct_key,
+                "|".join(
+                    str((row or {}).get(k) or "").strip()
+                    for k in ("machine_code", "job_code", "finished_at_utc")
+                ),
+                "|".join(
+                    str((row or {}).get(k) or "").strip()
+                    for k in ("machine_code", "job_code", "ended_at_utc")
+                ),
+                "|".join(
+                    str((row or {}).get(k) or "").strip()
+                    for k in ("machine_code", "job_code", "last_seen_utc")
+                ),
+            }
+            found: List[Dict[str, Any]] = []
+            for key in candidates:
+                found.extend(issues_by_job.get(key, []))
+            if found:
+                return found
+            row_machine = str((row or {}).get("machine_code") or "").strip()
+            row_job = str((row or {}).get("job_code") or "").strip()
+            return [
+                issue for issue in (out.get("issues") or [])
+                if str(issue.get("machine_code") or "").strip() == row_machine
+                and str(issue.get("job_code") or "").strip() == row_job
+            ]
+
+        if is_operator:
+            job_rows = [_kpi_job_summary(row, _issues_for_job(row), active=False) for row in user_rows]
+            active_job_rows = [_kpi_job_summary(row, _issues_for_job(row), active=True) for row in active_user_rows]
+            out["handled_jobs"] = [*active_job_rows, *job_rows][:80]
         denominator = max(1, out["handled_records"] + out["approved_records"] + out["active_records"] + int(out.get("active_supervisor_records", 0) or 0))
         out["issue_rate_percent"] = round(min(100.0, (out["missed_total"] / denominator) * 100.0), 2)
         out["issues"] = out["issues"][:50]
@@ -3734,8 +3843,116 @@ DASHBOARD_HTML = """
     .kpi-number.bad { color:#b91c1c; }
     .kpi-number.warn { color:#b45309; }
     .kpi-breakdown { min-width:220px; font-weight:800; color:#334155; }
-    .kpi-unassigned { border:1px solid #fed7aa; border-radius:14px; background:#fff7ed; padding:12px; margin-top:12px; }
+    .kpi-unassigned { grid-column:1 / -1; border:1px solid #fed7aa; border-radius:14px; background:#fff7ed; padding:12px; margin-top:0; }
     .kpi-unassigned-title { font-weight:950; color:#9a3412; margin-bottom:4px; }
+    .user-kpi-shell { min-height:calc(100vh - 120px); padding:24px 28px 28px; border:1px solid #d6dee9; border-radius:16px; background:linear-gradient(135deg,#f8fbff 0%,#eef4fb 55%,#f7fbff 100%); box-shadow:inset 0 1px 0 rgba(255,255,255,.86); color:#0f172a; }
+    .user-kpi-head { display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:18px; }
+    .user-kpi-title-row { display:flex; align-items:flex-start; gap:14px; min-width:0; }
+    .user-kpi-mark { color:#155aa8; font-weight:950; font-size:.86rem; line-height:.75; text-align:center; padding-top:4px; }
+    .user-kpi-mark span { font-size:.72rem; letter-spacing:.06em; }
+    .user-kpi-head h3 { margin:0 0 6px; font-size:1.7rem; line-height:1; letter-spacing:0; color:#0b1220; }
+    .user-kpi-actions { display:flex; gap:12px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+    .user-kpi-date, .user-kpi-refresh { border:1px solid #cbd7e6; border-radius:10px; background:rgba(255,255,255,.78); color:#0f315f; min-height:38px; padding:0 16px; font-weight:850; box-shadow:0 4px 14px rgba(15,23,42,.05); cursor:pointer; }
+    .user-kpi-refresh { background:#e8f1fb; color:#164f91; }
+    #userKpiTab .kpi-filter-row { margin:0 0 18px; }
+    #userKpiTab .kpi-filter-btn { min-width:96px; border-radius:999px; background:#eef2f7; color:#0f172a; border-color:#cdd6e2; padding:9px 18px; box-shadow:inset 0 1px 0 rgba(255,255,255,.7); }
+    #userKpiTab .kpi-filter-btn.active { background:#0f64bd; border-color:#0f64bd; color:#fff; box-shadow:0 8px 18px rgba(15,100,189,.22); }
+    #userKpiTab .job-queue-summary { grid-template-columns:repeat(6,minmax(150px,1fr)); gap:14px; margin:0 0 22px; }
+    #userKpiTab .job-queue-metric { min-height:88px; display:grid; grid-template-columns:54px minmax(0,1fr); gap:12px; align-items:center; border:1px solid #cfd9e6; border-radius:12px; background:rgba(255,255,255,.72); box-shadow:0 10px 22px rgba(15,23,42,.08); padding:14px 16px; }
+    #userKpiTab .job-queue-metric .ico { width:48px; height:48px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:1.35rem; font-weight:950; color:#1859a6; background:#dce8f7; }
+    #userKpiTab .job-queue-metric .ico.warn { color:#b45309; background:#f7ead3; }
+    #userKpiTab .job-queue-metric .ico.bad { color:#b91c1c; background:#f1dada; }
+    #userKpiTab .job-queue-metric .ico.good { color:#15803d; background:#d8efe5; }
+    #userKpiTab .job-queue-metric .k { font-size:.67rem; color:#1f2937; letter-spacing:.03em; }
+    #userKpiTab .job-queue-metric .v { margin:3px 0 2px; font-size:1.38rem; line-height:1; font-weight:950; color:#0b1220; }
+    #userKpiTab .job-queue-metric .sub { font-size:.74rem; font-weight:750; color:#475569; }
+    .user-kpi-body { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:18px; align-items:start; }
+    .user-kpi-main-panel, .user-kpi-side-card { border:1px solid #cfd9e6; border-radius:12px; background:rgba(255,255,255,.70); box-shadow:0 10px 24px rgba(15,23,42,.08); overflow:hidden; }
+    .user-kpi-panel-head { min-height:58px; display:flex; align-items:center; justify-content:space-between; gap:14px; padding:14px 16px; border-bottom:1px solid #d8e1ed; }
+    .user-kpi-panel-head h4, .user-kpi-side-card h4 { margin:0; font-size:1rem; color:#0b1220; }
+    .user-kpi-tools { display:flex; gap:10px; align-items:center; }
+    .user-kpi-search { width:190px; min-height:34px; border:1px solid #cfd9e6; border-radius:10px; background:#f8fbff; padding:0 12px; font-weight:700; color:#334155; }
+    .user-kpi-tool-btn { min-height:34px; border:1px solid #cfd9e6; border-radius:10px; background:#f8fbff; color:#164f91; padding:0 12px; font-weight:900; }
+    .user-kpi-card-grid { display:grid; grid-template-columns:repeat(4,minmax(180px,1fr)); gap:14px; padding:16px; }
+    .user-kpi-card { min-width:0; border:1px solid #c7d2e0; border-radius:12px; background:linear-gradient(180deg,rgba(255,255,255,.92),rgba(246,250,254,.92)); box-shadow:0 10px 20px rgba(15,23,42,.10); padding:12px; cursor:pointer; transition:transform .12s ease, box-shadow .16s ease, border-color .16s ease; }
+    .user-kpi-card:hover { transform:translateY(-2px); border-color:#7aa7dc; box-shadow:0 14px 26px rgba(15,23,42,.14); }
+    .user-kpi-card-head { display:grid; grid-template-columns:50px minmax(0,1fr); gap:10px; align-items:center; margin-bottom:12px; }
+    .user-kpi-avatar { position:relative; width:48px; height:48px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:#dce8f7; color:#102c62; font-size:1.18rem; font-weight:900; }
+    .user-kpi-avatar img { width:100%; height:100%; border-radius:50%; object-fit:cover; display:block; }
+    .user-kpi-avatar::after { content:""; position:absolute; right:1px; top:3px; width:10px; height:10px; border-radius:50%; background:#22c55e; border:2px solid #fff; }
+    .user-kpi-card.busy .user-kpi-avatar::after { background:#f97316; }
+    .user-kpi-card.break .user-kpi-avatar::after { background:#eab308; }
+    .user-kpi-card-name { font-weight:950; color:#0b1220; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .user-kpi-card-id { margin-top:2px; color:#0f172a; font-size:.78rem; font-weight:750; }
+    .user-kpi-stat { display:grid; grid-template-columns:82px 1fr; gap:8px; align-items:center; margin:8px 0; font-size:.82rem; font-weight:900; }
+    .user-kpi-stat-value { color:#0b1220; font-weight:950; }
+    .user-kpi-bar { height:5px; border-radius:999px; background:#dbe2ea; overflow:hidden; margin-top:3px; }
+    .user-kpi-bar span { display:block; height:100%; border-radius:999px; background:#be123c; }
+    .user-kpi-bar.good span { background:#2ca968; }
+    .user-kpi-bar.mid span { background:#d99a16; }
+    .user-kpi-status { margin-top:10px; border-radius:8px; padding:8px 10px; text-align:center; font-size:.82rem; font-weight:950; background:#d9f4e6; color:#147a3f; }
+    .user-kpi-card.busy .user-kpi-status { background:#f5d7d7; color:#9b111e; }
+    .user-kpi-card.break .user-kpi-status { background:#f5edc8; color:#9a6a08; }
+    .user-kpi-footer { display:flex; align-items:center; justify-content:flex-end; gap:22px; min-height:40px; padding:0 16px 14px; color:#475569; font-size:.78rem; font-weight:750; }
+    .user-kpi-footer select { border:1px solid #cfd9e6; border-radius:8px; background:#f8fbff; padding:5px 24px 5px 8px; }
+    .user-kpi-side { display:grid; gap:16px; }
+    .user-kpi-side-card { padding:16px; }
+    .user-kpi-side-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
+    .user-kpi-side-head a { color:#0f4f91; font-weight:950; font-size:.8rem; text-decoration:none; }
+    .user-kpi-issue-row { display:grid; grid-template-columns:24px minmax(0,1fr) 26px; gap:10px; align-items:center; margin:14px 0; }
+    .user-kpi-issue-dot { width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:#f1dada; color:#b91c1c; font-weight:950; font-size:.75rem; }
+    .user-kpi-issue-dot.orange { background:#fde6cf; color:#c66a16; }
+    .user-kpi-issue-dot.yellow { background:#f7edc6; color:#b48a0a; }
+    .user-kpi-issue-dot.purple { background:#eadcf8; color:#7e22ce; }
+    .user-kpi-issue-dot.blue { background:#dfeaf8; color:#2563eb; }
+    .user-kpi-issue-label { font-size:.78rem; font-weight:900; color:#111827; margin-bottom:7px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .user-kpi-issue-track { height:5px; border-radius:999px; background:#dbe2ea; overflow:hidden; }
+    .user-kpi-issue-fill { height:100%; border-radius:999px; background:#d31d2f; }
+    .user-kpi-issue-count { text-align:right; font-size:.86rem; font-weight:950; color:#0f172a; }
+    .user-kpi-donut-row { display:grid; grid-template-columns:130px minmax(0,1fr); gap:18px; align-items:center; }
+    .user-kpi-donut { width:118px; height:118px; border-radius:50%; background:conic-gradient(#dc2626 0 18%, #d99a16 18% 35%, #2ca968 35% 100%); display:flex; align-items:center; justify-content:center; }
+    .user-kpi-donut-inner { width:78px; height:78px; border-radius:50%; background:#f8fbff; display:flex; flex-direction:column; align-items:center; justify-content:center; font-weight:950; color:#0b1220; }
+    .user-kpi-donut-inner span { font-size:.72rem; color:#475569; font-weight:800; }
+    .user-kpi-legend { display:grid; gap:13px; font-size:.8rem; font-weight:850; }
+    .user-kpi-legend-row { display:grid; grid-template-columns:10px minmax(0,1fr) 24px; gap:8px; align-items:center; }
+    .user-kpi-legend-dot { width:8px; height:8px; border-radius:50%; background:#dc2626; }
+    .user-kpi-legend-dot.mid { background:#d99a16; }
+    .user-kpi-legend-dot.low { background:#2ca968; }
+    .user-kpi-note { margin-top:14px; font-size:.72rem; color:#64748b; font-weight:750; }
+    .user-kpi-detail-card { width:min(1060px, calc(100vw - 34px)); max-height:min(88vh, 860px); border:1px solid #cfd9e6; border-radius:16px; background:#f8fbff; box-shadow:0 24px 54px rgba(15,23,42,.24); overflow:hidden; }
+    .user-kpi-detail-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:16px 18px; border-bottom:1px solid #d8e1ed; background:rgba(255,255,255,.74); }
+    .user-kpi-detail-person { display:grid; grid-template-columns:62px minmax(0,1fr); gap:12px; align-items:center; min-width:0; }
+    .user-kpi-detail-avatar { width:58px; height:58px; border-radius:50%; background:#dce8f7; color:#102c62; display:flex; align-items:center; justify-content:center; font-weight:950; font-size:1.25rem; overflow:hidden; }
+    .user-kpi-detail-avatar img { width:100%; height:100%; object-fit:cover; display:block; }
+    .user-kpi-detail-name { font-size:1.2rem; font-weight:950; color:#0b1220; overflow-wrap:anywhere; }
+    .user-kpi-detail-sub { margin-top:3px; color:#475569; font-weight:750; font-size:.84rem; }
+    .user-kpi-detail-body { padding:16px; display:grid; grid-template-columns:280px minmax(0,1fr); gap:16px; max-height:calc(88vh - 92px); overflow:auto; }
+    .user-kpi-detail-summary, .user-kpi-detail-jobs, .user-kpi-job-detail { border:1px solid #d8e1ed; border-radius:12px; background:#fff; box-shadow:0 8px 18px rgba(15,23,42,.06); }
+    .user-kpi-detail-summary { padding:14px; display:grid; gap:10px; align-content:start; }
+    .user-kpi-detail-metric { display:flex; justify-content:space-between; gap:10px; border-bottom:1px solid #eef2f7; padding-bottom:8px; font-size:.84rem; font-weight:850; }
+    .user-kpi-detail-metric:last-child { border-bottom:none; padding-bottom:0; }
+    .user-kpi-detail-metric strong { color:#0b1220; font-weight:950; }
+    .user-kpi-detail-jobs { overflow:hidden; }
+    .user-kpi-detail-jobs-head { display:flex; justify-content:space-between; align-items:center; padding:12px 14px; border-bottom:1px solid #eef2f7; }
+    .user-kpi-detail-jobs-head h4 { margin:0; font-size:.96rem; color:#0b1220; }
+    .user-kpi-job-list { display:grid; gap:8px; padding:12px; max-height:560px; overflow:auto; }
+    .user-kpi-job-row { border:1px solid #dbe4f0; border-radius:10px; background:#f8fbff; padding:10px; cursor:pointer; transition:background .12s ease, border-color .12s ease; }
+    .user-kpi-job-row:hover, .user-kpi-job-row.active { background:#eef6ff; border-color:#93c5fd; }
+    .user-kpi-job-top { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
+    .user-kpi-job-name { font-weight:950; color:#0b1220; overflow-wrap:anywhere; }
+    .user-kpi-job-meta { margin-top:3px; color:#64748b; font-size:.78rem; font-weight:750; }
+    .user-kpi-job-badge { flex:0 0 auto; border-radius:999px; padding:4px 8px; font-size:.68rem; font-weight:950; color:#166534; background:#dcfce7; }
+    .user-kpi-job-badge.warn { color:#92400e; background:#fef3c7; }
+    .user-kpi-job-badge.bad { color:#991b1b; background:#fee2e2; }
+    .user-kpi-job-detail { padding:14px; margin-top:12px; }
+    .user-kpi-job-detail h4 { margin:0 0 10px; color:#0b1220; }
+    .user-kpi-job-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin:10px 0; }
+    .user-kpi-job-metric { border:1px solid #e2e8f0; border-radius:9px; background:#f8fafc; padding:9px; }
+    .user-kpi-job-metric .k { color:#64748b; font-size:.68rem; font-weight:900; text-transform:uppercase; }
+    .user-kpi-job-metric .v { margin-top:4px; color:#0b1220; font-weight:950; }
+    .user-kpi-detail-section-title { margin:12px 0 6px; font-size:.8rem; font-weight:950; color:#334155; text-transform:uppercase; letter-spacing:.03em; }
+    .user-kpi-detail-list { display:grid; gap:6px; }
+    .user-kpi-detail-list div { border-left:3px solid #93c5fd; padding:6px 8px; background:#f8fbff; border-radius:0 8px 8px 0; font-size:.82rem; color:#334155; font-weight:750; }
     .sub-tabs { display:flex; gap:8px; margin-top:12px; margin-bottom:12px; flex-wrap:wrap; }
     .sub-tab-button { background:#fff; border:1px solid #cbd5e1; border-radius:999px; padding:8px 14px; font-weight:700; color:#334155; cursor:pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .sub-tab-button:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(15,23,42,0.08); }
@@ -4490,6 +4707,7 @@ DASHBOARD_HTML = """
       .planning-board { grid-template-columns:1fr; }
       .planning-lane.backlog { height:460px; min-height:0; }
       .planning-ops-summary { grid-template-columns:repeat(3, minmax(140px,1fr)); }
+      .user-kpi-card-grid { grid-template-columns:repeat(3,minmax(180px,1fr)); }
     }
     @media (max-width: 1200px) {
       .diagnostics { grid-template-columns: repeat(4, 48px) repeat(2, minmax(150px, 1fr)); }
@@ -4498,6 +4716,9 @@ DASHBOARD_HTML = """
       #maintenanceTab .maintenance-person { grid-template-columns:64px minmax(0,1fr); }
       #maintenanceTab .maintenance-stats { grid-column:1 / -1; border-left:none; border-top:1px solid #e5ecf4; }
       .archive-metric-grid, .raw-insight-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      #userKpiTab .job-queue-summary { grid-template-columns:repeat(3,minmax(150px,1fr)); }
+      .user-kpi-body { grid-template-columns:1fr; }
+      .user-kpi-side { grid-template-columns:repeat(2,minmax(0,1fr)); }
     }
     @media (max-width: 900px) {
       .diagnostics { grid-template-columns: repeat(4, 48px) minmax(0, 1fr); }
@@ -4517,6 +4738,11 @@ DASHBOARD_HTML = """
       .operator-directory-row { grid-template-columns:1fr 1fr; }
       .operator-directory-row.header { display:none; }
       .operator-directory-label { display:block; }
+      .user-kpi-head { display:grid; }
+      .user-kpi-actions { justify-content:flex-start; }
+      .user-kpi-card-grid { grid-template-columns:repeat(2,minmax(180px,1fr)); }
+      .user-kpi-side { grid-template-columns:1fr; }
+      .user-kpi-detail-body { grid-template-columns:1fr; }
     }
     @media (max-width: 640px) {
       body { font-size:14px; }
@@ -4526,6 +4752,25 @@ DASHBOARD_HTML = """
       .main-tabs { padding:10px 8px; gap:6px; }
       .main-tab-button { flex:1 1 calc(50% - 6px); padding:8px 10px; }
       .main-tab-content { padding:0 8px 10px; }
+      .job-queue-summary { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
+      .job-queue-metric { padding:10px; }
+      .job-queue-metric .k { font-size:.68rem; line-height:1.15; }
+      .job-queue-metric .v { font-size:1.05rem; overflow-wrap:anywhere; }
+      .kpi-issue-list { min-width:0; }
+      .user-kpi-shell { padding:14px 10px; border-radius:12px; }
+      .user-kpi-head h3 { font-size:1.35rem; }
+      #userKpiTab .job-queue-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      #userKpiTab .job-queue-metric { grid-template-columns:42px minmax(0,1fr); padding:10px; min-height:72px; }
+      #userKpiTab .job-queue-metric .ico { width:38px; height:38px; font-size:1rem; }
+      .user-kpi-panel-head { display:grid; }
+      .user-kpi-tools { width:100%; }
+      .user-kpi-search { width:100%; }
+      .user-kpi-card-grid { grid-template-columns:1fr; padding:10px; gap:10px; }
+      .user-kpi-donut-row { grid-template-columns:1fr; justify-items:center; }
+      .user-kpi-footer { justify-content:center; flex-wrap:wrap; gap:10px; }
+      .user-kpi-detail-head { padding:12px; }
+      .user-kpi-detail-body { padding:10px; }
+      .user-kpi-job-grid { grid-template-columns:1fr 1fr; }
       .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
       #machineGrid { grid-template-columns:repeat(2, minmax(0, 1fr)); }
       .card p { font-size:.78rem; }
@@ -4749,16 +4994,27 @@ DASHBOARD_HTML = """
   </div>
 
   <div id="userKpiTab" class="main-tab-content">
-    <div class="panel">
-      <h3>User KPIs</h3>
-      <div class="muted">Follow-up view for missed scans, wrong/voided scans, pending approvals, and active waiting items. These are based only on records saved on this server.</div>
+    <div class="user-kpi-shell">
+      <div class="user-kpi-head">
+        <div class="user-kpi-title-row">
+          <div class="user-kpi-mark">03<br><span>20</span></div>
+          <div>
+            <h3>User KPIs</h3>
+            <div class="muted">Monitor operator performance and follow up on issues that need attention.</div>
+          </div>
+        </div>
+        <div class="user-kpi-actions">
+          <button class="user-kpi-date" type="button">June 23, 2025</button>
+          <button id="userKpiRefreshBtn" class="user-kpi-refresh" type="button">Refresh</button>
+        </div>
+      </div>
       <div class="kpi-filter-row">
-        <button class="kpi-filter-btn active" type="button" data-user-kpi-role="all">All Users</button>
-        <button class="kpi-filter-btn" type="button" data-user-kpi-role="operator">Operators</button>
+        <button class="kpi-filter-btn" type="button" data-user-kpi-role="all">All Users</button>
+        <button class="kpi-filter-btn active" type="button" data-user-kpi-role="operator">Operators</button>
         <button class="kpi-filter-btn" type="button" data-user-kpi-role="supervisor">Supervisors</button>
       </div>
       <div id="userKpiSummary" class="job-queue-summary"></div>
-      <div id="userKpiTableWrap" class="table-wrap">
+      <div id="userKpiTableWrap" class="user-kpi-body">
         <div class="placeholder">Open this tab to load user KPIs.</div>
       </div>
     </div>
@@ -4768,6 +5024,16 @@ DASHBOARD_HTML = """
     <div class="panel">
       <h3>Production Daily Reports</h3>
       <div class="placeholder">PDR table and print-preview placeholder</div>
+    </div>
+  </div>
+
+  <div id="userKpiDetailOverlay" class="settings-overlay">
+    <div class="user-kpi-detail-card">
+      <div class="user-kpi-detail-head">
+        <div id="userKpiDetailPerson" class="user-kpi-detail-person"></div>
+        <button id="userKpiDetailCloseBtn" class="overlay-close" type="button">Close</button>
+      </div>
+      <div id="userKpiDetailBody" class="user-kpi-detail-body"></div>
     </div>
   </div>
 
@@ -5193,6 +5459,11 @@ DASHBOARD_HTML = """
   const maintenanceCurrentDate = document.getElementById("maintenanceCurrentDate");
   const userKpiSummary = document.getElementById("userKpiSummary");
   const userKpiTableWrap = document.getElementById("userKpiTableWrap");
+  const userKpiRefreshBtn = document.getElementById("userKpiRefreshBtn");
+  const userKpiDetailOverlay = document.getElementById("userKpiDetailOverlay");
+  const userKpiDetailCloseBtn = document.getElementById("userKpiDetailCloseBtn");
+  const userKpiDetailPerson = document.getElementById("userKpiDetailPerson");
+  const userKpiDetailBody = document.getElementById("userKpiDetailBody");
   const approvePrintOverlay = document.getElementById("approvePrintOverlay");
   const overlayCloseBtn = document.getElementById("overlayCloseBtn");
   const overlayCancelBtn = document.getElementById("overlayCancelBtn");
@@ -5338,8 +5609,9 @@ DASHBOARD_HTML = """
   let settingsProfilesState = [];
   let machineStatusOverridesState = {};
   let activeMachineDetailCode = "";
-  let userKpiRoleState = "all";
+  let userKpiRoleState = "operator";
   let userKpiLoading = false;
+  let userKpiItemsState = [];
 
   function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;"); }
   function escJson(v){
@@ -8254,9 +8526,192 @@ DASHBOARD_HTML = """
     `;
   }
 
+  function kpiInitials(name, fallback){
+    const raw = String(name || fallback || "").trim();
+    if(!raw) return "--";
+    const parts = raw.split(/\\s+/).filter(Boolean);
+    if(parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+    return `${parts[0][0] || ""}${parts[parts.length - 1][0] || ""}`.toUpperCase();
+  }
+
+  function kpiStatus(row){
+    const active = Number(row?.active_records || 0) + Number(row?.active_supervisor_records || 0);
+    const missed = Number(row?.missed_total || 0);
+    const wrong = Number(row?.wrong_or_voided_scans || 0);
+    if(active > 0 || missed >= 10) return { cls: "busy", label: "STATUS: BUSY" };
+    if(wrong > 0 || missed > 0) return { cls: "break", label: "STATUS: ON BREAK" };
+    return { cls: "available", label: "STATUS: AVAILABLE" };
+  }
+
+  function kpiTopIssueRows(items, unassigned){
+    const counts = {};
+    (Array.isArray(items) ? items : []).forEach(row => {
+      const bd = row?.missed_breakdown && typeof row.missed_breakdown === "object" ? row.missed_breakdown : {};
+      Object.entries(bd).forEach(([type, count]) => {
+        counts[type] = Number(counts[type] || 0) + Number(count || 0);
+      });
+    });
+    (Array.isArray(unassigned) ? unassigned : []).forEach(issue => {
+      const type = String(issue?.type || "unassigned_waiting_supervisor");
+      counts[type] = Number(counts[type] || 0) + 1;
+    });
+    const fallbackTypes = [
+      "missing_raw_material_scan",
+      "missing_reject_scan_review",
+      "missing_pack_qr_scan",
+      "wrong_voided_scan",
+      "unassigned_waiting_supervisor",
+    ];
+    fallbackTypes.forEach(type => { if(!(type in counts)) counts[type] = 0; });
+    return Object.entries(counts)
+      .map(([type, count]) => ({ type, count: Number(count || 0) }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
+  }
+
+  function userKpiSuccessRate(row){
+    const missed = Number(row?.missed_total || 0);
+    const handled = Number(row?.handled_records || 0);
+    return handled + missed > 0 ? Math.max(0, Math.round((handled / Math.max(1, handled + missed)) * 100)) : 100;
+  }
+
+  function renderKpiOperatorCard(row, index){
+    const missed = Number(row?.missed_total || 0);
+    const handled = Number(row?.handled_records || 0);
+    const rate = Number(row?.issue_rate_percent ?? 0);
+    const success = userKpiSuccessRate(row);
+    const status = kpiStatus(row);
+    const rateWidth = Math.max(8, Math.min(100, rate));
+    const photo = String(row?.photo_data_url || "").trim();
+    const avatar = photo
+      ? `<img src="${esc(photo)}" alt="${esc(row?.name || row?.id_number || 'Profile photo')}" />`
+      : esc(kpiInitials(row?.name, row?.id_number));
+    return `
+      <div class="user-kpi-card ${esc(status.cls)}" data-user-kpi-index="${esc(index)}" role="button" tabindex="0">
+        <div class="user-kpi-card-head">
+          <div class="user-kpi-avatar">${avatar}</div>
+          <div>
+            <div class="user-kpi-card-name">${esc(row?.name || row?.id_number || "-")}</div>
+            <div class="user-kpi-card-id">${esc(row?.id_number || "-")}</div>
+          </div>
+        </div>
+        <div class="user-kpi-stat">
+          <div>KPI Rate:</div>
+          <div>
+            <span class="user-kpi-stat-value">${esc(rate.toFixed(2))}%</span>
+            <div class="user-kpi-bar"><span style="width:${esc(rateWidth)}%;"></span></div>
+          </div>
+        </div>
+        <div class="user-kpi-stat">
+          <div>Jobs Handled:</div>
+          <div><span class="user-kpi-stat-value">${esc(handled)}</span></div>
+        </div>
+        <div class="user-kpi-stat">
+          <div>Success Rate:</div>
+          <div>
+            <span class="user-kpi-stat-value">${esc(success)}%</span>
+            <div class="user-kpi-bar good"><span style="width:${esc(success)}%;"></span></div>
+          </div>
+        </div>
+        <div class="user-kpi-status">${esc(status.label)}</div>
+      </div>
+    `;
+  }
+
+  function userKpiAvatarHtml(row, className){
+    const photo = String(row?.photo_data_url || "").trim();
+    const label = esc(row?.name || row?.id_number || "Profile photo");
+    return `<div class="${esc(className)}">${photo ? `<img src="${esc(photo)}" alt="${label}" />` : esc(kpiInitials(row?.name, row?.id_number))}</div>`;
+  }
+
+  function renderUserKpiJobDetail(job){
+    if(!job){
+      return '<div class="user-kpi-job-detail"><h4>Select a job</h4><div class="muted">Click a handled job to view its result, problems, and notable activity.</div></div>';
+    }
+    const statusClass = Number(job.issue_count || 0) > 0 ? "bad" : (job.active ? "warn" : "");
+    const problems = Array.isArray(job.problems) ? job.problems : [];
+    const notable = Array.isArray(job.notable_acts) ? job.notable_acts : [];
+    return `
+      <div class="user-kpi-job-detail">
+        <h4>${esc(jobDisplayName(job, job.job_code || "Job"))}</h4>
+        <div class="user-kpi-job-meta">${esc(job.machine_name || job.machine_code || "-")} | ${esc(job.finished_at_utc ? fmtDateLocal(job.finished_at_utc) : (job.started_at_utc ? fmtDateLocal(job.started_at_utc) : "-"))}</div>
+        <div style="margin-top:10px;"><span class="user-kpi-job-badge ${esc(statusClass)}">${esc(job.status || "-")}</span></div>
+        <div class="user-kpi-job-grid">
+          <div class="user-kpi-job-metric"><div class="k">Success Rate</div><div class="v">${esc(job.success_rate ?? 0)}%</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Problems</div><div class="v">${esc(job.issue_count ?? 0)}</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Wrong / Voided</div><div class="v">${esc(job.wrong_or_voided_scans ?? 0)}</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Pack</div><div class="v">${esc(job.pack_count ?? 0)}</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Good</div><div class="v">${esc(job.good_total ?? 0)}</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Reject</div><div class="v">${esc(job.reject_total ?? 0)}</div></div>
+        </div>
+        <div class="user-kpi-detail-section-title">Problems</div>
+        <div class="user-kpi-detail-list">
+          ${problems.length ? problems.map(issue => `<div><strong>${esc(kpiIssueLabel(issue?.type))}</strong><br>${esc(issue?.detail || "-")}</div>`).join("") : '<div>No problem recorded for this job.</div>'}
+        </div>
+        <div class="user-kpi-detail-section-title">Notable Acts</div>
+        <div class="user-kpi-detail-list">
+          ${notable.length ? notable.map(item => `<div>${esc(item)}</div>`).join("") : '<div>No notable activity recorded.</div>'}
+        </div>
+      </div>
+    `;
+  }
+
+  function openUserKpiDetail(index){
+    const row = Array.isArray(userKpiItemsState) ? userKpiItemsState[index] : null;
+    if(!row || !userKpiDetailOverlay || !userKpiDetailPerson || !userKpiDetailBody) return;
+    const status = kpiStatus(row);
+    const jobs = Array.isArray(row.handled_jobs) ? row.handled_jobs : [];
+    const firstJob = jobs[0] || null;
+    userKpiDetailPerson.innerHTML = `
+      ${userKpiAvatarHtml(row, "user-kpi-detail-avatar")}
+      <div>
+        <div class="user-kpi-detail-name">${esc(row.name || row.id_number || "-")}</div>
+        <div class="user-kpi-detail-sub">${esc(row.id_number || "-")} | ${esc(row.role || "Operator")} | ${esc(status.label.replace("STATUS: ", ""))}</div>
+      </div>
+    `;
+    userKpiDetailBody.innerHTML = `
+      <div class="user-kpi-detail-summary">
+        <div class="user-kpi-detail-metric"><span>KPI Rate</span><strong>${esc(row.issue_rate_percent ?? 0)}%</strong></div>
+        <div class="user-kpi-detail-metric"><span>Success Rate</span><strong>${esc(userKpiSuccessRate(row))}%</strong></div>
+        <div class="user-kpi-detail-metric"><span>Jobs Handled</span><strong>${esc(row.handled_records ?? 0)}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Active Jobs</span><strong>${esc((Number(row.active_records || 0) + Number(row.active_supervisor_records || 0)))}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Missed Items</span><strong>${esc(row.missed_total ?? 0)}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Wrong / Voided</span><strong>${esc(row.wrong_or_voided_scans ?? 0)}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Raw Scans</span><strong>${esc(row.raw_material_scans ?? 0)}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Pack QR</span><strong>${esc(row.pack_qr_scans ?? 0)}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Reject Scans</span><strong>${esc(row.reject_scans ?? 0)}</strong></div>
+      </div>
+      <div>
+        <div class="user-kpi-detail-jobs">
+          <div class="user-kpi-detail-jobs-head"><h4>Jobs Handled</h4><span class="muted">${esc(jobs.length)} record(s)</span></div>
+          <div class="user-kpi-job-list">
+            ${jobs.length ? jobs.map((job, jobIndex) => {
+              const badgeClass = Number(job.issue_count || 0) > 0 ? "bad" : (job.active ? "warn" : "");
+              return `
+                <div class="user-kpi-job-row ${jobIndex === 0 ? "active" : ""}" data-user-kpi-job-index="${esc(jobIndex)}">
+                  <div class="user-kpi-job-top">
+                    <div>
+                      <div class="user-kpi-job-name">${esc(jobDisplayName(job, job.job_code || "Job"))}</div>
+                      <div class="user-kpi-job-meta">${esc(job.machine_name || job.machine_code || "-")} | Pack ${esc(job.pack_count ?? 0)} | Good ${esc(job.good_total ?? 0)} | Reject ${esc(job.reject_total ?? 0)}</div>
+                    </div>
+                    <span class="user-kpi-job-badge ${esc(badgeClass)}">${esc(job.status || "-")}</span>
+                  </div>
+                </div>
+              `;
+            }).join("") : '<div class="placeholder">No handled job records found for this operator.</div>'}
+          </div>
+        </div>
+        <div id="userKpiJobDetailPane">${renderUserKpiJobDetail(firstJob)}</div>
+      </div>
+    `;
+    userKpiDetailOverlay.setAttribute("data-open-user-index", String(index));
+    userKpiDetailOverlay.classList.add("active");
+  }
+
   function renderUserKpis(payload){
     const data = (payload && typeof payload === "object") ? payload : {};
     const items = Array.isArray(data.items) ? data.items : [];
+    userKpiItemsState = items.slice();
     const unassigned = Array.isArray(data.unassigned_supervisor_issues) ? data.unassigned_supervisor_issues : [];
     const summary = (data.summary && typeof data.summary === "object") ? data.summary : {};
     const operators = items.filter(row => row?.is_operator).length;
@@ -8266,13 +8721,12 @@ DASHBOARD_HTML = """
 
     if(userKpiSummary){
       userKpiSummary.innerHTML = `
-        <div class="job-queue-metric"><div class="k">Users</div><div class="v">${esc(summary.users ?? items.length)}</div></div>
-        <div class="job-queue-metric"><div class="k">Operators</div><div class="v">${esc(operators)}</div></div>
-        <div class="job-queue-metric"><div class="k">Supervisors</div><div class="v">${esc(supervisors)}</div></div>
-        <div class="job-queue-metric"><div class="k">Missed Items</div><div class="v">${esc(summary.missed_total ?? 0)}</div></div>
-        <div class="job-queue-metric"><div class="k">Wrong / Voided</div><div class="v">${esc(summary.wrong_or_voided_scans ?? 0)}</div></div>
-        <div class="job-queue-metric"><div class="k">Unassigned Supervisor</div><div class="v">${esc(summary.unassigned_supervisor_issues ?? unassigned.length)}</div></div>
-        <div class="job-queue-metric"><div class="k">Handled / Approved</div><div class="v">${esc(handled)} / ${esc(approved)}</div></div>
+        <div class="job-queue-metric"><div class="ico">U</div><div><div class="k">Users</div><div class="v">${esc(summary.users ?? items.length)}</div><div class="sub">Total users</div></div></div>
+        <div class="job-queue-metric"><div class="ico">O</div><div><div class="k">Operators</div><div class="v">${esc(operators)}</div><div class="sub">Active operators</div></div></div>
+        <div class="job-queue-metric"><div class="ico">S</div><div><div class="k">Supervisors</div><div class="v">${esc(supervisors)}</div><div class="sub">Active supervisors</div></div></div>
+        <div class="job-queue-metric"><div class="ico warn">!</div><div><div class="k">Missed Items</div><div class="v">${esc(summary.missed_total ?? 0)}</div><div class="sub">Needs follow-up</div></div></div>
+        <div class="job-queue-metric"><div class="ico bad">X</div><div><div class="k">Wrong / Voided</div><div class="v">${esc(summary.wrong_or_voided_scans ?? 0)}</div><div class="sub">Wrong or voided</div></div></div>
+        <div class="job-queue-metric"><div class="ico good">✓</div><div><div class="k">Handled / Approved</div><div class="v">${esc(handled)}/${esc(approved)}</div><div class="sub">Handled / Approved</div></div></div>
       `;
     }
 
@@ -8290,47 +8744,71 @@ DASHBOARD_HTML = """
       </div>
     ` : "";
 
+    const topIssues = kpiTopIssueRows(items, unassigned);
+    const maxIssue = Math.max(1, ...topIssues.map(x => Number(x.count || 0)));
+    const highCount = items.filter(row => Number(row?.issue_rate_percent || 0) > 70).length;
+    const mediumCount = items.filter(row => {
+      const rate = Number(row?.issue_rate_percent || 0);
+      return rate >= 30 && rate <= 70;
+    }).length;
+    const lowCount = Math.max(0, items.length - highCount - mediumCount);
+    const totalRateRows = Math.max(1, items.length);
+    const highDeg = (highCount / totalRateRows) * 360;
+    const mediumDeg = highDeg + (mediumCount / totalRateRows) * 360;
+    const rowsShown = Math.min(10, items.length);
+
     userKpiTableWrap.innerHTML = `
       ${unassignedHtml}
-      <div class="kpi-card-grid">
-        ${items.map(row => {
-          const roles = [
-            row?.is_operator ? "Operator" : "",
-            row?.is_supervisor ? "Supervisor" : "",
-          ].filter(Boolean).join(" / ") || row?.role || "-";
-          const activeRecords = Number(row?.active_records || 0) + Number(row?.active_supervisor_records || 0);
-          const missed = Number(row?.missed_total || 0);
-          const wrong = Number(row?.wrong_or_voided_scans || 0);
-          const cardClass = missed >= 10 ? "bad" : (missed > 0 || wrong > 0 ? "warn" : "");
-          return `
-            <div class="kpi-user-card ${esc(cardClass)}">
-              <div class="kpi-card-head">
-                <div class="kpi-person">
-                  <div class="kpi-person-name">${esc(row?.name || row?.id_number || "-")}</div>
-                  <div class="kpi-person-id">${esc(row?.id_number || "-")}</div>
+      <div class="user-kpi-main-panel">
+        <div class="user-kpi-panel-head">
+          <h4>Operator Performance</h4>
+          <div class="user-kpi-tools">
+            <input class="user-kpi-search" type="search" placeholder="Search operator..." />
+            <button class="user-kpi-tool-btn" type="button">Filters</button>
+          </div>
+        </div>
+        <div class="user-kpi-card-grid">
+          ${items.slice(0, 10).map((row, index) => renderKpiOperatorCard(row, index)).join("")}
+        </div>
+        <div class="user-kpi-footer">
+          <span>Rows per page: <select><option>10</option><option>20</option></select></span>
+          <span>1-${esc(rowsShown)} of ${esc(items.length)}</span>
+          <span>‹</span>
+          <span>›</span>
+        </div>
+      </div>
+      <div class="user-kpi-side">
+        <div class="user-kpi-side-card">
+          <div class="user-kpi-side-head"><h4>Top Issues</h4><a href="#userKpiTab">View all</a></div>
+          ${topIssues.map((issue, idx) => {
+            const colors = ["", "orange", "yellow", "purple", "blue"];
+            const width = Math.round((Number(issue.count || 0) / maxIssue) * 100);
+            return `
+              <div class="user-kpi-issue-row">
+                <div class="user-kpi-issue-dot ${esc(colors[idx] || "blue")}">${esc(idx + 1)}</div>
+                <div>
+                  <div class="user-kpi-issue-label">${esc(kpiIssueLabel(issue.type))}</div>
+                  <div class="user-kpi-issue-track"><div class="user-kpi-issue-fill" style="width:${esc(width)}%;"></div></div>
                 </div>
-                <div class="kpi-role-pill">${esc(roles)}</div>
+                <div class="user-kpi-issue-count">${esc(issue.count)}</div>
               </div>
-              <div class="kpi-big-row">
-                <div class="kpi-big"><div class="v">${esc(missed)}</div><div class="k">Missed</div></div>
-                <div class="kpi-big"><div class="v">${esc(wrong)}</div><div class="k">Wrong / Voided</div></div>
-                <div class="kpi-big"><div class="v">${esc(row?.issue_rate_percent ?? 0)}%</div><div class="k">Issue Rate</div></div>
-              </div>
-              <div class="kpi-mini-grid">
-                <div class="kpi-mini"><div class="k">Handled</div><div class="v">${esc(row?.handled_records ?? 0)}</div></div>
-                <div class="kpi-mini"><div class="k">Approved</div><div class="v">${esc(row?.approved_records ?? 0)}</div></div>
-                <div class="kpi-mini"><div class="k">Active</div><div class="v">${esc(activeRecords)}</div></div>
-                <div class="kpi-mini"><div class="k">Raw Scans</div><div class="v">${esc(row?.raw_material_scans ?? 0)}</div></div>
-                <div class="kpi-mini"><div class="k">Pack QR</div><div class="v">${esc(row?.pack_qr_scans ?? 0)}</div></div>
-                <div class="kpi-mini"><div class="k">Reject Scans</div><div class="v">${esc(row?.reject_scans ?? 0)}</div></div>
-              </div>
-              <div class="kpi-breakdown">
-                <div>Top missing: ${renderKpiBreakdown(row?.missed_breakdown)}</div>
-                <div style="margin-top:8px;">${renderKpiIssues(row?.issues)}</div>
-              </div>
+            `;
+          }).join("")}
+        </div>
+        <div class="user-kpi-side-card">
+          <h4>Issue Rate Overview</h4>
+          <div class="user-kpi-donut-row" style="margin-top:16px;">
+            <div class="user-kpi-donut" style="background:conic-gradient(#dc2626 0 ${esc(highDeg)}deg, #d99a16 ${esc(highDeg)}deg ${esc(mediumDeg)}deg, #2ca968 ${esc(mediumDeg)}deg 360deg);">
+              <div class="user-kpi-donut-inner">${esc(items.length)}<span>Operators</span></div>
             </div>
-          `;
-        }).join("")}
+            <div class="user-kpi-legend">
+              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot"></span><span>High (&gt; 70%)</span><strong>${esc(highCount)}</strong></div>
+              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot mid"></span><span>Medium (30-70%)</span><strong>${esc(mediumCount)}</strong></div>
+              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot low"></span><span>Low (&lt; 20%)</span><strong>${esc(lowCount)}</strong></div>
+            </div>
+          </div>
+          <div class="user-kpi-note">Issue rate = Missed / (Handled + Missed)</div>
+        </div>
       </div>
     `;
   }
@@ -9126,6 +9604,45 @@ DASHBOARD_HTML = """
       loadUserKpis(role);
     });
   });
+  if(userKpiRefreshBtn){
+    userKpiRefreshBtn.addEventListener("click", () => loadUserKpis(userKpiRoleState));
+  }
+  if(userKpiTableWrap){
+    userKpiTableWrap.addEventListener("click", (ev) => {
+      const card = ev.target && ev.target.closest ? ev.target.closest("[data-user-kpi-index]") : null;
+      if(!card) return;
+      const idx = Number(card.getAttribute("data-user-kpi-index") || "-1");
+      if(idx >= 0) openUserKpiDetail(idx);
+    });
+    userKpiTableWrap.addEventListener("keydown", (ev) => {
+      if(ev.key !== "Enter" && ev.key !== " ") return;
+      const card = ev.target && ev.target.closest ? ev.target.closest("[data-user-kpi-index]") : null;
+      if(!card) return;
+      ev.preventDefault();
+      const idx = Number(card.getAttribute("data-user-kpi-index") || "-1");
+      if(idx >= 0) openUserKpiDetail(idx);
+    });
+  }
+  if(userKpiDetailCloseBtn){
+    userKpiDetailCloseBtn.addEventListener("click", () => userKpiDetailOverlay?.classList.remove("active"));
+  }
+  if(userKpiDetailOverlay){
+    userKpiDetailOverlay.addEventListener("click", (ev) => {
+      if(ev.target === userKpiDetailOverlay) userKpiDetailOverlay.classList.remove("active");
+      const jobRow = ev.target && ev.target.closest ? ev.target.closest("[data-user-kpi-job-index]") : null;
+      if(!jobRow) return;
+      const jobIdx = Number(jobRow.getAttribute("data-user-kpi-job-index") || "-1");
+      const detailPane = document.getElementById("userKpiJobDetailPane");
+      const openIndexSource = userKpiDetailOverlay.getAttribute("data-open-user-index");
+      const userIdx = Number(openIndexSource || "-1");
+      const row = userIdx >= 0 ? userKpiItemsState[userIdx] : null;
+      const jobs = Array.isArray(row?.handled_jobs) ? row.handled_jobs : [];
+      if(jobIdx < 0 || !detailPane) return;
+      userKpiDetailOverlay.querySelectorAll("[data-user-kpi-job-index]").forEach(el => el.classList.remove("active"));
+      jobRow.classList.add("active");
+      detailPane.innerHTML = renderUserKpiJobDetail(jobs[jobIdx]);
+    });
+  }
   document.querySelectorAll(".sub-tab-button").forEach(btn => {
     btn.addEventListener("click", () => {
       const host = btn.closest(".panel");
@@ -9770,6 +10287,10 @@ PROFILE_CREATOR_HTML = """
     .mini-btn.primary { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
     .mini-btn.danger { background: #fff1f2; color: #be123c; border-color: #fecdd3; }
     .mini-actions { display:flex; gap:6px; flex-wrap:wrap; }
+    .photo-row { display:grid; grid-template-columns:58px minmax(0,1fr); gap:10px; align-items:center; border:1px solid #dbe4f0; border-radius:12px; padding:10px; background:#f8fafc; }
+    .photo-preview { width:52px; height:52px; border-radius:50%; border:1px solid #cbd5e1; background:#e2e8f0; object-fit:cover; display:block; }
+    .photo-help { margin-top:4px; font-size:.74rem; color:#64748b; }
+    .profile-thumb { width:34px; height:34px; border-radius:50%; object-fit:cover; border:1px solid #cbd5e1; background:#e2e8f0; display:block; }
     body[data-theme="Soft Gray"] { background: #eef1f4 url('/Images/bgbg.png') center / cover fixed no-repeat; color: #243041; }
     body[data-theme="Soft Gray"] .card, body[data-theme="Soft Gray"] .table { background: rgba(248,250,252,.96); border-color: #dbe2eb; }
     body[data-theme="Soft Gray"] .head { border-bottom-color: #dbe2eb; color: #334155; }
@@ -9825,6 +10346,15 @@ PROFILE_CREATOR_HTML = """
                 <option>Production Manager</option>
               </select>
             </div>
+            <div class="row"><label>Profile Photo</label>
+              <div class="photo-row">
+                <img id="pfPhotoPreview" class="photo-preview" alt="Profile photo preview" />
+                <div>
+                  <input id="pfPhoto" type="file" accept="image/png,image/jpeg,image/webp" />
+                  <div class="photo-help">Used on User KPI cards. Photos are resized before saving.</div>
+                </div>
+              </div>
+            </div>
             <div class="row"><label>Print Size</label>
               <select id="pfSize">
                 <option value="barcode_4x1.25">Barcode Printer (4 x 1.25 split by 3)</option>
@@ -9848,9 +10378,10 @@ PROFILE_CREATOR_HTML = """
     </div>
     <div class="table">
       <table>
-        <thead><tr><th>Name</th><th>ID Number</th><th>Role</th><th>Created</th><th>Printed</th><th>Print Count</th><th>Action</th></tr></thead>
+        <thead><tr><th>Photo</th><th>Name</th><th>ID Number</th><th>Role</th><th>Created</th><th>Printed</th><th>Print Count</th><th>Action</th></tr></thead>
         <tbody id="pfTableBody"></tbody>
       </table>
+      <input id="pfExistingPhotoInput" type="file" accept="image/png,image/jpeg,image/webp" style="display:none;" />
     </div>
   </div>
 <script>
@@ -9858,6 +10389,9 @@ PROFILE_CREATOR_HTML = """
   const pfId = document.getElementById('pfId');
   const pfRole = document.getElementById('pfRole');
   const pfSize = document.getElementById('pfSize');
+  const pfPhoto = document.getElementById('pfPhoto');
+  const pfPhotoPreview = document.getElementById('pfPhotoPreview');
+  const pfExistingPhotoInput = document.getElementById('pfExistingPhotoInput');
   const pfPreviewBtn = document.getElementById('pfPreviewBtn');
   const pfSaveBtn = document.getElementById('pfSaveBtn');
   const pfSavePrintBtn = document.getElementById('pfSavePrintBtn');
@@ -9866,6 +10400,8 @@ PROFILE_CREATOR_HTML = """
   const pfPayloadPreview = document.getElementById('pfPayloadPreview');
   const pfTableBody = document.getElementById('pfTableBody');
   let lastPreview = { payload: '', image: '' };
+  let profilePhotoDataUrl = '';
+  let pendingExistingPhotoId = '';
   function esc(s){ return (s ?? '').toString().replaceAll('&','&amp;').replaceAll('<','&lt;'); }
   function escAttr(s){ return esc(s).replaceAll('\"','&quot;'); }
   function setStatus(t){ pfStatus.textContent = t || ''; }
@@ -9884,12 +10420,63 @@ PROFILE_CREATOR_HTML = """
       if(out && out.ok && out.settings) applyProfileTheme(out.settings.theme || 'Default');
     }catch(_e){}
   }
+  function setPhotoPreview(src){
+    profilePhotoDataUrl = src || '';
+    if(pfPhotoPreview){
+      if(profilePhotoDataUrl){
+        pfPhotoPreview.src = profilePhotoDataUrl;
+        pfPhotoPreview.style.visibility = 'visible';
+      } else {
+        pfPhotoPreview.removeAttribute('src');
+        pfPhotoPreview.style.visibility = 'hidden';
+      }
+    }
+  }
+  function profilePhotoThumb(src, name){
+    const photo = String(src || '').trim();
+    if(photo){
+      return `<img class="profile-thumb" src="${escAttr(photo)}" alt="${escAttr(name || 'Profile photo')}" />`;
+    }
+    return '<div class="profile-thumb" aria-hidden="true"></div>';
+  }
+  async function fileToProfilePhotoDataUrl(file){
+    if(!file) return '';
+    if(!new RegExp('^image/(png|jpeg|jpg|webp)$', 'i').test(file.type || '')){
+      throw new Error('Choose a PNG, JPG, or WebP photo.');
+    }
+    if(file.size > 8 * 1024 * 1024){
+      throw new Error('Photo is too large. Choose an image under 8 MB.');
+    }
+    const originalUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('Failed to read photo.'));
+      reader.readAsDataURL(file);
+    });
+    const img = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('Failed to load photo.'));
+      image.src = originalUrl;
+    });
+    const size = 160;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const side = Math.min(img.naturalWidth || img.width, img.naturalHeight || img.height);
+    const sx = ((img.naturalWidth || img.width) - side) / 2;
+    const sy = ((img.naturalHeight || img.height) - side) / 2;
+    ctx.drawImage(img, sx, sy, side, side, 0, 0, size, size);
+    return canvas.toDataURL('image/jpeg', 0.82);
+  }
   function getForm(){
     return {
       name: (pfName.value || '').trim(),
       id_number: (pfId.value || '').trim(),
       role: (pfRole.value || '').trim(),
       print_size: (pfSize.value || 'barcode_4x1.25').trim(),
+      photo_data_url: profilePhotoDataUrl,
     };
   }
   async function loadProfiles(){
@@ -9897,6 +10484,7 @@ PROFILE_CREATOR_HTML = """
     const out = await r.json();
     const rows = Array.isArray(out.items) ? out.items : [];
     pfTableBody.innerHTML = rows.slice().reverse().map(x => `<tr>
+      <td>${profilePhotoThumb(x.photo_data_url, x.name)}</td>
       <td>${esc(x.name)}</td>
       <td>${esc(x.id_number)}</td>
       <td>${esc(x.role)}</td>
@@ -9905,11 +10493,25 @@ PROFILE_CREATOR_HTML = """
       <td>${esc(x.print_count ?? 0)}</td>
       <td>
         <div class="mini-actions">
+          <button type="button" class="mini-btn" data-act="photo" data-id="${escAttr(x.id_number)}">Photo</button>
+          <button type="button" class="mini-btn" data-act="clear-photo" data-id="${escAttr(x.id_number)}">Clear Photo</button>
           <button type="button" class="mini-btn primary" data-act="print" data-id="${escAttr(x.id_number)}" data-name="${escAttr(x.name)}" data-role="${escAttr(x.role)}">Print</button>
           <button type="button" class="mini-btn danger" data-act="remove" data-id="${escAttr(x.id_number)}">Remove</button>
         </div>
       </td>
-    </tr>`).join('') || '<tr><td colspan="7">No profiles yet.</td></tr>';
+    </tr>`).join('') || '<tr><td colspan="8">No profiles yet.</td></tr>';
+  }
+  async function saveExistingProfilePhoto(idNumber, photoDataUrl){
+    if(!idNumber){ return; }
+    const r = await fetch('/api/profiles/photo', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ id_number: idNumber, photo_data_url: photoDataUrl || '' })
+    });
+    const out = await r.json().catch(() => ({}));
+    if(!r.ok || !out.ok){ setStatus(out.error || 'Photo update failed.'); return; }
+    setStatus(photoDataUrl ? 'Profile photo saved.' : 'Profile photo removed.');
+    await loadProfiles();
   }
   async function authorizeProfilePrint(idNumber){
     const firstResp = await fetch('/api/profiles/authorize-print', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id_number: idNumber }) });
@@ -10046,6 +10648,32 @@ PROFILE_CREATOR_HTML = """
   }
   pfPreviewBtn.addEventListener('click', previewQr);
   pfSaveBtn.addEventListener('click', () => saveProfile(false));
+  pfPhoto.addEventListener('change', async () => {
+    const file = pfPhoto.files && pfPhoto.files[0];
+    if(!file){ setPhotoPreview(''); return; }
+    try{
+      const dataUrl = await fileToProfilePhotoDataUrl(file);
+      setPhotoPreview(dataUrl);
+      setStatus('Profile photo ready.');
+    }catch(err){
+      setPhotoPreview('');
+      pfPhoto.value = '';
+      setStatus(err?.message || String(err));
+    }
+  });
+  pfExistingPhotoInput.addEventListener('change', async () => {
+    const id = pendingExistingPhotoId;
+    pendingExistingPhotoId = '';
+    const file = pfExistingPhotoInput.files && pfExistingPhotoInput.files[0];
+    pfExistingPhotoInput.value = '';
+    if(!id || !file){ return; }
+    try{
+      const dataUrl = await fileToProfilePhotoDataUrl(file);
+      await saveExistingProfilePhoto(id, dataUrl);
+    }catch(err){
+      setStatus(err?.message || String(err));
+    }
+  });
   pfSavePrintBtn.addEventListener('click', () => {
     const printWindow = preparePrintWindow();
     if(!printWindow) return;
@@ -10056,6 +10684,15 @@ PROFILE_CREATOR_HTML = """
     if(!btn) return;
     const act = btn.getAttribute('data-act') || '';
     const id = btn.getAttribute('data-id') || '';
+    if(act === 'photo'){
+      pendingExistingPhotoId = id;
+      pfExistingPhotoInput.click();
+      return;
+    }
+    if(act === 'clear-photo'){
+      await saveExistingProfilePhoto(id, '');
+      return;
+    }
     if(act === 'remove'){
       await removeProfile(id);
       return;
@@ -10065,6 +10702,7 @@ PROFILE_CREATOR_HTML = """
     }
   });
   loadProfilePageTheme();
+  setPhotoPreview('');
   loadProfiles();
 </script>
 </body>
@@ -10106,17 +10744,43 @@ async def api_profiles_create(req: Request):
     role = str(data.get("role", "")).strip()
     if not name or not id_number or not role:
         return JSONResponse({"ok": False, "error": "name, id_number, and role are required"}, status_code=400)
+    try:
+        photo_data_url = _clean_profile_photo_data_url(data.get("photo_data_url"))
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     if any(str(p.get("id_number", "")).strip() == id_number for p in PROFILES if isinstance(p, dict)):
         return JSONResponse({"ok": False, "error": "Profile already exists for this ID number"}, status_code=409)
     row = {
         "name": name,
         "id_number": id_number,
         "role": role,
+        "photo_data_url": photo_data_url,
         "created_at_utc": utc_now().isoformat(),
         "print_count": 0,
         "last_printed_at_utc": "",
     }
     PROFILES.append(row)
+    save_profiles(PROFILES)
+    return {"ok": True, "item": row}
+
+
+@APP.post("/api/profiles/photo")
+async def api_profiles_photo(req: Request):
+    data = await req.json()
+    id_number = str(data.get("id_number", "")).strip()
+    if not id_number:
+        return JSONResponse({"ok": False, "error": "id_number is required"}, status_code=400)
+    idx = next((i for i, p in enumerate(PROFILES) if str((p or {}).get("id_number", "")).strip() == id_number), -1)
+    if idx < 0:
+        return JSONResponse({"ok": False, "error": "Profile not found"}, status_code=404)
+    try:
+        photo_data_url = _clean_profile_photo_data_url(data.get("photo_data_url"))
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    row = dict(PROFILES[idx] or {})
+    row["photo_data_url"] = photo_data_url
+    row["photo_updated_at_utc"] = utc_now().isoformat() if photo_data_url else ""
+    PROFILES[idx] = row
     save_profiles(PROFILES)
     return {"ok": True, "item": row}
 
