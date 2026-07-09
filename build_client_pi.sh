@@ -10,6 +10,7 @@ fi
 
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install pyinstaller requests pyserial PyMySQL cryptography
+python -m py_compile client.py mappings.py ui_theme.py
 
 if ! python - <<'PY'
 import importlib.util

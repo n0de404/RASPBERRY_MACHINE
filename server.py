@@ -54,6 +54,7 @@ APP.mount("/Images", StaticFiles(directory=str(Path(__file__).resolve().parent /
 
 ACTIVE_TTL_SECONDS = 15  # allow several 5s client heartbeat intervals before marking disconnected
 STATE_TICK_SECONDS = 0.25
+OPERATOR_BREAK_WINDOW_SECONDS = float(os.environ.get("MACHINE_OPERATOR_BREAK_WINDOW_SECONDS", "1800"))
 PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"  # legacy fallback
 PRODUCT_API_CONFIG_FILE = Path(__file__).resolve().parent / "Database" / "product_api_config.json"
 PRODUCT_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "product_catalog_cache.json"
@@ -269,6 +270,12 @@ def _ensure_sql_schema() -> bool:
                   `machine_counter_difference` INT NULL,
                   `cycle_time_shift_avg_seconds` DOUBLE NULL,
                   `qty_per_shift_avg_cycle` INT NULL,
+                  `external_average_weight_grams` DOUBLE NULL,
+                  `external_average_weight_unit` VARCHAR(20) NULL,
+                  `external_average_weight_received_at` VARCHAR(50) NULL,
+                  `external_average_weight_sent_at` VARCHAR(50) NULL,
+                  `external_average_weight_source` VARCHAR(100) NULL,
+                  `external_average_weight_sender` VARCHAR(255) NULL,
                   `maintenance_name` VARCHAR(255) NULL,
                   `supervisor_name` VARCHAR(255) NULL,
                   `approved_by` VARCHAR(255) NULL,
@@ -502,6 +509,18 @@ def _ensure_sql_schema() -> bool:
                 "ALTER TABLE `finished_jobs` ADD COLUMN `partial_qty` INT NOT NULL DEFAULT 0 AFTER `total_good`",
                 "ALTER TABLE `finished_jobs` ADD COLUMN `cycle_time_shift_avg_seconds` DOUBLE NULL AFTER `machine_counter_difference`",
                 "ALTER TABLE `finished_jobs` ADD COLUMN `qty_per_shift_avg_cycle` INT NULL AFTER `cycle_time_shift_avg_seconds`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `external_average_weight_grams` DOUBLE NULL AFTER `qty_per_shift_avg_cycle`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `external_average_weight_unit` VARCHAR(20) NULL AFTER `external_average_weight_grams`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `external_average_weight_received_at` VARCHAR(50) NULL AFTER `external_average_weight_unit`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `external_average_weight_sent_at` VARCHAR(50) NULL AFTER `external_average_weight_received_at`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `external_average_weight_source` VARCHAR(100) NULL AFTER `external_average_weight_sent_at`",
+                "ALTER TABLE `finished_jobs` ADD COLUMN `external_average_weight_sender` VARCHAR(255) NULL AFTER `external_average_weight_source`",
+                "ALTER TABLE `archived_jobs_server` ADD COLUMN `external_average_weight_grams` DOUBLE NULL AFTER `qty_per_shift_avg_cycle`",
+                "ALTER TABLE `archived_jobs_server` ADD COLUMN `external_average_weight_unit` VARCHAR(20) NULL AFTER `external_average_weight_grams`",
+                "ALTER TABLE `archived_jobs_server` ADD COLUMN `external_average_weight_received_at` VARCHAR(50) NULL AFTER `external_average_weight_unit`",
+                "ALTER TABLE `archived_jobs_server` ADD COLUMN `external_average_weight_sent_at` VARCHAR(50) NULL AFTER `external_average_weight_received_at`",
+                "ALTER TABLE `archived_jobs_server` ADD COLUMN `external_average_weight_source` VARCHAR(100) NULL AFTER `external_average_weight_sent_at`",
+                "ALTER TABLE `archived_jobs_server` ADD COLUMN `external_average_weight_sender` VARCHAR(255) NULL AFTER `external_average_weight_source`",
                 "ALTER TABLE `finished_jobs` ADD COLUMN `approved_by` VARCHAR(255) NULL AFTER `supervisor_name`",
                 "ALTER TABLE `finished_jobs` ADD COLUMN `approved_by_code` VARCHAR(100) NULL AFTER `approved_by`",
                 "ALTER TABLE `finished_jobs` ADD COLUMN `approved_by_role` VARCHAR(100) NULL AFTER `approved_by_code`",
@@ -943,7 +962,10 @@ def _save_finished_jobs_sql(rows: List[Dict[str, Any]]) -> bool:
                      `pack_count`,`good_total`,`butal_total`,`reject_total`,`total_good`,`partial_qty`,`startup_reject_total`,`no_shot_total`,`raw_sacks_count`,
                      `downtime_last_seconds`,`downtime_reason_code`,`downtime_reason_text`,`cycle_time_current`,
                      `machine_counter_start`,`machine_counter_end`,`machine_counter_app_delta`,`machine_counter_app_end`,`machine_counter_difference`,
-                     `cycle_time_shift_avg_seconds`,`qty_per_shift_avg_cycle`,`maintenance_name`,`supervisor_name`,
+                     `cycle_time_shift_avg_seconds`,`qty_per_shift_avg_cycle`,
+                     `external_average_weight_grams`,`external_average_weight_unit`,`external_average_weight_received_at`,
+                     `external_average_weight_sent_at`,`external_average_weight_source`,`external_average_weight_sender`,
+                     `maintenance_name`,`supervisor_name`,
                      `approved_by`,`approved_by_code`,`approved_by_role`,`changed_by`,`changed_by_code`,`changed_by_role`,
                      `approved_remarks`,`change_remarks`,`approved_at_utc`,`changed_at_utc`,`review_status`,
                      `linkage_enabled`,`linkage_job_code`,`linkage_job_name`,`linkage_role`,`linkage_group_total_jobs`,
@@ -955,6 +977,7 @@ def _save_finished_jobs_sql(rows: List[Dict[str, Any]]) -> bool:
                      %s,%s,%s,%s,%s,%s,
                      %s,%s,%s,%s,%s,%s,%s,%s,%s,
                      %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                     %s,%s,%s,%s,%s,%s,
                      %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                      %s,%s,%s,%s,%s,
                      %s,%s,%s,
@@ -967,7 +990,10 @@ def _save_finished_jobs_sql(rows: List[Dict[str, Any]]) -> bool:
                         int(row.get("pack_count", 0) or 0), int(row.get("good_total", 0) or 0), int(row.get("butal_total", 0) or 0), int(row.get("reject_total", 0) or 0), int(row.get("total_good", 0) or 0), int(row.get("partial_qty", 0) or 0), int(row.get("startup_reject_total", 0) or 0), int(row.get("no_shot_total", 0) or 0), int(row.get("raw_sacks_count", 0) or 0),
                         row.get("downtime_last_seconds"), row.get("downtime_reason_code"), row.get("downtime_reason_text"), row.get("cycle_time_current"),
                         row.get("machine_counter_start"), row.get("machine_counter_end"), row.get("machine_counter_app_delta"), row.get("machine_counter_app_end"), row.get("machine_counter_difference"),
-                        row.get("cycle_time_shift_avg_seconds"), row.get("qty_per_shift_avg_cycle"), row.get("maintenance_name"), row.get("supervisor_name"),
+                        row.get("cycle_time_shift_avg_seconds"), row.get("qty_per_shift_avg_cycle"),
+                        row.get("external_average_weight_grams"), row.get("external_average_weight_unit"), row.get("external_average_weight_received_at"),
+                        row.get("external_average_weight_sent_at"), row.get("external_average_weight_source"), row.get("external_average_weight_sender"),
+                        row.get("maintenance_name"), row.get("supervisor_name"),
                         row.get("approved_by"), row.get("approved_by_code"), row.get("approved_by_role"), row.get("changed_by"), row.get("changed_by_code"), row.get("changed_by_role"),
                         row.get("approved_remarks"), row.get("change_remarks"), row.get("approved_at_utc"), row.get("changed_at_utc"), row.get("review_status"),
                         1 if row.get("linkage_enabled") else 0, row.get("linkage_job_code"), row.get("linkage_job_name"), row.get("linkage_role"), row.get("linkage_group_total_jobs"),
@@ -1063,6 +1089,14 @@ class MachineSession:
     # while it was offline.  The display/operator_id is derived from it, but
     # this provides an auditable, lossless record after the queue is replayed.
     operator_qr_payload: Optional[str] = None
+    active_scan_operator_id: Optional[str] = None
+    active_scan_owner_type: str = "ORIGINAL"
+    reliever_id: Optional[str] = None
+    reliever_qr_payload: str = ""
+    break_active: bool = False
+    current_break_session_id: str = ""
+    break_out_time: Optional[str] = None
+    break_sessions: List[Dict[str, Any]] = None
     external_average_weight_grams: Optional[float] = None
     external_average_weight_unit: Optional[str] = None
     external_average_weight_received_at: Optional[str] = None
@@ -1103,6 +1137,8 @@ class MachineSession:
     machine_counter_shift_end: Optional[int] = None
     maintenance_name: Optional[str] = None
     supervisor_name: Optional[str] = None
+    current_supervisor_review: Dict[str, Any] = None
+    supervisor_review_logs: List[Dict[str, Any]] = None
     job_payload: Dict[str, Any] = None
     linkage_enabled: bool = False
     linkage_jobs: List[Dict[str, Any]] = None
@@ -1126,6 +1162,9 @@ class MachineSession:
         d["job_payload"] = d["job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
         d["operator_shift_logs"] = d["operator_shift_logs"] or []
+        d["current_supervisor_review"] = d["current_supervisor_review"] or {}
+        d["supervisor_review_logs"] = d["supervisor_review_logs"] or []
+        d["break_sessions"] = d["break_sessions"] or []
         d["butal_by_job"] = d["butal_by_job"] or {}
         d["last_shift_butal_by_job"] = d["last_shift_butal_by_job"] or {}
         return d
@@ -1169,10 +1208,25 @@ def _reset_active_session_for_new_job_segment(sess: MachineSession, preserve_ope
     sess.machine_counter_shift_end = None
     sess.maintenance_name = None
     sess.supervisor_name = None
+    sess.current_supervisor_review = {}
+    sess.supervisor_review_logs = []
+    sess.external_average_weight_grams = None
+    sess.external_average_weight_unit = None
+    sess.external_average_weight_received_at = None
+    sess.external_average_weight_sent_at = None
+    sess.external_average_weight_source = None
+    sess.external_average_weight_sender = None
     sess.linkage_enabled = False
     sess.linkage_jobs = []
     if not preserve_operator_shift_logs:
         sess.operator_shift_logs = []
+    sess.active_scan_operator_id = sess.operator_id
+    sess.active_scan_owner_type = "ORIGINAL"
+    sess.reliever_id = None
+    sess.reliever_qr_payload = ""
+    sess.break_active = False
+    sess.current_break_session_id = ""
+    sess.break_out_time = None
     sess.butal_by_job = {}
 
 
@@ -1198,6 +1252,7 @@ def _active_shift_segment_key(row: Dict[str, Any], fallback_session: Optional[Ma
         str(row.get("machine_code") or getattr(fallback_session, "machine_code", "") or "").strip(),
         str(row.get("operator_id") or getattr(fallback_session, "operator_id", "") or "").strip(),
         job_key,
+        str(row.get("shift_index") or "").strip(),
     ])
 
 
@@ -1226,6 +1281,14 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         job_started_at=str(raw.get("job_started_at") or "").strip() or None,
         operator_id=str(raw.get("operator_id") or "").strip() or None,
         operator_qr_payload=str(raw.get("operator_qr_payload") or "").strip() or None,
+        active_scan_operator_id=str(raw.get("active_scan_operator_id") or raw.get("operator_id") or "").strip() or None,
+        active_scan_owner_type=str(raw.get("active_scan_owner_type") or ("RELIEVER" if raw.get("break_active") else "ORIGINAL")).strip().upper() or "ORIGINAL",
+        reliever_id=str(raw.get("reliever_id") or "").strip() or None,
+        reliever_qr_payload=str(raw.get("reliever_qr_payload") or "").strip(),
+        break_active=bool(raw.get("break_active", False)),
+        current_break_session_id=str(raw.get("current_break_session_id") or "").strip(),
+        break_out_time=str(raw.get("break_out_time") or "").strip() or None,
+        break_sessions=list(raw.get("break_sessions") or []),
         external_average_weight_grams=external_weight,
         external_average_weight_unit=str(raw.get("external_average_weight_unit") or "").strip() or None,
         external_average_weight_received_at=str(raw.get("external_average_weight_received_at") or "").strip() or None,
@@ -1266,6 +1329,8 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         machine_counter_shift_end=_parse_int_or_none(raw.get("machine_counter_shift_end")),
         maintenance_name=raw.get("maintenance_name"),
         supervisor_name=raw.get("supervisor_name"),
+        current_supervisor_review=dict(raw.get("current_supervisor_review") or {}),
+        supervisor_review_logs=list(raw.get("supervisor_review_logs") or []),
         job_payload=dict(raw.get("job_payload") or {}),
         linkage_enabled=bool(raw.get("linkage_enabled", False)),
         linkage_jobs=list(raw.get("linkage_jobs") or []),
@@ -1853,6 +1918,8 @@ def _normalize_company_role(value: Any) -> str:
         return "Operator"
     if low == "maintenance":
         return "Maintenance"
+    if low in {"material loader", "material_loader", "loader"}:
+        return "Material Loader"
     if low == "planner":
         return "Planner"
     if low == "production manager":
@@ -1870,6 +1937,8 @@ def _base_privilege_from_company_role(company_role: str) -> str:
         return "operator"
     if low == "maintenance":
         return "maintenance"
+    if low in {"material loader", "material_loader", "loader"}:
+        return "viewer"
     if low in {"planner", "production manager"}:
         return "viewer"
     return "viewer"
@@ -1993,27 +2062,50 @@ def _activity_timestamp(row: Dict[str, Any]) -> Optional[datetime]:
     return None
 
 
+def _open_break_is_within_window(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("status") or "").strip().upper() not in ("", "ONGOING"):
+        return False
+    start = _parse_iso_utc(row.get("break_out_time"))
+    if start is None:
+        return False
+    try:
+        return (utc_now() - start).total_seconds() <= max(0.0, float(OPERATOR_BREAK_WINDOW_SECONDS or 0.0))
+    except Exception:
+        return False
+
+
 def _operator_activity_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
     active_rows = [s.to_dict() for s in SESSIONS.values() if _operator_record_matches_profile(getattr(s, "operator_id", ""), profile)]
+    relieving_rows = [
+        s.to_dict()
+        for s in SESSIONS.values()
+        if bool(getattr(s, "break_active", False)) and _operator_record_matches_profile(getattr(s, "reliever_id", ""), profile)
+    ]
+    all_current_rows = [*active_rows, *relieving_rows]
+    all_current_rows.sort(key=lambda x: _activity_timestamp(x) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     active_rows.sort(key=lambda x: _activity_timestamp(x) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     history_rows = [r for r in [*FINISHED_JOBS, *ARCHIVED_JOBS] if _operator_record_matches_profile((r or {}).get("operator_id", ""), profile)]
     history_rows.sort(key=lambda x: _activity_timestamp(x) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
 
     latest_active = active_rows[0] if active_rows else None
+    latest_relieving = relieving_rows[0] if relieving_rows else None
+    latest_current = all_current_rows[0] if all_current_rows else None
     latest_history = history_rows[0] if history_rows else None
     recent_activity: List[Dict[str, Any]] = []
 
-    if latest_active:
+    if latest_current:
         recent_activity.append(
             {
                 "kind": "active_session",
                 "label": "Currently active",
-                "machine_code": latest_active.get("machine_code", ""),
-                "machine_name": latest_active.get("machine_name", ""),
-                "job_code": latest_active.get("job_code", ""),
-                "job_name": latest_active.get("job_name", ""),
-                "at_utc": latest_active.get("last_seen_utc", ""),
-                "detail": f"Monitoring {latest_active.get('machine_name') or latest_active.get('machine_code') or '-'}",
+                "machine_code": latest_current.get("machine_code", ""),
+                "machine_name": latest_current.get("machine_name", ""),
+                "job_code": latest_current.get("job_code", ""),
+                "job_name": latest_current.get("job_name", ""),
+                "at_utc": latest_current.get("last_seen_utc", ""),
+                "detail": f"Monitoring {latest_current.get('machine_name') or latest_current.get('machine_code') or '-'}",
             }
         )
 
@@ -2047,17 +2139,80 @@ def _operator_activity_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
         seen_keys.add(key)
         deduped_activity.append(item)
 
-    last_row = latest_active or latest_history or {}
+    break_logs: List[Dict[str, Any]] = []
+    for sess in SESSIONS.values():
+        snap = sess.to_dict()
+        for row in list(snap.get("break_sessions") or []):
+            if not isinstance(row, dict):
+                continue
+            is_original = _operator_record_matches_profile(row.get("original_operator"), profile)
+            is_reliever = _operator_record_matches_profile(row.get("reliever_operator"), profile)
+            if not (is_original or is_reliever):
+                continue
+            item = dict(row)
+            item["role_in_break"] = "ORIGINAL" if is_original else "RELIEVER"
+            break_logs.append(item)
+    break_logs.sort(key=lambda x: _parse_iso_utc(x.get("break_out_time")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+
+    status = "OFFLINE"
+    status_since = ""
+    status_detail = ""
+    current_machine_code = ""
+    current_machine_name = ""
+    current_job_code = ""
+    current_job_name = ""
+    reliever_name = ""
+    original_name = ""
+    active_break = None
+    if latest_relieving:
+        status = "WORKING"
+        current_machine_code = str(latest_relieving.get("machine_code") or "").strip()
+        current_machine_name = str(latest_relieving.get("machine_name") or "").strip()
+        current_job_code = str(latest_relieving.get("job_code") or "").strip()
+        current_job_name = str(latest_relieving.get("job_name") or "").strip()
+        active_break = next((r for r in break_logs if str(r.get("status") or "").upper() == "ONGOING"), None)
+        original_name = str((active_break or {}).get("original_operator_name") or latest_relieving.get("operator_id") or "").strip()
+        status_since = str((active_break or {}).get("break_out_time") or latest_relieving.get("last_seen_utc") or "").strip()
+        status_detail = f"Covering {original_name or '-'}" if _open_break_is_within_window(active_break) else "Assigned to machine"
+    elif latest_active and bool(latest_active.get("break_active")):
+        active_break = next((r for r in break_logs if str(r.get("status") or "").upper() == "ONGOING"), None)
+        if _open_break_is_within_window(active_break):
+            status = "ON BREAK"
+            current_machine_code = str(latest_active.get("machine_code") or "").strip()
+            current_machine_name = str(latest_active.get("machine_name") or "").strip()
+            current_job_code = str(latest_active.get("job_code") or "").strip()
+            current_job_name = str(latest_active.get("job_name") or "").strip()
+            reliever_name = str((active_break or {}).get("reliever_operator_name") or latest_active.get("reliever_id") or "").strip()
+            status_since = str((active_break or {}).get("break_out_time") or latest_active.get("break_out_time") or latest_active.get("last_seen_utc") or "").strip()
+            status_detail = f"Covered by {reliever_name or '-'}"
+    elif latest_active:
+        status = "WORKING"
+        current_machine_code = str(latest_active.get("machine_code") or "").strip()
+        current_machine_name = str(latest_active.get("machine_name") or "").strip()
+        current_job_code = str(latest_active.get("job_code") or "").strip()
+        current_job_name = str(latest_active.get("job_name") or "").strip()
+        status_since = str(latest_active.get("job_started_at") or latest_active.get("last_seen_utc") or "").strip()
+        status_detail = "Assigned to machine"
+
+    last_row = latest_current or latest_history or {}
     last_ts = _activity_timestamp(last_row)
     return {
         "name": str(profile.get("name") or "").strip(),
         "id_number": str(profile.get("id_number") or "").strip(),
         "role": str(profile.get("role") or "").strip(),
-        "is_active": bool(latest_active),
-        "current_machine_code": str((latest_active or {}).get("machine_code") or "").strip(),
-        "current_machine_name": str((latest_active or {}).get("machine_name") or "").strip(),
-        "current_job_code": str((latest_active or {}).get("job_code") or "").strip(),
-        "current_job_name": str((latest_active or {}).get("job_name") or "").strip(),
+        "photo_data_url": str(profile.get("photo_data_url") or "").strip(),
+        "is_active": bool(latest_current),
+        "operator_status": status,
+        "status_since_utc": status_since,
+        "status_detail": status_detail,
+        "reliever_name": reliever_name,
+        "original_name": original_name,
+        "current_break": active_break or {},
+        "break_logs": break_logs[:50],
+        "current_machine_code": current_machine_code,
+        "current_machine_name": current_machine_name,
+        "current_job_code": current_job_code,
+        "current_job_name": current_job_name,
         "last_machine_code": str(last_row.get("machine_code") or "").strip(),
         "last_machine_name": str(last_row.get("machine_name") or "").strip(),
         "last_job_code": str(last_row.get("job_code") or "").strip(),
@@ -2069,6 +2224,10 @@ def _operator_activity_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_operator_activity_directory() -> List[Dict[str, Any]]:
+    operators = [
+        p for p in PROFILES
+        if isinstance(p, dict) and _profile_has_role(p, "operator")
+    ]
     items = [_operator_activity_summary(p) for p in operators]
     items.sort(key=lambda row: str(row.get("name") or "").casefold())
     items.sort(key=lambda row: _parse_iso_utc(row.get("last_activity_at_utc")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
@@ -2176,6 +2335,8 @@ def _kpi_job_summary(row: Dict[str, Any], issues: List[Dict[str, Any]], active: 
     raw_logs = row.get("raw_material_logs") if isinstance(row.get("raw_material_logs"), list) else []
     pack_logs = row.get("product_pack_history_logs") if isinstance(row.get("product_pack_history_logs"), list) else []
     butal_logs = row.get("butal_scan_logs") if isinstance(row.get("butal_scan_logs"), list) else []
+    details = row.get("job_details") if isinstance(row.get("job_details"), dict) else {}
+    first_pack = pack_logs[-1] if pack_logs and isinstance(pack_logs[-1], dict) else {}
     reject_total = int(row.get("reject_total", 0) or 0) + int(row.get("startup_reject_total", 0) or 0) + int(row.get("no_shot_total", 0) or 0)
     pack_count = int(row.get("pack_count", row.get("pack_total", 0)) or 0)
     good_total = int(row.get("good_total", 0) or 0) + int(row.get("butal_total", 0) or 0)
@@ -2202,6 +2363,10 @@ def _kpi_job_summary(row: Dict[str, Any], issues: List[Dict[str, Any]], active: 
         "machine_name": str(row.get("machine_name") or "").strip(),
         "job_code": str(row.get("job_code") or "").strip(),
         "job_name": str(row.get("job_name") or "").strip(),
+        "product_id": str(row.get("product_id") or details.get("product_id") or first_pack.get("product_id") or "").strip(),
+        "product_name": str(row.get("product_name") or details.get("product_name") or first_pack.get("product_name") or "").strip(),
+        "product_sku": str(row.get("product_sku") or row.get("sku") or details.get("product_sku") or details.get("sku") or first_pack.get("product_sku") or first_pack.get("sku") or "").strip(),
+        "mold": str(row.get("mold") or row.get("mold_no") or details.get("mold") or details.get("mold_no") or row.get("custom_05") or "").strip(),
         "started_at_utc": row.get("started_at_utc") or row.get("job_started_at") or "",
         "finished_at_utc": row.get("finished_at_utc") or row.get("ended_at_utc") or "",
         "pack_count": pack_count,
@@ -2870,7 +3035,7 @@ def _profile_qr_payload(name: str, id_number: str, role: str) -> str:
 def _profile_qr_png_data_url(payload: str, role: str, layout: str = "barcode_4x1.25") -> str:
     # Render at higher DPI so printed QR edges stay crisp on label printers.
     dpi = 300
-    role_text = str(role or "").strip()
+    label_text = str(role or "").strip()
     resample_nearest = getattr(Image, "Resampling", Image).NEAREST
     if layout == "normal_2x2":
         w = int(round(2.0 * dpi))
@@ -2888,7 +3053,7 @@ def _profile_qr_png_data_url(payload: str, role: str, layout: str = "barcode_4x1
         qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB").resize((qr_size, qr_size), resample_nearest)
         x = (w - qr_size) // 2
         img.paste(qr_img, (x, pad_top))
-        _draw_centered(draw, (side_pad, pad_top + qr_size + 6, w - side_pad, h - side_pad), role_text or "-", start_px=62)
+        _draw_centered(draw, (side_pad, pad_top + qr_size + 6, w - side_pad, h - side_pad), label_text or "-", start_px=62)
     else:
         # Barcode-printer label: 4x1.25 overall, 3 columns. Fill only one column.
         total_w = int(round(4.0 * dpi))
@@ -2896,7 +3061,7 @@ def _profile_qr_png_data_url(payload: str, role: str, layout: str = "barcode_4x1
         col_w = int(round(total_w / 3.0))
         img = Image.new("RGB", (col_w, total_h), (255, 255, 255))
         draw = ImageDraw.Draw(img)
-        # Reserve a compact footer for role text; maximize QR within one column.
+        # Reserve a compact footer for profile name; maximize QR within one column.
         footer_h = int(round(0.22 * dpi))
         inner_pad_x = int(round(0.03 * dpi))
         inner_pad_top = int(round(0.03 * dpi))
@@ -2909,7 +3074,7 @@ def _profile_qr_png_data_url(payload: str, role: str, layout: str = "barcode_4x1
         x = (col_w - qr_size) // 2
         y = inner_pad_top
         img.paste(qr_img, (x, y))
-        _draw_centered(draw, (4, total_h - footer_h, col_w - 4, total_h - 4), role_text or "-", start_px=34)
+        _draw_centered(draw, (4, total_h - footer_h, col_w - 4, total_h - 4), label_text or "-", start_px=34)
         draw.rectangle((0, 0, col_w - 1, total_h - 1), outline=(0, 0, 0), width=1)
 
     buf = io.BytesIO()
@@ -3130,6 +3295,63 @@ def _planning_extract_job_record(payload: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(payload.get("job"), dict):
         return payload.get("job") or {}
     return data if isinstance(data, dict) else {}
+
+
+def _job_product_identity_from_payload(payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    src = payload if isinstance(payload, dict) else {}
+    data = src.get("data") if isinstance(src.get("data"), dict) else {}
+    job = _planning_extract_job_record(src)
+    details = {}
+    if isinstance(data.get("job_details"), dict):
+        details = data.get("job_details") or {}
+    elif isinstance(src.get("job_details"), dict):
+        details = src.get("job_details") or {}
+    parts = data.get("parts") if isinstance(data.get("parts"), list) else []
+    first_part = parts[0] if parts and isinstance(parts[0], dict) else {}
+    product_id = str(
+        details.get("product_id")
+        or job.get("product_id")
+        or src.get("product_id")
+        or first_part.get("product_id")
+        or ""
+    ).strip()
+    product_meta = _lookup_product_meta(product_id) if product_id else {"id": "", "name": "", "sku": ""}
+    product_sku = str(
+        product_meta.get("sku")
+        or details.get("product_sku")
+        or details.get("sku")
+        or job.get("product_sku")
+        or job.get("sku")
+        or src.get("product_sku")
+        or src.get("sku")
+        or first_part.get("product_sku")
+        or first_part.get("sku")
+        or ""
+    ).strip()
+    product_name = str(
+        product_meta.get("name")
+        or details.get("product_name")
+        or details.get("name")
+        or job.get("product_name")
+        or job.get("name")
+        or src.get("product_name")
+        or first_part.get("product_name")
+        or first_part.get("name")
+        or ""
+    ).strip()
+    return {"product_id": product_id, "product_sku": product_sku, "product_name": product_name}
+
+
+def _fill_session_product_identity(sess: MachineSession) -> None:
+    if sess is None:
+        return
+    ident = _job_product_identity_from_payload(sess.job_payload if isinstance(sess.job_payload, dict) else {})
+    if not str(sess.product_id or "").strip() and ident.get("product_id"):
+        sess.product_id = ident.get("product_id", "")
+    if not str(sess.product_sku or "").strip() and ident.get("product_sku"):
+        sess.product_sku = ident.get("product_sku", "")
+    if not str(sess.product_name or "").strip() and ident.get("product_name"):
+        sess.product_name = ident.get("product_name", "")
 
 
 def _planning_job_card_from_payload(identifier: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -3941,6 +4163,7 @@ DASHBOARD_HTML = """
     .user-kpi-job-top { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
     .user-kpi-job-name { font-weight:950; color:#0b1220; overflow-wrap:anywhere; }
     .user-kpi-job-meta { margin-top:3px; color:#64748b; font-size:.78rem; font-weight:750; }
+    .user-kpi-job-meta.product { color:#475569; font-weight:900; }
     .user-kpi-job-badge { flex:0 0 auto; border-radius:999px; padding:4px 8px; font-size:.68rem; font-weight:950; color:#166534; background:#dcfce7; }
     .user-kpi-job-badge.warn { color:#92400e; background:#fef3c7; }
     .user-kpi-job-badge.bad { color:#991b1b; background:#fee2e2; }
@@ -3953,6 +4176,40 @@ DASHBOARD_HTML = """
     .user-kpi-detail-section-title { margin:12px 0 6px; font-size:.8rem; font-weight:950; color:#334155; text-transform:uppercase; letter-spacing:.03em; }
     .user-kpi-detail-list { display:grid; gap:6px; }
     .user-kpi-detail-list div { border-left:3px solid #93c5fd; padding:6px 8px; background:#f8fbff; border-radius:0 8px 8px 0; font-size:.82rem; color:#334155; font-weight:750; }
+    .main-tab-content:not(#userKpiTab) { border:1px solid #d6dee9; border-radius:16px; background:linear-gradient(135deg,#f8fbff 0%,#eef4fb 55%,#f7fbff 100%); box-shadow:inset 0 1px 0 rgba(255,255,255,.86); margin:0 clamp(10px,1.6vw,20px) clamp(12px,1.6vw,20px); padding:18px; min-height:calc(100vh - 156px); color:#0f172a; }
+    #machinesTab.main-tab-content { padding:18px; }
+    .main-tab-content:not(#userKpiTab) .panel,
+    .main-tab-content:not(#userKpiTab) .planning-shell,
+    #maintenanceTab .maintenance-shell { border:1px solid #cfd9e6; border-radius:12px; background:rgba(255,255,255,.72); box-shadow:0 10px 24px rgba(15,23,42,.08); overflow:hidden; }
+    .main-tab-content:not(#userKpiTab) .panel { margin-top:0; padding:16px; }
+    #machineArchiveTab .panel + .panel { margin-top:16px; }
+    .main-tab-content:not(#userKpiTab) .panel h3,
+    .main-tab-content:not(#userKpiTab) .planning-title h3,
+    #maintenanceTab .maintenance-topbar h3,
+    #maintenanceTab .maintenance-section-title,
+    #maintenanceTab .maintenance-performance-title { margin:0 0 6px; font-size:1.18rem; line-height:1.05; font-weight:950; letter-spacing:0; color:#0b1220; }
+    .main-tab-content:not(#userKpiTab) .muted { color:#475569; font-size:.86rem; font-weight:750; }
+    .main-tab-content:not(#userKpiTab) .table-wrap,
+    #maintenanceTab .maintenance-performance-wrap,
+    #maintenanceTab .maintenance-call-board { border:1px solid #cfd9e6; border-radius:12px; background:rgba(255,255,255,.74); box-shadow:0 10px 24px rgba(15,23,42,.07); overflow:auto; }
+    .main-tab-content:not(#userKpiTab) .data-table th { background:#f8fafc; color:#475569; font-size:.72rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; }
+    .main-tab-content:not(#userKpiTab) .data-table td { color:#0f172a; font-size:.84rem; font-weight:700; }
+    .main-tab-content:not(#userKpiTab) .placeholder { border:1px dashed #cfd9e6; border-radius:12px; background:#f8fbff; color:#64748b; font-weight:800; }
+    .main-tab-content:not(#userKpiTab) input,
+    .main-tab-content:not(#userKpiTab) select,
+    .main-tab-content:not(#userKpiTab) textarea { border:1px solid #cfd9e6; border-radius:10px; background:#f8fbff; color:#334155; font-weight:750; }
+    .main-tab-content:not(#userKpiTab) button:not(.sub-tab-button):not(.approve-print-btn):not(.overlay-close):not(.review-slide-arrow) { border:1px solid #cfd9e6; border-radius:10px; background:#f8fbff; color:#164f91; font-weight:900; box-shadow:0 4px 14px rgba(15,23,42,.05); }
+    .job-queue-metric,
+    .planning-ops-metric,
+    .planning-lane,
+    .planning-live-queue,
+    .finished-item,
+    .maintenance-metric,
+    .maintenance-person,
+    .maintenance-call-card { border-radius:12px; border-color:#cfd9e6; box-shadow:0 10px 22px rgba(15,23,42,.08); }
+    .main-tabs { background:#eef4fb; border-top:1px solid #d6dee9; border-bottom:1px solid #d6dee9; }
+    .main-tab-button { border:1px solid #cdd6e2; border-radius:999px; background:#eef2f7; color:#0f172a; padding:9px 18px; font-weight:900; box-shadow:inset 0 1px 0 rgba(255,255,255,.7); }
+    .main-tab-button.active { background:#0f64bd; border-color:#0f64bd; color:#fff; box-shadow:0 8px 18px rgba(15,100,189,.22); }
     .sub-tabs { display:flex; gap:8px; margin-top:12px; margin-bottom:12px; flex-wrap:wrap; }
     .sub-tab-button { background:#fff; border:1px solid #cbd5e1; border-radius:999px; padding:8px 14px; font-weight:700; color:#334155; cursor:pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .sub-tab-button:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(15,23,42,0.08); }
@@ -4404,6 +4661,24 @@ DASHBOARD_HTML = """
     .operator-detail-list-item { border-left:3px solid #93c5fd; padding-left:10px; }
     .operator-detail-list-item strong { display:block; font-size:.82rem; color:#0f172a; }
     .operator-detail-list-item span { display:block; font-size:.77rem; color:#64748b; }
+    .operator-status-toolbar { display:flex; gap:8px; flex-wrap:wrap; padding:12px 16px; border-bottom:1px solid #dde5ef; background:#f8fafc; }
+    .operator-status-filter { border:1px solid #cbd5e1; background:#fff; color:#334155; border-radius:999px; padding:7px 11px; font-size:.75rem; font-weight:900; cursor:pointer; }
+    .operator-status-filter.active { background:#0f64bd; border-color:#0f64bd; color:#fff; }
+    .operator-card-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(178px,1fr)); gap:14px; padding:16px; max-height:min(72vh,760px); overflow:auto; }
+    .operator-status-card { border:1px solid #dbe4f0; border-radius:8px; background:#fff; min-height:242px; padding:14px 12px; text-align:center; cursor:pointer; box-shadow:0 10px 24px rgba(15,23,42,.08); transition:transform .14s ease,border-color .14s ease,box-shadow .14s ease; }
+    .operator-status-card:hover { transform:translateY(-2px); border-color:#93c5fd; box-shadow:0 14px 30px rgba(15,23,42,.12); }
+    .operator-status-photo { width:68px; height:68px; border-radius:50%; margin:0 auto 10px; background:#e2e8f0; display:flex; align-items:center; justify-content:center; color:#334155; font-weight:950; font-size:1.25rem; overflow:hidden; }
+    .operator-status-photo img { width:100%; height:100%; object-fit:cover; display:block; }
+    .operator-status-name { min-height:34px; display:flex; align-items:flex-end; justify-content:center; font-size:.86rem; line-height:1.2; font-weight:950; color:#0f172a; overflow-wrap:anywhere; }
+    .operator-status-role { margin-top:4px; font-size:.72rem; color:#64748b; font-weight:800; min-height:18px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .operator-status-pill { display:inline-flex; align-items:center; justify-content:center; margin-top:10px; border-radius:999px; padding:5px 9px; font-size:.68rem; font-weight:950; letter-spacing:.02em; }
+    .operator-status-pill.offline { background:#e5e7eb; color:#374151; }
+    .operator-status-pill.working { background:#dbeafe; color:#1d4ed8; }
+    .operator-status-pill.on-break { background:#fef3c7; color:#92400e; }
+    .operator-status-meta { margin-top:10px; min-height:48px; display:grid; align-content:start; gap:3px; color:#475569; font-size:.72rem; font-weight:800; line-height:1.25; }
+    .operator-break-table { display:grid; gap:7px; }
+    .operator-break-row { display:grid; grid-template-columns:1fr 1fr 86px 1fr; gap:8px; border:1px solid #e2e8f0; border-radius:8px; padding:8px; background:#f8fafc; font-size:.78rem; color:#334155; }
+    .operator-break-row.head { background:#eef2f7; color:#475569; font-size:.7rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; }
     .linkage-pill { display:inline-block; margin-left:8px; padding:2px 8px; border-radius:999px; font-size:.72rem; font-weight:800; background:#fff7ed; color:#c2410c; border:1px solid #fdba74; }
     .machine-linkage-flag { display:inline-block; margin-bottom:6px; padding:3px 8px; border-radius:999px; font-size:.72rem; font-weight:800; background:#ffedd5; color:#9a3412; border:1px solid #fdba74; box-shadow:0 0 0 0 rgba(251,146,60,.45); animation: linkagePulse 1.1s ease-in-out infinite; }
     @keyframes linkagePulse { 0%,100% { box-shadow:0 0 0 0 rgba(251,146,60,.25);} 50% { box-shadow:0 0 0 8px rgba(251,146,60,0);} }
@@ -5571,6 +5846,7 @@ DASHBOARD_HTML = """
   let planningMachineDropScrollLeft = {};
   let planningMachineScrollActiveUntil = 0;
   let operatorDirectoryState = [];
+  let operatorDirectoryFilter = "ALL";
   const machineCardEls = new Map();
   const machineLinkageDisplayIndex = new Map();
   const machineLinkageFlipTimers = new Map();
@@ -5729,6 +6005,19 @@ DASHBOARD_HTML = """
     return item.job_code ? `Job ${item.job_code}` : "-";
   }
 
+  function jobProductMoldLabel(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const sku = firstValue(item.product_sku, item.sku, "");
+    const name = firstValue(item.product_name, item.product, "");
+    const productId = firstValue(item.product_id, item.productId, "");
+    const mold = firstValue(item.mold, item.mold_no, item.custom_05, "");
+    const product = [sku, name].filter(Boolean).join(" - ") || productId;
+    const parts = [];
+    if(product) parts.push(`SKU/Product: ${product}`);
+    if(mold) parts.push(`Mold: ${mold}`);
+    return parts.join(" | ");
+  }
+
   function shiftReasonLabel(reason){
     const key = String(reason || "").trim().toUpperCase();
     if(key === "COLOR_CHANGE") return "Color Change";
@@ -5752,6 +6041,7 @@ DASHBOARD_HTML = """
           String(x.machine_code || session?.machine_code || "").trim(),
           String(x.operator_id || session?.operator_id || "").trim(),
           jobKey,
+          String(x.shift_index || "").trim(),
         ].join("|");
         const row = {...x, _is_current_segment: false};
         if(key && indexByKey.has(key)){
@@ -5768,6 +6058,7 @@ DASHBOARD_HTML = """
         String(session.machine_code || "").trim(),
         String(session.operator_id || "").trim(),
         currentJobKey,
+        String(session.operator_shift_index || "").trim(),
       ].join("|");
       const currentRow = {
         _is_current_segment: true,
@@ -5811,9 +6102,10 @@ DASHBOARD_HTML = """
 
   function shiftJobTabLabel(row){
     const index = Number(row?._tab_index || 0);
-    const prefix = row?._is_current_segment ? "Current" : `Job ${index || ""}`.trim();
+    const prefix = row?._is_current_segment ? "Current" : `Segment ${index || ""}`.trim();
     const name = jobDisplayName(row, row?.job_name || row?.job_code || "Job");
-    return `${prefix}: ${name}`;
+    const operator = row?.operator_name || displayNameForId(row?.operator_id || "");
+    return `${prefix}: ${operator || name}`;
   }
 
   function shiftJobDetailHtml(row){
@@ -5828,6 +6120,11 @@ DASHBOARD_HTML = """
       .map(([reasonText, qty]) => ({reason: reasonText, qty}));
     const rawRows = archivedMaterialRows(item);
     const packRows = productPackHistoryRows(item);
+    const avgWeight = Number(item.external_average_weight_grams || 0);
+    const avgWeightLabel = avgWeight > 0 ? `${(avgWeight / 1000).toFixed(4)} kg / ${avgWeight.toFixed(4)} ${item.external_average_weight_unit || "g"}` : "-";
+    const changeInfo = item.change_classification && typeof item.change_classification === "object" ? item.change_classification : {};
+    const changeCurrent = changeInfo.current && typeof changeInfo.current === "object" ? changeInfo.current : {};
+    const changeNew = changeInfo.new && typeof changeInfo.new === "object" ? changeInfo.new : {};
     return `
       <div class="shift-job-summary-line">
         <span class="shift-job-pill${isChange ? " change" : ""}">${esc(reason)}</span>
@@ -5845,6 +6142,16 @@ DASHBOARD_HTML = """
         ${detailItem("Machine Counter Start", item.machine_counter_start ?? "-")}
         ${detailItem("Machine Counter End", item.machine_counter_end ?? "-")}
         ${detailItem("Cycle Time", item.cycle_time_current || item.cycle_time_shift_avg_seconds || "-")}
+        ${detailItem("Change Type", item.reason || "-")}
+        ${detailItem("Change Target", item.change_target_job_name || item.change_target_job_code || "-")}
+        ${detailItem("Change Product", changeInfo.reason ? `${changeCurrent.product_id || changeCurrent.product_name || "-"} -> ${changeNew.product_id || changeNew.product_name || "-"}` : "-")}
+        ${detailItem("Change Color", changeInfo.reason ? `${changeCurrent.color || "-"} -> ${changeNew.color || "-"}` : "-")}
+        ${detailItem("Change Mold", changeInfo.reason ? `${changeCurrent.mold || "-"} -> ${changeNew.mold || "-"}` : "-")}
+        ${detailItem("Average Weight", avgWeightLabel)}
+        ${detailItem("Weight Source", item.external_average_weight_source || "-")}
+        ${detailItem("Weight Sender", item.external_average_weight_sender || "-")}
+        ${detailItem("Weight Sent At", fmtDateLocal(item.external_average_weight_sent_at || ""))}
+        ${detailItem("Weight Received At", fmtDateLocal(item.external_average_weight_received_at || ""))}
       </div>
       <div class="archive-metric-grid">
         ${archiveMetric("Pack", Number(item.pack_count || 0))}
@@ -5894,8 +6201,8 @@ DASHBOARD_HTML = """
     return `
       <div class="shift-job-tabs" data-shift-tabs="${esc(groupId)}">
         <div class="shift-job-tabs-head">
-          <div class="shift-job-tabs-title">Jobs This Shift</div>
-          <div class="shift-job-tabs-meta">${esc(rows.length)} tab${rows.length === 1 ? "" : "s"}</div>
+          <div class="shift-job-tabs-title">Operator / Job Segments</div>
+          <div class="shift-job-tabs-meta">${esc(rows.length)} segment${rows.length === 1 ? "" : "s"}</div>
         </div>
         <div class="shift-job-tabbar">
           ${rows.map((row, idx) => `<button type="button" class="shift-job-tab-button${idx === activeIdx ? " active" : ""}" data-shift-tab="${esc(groupId)}-${idx}">${esc(shiftJobTabLabel(row))}</button>`).join("")}
@@ -6008,6 +6315,7 @@ DASHBOARD_HTML = """
         source: firstValue(x.source, x.type, x.status, "PACK"),
         qty: firstValue(x.good_qty, x.qty_q, x.qty, x.completed_pack_qty, "-"),
         pack_qty: firstValue(x.completed_pack_qty, x.pack_qty, x.qty, "-"),
+        product: firstValue(x.product_p, x.product_id, "-"),
         series: firstValue(x.series, x.index, x.label_index, "-"),
         total_labels: firstValue(x.total_labels, x.total, "-"),
         lot: firstValue(x.lot_number, x.lot, "-"),
@@ -6044,16 +6352,18 @@ DASHBOARD_HTML = """
     const rows = productPackHistoryRows(session);
     const groups = new Map();
     rows.forEach(row => {
-      const key = [row.po || "-", row.lot || "-", row.total_labels || "-"].join("|");
+      const key = [row.product || "-", row.po || "-", row.total_labels || "-"].join("|");
       if(!groups.has(key)){
         groups.set(key, {
+          product: row.product || "-",
           po: row.po || "-",
-          lot: row.lot || "-",
+          lots: new Set(),
           total: Number(row.total_labels || 0) || 0,
           scanned: [],
         });
       }
       const group = groups.get(key);
+      if(row.lot && row.lot !== "-") group.lots.add(row.lot);
       const series = Number(row.series || 0) || 0;
       if(series > 0) group.scanned.push(series);
       if(!group.total && Number(row.total_labels || 0) > 0) group.total = Number(row.total_labels || 0);
@@ -6068,8 +6378,9 @@ DASHBOARD_HTML = """
         if(!scannedSet.has(i)) missing.push(i);
       }
       return {
+        product: group.product,
         po: group.po,
-        lot: group.lot,
+        lot: [...group.lots].slice(0, 3).join(", ") || "-",
         expected: group.total || maxScanned || "-",
         scanned: group.scanned.length,
         scanned_series: compressNumberRanges(group.scanned),
@@ -6083,13 +6394,14 @@ DASHBOARD_HTML = """
     const missingRows = productPackMissingSeriesRows(session);
     const visible = rows.slice().reverse();
     const missingTable = tableFromRows(missingRows, [
+      { label: "Item", value: x => x.product },
       { label: "PO", value: x => x.po },
-      { label: "Lot", value: x => x.lot },
+      { label: "Lots", value: x => x.lot },
       { label: "Expected Series", value: x => x.expected },
       { label: "Scanned", value: x => x.scanned },
       { label: "Scanned Series", value: x => x.scanned_series },
       { label: "Missing Series", value: x => x.missing_series },
-    ], "No pack QR scans recorded.", 6);
+    ], "No pack QR scans recorded.", 7);
     const table = tableFromRows(visible, [
       { label: "#", value: x => x.index },
       { label: "Source", value: x => x.source },
@@ -6419,6 +6731,9 @@ DASHBOARD_HTML = """
     const packHistoryRows = productPackHistoryRows(session);
     const shiftJobRows = operatorShiftJobRows(session);
     const scannedRawQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
+    const supervisorReviewRows = Array.isArray(session.supervisor_review_logs) ? session.supervisor_review_logs : [];
+    const openSupervisorReview = session.current_supervisor_review && typeof session.current_supervisor_review === "object" ? session.current_supervisor_review : null;
+    const latestSupervisorReview = openSupervisorReview && Object.keys(openSupervisorReview).length ? openSupervisorReview : (supervisorReviewRows.length ? supervisorReviewRows[supervisorReviewRows.length - 1] : null);
     const activeJobSummaryHtml = session.job_code || session.job_name ? `
       <div class="archive-detail-hero">
         <div>
@@ -6478,6 +6793,10 @@ DASHBOARD_HTML = """
           ${detailItem("Weight Sender", session.external_average_weight_sender || "-")}
           ${detailItem("Weight Sent At", fmtDateLocal(session.external_average_weight_sent_at || ""))}
           ${detailItem("Weight Received At", fmtDateLocal(session.external_average_weight_received_at || ""))}
+          ${detailItem("Supervisor Review", latestSupervisorReview ? `${latestSupervisorReview.actor_name || "-"} | ${latestSupervisorReview.status || "-"}` : "-")}
+          ${detailItem("Review Opened", latestSupervisorReview ? fmtDateLocal(latestSupervisorReview.opened_at_utc || "") : "-")}
+          ${detailItem("Review Closed", latestSupervisorReview ? fmtDateLocal(latestSupervisorReview.closed_at_utc || "") : "-")}
+          ${detailItem("Review Minutes", latestSupervisorReview && latestSupervisorReview.duration_seconds != null ? (Number(latestSupervisorReview.duration_seconds || 0) / 60).toFixed(2) : "-")}
           ${detailItem("Machine Counter Start", machineCounterStartValue(session))}
           ${detailItem("Machine Counter Current", session.machine_counter_current ?? "-")}
           ${detailItem("Last Seen", fmtDateLocal(session.last_seen_utc))}
@@ -6605,6 +6924,7 @@ DASHBOARD_HTML = """
     if(low === "supervisor") return "Supervisor";
     if(low === "operator") return "Operator";
     if(low === "maintenance") return "Maintenance";
+    if(low === "material loader" || low === "material_loader" || low === "loader") return "Material Loader";
     if(low === "planner") return "Planner";
     return String(role || "").trim();
   }
@@ -6795,8 +7115,9 @@ DASHBOARD_HTML = """
     const row = Array.isArray(operatorDirectoryState) ? operatorDirectoryState[index] : null;
     if(!row || !operatorDetailBody) return;
     const fullName = row.name || "-";
-    const badge = row.is_active ? "ACTIVE" : "IDLE";
+    const badge = row.operator_status || (row.is_active ? "WORKING" : "OFFLINE");
     const activity = Array.isArray(row.all_activity) ? row.all_activity : [];
+    const breakLogs = Array.isArray(row.break_logs) ? row.break_logs : [];
     operatorDetailTitle.textContent = fullName;
     operatorDetailSub.textContent = `ID ${row.id_number || '-'} | ${row.role || 'Operator'} | ${badge}`;
     const currentPair = compactPair(row.current_machine_name || row.current_machine_code, row.current_job_name || row.current_job_code);
@@ -6804,11 +7125,29 @@ DASHBOARD_HTML = """
     const activityHtml = activity.length
       ? activity.map(item => `<div class="operator-detail-list-item"><strong>${esc(item.label || 'Activity')}</strong><span>${esc(item.detail || '-')}</span><span>${esc(fmtLocal(item.at_utc))}</span></div>`).join('')
       : '<div class="operator-directory-empty" style="padding:0;">No machine activity recorded yet.</div>';
+    const breakHtml = breakLogs.length
+      ? `<div class="operator-break-table">
+          <div class="operator-break-row head"><div>Break Out</div><div>Break In</div><div>Duration</div><div>Cover</div></div>
+          ${breakLogs.slice(0, 20).map(item => {
+            const dur = item.duration_seconds == null ? "Ongoing" : fmtDowntimeSeconds(item.duration_seconds);
+            return `<div class="operator-break-row">
+              <div>${esc(fmtLocal(item.break_out_time))}</div>
+              <div>${esc(item.break_in_time ? fmtLocal(item.break_in_time) : "Ongoing")}</div>
+              <div>${esc(dur)}</div>
+              <div>${esc(item.reliever_operator_name || item.reliever_operator || "-")}</div>
+            </div>`;
+          }).join("")}
+        </div>`
+      : '<div class="operator-directory-empty" style="padding:0;">No break logs recorded yet.</div>';
     operatorDetailBody.innerHTML = `
       <div class="operator-detail-grid">
         <div class="operator-detail-item"><div class="k">Current Machine</div><div class="v">${esc(currentPair.primary)}${currentPair.secondary ? `<br>${esc(currentPair.secondary)}` : ''}</div></div>
-        <div class="operator-detail-item"><div class="k">Last Handled</div><div class="v">${esc(lastPair.primary)}${lastPair.secondary ? `<br>${esc(lastPair.secondary)}` : ''}</div></div>
-        <div class="operator-detail-item"><div class="k">Last Activity</div><div class="v">${esc(fmtLocal(row.last_activity_at_utc))}</div></div>
+        <div class="operator-detail-item"><div class="k">Status Since</div><div class="v">${esc(fmtLocal(row.status_since_utc || row.last_activity_at_utc))}</div></div>
+        <div class="operator-detail-item"><div class="k">Current Status</div><div class="v">${esc(badge)}<br>${esc(row.status_detail || "-")}</div></div>
+      </div>
+      <div class="operator-detail-section">
+        <h4>Break Logs</h4>
+        ${breakHtml}
       </div>
       <div class="operator-detail-section">
         <h4>Recent Activity</h4>
@@ -6826,48 +7165,41 @@ DASHBOARD_HTML = """
       operatorDirectoryGrid.innerHTML = '<div class="operator-directory-empty">No operator profiles found yet.</div>';
       return;
     }
-    const header = `<div class="operator-directory-row header">
-      <div>Operator</div>
-      <div>Current Machine</div>
-      <div>Last Handled</div>
-      <div>Last Activity</div>
-      <div>Status</div>
-    </div>`;
-    const body = rows.map((x, index) => {
-      const badge = x.is_active ? '<span class="operator-directory-badge live">ACTIVE</span>' : '<span class="operator-directory-badge">IDLE</span>';
+    const filtered = rows.filter(x => operatorDirectoryFilter === "ALL" || String(x.operator_status || "OFFLINE").toUpperCase() === operatorDirectoryFilter);
+    const counts = rows.reduce((acc, x) => {
+      const key = String(x.operator_status || "OFFLINE").toUpperCase();
+      acc[key] = (acc[key] || 0) + 1;
+      acc.ALL = (acc.ALL || 0) + 1;
+      return acc;
+    }, {ALL: 0});
+    const filters = ["ALL", "OFFLINE", "WORKING", "ON BREAK"].map(key => (
+      `<button class="operator-status-filter ${operatorDirectoryFilter === key ? "active" : ""}" type="button" data-operator-status-filter="${esc(key)}">${esc(key)} ${esc(counts[key] || 0)}</button>`
+    )).join("");
+    const body = filtered.map((x, index) => {
+      const originalIndex = rows.indexOf(x);
+      const status = String(x.operator_status || "OFFLINE").toUpperCase();
+      const statusClass = status.toLowerCase().replace(/\\s+/g, "-");
       const currentPair = compactPair(x.current_machine_name || x.current_machine_code, x.current_job_name || x.current_job_code);
-      const lastPair = compactPair(x.last_machine_name || x.last_machine_code, x.last_job_name || x.last_job_code);
-      const activity = Array.isArray(x.recent_activity) ? x.recent_activity : [];
-      const recentPreview = activity.length
-        ? activity.map(item => `${item.label || 'Activity'}: ${item.detail || '-'}`).slice(0, 2).join(' | ')
-        : 'No machine activity recorded yet.';
-      return `<div class="operator-directory-row" data-operator-index="${index}">
-        <div class="operator-directory-name">
-          <strong>${esc(x.name || '-')}</strong>
-          <div class="operator-directory-meta">ID ${esc(x.id_number || '-')} | ${esc(x.role || 'Operator')}</div>
-        </div>
-        <div class="operator-directory-cell">
-          <div class="operator-directory-label">Current Machine</div>
-          <div class="operator-directory-value">${esc(currentPair.primary)}</div>
-          ${currentPair.secondary ? `<div class="operator-directory-subvalue">${esc(currentPair.secondary)}</div>` : ``}
-        </div>
-        <div class="operator-directory-cell">
-          <div class="operator-directory-label">Last Handled</div>
-          <div class="operator-directory-value">${esc(lastPair.primary)}</div>
-          ${lastPair.secondary ? `<div class="operator-directory-subvalue">${esc(lastPair.secondary)}</div>` : ``}
-        </div>
-        <div class="operator-directory-cell">
-          <div class="operator-directory-label">Last Activity</div>
-          <div class="operator-directory-value">${esc(fmtLocal(x.last_activity_at_utc))}</div>
-          <div class="operator-directory-subvalue">${esc(recentPreview)}</div>
-        </div>
-        <div class="operator-directory-cell">
-          <div class="operator-directory-label">Status</div>
-          ${badge}
+      const initials = String(x.name || x.id_number || "?").trim().split(/\\s+/).slice(0,2).map(v => v[0] || "").join("").toUpperCase() || "?";
+      const photo = String(x.photo_data_url || "").trim();
+      const avatar = photo ? `<img src="${escAttr(photo)}" alt="${escAttr(x.name || 'Operator photo')}" />` : esc(initials);
+      return `<div class="operator-status-card" data-operator-index="${esc(originalIndex)}">
+        <div class="operator-status-photo">${avatar}</div>
+        <div class="operator-status-name">${esc(x.name || x.id_number || "-")}</div>
+        <div class="operator-status-role">${esc(x.role || "Operator")}</div>
+        <div><span class="operator-status-pill ${esc(statusClass)}">${esc(status)}</span></div>
+        <div class="operator-status-meta">
+          <div>${esc(currentPair.primary)}</div>
+          ${currentPair.secondary ? `<div>${esc(currentPair.secondary)}</div>` : ""}
+          <div>${esc(x.status_detail || (status === "OFFLINE" ? "No active machine" : ""))}</div>
+          <div>${esc(x.status_since_utc ? fmtLocal(x.status_since_utc) : "")}</div>
         </div>
       </div>`;
     }).join('');
-    operatorDirectoryGrid.innerHTML = header + body;
+    operatorDirectoryGrid.innerHTML = `
+      <div class="operator-status-toolbar">${filters}</div>
+      <div class="operator-card-grid">${body || '<div class="operator-directory-empty">No operators in this status.</div>'}</div>
+    `;
   }
 
   async function loadOperatorDirectory(){
@@ -7281,6 +7613,10 @@ DASHBOARD_HTML = """
     const data = (payload.data && typeof payload.data === "object") ? payload.data : {};
     const job = (data.job && typeof data.job === "object") ? data.job : {};
     const jobDetails = (data.job_details && typeof data.job_details === "object") ? data.job_details : {};
+    const changeInfo = item.change_classification && typeof item.change_classification === "object" ? item.change_classification : {};
+    const changeCurrent = changeInfo.current && typeof changeInfo.current === "object" ? changeInfo.current : {};
+    const changeNew = changeInfo.new && typeof changeInfo.new === "object" ? changeInfo.new : {};
+    const changeValue = (left, right) => changeInfo.reason ? `${left || "-"} -> ${right || "-"}` : "-";
     const partials = Array.isArray(data.partials) ? data.partials : [];
     const productParts = Array.isArray(data.product_parts) ? data.product_parts : [];
     let targetRawMaterials = [];
@@ -7308,6 +7644,8 @@ DASHBOARD_HTML = """
             <span class="archive-pill">${esc(item.review_status || "Pending Review")}</span>
             <span class="archive-pill">Operator ${esc(displayNameForId(item.operator_id || item.operator_name || "-"))}</span>
             <span class="archive-pill">Ended ${esc(fmtDateLocal(item.ended_at_utc || item.finished_at_utc || ""))}</span>
+            ${item.approved_by ? `<span class="archive-pill">Approved by ${esc(item.approved_by)}</span>` : ""}
+            ${item.approved_at_utc ? `<span class="archive-pill">Approved ${esc(fmtDateLocal(item.approved_at_utc))}</span>` : ""}
           </div>
         </div>
         <div class="archive-detail-hero-side">
@@ -7357,6 +7695,18 @@ DASHBOARD_HTML = """
       shift_index: item.shift_index ?? "-",
       started_at_utc: item.started_at_utc || "-",
       ended_at_utc: item.ended_at_utc || item.finished_at_utc || "-",
+      approved_by: item.approved_by || "-",
+      approved_by_code: item.approved_by_code || "-",
+      approved_by_role: item.approved_by_role || "-",
+      approved_at_utc: item.approved_at_utc || "-",
+      approved_remarks: item.approved_remarks || "-",
+      changed_by: item.changed_by || "-",
+      changed_at_utc: item.changed_at_utc || "-",
+      change_type: shiftReasonLabel(changeInfo.reason || item.reason || "-"),
+      change_target: item.change_target_job_name || item.change_target_job_code || "-",
+      change_product: changeValue(changeCurrent.product_id || changeCurrent.product_name, changeNew.product_id || changeNew.product_name),
+      change_color: changeValue(changeCurrent.color, changeNew.color),
+      change_mold: changeValue(changeCurrent.mold, changeNew.mold),
     };
     const summaryProduction = {
       pack_count: item.pack_count ?? 0,
@@ -7373,6 +7723,9 @@ DASHBOARD_HTML = """
       cycle_time_current: item.cycle_time_current || "-",
       cycle_time_shift_avg_seconds: item.cycle_time_shift_avg_seconds ?? "-",
       qty_per_shift_avg_cycle: item.qty_per_shift_avg_cycle ?? "-",
+      external_average_weight: Number(item.external_average_weight_grams || 0) > 0 ? `${(Number(item.external_average_weight_grams || 0) / 1000).toFixed(4)} kg` : "-",
+      external_average_weight_sent_at: item.external_average_weight_sent_at || "-",
+      external_average_weight_received_at: item.external_average_weight_received_at || "-",
       downtime_reason_code: item.downtime_reason_code || "-",
       downtime_reason_text: item.downtime_reason_text || "-",
       downtime_last_seconds: item.downtime_last_seconds ?? 0,
@@ -7389,6 +7742,18 @@ DASHBOARD_HTML = """
       reject_review_logs_count: rejectReviews.length,
       partials_count: partials.length,
       product_parts_count: productParts.length,
+    };
+    const summaryApproval = {
+      review_status: item.review_status || "-",
+      approved_by: item.approved_by || "-",
+      approved_by_code: item.approved_by_code || "-",
+      approved_by_role: item.approved_by_role || "-",
+      approved_at: fmtDateLocal(item.approved_at_utc || "") || "-",
+      approved_remarks: item.approved_remarks || "-",
+      changed_by: item.changed_by || "-",
+      changed_by_code: item.changed_by_code || "-",
+      changed_at: fmtDateLocal(item.changed_at_utc || "") || "-",
+      change_remarks: item.change_remarks || "-",
     };
     return {
       summary: [
@@ -7407,16 +7772,23 @@ DASHBOARD_HTML = """
         { title: "Shift Details", kind: "html", content: renderKeyValueTableHtml({
           record_type: item.record_type || "SHIFT_PARTIAL",
           reason: item.reason || "-",
+          change_type: shiftReasonLabel(changeInfo.reason || item.reason || "-"),
+          change_target: item.change_target_job_name || item.change_target_job_code || "-",
+          change_product: changeValue(changeCurrent.product_id || changeCurrent.product_name, changeNew.product_id || changeNew.product_name),
+          change_color: changeValue(changeCurrent.color, changeNew.color),
+          change_mold: changeValue(changeCurrent.mold, changeNew.mold),
           machine: `${item.machine_name || item.machine_code || "-"} (${item.machine_code || "-"})`,
           job: `${jobDisplayName(item, "-")} (${jobSecondaryLabel(item)})`,
           shift_index: item.shift_index ?? "-",
           started: fmtDateLocal(item.started_at_utc || ""),
           ended: fmtDateLocal(item.ended_at_utc || item.finished_at_utc || ""),
         }) },
+        { title: "Approval", kind: "html", content: renderKeyValueTableHtml(summaryApproval) },
         { title: "Timing", kind: "metrics", content: [
           { label: "Cycle Time", value: item.cycle_time_current || "-" },
           { label: "Shift Avg", value: item.cycle_time_shift_avg_seconds ?? "-" },
           { label: "Qty / Shift Avg", value: item.qty_per_shift_avg_cycle ?? "-" },
+          { label: "Avg Weight", value: Number(item.external_average_weight_grams || 0) > 0 ? `${(Number(item.external_average_weight_grams || 0) / 1000).toFixed(4)} kg` : "-" },
           { label: "Downtime", value: fmtDowntimeSeconds(item.downtime_last_seconds ?? 0), tone: Number(item.downtime_last_seconds || 0) > 0 ? "warn" : "" },
         ] },
       ],
@@ -7553,6 +7925,8 @@ DASHBOARD_HTML = """
           <div class="finished-grid">
             <div><strong>Shift End:</strong> ${esc(fmtDateLocal(r.finished_at_utc || r.ended_at_utc || ""))}</div>
             <div><strong>Operator:</strong> ${esc(displayNameForId(r.operator_id || "-"))}</div>
+            <div><strong>Approved By:</strong> ${esc(r.approved_by || "-")}${r.approved_by_code ? ` (${esc(r.approved_by_code)})` : ""}</div>
+            <div><strong>Approved At:</strong> ${esc(fmtDateLocal(r.approved_at_utc || ""))}</div>
             <div><strong>Pack:</strong> ${esc(r.pack_count ?? 0)}</div>
             <div><strong>Total Good:</strong> ${esc(r.total_good ?? r.partial_qty ?? 0)}</div>
             <div><strong>Reject:</strong> ${esc(r.reject_total ?? 0)}</div>
@@ -7735,7 +8109,7 @@ DASHBOARD_HTML = """
         ? rawLogs.map((x, idx) => `${idx+1}. ${x.material || "-"} | qty=${x.qty || 0}`).join("\\n")
         : "No raw materials scanned.";
       const partialSummaryText = relatedApprovedShifts.length
-        ? relatedApprovedShifts.map((x, rowIdx) => `${rowIdx + 1}. ${fmtDateLocal(x.finished_at_utc || x.ended_at_utc || "")} | Qty ${x.partial_qty || x.total_good || 0} | Reject ${x.reject_total || 0} | No Shot ${x.no_shot_total || 0} | Downtime ${fmtDowntimeSeconds(x.downtime_last_seconds)}`).join("\\n")
+        ? relatedApprovedShifts.map((x, rowIdx) => `${rowIdx + 1}. ${fmtDateLocal(x.finished_at_utc || x.ended_at_utc || "")} | Qty ${x.partial_qty || x.total_good || 0} | Reject ${x.reject_total || 0} | No Shot ${x.no_shot_total || 0} | Downtime ${fmtDowntimeSeconds(x.downtime_last_seconds)} | Approved by ${x.approved_by || "-"} ${x.approved_at_utc ? `at ${fmtDateLocal(x.approved_at_utc)}` : ""}`).join("\\n")
         : "No approved shift partials linked to this job yet.";
       const linkageRole = String(r.linkage_role || "").toUpperCase();
       const linkageTotal = Number(r.linkage_group_total_jobs || 0);
@@ -7855,7 +8229,7 @@ DASHBOARD_HTML = """
                 <td>${esc(fmtDateLocal(r.finished_at_utc || ""))}</td>
                 <td>${esc(fmtDateLocal(r.printed_at_utc || r.archived_at_utc || ""))}</td>
                 <td>${esc(r.review_status || "ARCHIVED")}</td>
-                <td>${esc(actor)}${actorRole ? `<br><span class="muted">${esc(actorRole)}</span>` : ""}</td>
+                <td>${esc(actor)}${actorRole ? `<br><span class="muted">${esc(actorRole)}</span>` : ""}${r.approved_at_utc || r.changed_at_utc ? `<br><span class="muted">${esc(fmtDateLocal(r.approved_at_utc || r.changed_at_utc || ""))}</span>` : ""}</td>
                 <td><div class="table-actions"><button class="mini-btn primary archived-view-btn" data-row-index="${idx}" type="button">View</button></div></td>
               </tr>
             `;
@@ -8631,10 +9005,12 @@ DASHBOARD_HTML = """
     const statusClass = Number(job.issue_count || 0) > 0 ? "bad" : (job.active ? "warn" : "");
     const problems = Array.isArray(job.problems) ? job.problems : [];
     const notable = Array.isArray(job.notable_acts) ? job.notable_acts : [];
+    const productMold = jobProductMoldLabel(job);
     return `
       <div class="user-kpi-job-detail">
         <h4>${esc(jobDisplayName(job, job.job_code || "Job"))}</h4>
         <div class="user-kpi-job-meta">${esc(job.machine_name || job.machine_code || "-")} | ${esc(job.finished_at_utc ? fmtDateLocal(job.finished_at_utc) : (job.started_at_utc ? fmtDateLocal(job.started_at_utc) : "-"))}</div>
+        ${productMold ? `<div class="user-kpi-job-meta product">${esc(productMold)}</div>` : ""}
         <div style="margin-top:10px;"><span class="user-kpi-job-badge ${esc(statusClass)}">${esc(job.status || "-")}</span></div>
         <div class="user-kpi-job-grid">
           <div class="user-kpi-job-metric"><div class="k">Success Rate</div><div class="v">${esc(job.success_rate ?? 0)}%</div></div>
@@ -8687,12 +9063,14 @@ DASHBOARD_HTML = """
           <div class="user-kpi-job-list">
             ${jobs.length ? jobs.map((job, jobIndex) => {
               const badgeClass = Number(job.issue_count || 0) > 0 ? "bad" : (job.active ? "warn" : "");
+              const productMold = jobProductMoldLabel(job);
               return `
                 <div class="user-kpi-job-row ${jobIndex === 0 ? "active" : ""}" data-user-kpi-job-index="${esc(jobIndex)}">
                   <div class="user-kpi-job-top">
                     <div>
                       <div class="user-kpi-job-name">${esc(jobDisplayName(job, job.job_code || "Job"))}</div>
                       <div class="user-kpi-job-meta">${esc(job.machine_name || job.machine_code || "-")} | Pack ${esc(job.pack_count ?? 0)} | Good ${esc(job.good_total ?? 0)} | Reject ${esc(job.reject_total ?? 0)}</div>
+                      ${productMold ? `<div class="user-kpi-job-meta product">${esc(productMold)}</div>` : ""}
                     </div>
                     <span class="user-kpi-job-badge ${esc(badgeClass)}">${esc(job.status || "-")}</span>
                   </div>
@@ -9740,6 +10118,12 @@ DASHBOARD_HTML = """
   }
   if(operatorDirectoryGrid){
     operatorDirectoryGrid.addEventListener("click", (ev) => {
+      const filter = ev.target && ev.target.closest ? ev.target.closest("[data-operator-status-filter]") : null;
+      if(filter){
+        operatorDirectoryFilter = filter.getAttribute("data-operator-status-filter") || "ALL";
+        renderOperatorDirectory(operatorDirectoryState);
+        return;
+      }
       const row = ev.target && ev.target.closest ? ev.target.closest("[data-operator-index]") : null;
       if(!row) return;
       const idx = Number(row.getAttribute("data-operator-index") || "-1");
@@ -10342,6 +10726,7 @@ PROFILE_CREATOR_HTML = """
                 <option>QA/QC</option>
                 <option>Operator</option>
                 <option>Maintenance</option>
+                <option>Material Loader</option>
                 <option>Planner</option>
                 <option>Production Manager</option>
               </select>
@@ -10495,7 +10880,7 @@ PROFILE_CREATOR_HTML = """
         <div class="mini-actions">
           <button type="button" class="mini-btn" data-act="photo" data-id="${escAttr(x.id_number)}">Photo</button>
           <button type="button" class="mini-btn" data-act="clear-photo" data-id="${escAttr(x.id_number)}">Clear Photo</button>
-          <button type="button" class="mini-btn primary" data-act="print" data-id="${escAttr(x.id_number)}" data-name="${escAttr(x.name)}" data-role="${escAttr(x.role)}">Print</button>
+          <button type="button" class="mini-btn primary" data-act="print" data-id="${escAttr(x.id_number)}" data-name="${escAttr(x.name)}" data-role="${escAttr(x.role)}" data-print-count="${escAttr(x.print_count ?? 0)}">Print</button>
           <button type="button" class="mini-btn danger" data-act="remove" data-id="${escAttr(x.id_number)}">Remove</button>
         </div>
       </td>
@@ -10515,10 +10900,10 @@ PROFILE_CREATOR_HTML = """
   }
   async function authorizeProfilePrint(idNumber){
     const firstResp = await fetch('/api/profiles/authorize-print', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id_number: idNumber }) });
-    if(firstResp.ok){
+    const firstOut = await firstResp.json().catch(() => ({}));
+    if(firstResp.ok && firstOut.ok){
       return { ok: true, message: '' };
     }
-    const firstOut = await firstResp.json().catch(() => ({}));
     if(!firstOut.requires_password){
       const msg = firstOut.error || 'Print authorization failed.';
       setStatus(msg);
@@ -10528,7 +10913,7 @@ PROFILE_CREATOR_HTML = """
     if(pw === null){
       const msg = 'Reprint cancelled.';
       setStatus(msg);
-      return { ok: false, message: msg };
+      return { ok: false, message: msg, cancelled: true };
     }
     const secondResp = await fetch('/api/profiles/authorize-print', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id_number: idNumber, admin_password: pw }) });
     const secondOut = await secondResp.json();
@@ -10562,15 +10947,22 @@ PROFILE_CREATOR_HTML = """
     try { w.focus(); } catch(_e) {}
     return w;
   }
-  function closePreparedPrintWindow(w, message='Print cancelled or failed. Check the Profile Creator page for details.'){
+  function showPreparedPrintMessage(w, message='Print cancelled or failed. Check the Profile Creator page for details.'){
     if(!w) return;
     try {
       w.document.write(`<!doctype html><html><head><title>Print QR</title>
-        <style>html,body{margin:0;padding:16px;font-family:Arial,sans-serif;background:#fff;color:#111;}</style>
-        </head><body>${esc(message)}</body></html>`);
+        <style>
+          html,body{margin:0;padding:16px;font-family:Arial,sans-serif;background:#fff;color:#111;}
+          .msg{font-size:16px;line-height:1.4;}
+          button{margin-top:12px;padding:8px 14px;border:1px solid #aaa;border-radius:6px;background:#f8f8f8;cursor:pointer;}
+        </style>
+        </head><body><div class="msg">${esc(message)}</div><button onclick="window.close()">Close</button></body></html>`);
       w.document.close();
       w.focus();
     } catch(_e) {}
+  }
+  function closePreparedPrintWindow(w, message='Print cancelled or failed. Check the Profile Creator page for details.'){
+    showPreparedPrintMessage(w, message);
   }
   async function openPrintWindow(imageSrc, printSize, printWindow=null){
     if(!imageSrc){ return; }
@@ -10585,32 +10977,45 @@ PROFILE_CREATOR_HTML = """
         html,body { margin:0; padding:0; background:#fff; }
         body { display:flex; align-items:flex-start; justify-content:flex-start; }
         img { ${sizeCss} display:block; object-fit:contain; image-rendering:auto; }
-      </style></head><body><img src="${imageSrc}" /></body></html>`);
+      </style></head><body><img id="qrPrintImage" src="${imageSrc}" />
+      <script>
+        const img = document.getElementById('qrPrintImage');
+        function runPrint(){ setTimeout(() => { try { window.focus(); window.print(); } catch(_e) {} }, 120); }
+        if(img && img.complete){ runPrint(); }
+        else if(img){ img.onload = runPrint; img.onerror = () => { document.body.textContent = 'QR image failed to load.'; }; }
+      <${"/"}script></body></html>`);
     w.document.close();
     try { w.focus(); } catch(_e) {}
-    setTimeout(() => { try { w.print(); } catch(_e) {} }, 180);
   }
-  async function printExistingProfile(idNumber, name, role, printWindow=null){
-    if(!idNumber){ closePreparedPrintWindow(printWindow, 'Missing profile ID number.'); return; }
-    const auth = await authorizeProfilePrint(idNumber);
-    if(!auth.ok){ closePreparedPrintWindow(printWindow, auth.message || 'Reprint was not authorized.'); return; }
-    const payload = {
-      name: (name || '').trim(),
-      id_number: (idNumber || '').trim(),
-      role: (role || '').trim(),
-      print_size: (pfSize.value || 'barcode_4x1.25').trim(),
-    };
-    const r = await fetch('/api/profile-qr-preview', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-    const out = await r.json();
+  async function printExistingProfile(idNumber, name, role, printWindow=null, adminPassword=''){
+    if(!idNumber){ showPreparedPrintMessage(printWindow, 'Missing profile ID number.'); return; }
+    const printSize = (pfSize.value || 'barcode_4x1.25').trim();
+    async function requestPrintPreview(adminPassword=''){
+      const body = { id_number: (idNumber || '').trim(), print_size: printSize };
+      if(adminPassword){ body.admin_password = adminPassword; }
+      const resp = await fetch('/api/profiles/print-preview', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      const json = await resp.json().catch(() => ({}));
+      return { resp, json };
+    }
+    let { resp: r, json: out } = await requestPrintPreview(adminPassword || '');
+    if(out.requires_password){
+      const pw = window.prompt('Admin password required for reprint:', '');
+      if(pw === null){
+        setStatus('Reprint cancelled.');
+        showPreparedPrintMessage(printWindow, 'Reprint cancelled.');
+        return;
+      }
+      ({ resp: r, json: out } = await requestPrintPreview(pw));
+    }
     if(!r.ok || !out.ok){
       const msg = out.error || 'Preview failed.';
-      closePreparedPrintWindow(printWindow, msg);
+      showPreparedPrintMessage(printWindow, msg);
       setStatus(msg);
       return;
     }
     pfPreviewImg.src = out.image_data_url || '';
     pfPayloadPreview.textContent = out.qr_payload || '';
-    await openPrintWindow(out.image_data_url || '', payload.print_size, printWindow);
+    await openPrintWindow(out.image_data_url || '', out.print_size || printSize, printWindow);
     await loadProfiles();
     setStatus('Profile print opened.');
   }
@@ -10698,7 +11103,19 @@ PROFILE_CREATOR_HTML = """
       return;
     }
     if(act === 'print'){
-      await printExistingProfile(id, btn.getAttribute('data-name') || '', btn.getAttribute('data-role') || '', null);
+      const printCount = Number(btn.getAttribute('data-print-count') || '0') || 0;
+      let adminPassword = '';
+      if(printCount > 0){
+        const pw = window.prompt('Admin password required for reprint:', '');
+        if(pw === null){
+          setStatus('Reprint cancelled.');
+          return;
+        }
+        adminPassword = pw;
+      }
+      const printWindow = preparePrintWindow();
+      if(!printWindow) return;
+      await printExistingProfile(id, btn.getAttribute('data-name') || '', btn.getAttribute('data-role') || '', printWindow, adminPassword);
     }
   });
   loadProfilePageTheme();
@@ -10797,8 +11214,45 @@ async def api_profile_qr_preview(req: Request):
     if print_size not in ("barcode_4x1.25", "normal_2x2"):
         print_size = "barcode_4x1.25"
     payload = _profile_qr_payload(name=name, id_number=id_number, role=role)
-    image_data_url = _profile_qr_png_data_url(payload, role=role, layout=print_size)
+    image_data_url = _profile_qr_png_data_url(payload, role=name, layout=print_size)
     return {"ok": True, "qr_payload": payload, "image_data_url": image_data_url, "print_size": print_size}
+
+
+@APP.post("/api/profiles/print-preview")
+async def api_profiles_print_preview(req: Request):
+    data = await req.json()
+    id_number = str(data.get("id_number", "")).strip()
+    admin_password = str(data.get("admin_password", "") or "")
+    print_size = str(data.get("print_size", "barcode_4x1.25")).strip()
+    if print_size not in ("barcode_4x1.25", "normal_2x2"):
+        print_size = "barcode_4x1.25"
+    if not id_number:
+        return JSONResponse({"ok": False, "error": "id_number is required"}, status_code=400)
+    idx = next((i for i, p in enumerate(PROFILES) if str((p or {}).get("id_number", "")).strip() == id_number), -1)
+    if idx < 0:
+        return JSONResponse({"ok": False, "error": "Profile not found"}, status_code=404)
+    row = dict(PROFILES[idx] or {})
+    print_count = int(row.get("print_count", 0) or 0)
+    if print_count > 0 and admin_password != PROFILE_REPRINT_ADMIN_PASSWORD:
+        error = "Invalid admin password" if admin_password else "Admin password required for reprint"
+        return {"ok": False, "error": error, "requires_password": True, "print_count": print_count}
+    name = str(row.get("name", "")).strip()
+    role = str(row.get("role", "")).strip()
+    if not name or not id_number or not role:
+        return JSONResponse({"ok": False, "error": "Saved profile is missing name, id_number, or role"}, status_code=400)
+    payload = _profile_qr_payload(name=name, id_number=id_number, role=role)
+    image_data_url = _profile_qr_png_data_url(payload, role=name, layout=print_size)
+    row["print_count"] = print_count + 1
+    row["last_printed_at_utc"] = utc_now().isoformat()
+    PROFILES[idx] = row
+    save_profiles(PROFILES)
+    return {
+        "ok": True,
+        "qr_payload": payload,
+        "image_data_url": image_data_url,
+        "print_size": print_size,
+        "print_count": int(row["print_count"]),
+    }
 
 
 @APP.post("/api/profiles/authorize-print")
@@ -10815,10 +11269,8 @@ async def api_profiles_authorize_print(req: Request):
     row = PROFILES[idx]
     print_count = int(row.get("print_count", 0) or 0)
     if print_count > 0 and admin_password != PROFILE_REPRINT_ADMIN_PASSWORD:
-        return JSONResponse(
-            {"ok": False, "error": "Admin password required for reprint", "requires_password": True, "print_count": print_count},
-            status_code=403,
-        )
+        error = "Invalid admin password" if admin_password else "Admin password required for reprint"
+        return {"ok": False, "error": error, "requires_password": True, "print_count": print_count}
     row["print_count"] = print_count + 1
     row["last_printed_at_utc"] = utc_now().isoformat()
     PROFILES[idx] = row
@@ -10973,6 +11425,7 @@ async def api_event(req: Request):
             product_pack_history_logs=[],
             job_payload={},
             operator_shift_logs=[],
+            break_sessions=[],
         )
         SESSIONS[machine_code] = sess
 
@@ -10988,6 +11441,9 @@ async def api_event(req: Request):
         sess.job_name = incoming_job_name
     if str(incoming_operator_id or "").strip():
         sess.operator_id = incoming_operator_id
+        if not sess.break_active:
+            sess.active_scan_operator_id = incoming_operator_id
+            sess.active_scan_owner_type = "ORIGINAL"
     sess.last_seen_utc = utc_now().isoformat()
     sess.last_event = str(data.get("last_event", sess.last_event))
 
@@ -10998,6 +11454,81 @@ async def api_event(req: Request):
         raw_operator_qr = str(ev.get("operator_qr_payload") or "").strip()
         if raw_operator_qr:
             sess.operator_qr_payload = raw_operator_qr
+        sess.active_scan_operator_id = sess.operator_id
+        sess.active_scan_owner_type = "ORIGINAL"
+        sess.reliever_id = None
+        sess.reliever_qr_payload = ""
+        sess.break_active = False
+        sess.current_break_session_id = ""
+        sess.break_out_time = None
+    elif ev_type == "OPERATOR_CHANGE":
+        shift_payload = ev.get("operator_shift")
+        if isinstance(shift_payload, dict):
+            rows = list(sess.operator_shift_logs or [])
+            key = _active_shift_segment_key(shift_payload, sess)
+            rows = [
+                row for row in rows
+                if not (
+                    isinstance(row, dict)
+                    and key
+                    and _active_shift_segment_key(row, sess) == key
+                )
+            ]
+            rows.append(dict(shift_payload))
+            sess.operator_shift_logs = rows[-40:]
+        new_operator = str(ev.get("new_operator") or incoming_operator_id or "").strip()
+        if new_operator:
+            sess.operator_id = new_operator
+            sess.active_scan_operator_id = new_operator
+        raw_operator_qr = str(ev.get("operator_qr_payload") or "").strip()
+        sess.operator_qr_payload = raw_operator_qr
+        sess.active_scan_owner_type = "ORIGINAL"
+        sess.reliever_id = None
+        sess.reliever_qr_payload = ""
+        sess.break_active = False
+        sess.current_break_session_id = ""
+        sess.break_out_time = None
+        sess.pack_total = 0
+        sess.good_total = 0
+        sess.butal_total = 0
+        sess.reject_total = 0
+        sess.reject_breakdown = {}
+        sess.no_shot_total = 0
+        sess.startup_reject_total = 0
+        sess.raw_sacks_count = 0
+        sess.raw_material_scans = []
+        sess.raw_material_logs = []
+        sess.product_pack_history_logs = []
+        sess.last_event = f"OPERATOR CHANGE {new_operator}".strip()
+    elif ev_type in ("RELIEF_START", "RELIEF_END"):
+        break_row = ev.get("break_session")
+        if isinstance(break_row, dict):
+            rows = [
+                row for row in list(sess.break_sessions or [])
+                if not (
+                    isinstance(row, dict)
+                    and str(row.get("break_session_id") or "")
+                    and str(row.get("break_session_id") or "") == str(break_row.get("break_session_id") or "")
+                )
+            ]
+            rows.append(dict(break_row))
+            sess.break_sessions = rows[-100:]
+            if ev_type == "RELIEF_START":
+                sess.reliever_id = str(break_row.get("reliever_operator") or "").strip() or sess.reliever_id
+                sess.reliever_qr_payload = str(ev.get("operator_qr_payload") or sess.reliever_qr_payload or "").strip()
+                sess.active_scan_operator_id = sess.reliever_id
+                sess.active_scan_owner_type = "RELIEVER"
+                sess.break_active = True
+                sess.current_break_session_id = str(break_row.get("break_session_id") or "").strip()
+                sess.break_out_time = str(break_row.get("break_out_time") or "").strip() or sess.break_out_time
+            else:
+                sess.active_scan_operator_id = sess.operator_id
+                sess.active_scan_owner_type = "ORIGINAL"
+                sess.reliever_id = None
+                sess.reliever_qr_payload = ""
+                sess.break_active = False
+                sess.current_break_session_id = ""
+                sess.break_out_time = None
     if ev_type == "FINISH_SHIFT":
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
@@ -11072,11 +11603,12 @@ async def api_event(req: Request):
             rows = list(sess.linkage_jobs or [])
             rows.append({"job_code": linked_code, "job_name": linked_name})
             sess.linkage_jobs = rows
-    elif ev_type in ("JOB_SET", "JOB_STUB_SET", "COLOR_CHANGE_JOB_SET"):
-        _reset_active_session_for_new_job_segment(sess, preserve_operator_shift_logs=(ev_type == "COLOR_CHANGE_JOB_SET"))
+    elif ev_type in ("JOB_SET", "JOB_STUB_SET", "COLOR_CHANGE_JOB_SET", "MOLD_CHANGE_JOB_SET"):
+        _reset_active_session_for_new_job_segment(sess, preserve_operator_shift_logs=(ev_type in ("COLOR_CHANGE_JOB_SET", "MOLD_CHANGE_JOB_SET")))
         job_payload = ev.get("job_payload") or ev.get("stub")
         if isinstance(job_payload, dict):
             sess.job_payload = dict(job_payload or {})
+            _fill_session_product_identity(sess)
         sess.job_started_at = utc_now().isoformat()
     elif ev_type == "OPERATOR_SHIFT_SAVE":
         shift_payload = ev.get("operator_shift")
@@ -11108,6 +11640,15 @@ async def api_event(req: Request):
             sess.product_name = str(snap.get("product_name", sess.product_name) or "")
             sess.job_started_at = snap.get("job_started_at", sess.job_started_at)
             sess.operator_id = snap.get("operator_id", sess.operator_id)
+            sess.active_scan_operator_id = snap.get("active_scan_operator_id", sess.active_scan_operator_id or sess.operator_id)
+            sess.active_scan_owner_type = str(snap.get("active_scan_owner_type", sess.active_scan_owner_type or "ORIGINAL") or "ORIGINAL").strip().upper()
+            sess.reliever_id = snap.get("reliever_id", sess.reliever_id)
+            sess.reliever_qr_payload = str(snap.get("reliever_qr_payload", sess.reliever_qr_payload or "") or "")
+            sess.break_active = bool(snap.get("break_active", sess.break_active))
+            sess.current_break_session_id = str(snap.get("current_break_session_id", sess.current_break_session_id or "") or "")
+            sess.break_out_time = snap.get("break_out_time", sess.break_out_time)
+            if isinstance(snap.get("break_sessions"), list):
+                sess.break_sessions = list(snap.get("break_sessions") or [])
             sess.pack_total = int(snap.get("pack_total", snap.get("pack_count", sess.pack_total)) or 0)
             sess.good_total = int(snap.get("good_total", sess.good_total) or 0)
             sess.butal_total = int(snap.get("butal_total", sess.butal_total) or 0)
@@ -11150,8 +11691,13 @@ async def api_event(req: Request):
                 pass
             sess.maintenance_name = snap.get("maintenance_name", sess.maintenance_name)
             sess.supervisor_name = snap.get("supervisor_name", sess.supervisor_name)
+            if isinstance(snap.get("current_supervisor_review"), dict):
+                sess.current_supervisor_review = dict(snap.get("current_supervisor_review") or {})
+            if isinstance(snap.get("supervisor_review_logs"), list):
+                sess.supervisor_review_logs = list(snap.get("supervisor_review_logs") or [])
             if isinstance(snap.get("job_payload"), dict):
                 sess.job_payload = dict(snap.get("job_payload") or {})
+            _fill_session_product_identity(sess)
             sess.linkage_enabled = bool(snap.get("linkage_enabled", sess.linkage_enabled))
             if isinstance(snap.get("linkage_jobs"), list):
                 sess.linkage_jobs = list(snap.get("linkage_jobs") or [])
@@ -11176,6 +11722,27 @@ async def api_event(req: Request):
             sess.external_average_weight_sent_at = snap.get("external_average_weight_sent_at") or sess.external_average_weight_sent_at
             sess.external_average_weight_source = str(snap.get("external_average_weight_source") or sess.external_average_weight_source or "").strip() or None
             sess.external_average_weight_sender = str(snap.get("external_average_weight_sender") or sess.external_average_weight_sender or "").strip() or None
+            _persist_active_sessions_state()
+    elif ev_type == "SUPERVISOR_REVIEW":
+        review = ev.get("review")
+        if isinstance(review, dict):
+            rows = [dict(row) for row in (sess.supervisor_review_logs or []) if isinstance(row, dict)]
+            review_id = str(review.get("review_id") or "")
+            replaced = False
+            for idx, row in enumerate(rows):
+                if review_id and str(row.get("review_id") or "") == review_id:
+                    rows[idx] = dict(review)
+                    replaced = True
+                    break
+            if not replaced:
+                rows.append(dict(review))
+            sess.supervisor_review_logs = rows[-100:]
+            if str(review.get("status") or "").upper() == "OPEN":
+                sess.current_supervisor_review = dict(review)
+            else:
+                sess.current_supervisor_review = {}
+            sess.last_event = f"SUPERVISOR REVIEW {review.get('actor_name') or ''}".strip()
+            sess.last_seen_utc = utc_now().isoformat()
             _persist_active_sessions_state()
     elif ev_type == "PACK":
         qty = int(ev.get("qty", 0) or 0)
@@ -11329,8 +11896,17 @@ async def api_average_weight(req: Request):
     sess = SESSIONS.get(machine_code)
     if sess is None or not str(sess.job_code or "").strip():
         return JSONResponse({"ok": False, "error": "machine has no active job"}, status_code=404)
+    _fill_session_product_identity(sess)
     active_product_id = str(sess.product_id or "").strip()
     active_sku = str(sess.product_sku or "").strip()
+    requested_product_meta = _lookup_product_meta(product_id) if product_id else {"id": "", "name": "", "sku": ""}
+    requested_product_sku = str(requested_product_meta.get("sku") or "").strip()
+    if product_id and not sku and requested_product_sku:
+        sku = requested_product_sku
+    if active_product_id and not active_sku:
+        active_sku = str(_lookup_product_meta(active_product_id).get("sku") or "").strip()
+        if active_sku:
+            sess.product_sku = active_sku
     def _product_key(value: Any) -> str:
         raw = str(value or "").strip()
         digits = re.sub(r"\D+", "", raw)
@@ -11339,8 +11915,27 @@ async def api_average_weight(req: Request):
         return raw.casefold()
     product_match = bool(product_id and active_product_id and _product_key(active_product_id) == _product_key(product_id))
     sku_match = bool(sku and active_sku and active_sku.casefold() == sku.casefold())
-    if product_id and not active_product_id:
-        return JSONResponse({"ok": False, "error": "active machine session has no product_id", "machine_code": machine_code}, status_code=409)
+    if product_id and sku_match and not active_product_id:
+        sess.product_id = product_id
+        active_product_id = product_id
+        if requested_product_sku and not sess.product_sku:
+            sess.product_sku = requested_product_sku
+            active_sku = requested_product_sku
+        product_name = str(requested_product_meta.get("name") or "").strip()
+        if product_name and not str(sess.product_name or "").strip():
+            sess.product_name = product_name
+    if product_id and not active_product_id and not sku_match:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "active machine session has no product_id and product_id could not be matched by SKU",
+                "machine_code": machine_code,
+                "expected_sku": active_sku,
+                "received_product_id": product_id,
+                "received_sku": sku,
+            },
+            status_code=409,
+        )
     if sku and not active_sku and not product_id:
         return JSONResponse({"ok": False, "error": "active machine session has no SKU", "machine_code": machine_code}, status_code=409)
     if not (product_match or sku_match):

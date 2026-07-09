@@ -119,6 +119,7 @@ Default launcher values:
 - `MACHINE_SERVER_URL=http://127.0.0.1:8000`
 - `MACHINE_SCANNER_MODE=auto`
 - `MACHINE_SCANNER_COM_PORT=/dev/ttyACM0`
+- `MACHINE_PACK_SCAN_INTERVAL_SECONDS=10`
 - `MACHINE_DEFAULT_GRAPHICS_MODE=faster`
 
 If your scanner appears on a different port, check with:
@@ -138,8 +139,10 @@ export MACHINE_SCANNER_COM_PORT=/dev/ttyUSB0
 ## 9. Current client behavior that matters on Pi
 
 - `client.py` runs fullscreen by default.
+- Press `Alt + F3` to leave fullscreen and minimize the client to the desktop.
 - `client.py` already defaults to Linux serial paths like `/dev/ttyACM0`.
-- the client reads and writes files relative to the project folder, so keep `Database`, `Images`, `Animations`, and `PDR_Icon` together
+- the packaged client does not bundle `Database`; it reads/writes the external project folder at `Raspberry_Machine/Database`
+- keep `Images`, `Animations`, and `PDR_Icon` with the project folder for the build/runtime assets
 - MySQL is optional. If MySQL is not available, the client still uses local JSON files for many functions.
 
 ## 10. Scanner setup
@@ -235,6 +238,12 @@ If your scanner is on `/dev/ttyUSB0`:
 ./install_pi_client_autostart.sh --server-url http://<server-ip>:8000 --scanner-port /dev/ttyUSB0
 ```
 
+To prevent operators from scanning completed PACK labels too fast, set the PACK scan lock interval:
+
+```bash
+./install_pi_client_autostart.sh --server-url http://<server-ip>:8000 --pack-scan-interval 10
+```
+
 If you want to build the packaged app first and make the shortcut use it:
 
 ```bash
@@ -273,6 +282,7 @@ chmod +x update_pi_client.sh
 ```
 
 This stops the currently running client, rebuilds `dist/RaspberryMachineClient`, and starts the rebuilt app.
+The rebuild does not include or replace files inside `Database`; those stay as the Pi's live local data.
 
 If the Pi folder is a git checkout, pull and rebuild in one command:
 
@@ -284,6 +294,12 @@ If you also need to refresh the shortcut/autostart server URL:
 
 ```bash
 ./update_pi_client.sh --server-url http://<server-ip>:8000
+```
+
+To rebuild and set the PACK QR scan lock interval:
+
+```bash
+./update_pi_client.sh --pack-scan-interval 10
 ```
 
 To rebuild without starting the app:

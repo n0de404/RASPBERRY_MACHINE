@@ -8,6 +8,7 @@ SERVER_URL="${MACHINE_SERVER_URL:-http://127.0.0.1:8000}"
 SCANNER_PORT="${MACHINE_SCANNER_COM_PORT:-/dev/ttyACM0}"
 SCANNER_MODE="${MACHINE_SCANNER_MODE:-auto}"
 GRAPHICS_MODE="${MACHINE_DEFAULT_GRAPHICS_MODE:-faster_quality}"
+PACK_SCAN_INTERVAL="${MACHINE_PACK_SCAN_INTERVAL_SECONDS:-10}"
 DO_BUILD=0
 DO_AUTOSTART=1
 DO_DESKTOP=1
@@ -21,6 +22,7 @@ Options:
   --scanner-port PATH    Scanner serial port. Default: ${SCANNER_PORT}
   --scanner-mode MODE    Scanner mode. Default: ${SCANNER_MODE}
   --graphics-mode MODE   Graphics mode. Default: ${GRAPHICS_MODE}
+  --pack-scan-interval N PACK QR scan lock interval in seconds. Default: ${PACK_SCAN_INTERVAL}
   --build               Run build_client_pi.sh before installing shortcut/autostart
   --no-autostart        Do not install boot/login autostart entry
   --no-desktop          Do not install desktop shortcut
@@ -48,6 +50,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --graphics-mode)
       GRAPHICS_MODE="${2:?Missing value for --graphics-mode}"
+      shift 2
+      ;;
+    --pack-scan-interval)
+      PACK_SCAN_INTERVAL="${2:?Missing value for --pack-scan-interval}"
       shift 2
       ;;
     --build)
@@ -96,8 +102,9 @@ export MACHINE_SERVER_URL="$SERVER_URL"
 export MACHINE_SCANNER_COM_PORT="$SCANNER_PORT"
 export MACHINE_SCANNER_MODE="$SCANNER_MODE"
 export MACHINE_DEFAULT_GRAPHICS_MODE="$GRAPHICS_MODE"
+export MACHINE_PACK_SCAN_INTERVAL_SECONDS="$PACK_SCAN_INTERVAL"
 
-mkdir -p "\$HOME/.local/state/raspberry-machine-client"
+mkdir -p "\$HOME/.local/state/raspberry-machine-client" "$PROJECT_DIR/Database"
 LOG_FILE="\$HOME/.local/state/raspberry-machine-client/client.log"
 
 if [[ -x "$PROJECT_DIR/dist/RaspberryMachineClient" ]]; then
@@ -149,4 +156,5 @@ if [[ "$DO_AUTOSTART" -eq 1 ]]; then
 fi
 echo "Server URL: $SERVER_URL"
 echo "Scanner port: $SCANNER_PORT"
+echo "PACK scan interval: $PACK_SCAN_INTERVAL seconds"
 echo "Log file: $HOME/.local/state/raspberry-machine-client/client.log"

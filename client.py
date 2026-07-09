@@ -109,6 +109,7 @@ SUPERVISOR_BADGES = {"3000001": "Charlie Brown"}
 QC_BADGES = {"4000001": "Lucy Van Pelt"}
 REJECT_REVIEW_REQUIRED_ROTATIONS = 4
 USER_QR_PROFILES_FILE = os.path.join(DATABASE_DIR, "user_qr_profiles.json")
+LOCAL_OPERATOR_CACHE_FILE = os.path.join(DATABASE_DIR, "local_operator_cache.json")
 PRODUCT_CATALOG_CACHE_FILE = os.path.join(DATABASE_DIR, "product_catalog_cache.json")
 FINISHED_JOBS_FILE = os.path.join(DATABASE_DIR, "finished_jobs.json")
 FINISH_SHIFT_FILE = os.path.join(DATABASE_DIR, "finish_shift.json")
@@ -135,6 +136,8 @@ JOB_API_PENDING_MAX_RETRIES = int(os.environ.get("MACHINE_JOB_API_PENDING_MAX_RE
 SCANNER_MIN_TIMEOUT_SECONDS = float(os.environ.get("MACHINE_SCANNER_MIN_TIMEOUT", "0.2"))
 UI_REFRESH_DEBOUNCE_MS = int(os.environ.get("MACHINE_UI_REFRESH_DEBOUNCE_MS", "60"))
 SCAN_DEDUP_WINDOW_MS = int(os.environ.get("MACHINE_SCAN_DEDUP_WINDOW_MS", "900"))
+PACK_SCAN_INTERVAL_SECONDS = float(os.environ.get("MACHINE_PACK_SCAN_INTERVAL_SECONDS", "10"))
+OPERATOR_BREAK_WINDOW_SECONDS = float(os.environ.get("MACHINE_OPERATOR_BREAK_WINDOW_SECONDS", "1800"))
 MOTION_TIMER_INTERVAL_MS = int(os.environ.get("MACHINE_MOTION_TIMER_INTERVAL_MS", "250"))
 OVERLAY_PULSE_INTERVAL_MS = int(os.environ.get("MACHINE_OVERLAY_PULSE_INTERVAL_MS", "160"))
 ACTIVE_SESSION_AUTOSAVE_INTERVAL_MS = int(os.environ.get("MACHINE_AUTOSAVE_INTERVAL_MS", "10000"))
@@ -276,6 +279,18 @@ def _normalized_finished_job_row(row: Dict[str, Any]) -> Dict[str, Any]:
         out["cycle_time_shift_avg_seconds"] = float(out.get("cycle_time_shift_avg_seconds"))
     else:
         out["cycle_time_shift_avg_seconds"] = None
+    if out.get("external_average_weight_grams") not in (None, ""):
+        out["external_average_weight_grams"] = float(out.get("external_average_weight_grams") or 0)
+    else:
+        out["external_average_weight_grams"] = None
+    for key in (
+        "external_average_weight_unit",
+        "external_average_weight_received_at",
+        "external_average_weight_sent_at",
+        "external_average_weight_source",
+        "external_average_weight_sender",
+    ):
+        out[key] = str(out.get(key) or "").strip() or None
     for key, default in (
         ("reject_breakdown", {}),
         ("raw_material_scans", []),
@@ -286,10 +301,16 @@ def _normalized_finished_job_row(row: Dict[str, Any]) -> Dict[str, Any]:
         ("action_logs", []),
         ("job_payload", {}),
         ("reject_review_logs", []),
+        ("supervisor_review_logs", []),
         ("review_history", []),
+        ("operator_segments", []),
     ):
         if not isinstance(out.get(key), type(default)):
             out[key] = default.copy() if isinstance(default, dict) else list(default)
+    try:
+        out["operator_count"] = int(out.get("operator_count") or 0)
+    except Exception:
+        out["operator_count"] = 0
     for key in ("linkage_job_payload", "linkage_jobs", "linkage_mirror"):
         if key not in out:
             out[key] = None
@@ -554,7 +575,7 @@ def _load_scanned_pack_qr_keys_json() -> Dict[str, Dict[str, Any]]:
             rows = json.load(f)
         if not isinstance(rows, dict):
             return {}
-        return {
+        payload = {
             str(key): dict(value)
             for key, value in rows.items()
             if str(key).strip() and isinstance(value, dict)
@@ -951,6 +972,7 @@ def _load_client_config() -> Dict[str, Any]:
         "scanner_com_port": SCANNER_COM_PORT,
         "scanner_baudrate": SCANNER_BAUDRATE,
         "scanner_timeout": SCANNER_TIMEOUT,
+        "pack_scan_interval_seconds": PACK_SCAN_INTERVAL_SECONDS,
         "graphics_mode": _default_graphics_mode(),
     }
     try:
@@ -970,6 +992,7 @@ def _load_client_config() -> Dict[str, Any]:
         "scanner_com_port": os.environ.get("MACHINE_SCANNER_COM_PORT"),
         "scanner_baudrate": os.environ.get("MACHINE_SCANNER_BAUDRATE"),
         "scanner_timeout": os.environ.get("MACHINE_SCANNER_TIMEOUT"),
+        "pack_scan_interval_seconds": os.environ.get("MACHINE_PACK_SCAN_INTERVAL_SECONDS"),
         "graphics_mode": os.environ.get("MACHINE_DEFAULT_GRAPHICS_MODE"),
     }
     for key, value in env_overrides.items():
@@ -988,6 +1011,10 @@ def _load_client_config() -> Dict[str, Any]:
         defaults["scanner_timeout"] = float(defaults.get("scanner_timeout", SCANNER_TIMEOUT))
     except Exception:
         defaults["scanner_timeout"] = SCANNER_TIMEOUT
+    try:
+        defaults["pack_scan_interval_seconds"] = max(0.0, float(defaults.get("pack_scan_interval_seconds", PACK_SCAN_INTERVAL_SECONDS)))
+    except Exception:
+        defaults["pack_scan_interval_seconds"] = PACK_SCAN_INTERVAL_SECONDS
     mode = str(defaults.get("graphics_mode", _default_graphics_mode())).strip().lower().replace(" ", "_")
     if mode in ("fast",):
         mode = "faster"
@@ -1149,6 +1176,14 @@ class ClientState:
     operator_id: Optional[str] = None
     operator_qr_payload: str = ""
     operator_pending_server_validation: bool = False
+    active_scan_operator_id: Optional[str] = None
+    active_scan_owner_type: str = "ORIGINAL"
+    reliever_id: Optional[str] = None
+    reliever_qr_payload: str = ""
+    break_active: bool = False
+    current_break_session_id: str = ""
+    break_out_time: Optional[str] = None
+    break_sessions: List[Dict[str, Any]] = None
 
     pack_count: int = 0
     good_total: int = 0
@@ -1194,6 +1229,9 @@ class ClientState:
     supervisor_review_actor_code: Optional[str] = None
     supervisor_review_actor_name: Optional[str] = None
     supervisor_review_actor_role: Optional[str] = None
+    supervisor_review_started_at: Optional[str] = None
+    current_supervisor_review: Dict[str, Any] = None
+    supervisor_review_logs: List[Dict[str, Any]] = None
     waiting_maintenance_qr: bool = False
     waiting_supervisor_qr: bool = False
     waiting_operator_downtime_confirm: bool = False
@@ -1286,6 +1324,9 @@ class ClientState:
     external_average_weight_grams: Optional[float] = None
     external_average_weight_unit: Optional[str] = None
     external_average_weight_received_at: Optional[str] = None
+    external_average_weight_sent_at: Optional[str] = None
+    external_average_weight_source: Optional[str] = None
+    external_average_weight_sender: Optional[str] = None
 
     def __post_init__(self):
         if self.reject_breakdown is None:
@@ -1312,6 +1353,10 @@ class ClientState:
             self.reject_review_logs = []
         if self.production_adjustment_logs is None:
             self.production_adjustment_logs = []
+        if self.current_supervisor_review is None:
+            self.current_supervisor_review = {}
+        if self.supervisor_review_logs is None:
+            self.supervisor_review_logs = []
         if self.pdr_reason_segments is None:
             self.pdr_reason_segments = []
         if self.linkage_job_payload is None:
@@ -1324,6 +1369,8 @@ class ClientState:
             self.cycle_time_change_logs = []
         if self.operator_shift_baseline_reject_breakdown is None:
             self.operator_shift_baseline_reject_breakdown = {}
+        if self.break_sessions is None:
+            self.break_sessions = []
 
 
 @dataclass
@@ -1724,6 +1771,7 @@ class BmsLoadingSpinner(QWidget):
 
 class ScannerFilter(QObject):
     scanned = pyqtSignal(str)
+    minimize_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -1732,6 +1780,12 @@ class ScannerFilter(QObject):
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()
+            modifiers = event.modifiers()
+
+            if key == Qt.Key.Key_F3 and bool(modifiers & Qt.KeyboardModifier.AltModifier):
+                self._buf.clear()
+                self.minimize_requested.emit()
+                return True
 
             # scanners usually end with Enter/Return
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -2835,8 +2889,8 @@ class ClientUI(QWidget):
 
     scan_received = pyqtSignal(str)
     scanner_status = pyqtSignal(str)
-    average_weight_received = pyqtSignal(float, str)
-    server_average_weight_received = pyqtSignal(str, float, str, str)
+    average_weight_received = pyqtSignal(float, str, str, str, str)
+    server_average_weight_received = pyqtSignal(str, float, str, str, str, str, str)
 
     @staticmethod
     def _load_digital_font_family() -> str:
@@ -2875,6 +2929,7 @@ class ClientUI(QWidget):
         self._animation_burst_until = 0.0
         self._marquee_frame_skip = False
         self._recent_scan_seen: Dict[str, float] = {}
+        self._last_accepted_pack_scan_at: float = 0.0
         self._used_pack_qr_keys: Set[str] = set(_load_scanned_pack_qr_keys_json().keys())
         self._server_event_queue_lock = threading.Lock()
         self._server_was_offline = False
@@ -5043,7 +5098,7 @@ QWidget#ClientUIRoot {{
             "Machine", "Job", "Operator", "Shift Window",
             "Pack Count", "Good", "Butal", "Reject",
             "Total Good", "Raw Sacks", "Cycle Time", "Downtime",
-            "App Counter", "Machine Counter", "Counter Diff",
+            "App Counter", "Machine Counter", "Counter Diff", "Avg Weight",
         )):
             card = QFrame()
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -5459,6 +5514,12 @@ QWidget#ClientUIRoot {{
         self.apiScannerTimeoutInput.setProperty("app_log_name", "Scanner Timeout")
         self.apiScannerTimeoutInput.setPlaceholderText("1.0")
 
+        self.apiPackScanIntervalLabel = QLabel("PACK Scan Lock Interval (sec)")
+        self.apiPackScanIntervalLabel.setObjectName("MetaLabel")
+        self.apiPackScanIntervalInput = QLineEdit()
+        self.apiPackScanIntervalInput.setProperty("app_log_name", "PACK Scan Lock Interval")
+        self.apiPackScanIntervalInput.setPlaceholderText("10")
+
         self.apiJobApiBaseUrlLabel = QLabel("Job API Base URL")
         self.apiJobApiBaseUrlLabel.setObjectName("MetaLabel")
         self.apiJobApiBaseUrlInput = QLineEdit()
@@ -5498,6 +5559,7 @@ QWidget#ClientUIRoot {{
             self.apiScannerPortInput,
             self.apiScannerBaudInput,
             self.apiScannerTimeoutInput,
+            self.apiPackScanIntervalInput,
             self.apiJobApiBaseUrlInput,
             self.apiJobApiUserInput,
             self.apiJobApiTokenInput,
@@ -5520,6 +5582,8 @@ QWidget#ClientUIRoot {{
         self.settingsApiSection.layout().addWidget(self.apiScannerBaudInput, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsApiSection.layout().addWidget(self.apiScannerTimeoutLabel)
         self.settingsApiSection.layout().addWidget(self.apiScannerTimeoutInput, 0, Qt.AlignmentFlag.AlignLeft)
+        self.settingsApiSection.layout().addWidget(self.apiPackScanIntervalLabel)
+        self.settingsApiSection.layout().addWidget(self.apiPackScanIntervalInput, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsApiSection.layout().addWidget(self.apiJobApiBaseUrlLabel)
         self.settingsApiSection.layout().addWidget(self.apiJobApiBaseUrlInput, 0, Qt.AlignmentFlag.AlignLeft)
         self.settingsApiSection.layout().addWidget(self.apiJobApiUserLabel)
@@ -6216,143 +6280,259 @@ QWidget#ClientUIRoot {{
         hide_ms = 3000 + min(5000, max(0, len(msg) - 40) * 35)
         self._invalid_hide_timer.start(hide_ms)
 
-    def _show_session_recovery_prompt(self, server_snap: Dict[str, Any], local_snap: Optional[Dict[str, Any]] = None):
+    def _recovery_snapshot_int(self, snap: Optional[Dict[str, Any]], key: str, fallback: Any = 0) -> int:
+        if not isinstance(snap, dict):
+            return 0
+        try:
+            return int(float(snap.get(key, fallback) or 0))
+        except Exception:
+            return 0
+
+    def _recovery_last_pack_text(self, snap: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(snap, dict):
+            return "No saved session"
+        rows = snap.get("product_pack_history_logs")
+        if not isinstance(rows, list) or not rows:
+            return "No pack QR scanned yet"
+        last = rows[-1] if isinstance(rows[-1], dict) else {}
+        fields = dict(last)
+        raw = str(last.get("raw_scan") or "").strip()
+        if raw:
+            parsed = self._extract_pack_history_fields(raw)
+            if isinstance(parsed, dict):
+                fields.update(parsed)
+        product_id = str(fields.get("product_id") or fields.get("product_p") or "").strip()
+        product_name = (
+            str(fields.get("product_name") or "").strip()
+            or self._lookup_product_name(product_id)
+            or (f"Product {product_id.lstrip('0') or product_id}" if product_id else "Product")
+        )
+        index_text = str(fields.get("index") or "-").strip() or "-"
+        pcs = (
+            fields.get("good_qty")
+            if fields.get("good_qty") not in (None, "")
+            else fields.get("completed_pack_qty")
+            if fields.get("completed_pack_qty") not in (None, "")
+            else fields.get("qty_q")
+            if fields.get("qty_q") not in (None, "")
+            else fields.get("qty")
+        )
+        pcs_text = str(pcs if pcs not in (None, "") else "-").strip()
+        return f"{product_name} | Index {index_text} | {pcs_text} pcs"
+
+    def _recovery_session_job_title(self, snap: Dict[str, Any]) -> str:
+        return str(snap.get("job_name") or snap.get("job_code") or "-").strip() or "-"
+
+    def _recovery_session_kind_label(self, snap: Dict[str, Any], *, kind: str = "") -> str:
+        reason = str(snap.get("reason") or "").upper()
+        if str(kind or "").strip().lower() == "segment":
+            if reason == "MOLD_CHANGE":
+                return "Mold change"
+            if reason == "COLOR_CHANGE":
+                return "Color change"
+            return ""
+        if bool(snap.get("waiting_color_change_job_scan")):
+            pending = str(snap.get("pending_color_change_reason") or "COLOR_CHANGE").upper()
+            return "Mold change" if pending == "MOLD_CHANGE" else "Color change"
+        return "Current"
+
+    def _recovery_snapshot_card_html(
+        self,
+        choice: str,
+        title: str,
+        snap: Optional[Dict[str, Any]],
+        accent: str = "#6b7280",
+        dim: bool = False,
+        *,
+        kind_label: str = "",
+        empty_message: str = "No local data",
+        empty_hint: str = "Use this to discard server saved session and continue current flow.",
+        compact: bool = True,
+    ) -> str:
         def _esc(value: Any) -> str:
             return html.escape(str(value if value is not None else "-"), quote=True)
 
-        def _num(snap: Optional[Dict[str, Any]], key: str, fallback: Any = 0) -> int:
-            if not isinstance(snap, dict):
-                return 0
-            try:
-                return int(float(snap.get(key, fallback) or 0))
-            except Exception:
-                return 0
+        pad = 6 if compact else 13
+        outer_w = 272 if compact else 540
+        inner_w = outer_w - (12 if compact else 20)
+        outer_h = 318 if compact else 560
+        inner_h = outer_h - (12 if compact else 20)
+        title_size = 17 if compact else 40
+        job_size = 15 if compact else 25
+        op_size = 13 if compact else 21
+        stat_size = 13 if compact else 27
+        meta_size = 11 if compact else 22
+        kind_size = 11 if compact else 14
 
-        def _last_pack_text(snap: Optional[Dict[str, Any]]) -> str:
-            if not isinstance(snap, dict):
-                return "No local saved session"
-            rows = snap.get("product_pack_history_logs")
-            if not isinstance(rows, list) or not rows:
-                return "No pack QR scanned yet"
-            last = rows[-1] if isinstance(rows[-1], dict) else {}
-            fields = dict(last)
-            raw = str(last.get("raw_scan") or "").strip()
-            if raw:
-                parsed = self._extract_pack_history_fields(raw)
-                if isinstance(parsed, dict):
-                    fields.update(parsed)
-            product_id = str(fields.get("product_id") or fields.get("product_p") or "").strip()
-            product_name = (
-                str(fields.get("product_name") or "").strip()
-                or self._lookup_product_name(product_id)
-                or (f"Product {product_id.lstrip('0') or product_id}" if product_id else "Product")
-            )
-            index_text = str(fields.get("index") or "-").strip() or "-"
-            pcs = (
-                fields.get("good_qty")
-                if fields.get("good_qty") not in (None, "")
-                else fields.get("completed_pack_qty")
-                if fields.get("completed_pack_qty") not in (None, "")
-                else fields.get("qty_q")
-                if fields.get("qty_q") not in (None, "")
-                else fields.get("qty")
-            )
-            pcs_text = str(pcs if pcs not in (None, "") else "-").strip()
-            return f"{product_name} | Index {index_text} | {pcs_text} pcs"
-
-        def _card(choice: str, title: str, snap: Optional[Dict[str, Any]], accent: str, dim: bool = False) -> str:
-            if not isinstance(snap, dict):
-                return f"""
-                <td width="540" height="560" style="padding:13px; vertical-align:top;">
-                  <table width="520" height="540" cellspacing="0" cellpadding="14" style="border:2px solid #6b7280; background:#2f3339;">
-                    <tr><td height="70" style="font-size:40px; font-weight:900; color:#e5e7eb;">{_esc(choice)} {_esc(title)}</td></tr>
-                    <tr><td align="center" style="font-size:22px; font-weight:900; color:#e5e7eb;">No local data</td></tr>
-                    <tr><td height="90" style="font-size:16px; color:#cbd5e1;">Use this to discard server saved session and continue current flow.</td></tr>
-                  </table>
-                </td>
-                """
-            job = str(snap.get("job_name") or snap.get("job_code") or "-").strip()
-            operator = str(snap.get("operator_id") or "-").strip()
-            saved = str(snap.get("saved_at_utc") or snap.get("last_seen_utc") or "-").strip()
-            pack = _num(snap, "pack_count", snap.get("pack_total", 0))
-            good = _num(snap, "good_total")
-            butal = _num(snap, "butal_total")
-            reject = _num(snap, "reject_total") + _num(snap, "startup_reject_total") + _num(snap, "no_shot_total")
-            raw_count = _num(snap, "raw_sacks_count")
-            raw_logs = snap.get("raw_material_logs")
-            raw_log_count = len(raw_logs) if isinstance(raw_logs, list) else 0
-            last_pack = _last_pack_text(snap)
-            bg = "#30343a" if not dim else "#2b2f35"
+        if not isinstance(snap, dict):
             return f"""
-            <td width="540" height="560" style="padding:13px; vertical-align:top;">
-              <table width="520" height="540" cellspacing="0" cellpadding="14" style="border:2px solid {accent}; background:{bg}; color:#e5e7eb;">
-                <tr><td height="70" style="font-size:40px; font-weight:900; color:#f1f5f9;">{_esc(choice)} {_esc(title)}</td></tr>
-                <tr><td height="94" style="font-size:25px; font-weight:900; color:#e5e7eb; background:#3f444c; border:1px solid #7b8491;">{_esc(job)}<br><span style="font-size:21px; color:#e5e7eb;">Op: {_esc(operator)}</span></td></tr>
-                <tr><td height="142">
-                <table width="100%" cellspacing="8" cellpadding="8">
-                  <tr>
-                    <td width="50%" style="background:#3a3f47; border:1px solid #7b8491; color:#e5e7eb; font-size:27px;"><b>Pack {pack}</b></td>
-                    <td width="50%" style="background:#3a3f47; border:1px solid #7b8491; color:#e5e7eb; font-size:27px;"><b>Good {good}</b></td>
-                  </tr>
-                  <tr>
-                    <td width="50%" style="background:#3a3f47; border:1px solid #7b8491; color:#e5e7eb; font-size:27px;"><b>Butal {butal}</b></td>
-                    <td width="50%" style="background:#3a3f47; border:1px solid #7b8491; color:#e5e7eb; font-size:27px;"><b>Reject {reject}</b></td>
-                  </tr>
-                </table>
-                </td></tr>
-                <tr><td height="58" style="font-size:22px; font-weight:900; color:#e5e7eb; background:#3a3f47; border:1px solid #7b8491;">Raw: {_esc(raw_count)} sacks / {_esc(raw_log_count)} logs</td></tr>
-                <tr><td height="78" style="font-size:21px; font-weight:900; color:#e5e7eb; background:#3a3f47; border:1px solid #7b8491;">Last PACK: {_esc(last_pack)}</td></tr>
-                <tr><td height="38" style="font-size:17px; font-weight:800; color:#e5e7eb; background:#3a3f47; border:1px solid #7b8491;">Saved: {_esc(saved)}</td></tr>
+            <td width="{outer_w}" height="{outer_h}" style="padding:{pad}px; vertical-align:top;">
+              <table width="{inner_w}" height="{inner_h}" cellspacing="0" cellpadding="8" style="border:2px solid #6b7280; background:rgba(47,51,57,0.88);">
+                <tr><td style="font-size:{title_size}px; font-weight:900; color:#e5e7eb;">{_esc(title)}</td></tr>
+                <tr><td align="center" style="font-size:{job_size}px; font-weight:900; color:#e5e7eb;">{_esc(empty_message)}</td></tr>
+                <tr><td style="font-size:{meta_size}px; color:#cbd5e1;">{_esc(empty_hint)}</td></tr>
               </table>
             </td>
             """
-
-        msg = f"""
-        <div style="font-size:30px; font-weight:900; color:#e5e7eb; margin-bottom:8px;">
-          Choose saved session.
-        </div>
-        <table align="center" cellspacing="0" cellpadding="0">
-          <tr>
-            {_card("1", "SERVER", server_snap, "#6b7280")}
-            {_card("2", "LOCAL", local_snap, "#6b7280", dim=not isinstance(local_snap, dict))}
-          </tr>
-        </table>
-        <div style="font-size:26px; font-weight:900; color:#e5e7eb; background:#3f444c; margin-top:8px;">
-          Scan 1 for SERVER saved data. Scan 2 for LOCAL/current data.
-        </div>
+        job = str(title or snap.get("job_name") or snap.get("job_code") or "-").strip()
+        operator = str(snap.get("operator_id") or "-").strip()
+        saved = str(snap.get("saved_at_utc") or snap.get("last_seen_utc") or "-").strip()
+        if compact and len(saved) > 19:
+            saved = saved[:19]
+        pack = self._recovery_snapshot_int(snap, "pack_count", snap.get("pack_total", 0))
+        good = self._recovery_snapshot_int(snap, "good_total")
+        butal = self._recovery_snapshot_int(snap, "butal_total")
+        reject = (
+            self._recovery_snapshot_int(snap, "reject_total")
+            + self._recovery_snapshot_int(snap, "startup_reject_total")
+            + self._recovery_snapshot_int(snap, "no_shot_total")
+        )
+        raw_count = self._recovery_snapshot_int(snap, "raw_sacks_count")
+        raw_logs = snap.get("raw_material_logs")
+        raw_log_count = len(raw_logs) if isinstance(raw_logs, list) else 0
+        bg = "rgba(48,52,58,0.92)" if not dim else "rgba(43,47,53,0.92)"
+        kind_html = (
+            f'<div style="font-size:{kind_size}px; font-weight:800; color:#cbd5e1; margin-top:2px;">{_esc(kind_label)}</div>'
+            if str(kind_label or "").strip()
+            else ""
+        )
+        header = f"{_esc(choice)} {_esc(job)}".strip()
+        return f"""
+        <td width="{outer_w}" height="{outer_h}" style="padding:{pad}px; vertical-align:top;">
+          <table width="{inner_w}" height="{inner_h}" cellspacing="0" cellpadding="8" style="border:2px solid {accent}; background:{bg}; color:#e5e7eb;">
+            <tr><td style="font-size:{title_size}px; font-weight:900; color:#f1f5f9; line-height:1.15;">{header}{kind_html}</td></tr>
+            <tr><td style="font-size:{op_size}px; font-weight:700; color:#e5e7eb; background:rgba(63,68,76,0.92); border:1px solid #7b8491; padding:6px;">Op: {_esc(operator)}</td></tr>
+            <tr><td>
+            <table width="100%" cellspacing="4" cellpadding="4">
+              <tr>
+                <td width="50%" style="background:rgba(58,63,71,0.92); border:1px solid #7b8491; color:#e5e7eb; font-size:{stat_size}px;"><b>Pack {pack}</b></td>
+                <td width="50%" style="background:rgba(58,63,71,0.92); border:1px solid #7b8491; color:#e5e7eb; font-size:{stat_size}px;"><b>Good {good}</b></td>
+              </tr>
+              <tr>
+                <td width="50%" style="background:rgba(58,63,71,0.92); border:1px solid #7b8491; color:#e5e7eb; font-size:{stat_size}px;"><b>Butal {butal}</b></td>
+                <td width="50%" style="background:rgba(58,63,71,0.92); border:1px solid #7b8491; color:#e5e7eb; font-size:{stat_size}px;"><b>Reject {reject}</b></td>
+              </tr>
+            </table>
+            </td></tr>
+            <tr><td style="font-size:{meta_size}px; font-weight:800; color:#e5e7eb; background:rgba(58,63,71,0.92); border:1px solid #7b8491; padding:5px;">Raw: {_esc(raw_count)} / {_esc(raw_log_count)} logs</td></tr>
+            <tr><td style="font-size:{meta_size}px; font-weight:700; color:#e5e7eb; background:rgba(58,63,71,0.92); border:1px solid #7b8491; padding:5px;">Saved: {_esc(saved)}</td></tr>
+          </table>
+        </td>
         """
+
+    def _apply_session_recovery_overlay(self, msg: str, *, width: int, height: int, title: str = "SESSION RECOVERY"):
         self._invalid_hide_timer.stop()
         if self._invalid_movie is not None:
             self._invalid_movie.stop()
         self.invalidGifLabel.hide()
         self.invalidOverlay.setStyleSheet(
-            "background: rgba(31,36,42,0.96); border: none; border-radius: 0px;"
+            "background: rgba(31,36,42,0.30); border: none; border-radius: 0px;"
         )
         self.invalidTextBand.setStyleSheet(
             "QFrame#InvalidTextBand {"
-            "background: rgba(31, 36, 42, 0.96);"
+            "background: rgba(31, 36, 42, 0.30);"
             "border: none;"
             "border-radius: 2px;"
             "}"
         )
-        self.invalidTextLabel.setText("SESSION RECOVERY")
+        self.invalidTextLabel.setText(title)
         self.invalidTextLabel.setStyleSheet(
-            "background: transparent; border: none; color: #e5e7eb; font-size: 56px; font-weight: 900;"
+            "background: transparent; border: none; color: #e5e7eb; font-size: 34px; font-weight: 900;"
         )
         self.invalidReasonLabel.setTextFormat(Qt.TextFormat.RichText)
         self.invalidReasonLabel.setStyleSheet(
-            "background: transparent; border: none; color: #e5e7eb; font-size: 14px; font-weight: 700;"
+            "background: transparent; border: none; color: #e5e7eb; font-size: 13px; font-weight: 700;"
         )
         self.invalidReasonLabel.setText(msg)
-        w = min(max(1220, int(self.width() * 0.92)), max(1320, self.width() - 20))
-        h = min(max(760, int(self.height() * 0.92)), max(860, self.height() - 20))
+        w = min(max(width, int(self.width() * 0.96)), max(width + 40, self.width() - 12))
+        h = min(max(height, int(self.height() * 0.92)), max(height + 40, self.height() - 12))
         self.invalidOverlay.setGeometry(max(0, (self.width() - w) // 2), max(0, (self.height() - h) // 2), w, h)
-        self.invalidTextBand.setMinimumWidth(max(1180, w - 28))
-        self.invalidReasonLabel.setMinimumWidth(max(1160, w - 44))
-        self.invalidReasonLabel.setMaximumWidth(max(1160, w - 44))
+        band_w = max(width - 24, w - 20)
+        label_w = max(width - 36, w - 32)
+        self.invalidTextBand.setMinimumWidth(band_w)
+        self.invalidReasonLabel.setMinimumWidth(label_w)
+        self.invalidReasonLabel.setMaximumWidth(label_w)
         self.invalidOverlay.show()
         self.invalidOverlay.raise_()
         self.invalidOverlay.layout().activate()
+
+    def _show_session_recovery_options_prompt(
+        self,
+        options: List[Dict[str, Any]],
+        *,
+        title: str = "SESSION RECOVERY",
+        headline: Optional[str] = None,
+        footer: Optional[str] = None,
+    ):
+        cards_per_row = 4
+        card_outer_w = 272 + 12
+        card_outer_h = 318 + 12
+        rows_html: List[str] = []
+        accents = ("#22c55e", "#3b82f6", "#a855f7", "#f59e0b", "#14b8a6", "#ec4899", "#64748b", "#0ea5e9")
+        row_cells: List[str] = []
+        for idx, option in enumerate(options, start=1):
+            card_snap = option.get("display_snap") if isinstance(option.get("display_snap"), dict) else option.get("snap")
+            accent = accents[(idx - 1) % len(accents)]
+            card_title = self._recovery_session_job_title(card_snap if isinstance(card_snap, dict) else {})
+            kind = str(option.get("kind") or "").strip().lower()
+            kind_label = self._recovery_session_kind_label(
+                card_snap if isinstance(card_snap, dict) else {},
+                kind=kind,
+            )
+            row_cells.append(
+                self._recovery_snapshot_card_html("", card_title, card_snap, accent, kind_label=kind_label)
+            )
+            if len(row_cells) >= cards_per_row:
+                rows_html.append(f"<tr>{''.join(row_cells)}</tr>")
+                row_cells = []
+        if row_cells:
+            rows_html.append(f"<tr>{''.join(row_cells)}</tr>")
+
+        if not headline:
+            headline = (
+                "Scan matching JOB QR to continue."
+                if len(options) == 1
+                else f"{len(options)} saved sessions. Scan matching JOB QR."
+            )
+        if not footer:
+            footer = (
+                "Scan the JOB QR / job order for the session you want to continue. "
+                "Scan cancel to start fresh."
+            )
+        row_count = max(1, (len(options) + cards_per_row - 1) // cards_per_row)
+        width = min(self.width() - 16, cards_per_row * card_outer_w + 32)
+        height = min(self.height() - 24, 150 + row_count * card_outer_h + 90)
+
+        cards_html = "".join(rows_html)
+        msg = f"""
+        <div style="font-size:18px; font-weight:900; color:#e5e7eb; margin-bottom:6px;">
+          {headline}
+        </div>
+        <table align="center" cellspacing="0" cellpadding="0">
+          {cards_html}
+        </table>
+        <div style="font-size:15px; font-weight:800; color:#e5e7eb; background:rgba(63,68,76,0.88); margin-top:6px; padding:6px 8px;">
+          {footer}
+        </div>
+        """
+        self._apply_session_recovery_overlay(msg, width=width, height=height, title=title)
+
+    def _show_session_recovery_confirm_prompt(self, snap: Dict[str, Any]):
+        self._show_session_recovery_options_prompt(
+            [{
+                "kind": "current",
+                "title": self._recovery_session_job_title(snap),
+                "snap": snap,
+                "display_snap": snap,
+                "base_snap": snap,
+                "segment": None,
+            }]
+        )
+
+    def _show_session_recovery_prompt(self, server_snap: Dict[str, Any], local_snap: Optional[Dict[str, Any]] = None):
+        options = self._build_recovery_session_options(server_snap, local_snap)
+        if options:
+            self._show_session_recovery_options_prompt(options)
 
     def _hide_invalid_overlay(self):
         if self._invalid_movie is not None:
@@ -6415,7 +6595,6 @@ QWidget#ClientUIRoot {{
         parts = [
             str(row.get("product_p") or row.get("product_id") or "").strip(),
             self._normalize_job_code(row.get("po_number")),
-            str(row.get("lot_number") or "").strip(),
             str(row.get("total_labels") or "").strip(),
         ]
         key = "|".join(parts).strip("|")
@@ -6440,12 +6619,16 @@ QWidget#ClientUIRoot {{
                 {
                     "key": key,
                     "indexes": set(),
+                    "lots": set(),
                     "latest_pos": -1,
                     "latest_index": idx,
                     "latest_row": row,
                 },
             )
             group["indexes"].add(idx)
+            lot_value = str(row.get("lot_number") or "").strip()
+            if lot_value:
+                group["lots"].add(lot_value)
             if pos >= int(group.get("latest_pos", -1)):
                 group["latest_pos"] = pos
                 group["latest_index"] = idx
@@ -6481,7 +6664,10 @@ QWidget#ClientUIRoot {{
         latest_index = int(gap.get("latest_index") or 0)
         row = gap.get("latest_row") if isinstance(gap.get("latest_row"), dict) else {}
         total_text = str(row.get("total_labels") or "").strip()
-        lot_text = str(row.get("lot_number") or "").strip()
+        lots = sorted(str(x) for x in (gap.get("lots") or []) if str(x).strip())
+        lot_text = ", ".join(lots[:3])
+        if len(lots) > 3:
+            lot_text += f" (+{len(lots) - 3})"
         if total_text:
             latest_label = f"{latest_index} of {total_text}"
         else:
@@ -6763,6 +6949,38 @@ QWidget#ClientUIRoot {{
         self._add_finish_review_extra_page(
             "Shift Jobs",
             ["#", "Reason", "Job", "Pack", "Good", "Butal", "Reject", "Cycle"],
+            rows,
+            section_height=max(520, self._finish_review_available_content_height() - 2),
+            stretch_rows=False,
+        )
+
+    def _add_operator_segments_review_page_if_needed(self, shift_payload: Dict[str, Any]):
+        if not isinstance(shift_payload, dict):
+            return
+        rows_src = shift_payload.get("operator_segments")
+        if not isinstance(rows_src, list):
+            rows_src = shift_payload.get("operator_shift_logs")
+        segments = self._operator_shift_segment_rows(rows_src if isinstance(rows_src, list) else [])
+        if len(segments) <= 1:
+            return
+        rows: List[List[str]] = []
+        for idx, row in enumerate(segments, start=1):
+            rows.append([
+                str(idx),
+                self._safe_text(row.get("operator_name") or self._operator_display_name(row.get("operator_id")), "-"),
+                self._safe_text(row.get("reason"), "-"),
+                self._safe_text(row.get("started_at_utc"), "-"),
+                self._safe_text(row.get("ended_at_utc") or row.get("finished_at_utc"), "-"),
+                str(int(row.get("pack_count") or 0)),
+                str(int(row.get("good_total") or 0)),
+                str(int(row.get("butal_total") or 0)),
+                str(int(row.get("reject_total") or 0)),
+                str(int(row.get("raw_sacks_count") or 0)),
+                self._safe_text(row.get("cycle_time_current") or row.get("cycle_time_shift_avg_seconds"), "-"),
+            ])
+        self._add_finish_review_extra_page(
+            "Operator Segments",
+            ["#", "Operator", "Reason", "Start", "End", "Pack", "Good", "Butal", "Reject", "Raw", "Cycle"],
             rows,
             section_height=max(520, self._finish_review_available_content_height() - 2),
             stretch_rows=False,
@@ -7134,9 +7352,8 @@ QWidget#ClientUIRoot {{
 
         label_numbers_by_row: List[Optional[int]] = []
         out_of_order_rows: Set[int] = set()
-        last_label_num: Optional[int] = None
-        scanned_label_set: Set[int] = set()
-        expected_total_labels = 0
+        last_label_by_group: Dict[str, int] = {}
+        pack_series_groups: Dict[str, Dict[str, Any]] = {}
         for idx, row in enumerate(active_rows):
             label_num: Optional[int] = None
             try:
@@ -7145,21 +7362,29 @@ QWidget#ClientUIRoot {{
                 label_num = None
             label_numbers_by_row.append(label_num)
             if label_num is not None and label_num > 0:
-                scanned_label_set.add(label_num)
+                group_key = self._pack_gap_series_key(row)
+                group = pack_series_groups.setdefault(
+                    group_key,
+                    {"indexes": set(), "latest_pos": -1, "latest_row": row},
+                )
+                group["indexes"].add(label_num)
+                group["latest_pos"] = idx
+                group["latest_row"] = row
+                last_label_num = last_label_by_group.get(group_key)
                 if last_label_num is not None and label_num < last_label_num:
                     out_of_order_rows.add(idx)
-                last_label_num = label_num
-            try:
-                tl = int(str((row or {}).get("total_labels") or "").strip())
-                if tl > expected_total_labels:
-                    expected_total_labels = tl
-            except Exception:
-                pass
+                last_label_by_group[group_key] = label_num
         missing_labels: List[int] = []
-        if scanned_label_set:
-            first_scanned_label = min(scanned_label_set)
-            last_scanned_label = max(scanned_label_set)
-            missing_labels = [n for n in range(first_scanned_label, last_scanned_label + 1) if n not in scanned_label_set]
+        latest_missing_pos = -1
+        for group in pack_series_groups.values():
+            indexes = sorted(group.get("indexes") or [])
+            if len(indexes) < 2:
+                continue
+            scanned_set = set(indexes)
+            group_missing = [n for n in range(indexes[0], indexes[-1] + 1) if n not in scanned_set]
+            if group_missing and int(group.get("latest_pos", -1)) >= latest_missing_pos:
+                latest_missing_pos = int(group.get("latest_pos", -1))
+                missing_labels = group_missing
 
         total_qty = 0
         for row in active_rows:
@@ -7421,6 +7646,7 @@ QWidget#ClientUIRoot {{
                         os.makedirs(DATABASE_DIR, exist_ok=True)
                         with open(USER_QR_PROFILES_FILE, "w", encoding="utf-8") as f:
                             json.dump(items, f, ensure_ascii=False, indent=2)
+                        self._save_local_operator_cache_from_profiles(items)
                         ok = True
 
                 # Daily roles cache stays local on the client.
@@ -7479,6 +7705,92 @@ QWidget#ClientUIRoot {{
 
     def _clean_badge_scan_code(self, raw: str) -> str:
         return re.sub(r"[\x00-\x1f\x7f]+", "", str(raw or "")).strip()
+
+    def _is_offline_operator_payload(self, payload: str) -> bool:
+        text = self._clean_badge_scan_code(payload)
+        return bool(re.fullmatch(r"\d{5}", text) or re.fullmatch(r"26-\d{1,64}", text))
+
+    def _load_local_operator_cache(self) -> List[Dict[str, Any]]:
+        try:
+            if not os.path.exists(LOCAL_OPERATOR_CACHE_FILE):
+                return []
+            with open(LOCAL_OPERATOR_CACHE_FILE, "r", encoding="utf-8-sig") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                return [row for row in loaded if isinstance(row, dict)]
+        except Exception:
+            pass
+        return []
+
+    def _save_local_operator_cache_rows(self, rows: List[Dict[str, Any]]) -> None:
+        try:
+            os.makedirs(DATABASE_DIR, exist_ok=True)
+            tmp_path = f"{LOCAL_OPERATOR_CACHE_FILE}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(rows, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, LOCAL_OPERATOR_CACHE_FILE)
+        except Exception:
+            pass
+
+    def _save_local_operator_cache_from_profiles(self, profiles: List[Dict[str, Any]]) -> None:
+        by_code: Dict[str, Dict[str, Any]] = {}
+        for existing in self._load_local_operator_cache():
+            code = self._clean_badge_scan_code((existing or {}).get("id_number"))
+            if code:
+                by_code[code] = dict(existing or {})
+        for row in profiles or []:
+            if not isinstance(row, dict):
+                continue
+            code = self._clean_badge_scan_code(row.get("id_number"))
+            if not code:
+                continue
+            caps = self._role_caps_from_text(row.get("role"))
+            if "operator" not in caps:
+                continue
+            by_code[code] = {
+                **by_code.get(code, {}),
+                "id_number": code,
+                "name": str(row.get("name") or code).strip() or code,
+                "role": "Operator",
+                "source": "server_profile_cache",
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+        if by_code:
+            self._save_local_operator_cache_rows(list(by_code.values()))
+
+    def _upsert_local_operator_cache(self, code: str, name: str = "", source: str = "offline_scan") -> None:
+        clean_code = self._clean_badge_scan_code(code)
+        if not clean_code:
+            return
+        rows = self._load_local_operator_cache()
+        next_row = {
+            "id_number": clean_code,
+            "name": str(name or clean_code).strip() or clean_code,
+            "role": "Operator",
+            "source": source,
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        replaced = False
+        for idx, row in enumerate(rows):
+            if self._clean_badge_scan_code((row or {}).get("id_number")) == clean_code:
+                merged = dict(row or {})
+                merged.update(next_row)
+                rows[idx] = merged
+                replaced = True
+                break
+        if not replaced:
+            rows.append(next_row)
+        self._save_local_operator_cache_rows(rows)
+
+    def _operator_from_local_cache(self, code: str) -> Optional[Dict[str, str]]:
+        badge = self._clean_badge_scan_code(code)
+        if not badge:
+            return None
+        for row in self._load_local_operator_cache():
+            if self._clean_badge_scan_code((row or {}).get("id_number")) != badge:
+                continue
+            return {"code": badge, "name": str((row or {}).get("name") or badge).strip() or badge}
+        return None
 
     def _local_operator_from_history(self, code: str) -> Optional[Dict[str, str]]:
         badge = self._clean_badge_scan_code(code)
@@ -7562,6 +7874,7 @@ QWidget#ClientUIRoot {{
                     os.makedirs(DATABASE_DIR, exist_ok=True)
                     with open(USER_QR_PROFILES_FILE, "w", encoding="utf-8") as f:
                         json.dump(profiles, f, ensure_ascii=False, indent=2)
+                    self._save_local_operator_cache_from_profiles(profiles)
                 except Exception:
                     pass
         for row in profiles:
@@ -7601,6 +7914,12 @@ QWidget#ClientUIRoot {{
                         caps.add("qc")
                     if extra_priv == "supervisor":
                         caps.add("supervisor")
+
+        if not caps:
+            cached_operator = self._operator_from_local_cache(code)
+            if cached_operator:
+                caps.add("operator")
+                display_name = display_name or str(cached_operator.get("name") or "").strip()
 
         if not caps:
             local_operator = self._local_operator_from_history(code)
@@ -7649,17 +7968,21 @@ QWidget#ClientUIRoot {{
     def _offline_operator_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
         """Accept a profile QR while the profile cache/server is unavailable.
 
-        Profile QR codes intentionally contain only the numeric employee ID.
-        Keep this narrow so an arbitrary, unrecognised production QR cannot be
-        used as an operator identity.  The exact QR payload is included in the
-        durable event queue and sent unchanged when the server recovers.
+        Profile QR codes usually contain either a 5-digit employee ID or the
+        HR-style 26- prefixed ID. Keep this narrow so an arbitrary production
+        QR cannot be used as an operator identity. The exact QR payload is
+        included in the durable event queue and sent unchanged when the server
+        recovers.
         """
         payload = self._clean_badge_scan_code(raw)
-        if not re.fullmatch(r"\d{4,64}", payload):
+        if not self._is_offline_operator_payload(payload):
             return None
+        cached_operator = self._operator_from_local_cache(payload)
+        name = str((cached_operator or {}).get("name") or payload).strip() or payload
+        self._upsert_local_operator_cache(payload, name=name, source="offline_scan")
         return {
             "code": payload,
-            "name": payload,
+            "name": name,
             "raw_payload": payload,
         }
 
@@ -9451,6 +9774,7 @@ QWidget#ClientUIRoot {{
             "product_pack_history_logs": list((s.product_pack_history_logs or [])[pack_from:]),
             "butal_scan_logs": list((s.butal_scan_logs or [])[butal_from:]),
             "reject_review_logs": list((s.reject_review_logs or [])[review_from:]),
+            "supervisor_review_logs": list(s.supervisor_review_logs or []),
             "production_adjustment_logs": list((s.production_adjustment_logs or [])[adjustment_from:]),
             "action_logs": list(getattr(self, "_action_logs", []) or []),
             "downtime_active": bool(s.downtime_active),
@@ -9546,6 +9870,7 @@ QWidget#ClientUIRoot {{
             str(row.get("machine_code") or self.state.machine_code or "").strip(),
             str(row.get("operator_id") or self.state.operator_id or "").strip(),
             job_key,
+            str(row.get("shift_index") or "").strip(),
         ])
 
     def _upsert_pending_operator_shift_segment(self, payload: Dict[str, Any]) -> None:
@@ -9616,6 +9941,14 @@ QWidget#ClientUIRoot {{
             "operator_id": s.operator_id,
             "operator_qr_payload": str(s.operator_qr_payload or ""),
             "operator_pending_server_validation": bool(s.operator_pending_server_validation),
+            "active_scan_operator_id": s.active_scan_operator_id or s.operator_id,
+            "active_scan_owner_type": str(s.active_scan_owner_type or "ORIGINAL").strip().upper() or "ORIGINAL",
+            "reliever_id": s.reliever_id,
+            "reliever_qr_payload": str(s.reliever_qr_payload or ""),
+            "break_active": bool(s.break_active),
+            "current_break_session_id": str(s.current_break_session_id or ""),
+            "break_out_time": s.break_out_time,
+            "break_sessions": list(s.break_sessions or []),
             "pack_count": int(s.pack_count or 0),
             "good_total": int(s.good_total or 0),
             "butal_total": int(s.butal_total or 0),
@@ -9693,6 +10026,9 @@ QWidget#ClientUIRoot {{
             "supervisor_review_actor_code": s.supervisor_review_actor_code,
             "supervisor_review_actor_name": s.supervisor_review_actor_name,
             "supervisor_review_actor_role": s.supervisor_review_actor_role,
+            "supervisor_review_started_at": s.supervisor_review_started_at,
+            "current_supervisor_review": dict(s.current_supervisor_review or {}),
+            "supervisor_review_logs": list(s.supervisor_review_logs or []),
             "cycle_time_confirmed_by": s.cycle_time_confirmed_by,
             "cycle_time_confirm_actor_code": s.cycle_time_confirm_actor_code,
             "cycle_time_confirm_actor_name": s.cycle_time_confirm_actor_name,
@@ -9751,6 +10087,9 @@ QWidget#ClientUIRoot {{
             "external_average_weight_grams": s.external_average_weight_grams,
             "external_average_weight_unit": s.external_average_weight_unit,
             "external_average_weight_received_at": s.external_average_weight_received_at,
+            "external_average_weight_sent_at": s.external_average_weight_sent_at,
+            "external_average_weight_source": s.external_average_weight_source,
+            "external_average_weight_sender": s.external_average_weight_sender,
         }
 
     def _save_active_session_snapshot(self, force: bool = False):
@@ -10046,6 +10385,350 @@ QWidget#ClientUIRoot {{
             merged[key] = rows
         return merged
 
+    def _recovery_snapshot_total_score(self, snap: Dict[str, Any]) -> int:
+        if not isinstance(snap, dict):
+            return 0
+        return (
+            self._recovery_snapshot_int(snap, "pack_count", snap.get("pack_total", 0))
+            + self._recovery_snapshot_int(snap, "good_total")
+            + self._recovery_snapshot_int(snap, "butal_total")
+            + self._recovery_snapshot_int(snap, "reject_total")
+            + self._recovery_snapshot_int(snap, "startup_reject_total")
+            + self._recovery_snapshot_int(snap, "no_shot_total")
+            + self._recovery_snapshot_int(snap, "raw_sacks_count")
+        )
+
+    def _resolve_recovery_snapshot(
+        self,
+        server_snap: Optional[Dict[str, Any]],
+        local_snap: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if isinstance(server_snap, dict) and isinstance(local_snap, dict):
+            server_score = self._recovery_snapshot_total_score(server_snap)
+            local_score = self._recovery_snapshot_total_score(local_snap)
+            if local_score > server_score:
+                return self._merge_matching_recovery_snapshots(server_snap, local_snap)
+            return self._merge_matching_recovery_snapshots(local_snap, server_snap)
+        if isinstance(local_snap, dict):
+            return local_snap
+        return dict(server_snap or {})
+
+    def _recovery_shift_segment_key_from_row(self, row: Dict[str, Any], base_snap: Dict[str, Any]) -> str:
+        job_key = self._normalize_job_code(row.get("job_code"))
+        if not job_key:
+            job_key = str(row.get("job_name") or "").strip().upper()
+        return "|".join([
+            str(row.get("client_id") or base_snap.get("client_id") or self._current_client_id()).strip(),
+            str(row.get("machine_code") or base_snap.get("machine_code") or "").strip(),
+            str(row.get("operator_id") or base_snap.get("operator_id") or "").strip(),
+            job_key,
+        ])
+
+    def _recovery_shift_segment_is_recoverable(self, row: Dict[str, Any]) -> bool:
+        if not isinstance(row, dict):
+            return False
+        if not str(row.get("job_code") or row.get("job_name") or "").strip():
+            return False
+        reason = str(row.get("reason") or "").upper()
+        if reason not in ("COLOR_CHANGE", "MOLD_CHANGE"):
+            return False
+        if self._recovery_snapshot_total_score(row) > 0:
+            return True
+        pack_logs = row.get("product_pack_history_logs")
+        return isinstance(pack_logs, list) and len(pack_logs) > 0
+
+    def _recovery_current_session_title(self, snap: Dict[str, Any]) -> str:
+        return self._recovery_session_job_title(snap)
+
+    def _recovery_shift_segment_title(self, row: Dict[str, Any], index: int) -> str:
+        return self._recovery_session_job_title(row)
+
+    def _build_recovery_session_options(
+        self,
+        server_snap: Optional[Dict[str, Any]],
+        local_snap: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        server_ok = isinstance(server_snap, dict) and self._snapshot_is_recoverable(server_snap)
+        local_ok = isinstance(local_snap, dict) and self._snapshot_is_recoverable(local_snap)
+        if not server_ok and not local_ok:
+            return []
+
+        base_snap = self._resolve_recovery_snapshot(
+            server_snap if server_ok else None,
+            local_snap if local_ok else None,
+        )
+        options: List[Dict[str, Any]] = []
+        seen_segment_keys: Set[str] = set()
+
+        if self._snapshot_is_recoverable(base_snap):
+            current_key = self._recovery_shift_segment_key_from_row(base_snap, base_snap)
+            options.append(
+                {
+                    "kind": "current",
+                    "title": self._recovery_current_session_title(base_snap),
+                    "snap": base_snap,
+                    "display_snap": base_snap,
+                    "base_snap": base_snap,
+                    "segment": None,
+                }
+            )
+            if current_key:
+                seen_segment_keys.add(current_key)
+
+        segment_rows = [
+            dict(row)
+            for row in (base_snap.get("operator_shift_logs") or [])
+            if isinstance(row, dict) and self._recovery_shift_segment_is_recoverable(row)
+        ]
+        segment_rows.sort(
+            key=lambda row: (
+                int(row.get("shift_index") or 0),
+                str(row.get("started_at_utc") or row.get("finished_at_utc") or row.get("ended_at_utc") or ""),
+            )
+        )
+        segment_index = 0
+        for row in segment_rows:
+            segment_key = self._recovery_shift_segment_key_from_row(row, base_snap)
+            if segment_key and segment_key in seen_segment_keys:
+                continue
+            segment_index += 1
+            display_snap = dict(row)
+            display_snap.setdefault("machine_code", base_snap.get("machine_code"))
+            display_snap.setdefault("machine_name", base_snap.get("machine_name"))
+            display_snap.setdefault("operator_id", base_snap.get("operator_id"))
+            display_snap.setdefault(
+                "saved_at_utc",
+                row.get("finished_at_utc") or row.get("ended_at_utc") or row.get("started_at_utc"),
+            )
+            options.append(
+                {
+                    "kind": "segment",
+                    "title": self._recovery_shift_segment_title(row, segment_index),
+                    "snap": base_snap,
+                    "display_snap": display_snap,
+                    "base_snap": base_snap,
+                    "segment": row,
+                }
+            )
+            if segment_key:
+                seen_segment_keys.add(segment_key)
+
+        return options
+
+    def _recovery_job_codes_from_scan(
+        self,
+        job_data: Optional[Dict[str, Any]],
+        res: Any = None,
+        raw_s: str = "",
+    ) -> Set[str]:
+        keys: Set[str] = set()
+        if isinstance(job_data, dict):
+            for field in ("job_code", "requested_job_id", "job_name"):
+                key = self._normalize_job_code(job_data.get(field))
+                if key:
+                    keys.add(key)
+            payload = job_data.get("job_payload") if isinstance(job_data.get("job_payload"), dict) else {}
+            job = self._extract_job_record_from_payload(payload)
+            for field in ("id", "ref_no"):
+                key = self._normalize_job_code(self._safe_text(job.get(field), ""))
+                if key:
+                    keys.add(key)
+        if res is not None:
+            if isinstance(getattr(res, "meta", None), dict):
+                key = self._normalize_job_code(res.meta.get("po_number"))
+                if key:
+                    keys.add(key)
+            key = self._normalize_job_code(getattr(res, "value", None))
+            if key:
+                keys.add(key)
+        pack_job = self._extract_job_code_from_pack_qr(str(raw_s or ""))
+        if pack_job:
+            keys.add(self._normalize_job_code(pack_job))
+        raw_key = self._normalize_job_code(raw_s)
+        if raw_key:
+            keys.add(raw_key)
+        return keys
+
+    def _recovery_option_job_codes(self, option: Dict[str, Any]) -> Set[str]:
+        keys: Set[str] = set()
+        rows: List[Dict[str, Any]] = []
+        if str(option.get("kind") or "").strip().lower() == "segment":
+            segment = option.get("segment")
+            if isinstance(segment, dict):
+                rows.append(segment)
+        else:
+            snap = option.get("snap") if isinstance(option.get("snap"), dict) else option.get("display_snap")
+            if isinstance(snap, dict):
+                rows.append(snap)
+        for row in rows:
+            for field in ("job_code", "job_name"):
+                key = self._normalize_job_code(row.get(field))
+                if key:
+                    keys.add(key)
+            payload = row.get("job_payload") if isinstance(row.get("job_payload"), dict) else {}
+            job = self._extract_job_record_from_payload(payload)
+            for field in ("id", "ref_no"):
+                key = self._normalize_job_code(self._safe_text(job.get(field), ""))
+                if key:
+                    keys.add(key)
+        return keys
+
+    def _find_recovery_option_for_job(
+        self,
+        options: List[Dict[str, Any]],
+        job_data: Optional[Dict[str, Any]],
+        res: Any = None,
+        raw_s: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        scanned_codes = self._recovery_job_codes_from_scan(job_data, res, raw_s)
+        if not scanned_codes:
+            return None
+        segment_match: Optional[Dict[str, Any]] = None
+        current_match: Optional[Dict[str, Any]] = None
+        for option in options:
+            if not (scanned_codes & self._recovery_option_job_codes(option)):
+                continue
+            if str(option.get("kind") or "").strip().lower() == "segment":
+                segment_match = option
+            else:
+                current_match = option
+        return segment_match or current_match
+
+    def _build_recovery_session_options_from_state(self) -> List[Dict[str, Any]]:
+        snap = self._state_to_active_snapshot()
+        if not isinstance(snap, dict):
+            return []
+        return self._build_recovery_session_options(snap, None)
+
+    def _find_shift_segment_for_job(self, normalized_job_code: str) -> Optional[Dict[str, Any]]:
+        code = str(normalized_job_code or "").strip()
+        if not code:
+            return None
+        for row in reversed(list(self.state.operator_shift_logs or [])):
+            if not isinstance(row, dict):
+                continue
+            if self._normalize_job_code(row.get("job_code")) == code:
+                return row
+        return None
+
+    def _cancel_session_recovery(self, machine_code: str, server_snap: Optional[Dict[str, Any]]) -> bool:
+        code = str(machine_code or "").strip()
+        if isinstance(server_snap, dict) and not self._discard_server_recovery(code):
+            return False
+        self._clear_active_session_snapshot(code)
+        return True
+
+    def _restore_shift_segment_from_recovery(
+        self,
+        base_snap: Dict[str, Any],
+        segment: Dict[str, Any],
+        machine_name: str,
+        note: str,
+    ) -> None:
+        self._hide_invalid_overlay()
+        self._restore_state_from_snapshot(base_snap)
+        if not self.state.machine_name:
+            self.state.machine_name = _machine_display_name(self.state.machine_code, machine_name)
+        s = self.state
+        job_code = str(segment.get("job_code") or "").strip()
+        if not job_code:
+            self.status.setText("Could not recover saved color/mold session: missing job code.")
+            return
+        operator_id = s.operator_id
+        s.job_code = job_code
+        s.job_name = str(segment.get("job_name") or job_code).strip()
+        s.job_payload = dict(segment.get("job_payload") or {})
+        s.job_started_at = str(
+            segment.get("started_at_utc")
+            or segment.get("finished_at_utc")
+            or segment.get("ended_at_utc")
+            or datetime.now(timezone.utc).isoformat()
+        )
+        self._reset_production_for_color_change_segment()
+        s.operator_id = operator_id
+        s.pack_count = int(segment.get("pack_count") or 0)
+        s.good_total = int(segment.get("good_total") or 0)
+        s.butal_total = int(segment.get("butal_total") or 0)
+        s.reject_total = int(segment.get("reject_total") or 0)
+        s.reject_breakdown = dict(segment.get("reject_breakdown") or {})
+        s.no_shot_total = int(segment.get("no_shot_total") or 0)
+        s.startup_reject_total = int(segment.get("startup_reject_total") or 0)
+        s.raw_sacks_count = int(segment.get("raw_sacks_count") or 0)
+        s.raw_material_logs = list(segment.get("raw_material_logs") or [])
+        s.raw_material_scans = list(segment.get("raw_material_scans") or [])
+        s.raw_material_unique_keys = {
+            str(item).strip()
+            for item in (s.raw_material_scans or [])
+            if str(item).strip()
+        }
+        s.product_pack_history_logs = list(segment.get("product_pack_history_logs") or [])
+        s.product_pack_history_keys = {
+            self._pack_history_key(row)
+            for row in (s.product_pack_history_logs or [])
+            if isinstance(row, dict) and self._pack_history_key(row)
+        }
+        for row in (s.product_pack_history_logs or []):
+            if not isinstance(row, dict):
+                continue
+            pack_key = self._pack_history_key(row)
+            if pack_key:
+                self._mark_pack_qr_used_permanently(pack_key, row)
+        s.butal_scan_logs = list(segment.get("butal_scan_logs") or [])
+        s.production_adjustment_logs = list(segment.get("production_adjustment_logs") or [])
+        s.cycle_time_current = segment.get("cycle_time_current")
+        s.waiting_color_change_job_scan = False
+        s.pending_color_change_reason = ""
+        self._start_operator_shift_tracking()
+        self._reset_operator_shift_baseline_to_full_segment(segment)
+        self._ensure_recovered_job_details(job_code)
+        self._save_active_session_snapshot()
+        self.push_event({"type": "SESSION_RESUME"}, "SESSION RESUMED")
+        self.sync_session_snapshot_to_server(note)
+        self.status.setText(
+            f"Recovered saved session for {self.state.machine_name} / {s.job_name or s.job_code}."
+        )
+        self._refresh_ui()
+
+    def _complete_session_recovery_option(
+        self,
+        option: Dict[str, Any],
+        machine_name: str,
+        note: str = "SESSION SNAPSHOT SYNC (RECOVERY CONFIRMED)",
+    ) -> None:
+        if str(option.get("kind") or "").strip().lower() == "segment":
+            segment = option.get("segment") if isinstance(option.get("segment"), dict) else {}
+            base_snap = option.get("base_snap") if isinstance(option.get("base_snap"), dict) else {}
+            self._restore_shift_segment_from_recovery(base_snap, segment, machine_name, note)
+            return
+        snap = option.get("snap") if isinstance(option.get("snap"), dict) else {}
+        self._resume_snapshot(snap, machine_name, note)
+
+    def _prompt_session_recovery(
+        self,
+        machine_code: str,
+        machine_name: str,
+        server_snap: Optional[Dict[str, Any]],
+        local_snap: Optional[Dict[str, Any]],
+    ) -> bool:
+        options = self._build_recovery_session_options(server_snap, local_snap)
+        if not options:
+            return False
+
+        server_ok = isinstance(server_snap, dict) and self._snapshot_is_recoverable(server_snap)
+        local_ok = isinstance(local_snap, dict) and self._snapshot_is_recoverable(local_snap)
+        self._pending_server_recovery = {
+            "machine_code": machine_code,
+            "machine_name": machine_name,
+            "server_snapshot": server_snap if server_ok else None,
+            "local_snapshot": local_snap if local_ok else None,
+            "options": options,
+        }
+        self.status.setText(
+            f"{len(options)} saved session(s) found. Scan the JOB QR / job order to continue."
+        )
+        self._show_session_recovery_options_prompt(options)
+        return True
+
     def _job_payload_has_details(self, payload: Any) -> bool:
         if not isinstance(payload, dict):
             return False
@@ -10135,6 +10818,14 @@ QWidget#ClientUIRoot {{
         s.operator_id = snap.get("operator_id")
         s.operator_qr_payload = str(snap.get("operator_qr_payload") or "")
         s.operator_pending_server_validation = bool(snap.get("operator_pending_server_validation"))
+        s.active_scan_operator_id = snap.get("active_scan_operator_id") or s.operator_id
+        s.active_scan_owner_type = str(snap.get("active_scan_owner_type") or ("RELIEVER" if snap.get("break_active") else "ORIGINAL")).strip().upper() or "ORIGINAL"
+        s.reliever_id = snap.get("reliever_id")
+        s.reliever_qr_payload = str(snap.get("reliever_qr_payload") or "")
+        s.break_active = bool(snap.get("break_active"))
+        s.current_break_session_id = str(snap.get("current_break_session_id") or "")
+        s.break_out_time = snap.get("break_out_time")
+        s.break_sessions = list(snap.get("break_sessions") or [])
         s.pack_count = int(snap.get("pack_count", snap.get("pack_total", 0)) or 0)
         s.good_total = int(snap.get("good_total") or 0)
         s.butal_total = int(snap.get("butal_total") or 0)
@@ -10212,6 +10903,9 @@ QWidget#ClientUIRoot {{
         s.supervisor_review_actor_code = snap.get("supervisor_review_actor_code")
         s.supervisor_review_actor_name = snap.get("supervisor_review_actor_name")
         s.supervisor_review_actor_role = snap.get("supervisor_review_actor_role")
+        s.supervisor_review_started_at = snap.get("supervisor_review_started_at")
+        s.current_supervisor_review = dict(snap.get("current_supervisor_review") or {})
+        s.supervisor_review_logs = list(snap.get("supervisor_review_logs") or [])
         s.cycle_time_confirmed_by = snap.get("cycle_time_confirmed_by")
         s.cycle_time_confirm_actor_code = snap.get("cycle_time_confirm_actor_code")
         s.cycle_time_confirm_actor_name = snap.get("cycle_time_confirm_actor_name")
@@ -10288,6 +10982,9 @@ QWidget#ClientUIRoot {{
         s.external_average_weight_grams = float(avg_weight) if avg_weight is not None else None
         s.external_average_weight_unit = snap.get("external_average_weight_unit")
         s.external_average_weight_received_at = snap.get("external_average_weight_received_at")
+        s.external_average_weight_sent_at = snap.get("external_average_weight_sent_at")
+        s.external_average_weight_source = snap.get("external_average_weight_source")
+        s.external_average_weight_sender = snap.get("external_average_weight_sender")
         for key in ("pack", "raw", "action"):
             setattr(self, f"_history_init_{key}", False)
             setattr(self, f"_history_last_{key}", "")
@@ -10348,6 +11045,61 @@ QWidget#ClientUIRoot {{
                 self.resolveHint.setText("SCAN SUPERVISOR QR TO PROCEED")
             self._show_resolve_overlay()
 
+    def _operator_shift_segment_rows(self, rows: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+        source = rows if isinstance(rows, list) else (self.state.operator_shift_logs or [])
+        clean_rows = [dict(row) for row in source if isinstance(row, dict)]
+        clean_rows.sort(key=lambda row: (
+            int(row.get("shift_index") or 0),
+            str(row.get("started_at_utc") or ""),
+            str(row.get("operator_id") or ""),
+        ))
+        return clean_rows
+
+    def _aggregate_operator_shift_totals(self, rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        segments = self._operator_shift_segment_rows(rows)
+        reject_breakdown: Dict[str, int] = {}
+        totals: Dict[str, Any] = {
+            "operator_segments": segments,
+            "operator_count": len({str(row.get("operator_id") or "").strip() for row in segments if str(row.get("operator_id") or "").strip()}),
+            "pack_count": 0,
+            "good_total": 0,
+            "butal_total": 0,
+            "reject_total": 0,
+            "startup_reject_total": 0,
+            "no_shot_total": 0,
+            "raw_sacks_count": 0,
+            "raw_material_logs": [],
+            "raw_material_scans": [],
+            "product_pack_history_logs": [],
+            "butal_scan_logs": [],
+            "reject_review_logs": [],
+            "production_adjustment_logs": [],
+            "machine_counter_app_delta": 0,
+            "reject_breakdown": reject_breakdown,
+        }
+        for row in segments:
+            totals["pack_count"] += int(row.get("pack_count") or 0)
+            totals["good_total"] += int(row.get("good_total") or 0)
+            totals["butal_total"] += int(row.get("butal_total") or 0)
+            totals["reject_total"] += int(row.get("reject_total") or 0)
+            totals["startup_reject_total"] += int(row.get("startup_reject_total") or 0)
+            totals["no_shot_total"] += int(row.get("no_shot_total") or 0)
+            totals["raw_sacks_count"] += int(row.get("raw_sacks_count") or 0)
+            totals["machine_counter_app_delta"] += int(row.get("machine_counter_app_delta") or 0)
+            for key in ("raw_material_logs", "raw_material_scans", "product_pack_history_logs", "butal_scan_logs", "reject_review_logs", "production_adjustment_logs"):
+                values = row.get(key)
+                if isinstance(values, list):
+                    totals[key].extend(dict(item) if isinstance(item, dict) else item for item in values)
+            row_rejects = row.get("reject_breakdown") if isinstance(row.get("reject_breakdown"), dict) else {}
+            for reason, qty in row_rejects.items():
+                try:
+                    reject_breakdown[str(reason)] = reject_breakdown.get(str(reason), 0) + int(qty or 0)
+                except Exception:
+                    pass
+        totals["total_good"] = int(totals["good_total"] + totals["butal_total"])
+        totals["partial_qty"] = int(totals["total_good"])
+        return totals
+
     def _build_finished_job_payload(self) -> Dict[str, Any]:
         s = self.state
         main_butal_total = self._butal_qty_for_job(s.job_code, fallback_current=not bool(s.linkage_enabled and (s.linkage_jobs or [])))
@@ -10364,6 +11116,7 @@ QWidget#ClientUIRoot {{
             "product_sku": product_identity.get("product_sku", ""),
             "product_name": product_identity.get("product_name", ""),
             "operator_id": s.operator_id,
+            "operator_name": self._operator_display_name(s.operator_id),
             "pack_count": int(s.pack_count or 0),
             "good_total": int(s.good_total or 0),
             "butal_total": int(main_butal_total or 0),
@@ -10406,6 +11159,7 @@ QWidget#ClientUIRoot {{
             ),
             "maintenance_name": s.maintenance_name,
             "supervisor_name": s.supervisor_name,
+            "supervisor_review_logs": list(s.supervisor_review_logs or []),
             "operator_shift_logs": list(s.operator_shift_logs or []),
             "partial_qty": int((s.good_total or 0) + (main_butal_total or 0)),
             "review_status": REVIEW_STATUS_CLOSED,
@@ -10417,6 +11171,9 @@ QWidget#ClientUIRoot {{
             "external_average_weight_grams": s.external_average_weight_grams,
             "external_average_weight_unit": s.external_average_weight_unit,
             "external_average_weight_received_at": s.external_average_weight_received_at,
+            "external_average_weight_sent_at": s.external_average_weight_sent_at,
+            "external_average_weight_source": s.external_average_weight_source,
+            "external_average_weight_sender": s.external_average_weight_sender,
             "linkage_mirror": {
                 "pack_count": int(s.pack_count or 0),
                 "good_total": int(s.good_total or 0),
@@ -10425,6 +11182,41 @@ QWidget#ClientUIRoot {{
                 "total_good": int((s.good_total or 0) + (s.butal_total or 0)),
             } if s.linkage_enabled else None,
         }
+        segment_totals = self._aggregate_operator_shift_totals(payload.get("operator_shift_logs"))
+        if len(segment_totals.get("operator_segments") or []) > 1:
+            payload["operator_segments"] = list(segment_totals.get("operator_segments") or [])
+            payload["operator_count"] = int(segment_totals.get("operator_count") or 0)
+            payload["operator_summary"] = f"{payload['operator_count']} operators"
+            for key in (
+                "pack_count",
+                "good_total",
+                "butal_total",
+                "reject_total",
+                "startup_reject_total",
+                "no_shot_total",
+                "raw_sacks_count",
+                "total_good",
+                "partial_qty",
+                "machine_counter_app_delta",
+                "reject_breakdown",
+                "raw_material_logs",
+                "raw_material_scans",
+                "product_pack_history_logs",
+                "butal_scan_logs",
+                "reject_review_logs",
+                "production_adjustment_logs",
+            ):
+                payload[key] = segment_totals.get(key, payload.get(key))
+            machine_counter_start = self._parse_int_value(payload.get("machine_counter_start"))
+            if machine_counter_start is not None:
+                payload["machine_counter_app_end"] = machine_counter_start + int(payload.get("machine_counter_app_delta") or 0)
+                machine_counter_end = self._parse_int_value(payload.get("machine_counter_end"))
+                payload["machine_counter_difference"] = (
+                    machine_counter_end - int(payload["machine_counter_app_end"])
+                    if machine_counter_end is not None
+                    else None
+                )
+        return payload
 
     def _build_linked_finished_job_payloads(self, main_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         s = self.state
@@ -10476,6 +11268,14 @@ QWidget#ClientUIRoot {{
         s.operator_id = None
         s.operator_qr_payload = ""
         s.operator_pending_server_validation = False
+        s.active_scan_operator_id = None
+        s.active_scan_owner_type = "ORIGINAL"
+        s.reliever_id = None
+        s.reliever_qr_payload = ""
+        s.break_active = False
+        s.current_break_session_id = ""
+        s.break_out_time = None
+        s.break_sessions = []
         s.pack_count = 0
         s.good_total = 0
         s.butal_total = 0
@@ -10542,6 +11342,9 @@ QWidget#ClientUIRoot {{
         s.supervisor_review_actor_code = None
         s.supervisor_review_actor_name = None
         s.supervisor_review_actor_role = None
+        s.supervisor_review_started_at = None
+        s.current_supervisor_review = {}
+        s.supervisor_review_logs = []
         s.cycle_time_confirm_actor_code = None
         s.cycle_time_confirm_actor_name = None
         s.cycle_time_confirm_actor_role = None
@@ -10720,6 +11523,34 @@ QWidget#ClientUIRoot {{
         s.operator_downtime_confirmation_started_at = None
         s.cycle_time_new_input = ""
 
+    def _cancel_pending_pdr_start(self) -> bool:
+        s = self.state
+        if s.downtime_active or s.downtime_started_at or s.waiting_downtime_end_maintenance:
+            return False
+        if not (s.waiting_production_report_reason or s.waiting_downtime_start_maintenance or s.waiting_pdr_maintenance_reason):
+            return False
+        s.waiting_production_report_reason = False
+        s.waiting_downtime_start_maintenance = False
+        s.waiting_pdr_maintenance_reason = False
+        s.pdr_operator_reason_code = None
+        s.pdr_operator_reason_text = None
+        s.downtime_reason_code = None
+        s.downtime_reason_text = None
+        s.downtime_wait_started_at = None
+        s.downtime_wait_last_seconds = None
+        s.downtime_started_at = None
+        s.downtime_last_seconds = None
+        s.downtime_active = False
+        s.maintenance_name = None
+        s.pdr_reason_segments = []
+        s.pdr_current_segment_start_seconds = None
+        s.pdr_followup_reasons_remaining = 0
+        self._hide_production_overlay()
+        self.status.setText("PDR start cancelled. Continue current job.")
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        return True
+
     def _begin_initial_cycle_time_setup(self):
         s = self.state
         s.waiting_initial_cycle_time_input = True
@@ -10753,6 +11584,7 @@ QWidget#ClientUIRoot {{
         s.supervisor_review_actor_role = reviewer.get("role")
         s.showing_reject_summary = True
         s.reject_summary_last_scanned_at = datetime.now(timezone.utc).isoformat()
+        review = self._start_or_update_supervisor_review(reviewer, action="CYCLE_REVIEW_OPEN")
         s.waiting_cycle_time_confirm_popup = True
         s.cycle_time_confirm_phase = 1
         s.cycle_time_confirm_actor_code = reviewer.get("code")
@@ -10779,6 +11611,107 @@ QWidget#ClientUIRoot {{
         self.resolveOldCycle.setText(f"Std Cycle Time: {std_cycle}")
         self.resolveNewCycle.setText(self._format_resolve_cycle_input_text())
         self._show_reject_summary_overlay()
+        if review:
+            self.push_event({"type": "SUPERVISOR_REVIEW", "review": review}, f"SUPERVISOR REVIEW OPEN {review.get('actor_name') or ''}".strip(), silent=True)
+
+    def _supervisor_review_summary_snapshot(self) -> Dict[str, Any]:
+        s = self.state
+        return {
+            "machine_code": s.machine_code,
+            "machine_name": s.machine_name,
+            "job_code": s.job_code,
+            "job_name": s.job_name,
+            "operator_id": s.operator_id,
+            "pack_count": int(s.pack_count or 0),
+            "good_total": int(s.good_total or 0),
+            "butal_total": int(s.butal_total or 0),
+            "reject_total": int(s.reject_total or 0),
+            "startup_reject_total": int(s.startup_reject_total or 0),
+            "no_shot_total": int(s.no_shot_total or 0),
+            "reject_breakdown": dict(s.reject_breakdown or {}),
+            "cycle_time_current": s.cycle_time_current,
+            "cycle_time_temporary": s.cycle_time_temporary,
+            "cycle_time_pending_supervisor": bool(s.cycle_time_pending_supervisor),
+            "cycle_time_confirmed_by": s.cycle_time_confirmed_by,
+            "raw_sacks_count": int(s.raw_sacks_count or 0),
+            "raw_material_logs_count": len(s.raw_material_logs or []),
+            "pack_history_count": len(s.product_pack_history_logs or []),
+            "reject_review_logs_count": len(s.reject_review_logs or []),
+            "production_adjustment_logs_count": len(s.production_adjustment_logs or []),
+        }
+
+    def _start_or_update_supervisor_review(self, reviewer: Dict[str, Any], action: str = "OPEN") -> Dict[str, Any]:
+        s = self.state
+        now_utc = datetime.now(timezone.utc).isoformat()
+        started_at = str(s.supervisor_review_started_at or "").strip() or now_utc
+        s.supervisor_review_started_at = started_at
+        review = dict(s.current_supervisor_review or {})
+        review.update({
+            "review_id": review.get("review_id") or f"SUP-{uuid.uuid4().hex[:10].upper()}",
+            "status": "OPEN",
+            "action": action,
+            "opened_at_utc": started_at,
+            "last_updated_at_utc": now_utc,
+            "closed_at_utc": None,
+            "duration_seconds": None,
+            "resolved": False,
+            "actor_code": reviewer.get("code") or s.supervisor_review_actor_code,
+            "actor_name": reviewer.get("name") or s.supervisor_review_actor_name,
+            "actor_role": reviewer.get("role") or s.supervisor_review_actor_role,
+            "summary": self._supervisor_review_summary_snapshot(),
+        })
+        s.current_supervisor_review = review
+        return review
+
+    def _close_supervisor_review_snapshot(self, actor_code: str = "", actor_name: str = "", actor_role: str = "", action: str = "CLOSE", resolved: bool = True) -> Optional[Dict[str, Any]]:
+        s = self.state
+        review = dict(s.current_supervisor_review or {})
+        if not review:
+            if not (s.supervisor_review_open or s.supervisor_review_started_at):
+                return None
+            review = self._start_or_update_supervisor_review(
+                {
+                    "code": actor_code or s.supervisor_review_actor_code or "",
+                    "name": actor_name or s.supervisor_review_actor_name or "",
+                    "role": actor_role or s.supervisor_review_actor_role or "SUPERVISOR",
+                },
+                action="RECOVERED_CLOSE",
+            )
+        now_utc = datetime.now(timezone.utc).isoformat()
+        opened_at = str(review.get("opened_at_utc") or s.supervisor_review_started_at or now_utc)
+        duration_seconds = 0
+        try:
+            start_dt = datetime.fromisoformat(opened_at.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(now_utc)
+            duration_seconds = max(0, int((end_dt - start_dt).total_seconds()))
+        except Exception:
+            duration_seconds = 0
+        review.update({
+            "status": "CLOSED",
+            "action": action,
+            "closed_at_utc": now_utc,
+            "last_updated_at_utc": now_utc,
+            "duration_seconds": duration_seconds,
+            "resolved": bool(resolved),
+            "actor_code": actor_code or review.get("actor_code") or s.supervisor_review_actor_code,
+            "actor_name": actor_name or review.get("actor_name") or s.supervisor_review_actor_name,
+            "actor_role": actor_role or review.get("actor_role") or s.supervisor_review_actor_role or "SUPERVISOR",
+            "summary": self._supervisor_review_summary_snapshot(),
+        })
+        logs = [dict(row) for row in (s.supervisor_review_logs or []) if isinstance(row, dict)]
+        review_id = str(review.get("review_id") or "")
+        replaced = False
+        for idx, row in enumerate(logs):
+            if review_id and str(row.get("review_id") or "") == review_id:
+                logs[idx] = review
+                replaced = True
+                break
+        if not replaced:
+            logs.append(review)
+        s.supervisor_review_logs = logs[-100:]
+        s.current_supervisor_review = {}
+        s.supervisor_review_started_at = None
+        return review
 
     def _hide_cycle_time_confirm_popup(self):
         s = self.state
@@ -10795,6 +11728,8 @@ QWidget#ClientUIRoot {{
         s.supervisor_review_actor_code = None
         s.supervisor_review_actor_name = None
         s.supervisor_review_actor_role = None
+        s.supervisor_review_started_at = None
+        s.current_supervisor_review = {}
         if not s.waiting_cycle_time_confirm_popup:
             s.showing_reject_summary = False
             self._hide_reject_summary_overlay()
@@ -10817,6 +11752,7 @@ QWidget#ClientUIRoot {{
                 "actor_code": actor_code,
             }
         )
+        review = self._close_supervisor_review_snapshot(actor_code, actor_name, actor_role, action="CYCLE_CONFIRMED", resolved=True)
         self._hide_cycle_time_confirm_popup()
         self._hide_supervisor_review()
         self.status.setText(f"Cycle time and reject summary confirmed by {actor_name}")
@@ -10832,6 +11768,8 @@ QWidget#ClientUIRoot {{
             },
             f"CYCLE TIME CONFIRMED {actor_name}",
         )
+        if review:
+            self.push_event({"type": "SUPERVISOR_REVIEW", "review": review}, f"SUPERVISOR REVIEW {actor_name}", silent=True)
 
     def _begin_downtime_resolution(self):
         s = self.state
@@ -11084,6 +12022,7 @@ QWidget#ClientUIRoot {{
         self.apiScannerPortInput.setText(str(cfg.get("scanner_com_port", SCANNER_COM_PORT)))
         self.apiScannerBaudInput.setText(str(cfg.get("scanner_baudrate", SCANNER_BAUDRATE)))
         self.apiScannerTimeoutInput.setText(str(cfg.get("scanner_timeout", SCANNER_TIMEOUT)))
+        self.apiPackScanIntervalInput.setText(str(cfg.get("pack_scan_interval_seconds", PACK_SCAN_INTERVAL_SECONDS)))
         jcfg = getattr(self, "job_api_config", {}) or {}
         self.apiJobApiBaseUrlInput.setText(str(jcfg.get("base_url", "")))
         self.apiJobApiUserInput.setText(str(jcfg.get("user") or jcfg.get("username") or ""))
@@ -11120,6 +12059,13 @@ QWidget#ClientUIRoot {{
         except Exception:
             self.status.setText("API config failed: Scanner timeout must be 0 or greater.")
             return
+        try:
+            pack_scan_interval = float(self.apiPackScanIntervalInput.text().strip())
+            if pack_scan_interval < 0:
+                raise ValueError()
+        except Exception:
+            self.status.setText("API config failed: PACK scan lock interval must be 0 or greater.")
+            return
 
         self.client_config.update({
             "server_url": server_url,
@@ -11128,6 +12074,7 @@ QWidget#ClientUIRoot {{
             "scanner_com_port": scanner_port or SCANNER_COM_PORT,
             "scanner_baudrate": scanner_baudrate,
             "scanner_timeout": scanner_timeout,
+            "pack_scan_interval_seconds": pack_scan_interval,
         })
         self.job_api_config.update({
             "base_url": job_api_base_url,
@@ -11140,7 +12087,7 @@ QWidget#ClientUIRoot {{
         _save_job_api_config(self.job_api_config)
         self._restart_scanner_input()
         self._trigger_identity_cache_sync(force=True)
-        self.status.setText(f"API/Scanner configuration applied. Client ID: {client_id}")
+        self.status.setText(f"API/Scanner configuration applied. PACK scan lock: {pack_scan_interval:g}s.")
 
     def _test_job_api_settings(self):
         server_url = self.apiServerUrlInput.text().strip().rstrip("/") or str(self.client_config.get("server_url", SERVER_URL)).strip().rstrip("/")
@@ -11266,6 +12213,9 @@ QWidget#ClientUIRoot {{
         s.external_average_weight_grams = None
         s.external_average_weight_unit = None
         s.external_average_weight_received_at = None
+        s.external_average_weight_sent_at = None
+        s.external_average_weight_source = None
+        s.external_average_weight_sender = None
 
     def _job_part_rows(self, payload: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         base_payload = payload if isinstance(payload, dict) else (self.state.job_payload or {})
@@ -11521,7 +12471,7 @@ QWidget#ClientUIRoot {{
                 item.setBackground(QBrush(QColor(248, 113, 113, flash_alpha)))
                 item.setForeground(QBrush(QColor("#fff7ed")))
 
-    def _apply_external_average_weight(self, average_grams: float, unit: str):
+    def _apply_external_average_weight(self, average_grams: float, unit: str, sent_at: str = "", source: str = "app", sender: str = ""):
         grams = float(average_grams or 0.0)
         normalized_unit = str(unit or "g").strip() or "g"
         if grams <= 0:
@@ -11531,16 +12481,28 @@ QWidget#ClientUIRoot {{
         s.external_average_weight_grams = grams
         s.external_average_weight_unit = normalized_unit
         s.external_average_weight_received_at = datetime.now(timezone.utc).isoformat()
+        s.external_average_weight_sent_at = str(sent_at or "").strip() or None
+        s.external_average_weight_source = str(source or "app").strip() or "app"
+        s.external_average_weight_sender = str(sender or "").strip() or None
         self.status.setText(f"Average weight received from app: {kg_value:.4f} kg")
         self._refresh_ui()
         if s.machine_code:
             self._save_active_session_snapshot()
         self.push_event(
-            {"type": "AVERAGE_WEIGHT_RECEIVED", "average_grams": grams, "average_kg": kg_value, "unit": normalized_unit},
+            {
+                "type": "AVERAGE_WEIGHT_RECEIVED",
+                "average_grams": grams,
+                "average_kg": kg_value,
+                "unit": normalized_unit,
+                "sent_at": s.external_average_weight_sent_at,
+                "source": s.external_average_weight_source,
+                "sender": s.external_average_weight_sender,
+                "received_at": s.external_average_weight_received_at,
+            },
             f"AVERAGE WEIGHT {kg_value:.4f} kg",
         )
 
-    def _apply_server_average_weight(self, machine_code: str, average_grams: float, unit: str, received_at: str):
+    def _apply_server_average_weight(self, machine_code: str, average_grams: float, unit: str, received_at: str, sent_at: str, source: str, sender: str):
         if str(self.state.machine_code or "").strip() != str(machine_code or "").strip():
             return
         identity = self._job_product_identity_from_payload(self.state.job_payload)
@@ -11549,7 +12511,10 @@ QWidget#ClientUIRoot {{
         # The server already validates product/SKU. This second check prevents a stale
         # poll from applying a result after this client changed jobs locally.
         if current_product_id or current_sku:
-            self._apply_external_average_weight(average_grams, unit)
+            self._apply_external_average_weight(average_grams, unit, sent_at, source or "server", sender)
+            self.state.external_average_weight_received_at = str(received_at or "").strip() or self.state.external_average_weight_received_at
+            if self.state.machine_code:
+                self._save_active_session_snapshot()
 
     def _poll_server_average_weight(self):
         machine_code = str(self.state.machine_code or "").strip()
@@ -11578,7 +12543,13 @@ QWidget#ClientUIRoot {{
                 if weight is not None and received_at and marker != self._last_server_weight_marker:
                     self._last_server_weight_marker = marker
                     self.server_average_weight_received.emit(
-                        machine_code, float(weight), str(row.get("external_average_weight_unit") or "g"), received_at
+                        machine_code,
+                        float(weight),
+                        str(row.get("external_average_weight_unit") or "g"),
+                        received_at,
+                        str(row.get("external_average_weight_sent_at") or ""),
+                        str(row.get("external_average_weight_source") or "server"),
+                        str(row.get("external_average_weight_sender") or ""),
                     )
             except Exception:
                 pass
@@ -11629,10 +12600,13 @@ QWidget#ClientUIRoot {{
                     self._send_json(400, {"success": False, "message": "average_grams must be numeric"})
                     return
                 unit = str(payload.get("unit") or "").strip() or "g"
+                sent_at = str(payload.get("sent_at") or payload.get("sent_at_utc") or "").strip()
+                source = str(payload.get("source") or "app").strip() or "app"
+                sender = str(payload.get("sender") or payload.get("sent_by") or "").strip()
                 if average_grams <= 0:
                     self._send_json(400, {"success": False, "message": "average_grams must be greater than zero"})
                     return
-                ui.average_weight_received.emit(average_grams, unit)
+                ui.average_weight_received.emit(average_grams, unit, sent_at, source, sender)
                 self._send_json(200, {"success": True, "message": "Average weight received"})
 
         try:
@@ -11881,6 +12855,74 @@ QWidget#ClientUIRoot {{
             "product_name": product_name,
         }
 
+    def _normalized_identity_text(self, value: Any) -> str:
+        return re.sub(r"[^A-Z0-9]+", "", str(value or "").strip().upper())
+
+    def _job_change_identity_from_payload(self, payload: Optional[Dict[str, Any]]) -> Dict[str, str]:
+        src = payload if isinstance(payload, dict) else {}
+        ctx = self._extract_job_payload_context(src)
+        job = ctx.get("job") if isinstance(ctx.get("job"), dict) else {}
+        details = ctx.get("job_details") if isinstance(ctx.get("job_details"), dict) else {}
+        product = self._job_product_identity_from_payload(src)
+        color = (
+            details.get("color")
+            or details.get("colour")
+            or details.get("custom_06")
+            or job.get("color")
+            or job.get("colour")
+            or job.get("custom_06")
+            or src.get("color")
+            or src.get("colour")
+            or ""
+        )
+        mold = (
+            details.get("mold")
+            or details.get("mold_no")
+            or details.get("mould")
+            or details.get("custom_05")
+            or job.get("mold")
+            or job.get("mold_no")
+            or job.get("mould")
+            or job.get("custom_05")
+            or src.get("mold")
+            or ""
+        )
+        return {
+            "product_id": str(product.get("product_id") or "").strip(),
+            "product_sku": str(product.get("product_sku") or "").strip(),
+            "product_name": str(product.get("product_name") or "").strip(),
+            "color": str(color or "").strip(),
+            "mold": str(mold or "").strip(),
+        }
+
+    def _classify_job_change_reason(self, current_payload: Optional[Dict[str, Any]], new_payload: Optional[Dict[str, Any]], requested_reason: str = "COLOR_CHANGE") -> Dict[str, Any]:
+        requested = str(requested_reason or "COLOR_CHANGE").strip().upper()
+        if requested not in ("COLOR_CHANGE", "MOLD_CHANGE"):
+            requested = "COLOR_CHANGE"
+        current_identity = self._job_change_identity_from_payload(current_payload)
+        new_identity = self._job_change_identity_from_payload(new_payload)
+        same_product = False
+        for key in ("product_id", "product_sku", "product_name"):
+            left = self._normalized_identity_text(current_identity.get(key))
+            right = self._normalized_identity_text(new_identity.get(key))
+            if left and right and left == right:
+                same_product = True
+                break
+        current_color = self._normalized_identity_text(current_identity.get("color"))
+        new_color = self._normalized_identity_text(new_identity.get("color"))
+        color_changed = bool(current_color and new_color and current_color != new_color)
+        reason = "COLOR_CHANGE" if same_product else "MOLD_CHANGE"
+        if same_product and not color_changed:
+            reason = "COLOR_CHANGE"
+        return {
+            "reason": reason,
+            "requested_reason": requested,
+            "same_product": same_product,
+            "color_changed": color_changed,
+            "current": current_identity,
+            "new": new_identity,
+        }
+
     def _finish_shift_row_key(self, row: Dict[str, Any]) -> str:
         return "|".join([
             str(row.get("record_type") or "").strip().upper(),
@@ -11990,9 +13032,13 @@ QWidget#ClientUIRoot {{
             self.finishSummaryCards["Job"].setText(f"{len(pending_shift_jobs)} jobs in shift")
         else:
             self.finishSummaryCards["Job"].setText(self._safe_text(shift_payload.get("job_name") or shift_payload.get("job_code")))
-        self.finishSummaryCards["Operator"].setText(
-            f"{self._safe_text(shift_payload.get('operator_name'))} ({self._safe_text(shift_payload.get('operator_id'))})"
-        )
+        operator_count = int(shift_payload.get("operator_count") or 0)
+        if operator_count > 1:
+            self.finishSummaryCards["Operator"].setText(f"{operator_count} operators")
+        else:
+            self.finishSummaryCards["Operator"].setText(
+                f"{self._safe_text(shift_payload.get('operator_name'))} ({self._safe_text(shift_payload.get('operator_id'))})"
+            )
         self.finishSummaryCards["Shift Window"].setText(f"{start_label}\n{end_label}")
         self.finishSummaryCards["Pack Count"].setText(str(int(shift_payload.get("pack_count") or 0)))
         self.finishSummaryCards["Good"].setText(str(int(shift_payload.get("good_total") or 0)))
@@ -12005,6 +13051,13 @@ QWidget#ClientUIRoot {{
         self.finishSummaryCards["App Counter"].setText(self._safe_text(shift_payload.get("machine_counter_app_end"), "-"))
         self.finishSummaryCards["Machine Counter"].setText(self._safe_text(shift_payload.get("machine_counter_end"), "-"))
         self.finishSummaryCards["Counter Diff"].setText(self._safe_text(shift_payload.get("machine_counter_difference"), "-"))
+        avg_weight = self._parse_number(shift_payload.get("external_average_weight_grams"))
+        avg_unit = self._safe_text(shift_payload.get("external_average_weight_unit") or "g", "g")
+        avg_weight_label = f"{(avg_weight / 1000.0):.4f} kg / {avg_weight:.4f} {avg_unit}" if avg_weight > 0 else "-"
+        self.finishSummaryCards["Avg Weight"].setText(f"{(avg_weight / 1000.0):.4f} kg" if avg_weight > 0 else "-")
+        change_info = shift_payload.get("change_classification") if isinstance(shift_payload.get("change_classification"), dict) else {}
+        change_current = change_info.get("current") if isinstance(change_info.get("current"), dict) else {}
+        change_new = change_info.get("new") if isinstance(change_info.get("new"), dict) else {}
 
         job_rows = [
             [f"Job Code: {self._safe_text(shift_payload.get('job_code'))}"],
@@ -12018,6 +13071,16 @@ QWidget#ClientUIRoot {{
             [f"Std Cycle Time: {self._safe_text(job_details.get('std_cycle_time'), 'N/A')}"],
             [f"Qty/Shift: {self._safe_text(job_details.get('qty_per_shift'), 'N/A')}"],
             [f"Requested Qty: {self._safe_text(job.get('approve_qty') or job.get('request_qty'))}"],
+            [f"Change Type: {self._safe_text(shift_payload.get('reason'), '-')}"],
+            [f"Change Target Job: {self._safe_text(shift_payload.get('change_target_job_name') or shift_payload.get('change_target_job_code'), '-')}"],
+            [f"Change Product: {self._safe_text(change_current.get('product_id') or change_current.get('product_name'), '-')} -> {self._safe_text(change_new.get('product_id') or change_new.get('product_name'), '-')}"],
+            [f"Change Color: {self._safe_text(change_current.get('color'), '-')} -> {self._safe_text(change_new.get('color'), '-')}"],
+            [f"Change Mold: {self._safe_text(change_current.get('mold'), '-')} -> {self._safe_text(change_new.get('mold'), '-')}"],
+            [f"Average Weight: {avg_weight_label}"],
+            [f"Weight Source: {self._safe_text(shift_payload.get('external_average_weight_source'), '-')}"],
+            [f"Weight Sender: {self._safe_text(shift_payload.get('external_average_weight_sender'), '-')}"],
+            [f"Weight Sent At: {self._safe_text(shift_payload.get('external_average_weight_sent_at'), '-')}"],
+            [f"Weight Received At: {self._safe_text(shift_payload.get('external_average_weight_received_at'), '-')}"],
         ]
         self._set_finish_summary_table_rows(self.finishReviewJobDetails, job_rows)
 
@@ -12035,6 +13098,7 @@ QWidget#ClientUIRoot {{
             [f"Machine Counter App: {self._safe_text(shift_payload.get('machine_counter_app_end'), '-')}"],
             [f"Machine Counter End: {self._safe_text(shift_payload.get('machine_counter_end'), '-')}"],
             [f"Machine Counter Diff: {self._safe_text(shift_payload.get('machine_counter_difference'), '-')}"],
+            [f"Average Weight: {avg_weight_label}"],
         ]
         self._set_finish_summary_table_rows(self.finishReviewCounters, counter_rows)
         self._stretch_finish_summary_table(self.finishReviewJobDetails, page_one_section_h)
@@ -12043,8 +13107,22 @@ QWidget#ClientUIRoot {{
         reject_rows = [[f"{str(k)}: {str(int(v or 0))}"] for k, v in reject_breakdown.items() if int(v or 0) > 0]
         self._set_finish_summary_table_rows(self.finishReviewRejects, reject_rows)
 
+        supervisor_review_logs = [
+            row for row in (shift_payload.get("supervisor_review_logs") or []) if isinstance(row, dict)
+        ]
+        latest_supervisor_review = supervisor_review_logs[-1] if supervisor_review_logs else {}
         downtime_rows = [
             [f"Review Status: {self._safe_text(shift_payload.get('review_status'), REVIEW_STATUS_PENDING)}"],
+            [f"Approved By: {self._safe_text(shift_payload.get('approved_by'), '-')} ({self._safe_text(shift_payload.get('approved_by_code'), '-')})"],
+            [f"Approved Role: {self._safe_text(shift_payload.get('approved_by_role'), '-')}"],
+            [f"Approved At: {self._safe_text(shift_payload.get('approved_at_utc'), '-')}"],
+            [f"Approved Remarks: {self._safe_text(shift_payload.get('approved_remarks'), '-')}"],
+            [f"Changed By: {self._safe_text(shift_payload.get('changed_by'), '-')}"],
+            [f"Changed At: {self._safe_text(shift_payload.get('changed_at_utc'), '-')}"],
+            [f"Supervisor Summary Opened: {self._safe_text(latest_supervisor_review.get('opened_at_utc'), '-')}"],
+            [f"Supervisor Summary Closed: {self._safe_text(latest_supervisor_review.get('closed_at_utc'), '-')}"],
+            [f"Supervisor Review Minutes: {self._safe_text(round(float(latest_supervisor_review.get('duration_seconds') or 0) / 60.0, 2) if latest_supervisor_review else '-', '-')}"],
+            [f"Supervisor Review Result: {self._safe_text(latest_supervisor_review.get('action'), '-')}"],
             [f"Reason Code: {self._safe_text(shift_payload.get('downtime_reason_code'))}"],
             [f"Reason: {self._safe_text(shift_payload.get('downtime_reason_text'))}"],
             [f"Downtime Last: {self._format_timer_seconds(int(shift_payload.get('downtime_last_seconds') or 0))}"],
@@ -12154,6 +13232,7 @@ QWidget#ClientUIRoot {{
             )
 
         self._add_shift_jobs_review_page_if_needed()
+        self._add_operator_segments_review_page_if_needed(shift_payload)
 
         include_second_page = bool(partial_payload_rows or visible_part_table_rows)
         include_third_page = bool(visible_raw_rows)
@@ -12578,6 +13657,98 @@ QWidget#ClientUIRoot {{
         self._hide_product_history_overlay()
         self._hide_reject_review_overlay()
 
+    def _reset_production_for_operator_handoff(self):
+        s = self.state
+        s.pack_count = 0
+        s.good_total = 0
+        s.butal_total = 0
+        s.reject_total = 0
+        s.reject_breakdown = {}
+        s.no_shot_total = 0
+        s.startup_reject_total = 0
+        s.raw_sacks_count = 0
+        s.raw_material_scans = []
+        s.raw_material_logs = []
+        s.raw_material_unique_keys = set()
+        s.product_pack_history_logs = []
+        s.product_pack_history_keys = set()
+        s.butal_scan_logs = []
+        s.butal_by_job = {}
+        s.reject_review_logs = []
+        s.production_adjustment_logs = []
+        s.showing_reject_summary = False
+        s.reject_summary_last_scanned_at = None
+        s.waiting_reject_reason = False
+        s.reject_multiplier_input = ""
+        s.waiting_void_scan = False
+        s.waiting_void_pack_scan = False
+        s.waiting_void_butal_scan = False
+        s.waiting_void_reject_scan = False
+        self._clear_butal_completion_mode()
+        self._clear_pending_butal_assignment()
+        setattr(self, "_action_logs", [])
+        self._last_accepted_pack_scan_at = 0.0
+        self._hide_reject_summary_overlay()
+        self._hide_product_history_overlay()
+        self._hide_reject_review_overlay()
+
+    def _change_operator_for_active_job(self, operator_value: str, raw_payload: str = "", pending_server_validation: bool = False) -> bool:
+        s = self.state
+        operator_value = str(operator_value or "").strip()
+        if not (s.machine_code and s.job_code and s.operator_id and operator_value):
+            return False
+        old_operator = str(s.operator_id or "").strip()
+        if self._operator_code_only(old_operator) == self._operator_code_only(operator_value):
+            return False
+        outgoing_payload = self._finalize_current_operator_shift("OPERATOR_CHANGE", emit_event=True)
+        if outgoing_payload is None:
+            self.status.setText("Operator change failed: no active operator data to save.")
+            self._show_invalid_overlay("No active operator data to save.")
+            return False
+        self._close_open_relief_for_operator_handoff()
+        self._reset_production_for_operator_handoff()
+        s.operator_id = operator_value
+        s.operator_qr_payload = str(raw_payload or "").strip() if pending_server_validation else ""
+        s.operator_pending_server_validation = bool(pending_server_validation)
+        s.active_scan_operator_id = operator_value
+        s.active_scan_owner_type = "ORIGINAL"
+        s.reliever_id = None
+        s.reliever_qr_payload = ""
+        s.break_active = False
+        s.current_break_session_id = ""
+        s.break_out_time = None
+        self._start_operator_shift_tracking()
+        old_name = self._operator_display_name(old_operator)
+        new_name = self._operator_display_name(operator_value)
+        message = (
+            f"Operator has been changed: {old_name} -> {new_name}. "
+            "You may now proceed again. Previous operator scans were saved in the shift logs."
+        )
+        self._hide_invalid_overlay()
+        self._refresh_ui(force=True)
+        self._set_banner_text(
+            "Operator has been changed. You may now proceed again.\n"
+            "Previous operator data is saved in shift logs."
+        )
+        if hasattr(self, "productionActionBanner") and self.productionActionBanner is not None:
+            self.productionActionBanner.setText("OPERATOR CHANGED\nPROCEED SCANNING")
+            self._apply_production_action_banner_style()
+        self.status.setText(message)
+        self._save_active_session_snapshot()
+        self.push_event(
+            {
+                "type": "OPERATOR_CHANGE",
+                "previous_operator": old_operator,
+                "new_operator": operator_value,
+                "operator_shift": outgoing_payload,
+                "operator_qr_payload": raw_payload,
+                "pending_server_validation": bool(pending_server_validation),
+            },
+            f"OPERATOR CHANGE {old_name} -> {new_name}",
+        )
+        self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (OPERATOR CHANGE)")
+        return True
+
     def _change_color_to_job(self, job_data: Dict[str, Any], reason: str = "COLOR_CHANGE") -> bool:
         s = self.state
         reason_key = str(reason or "COLOR_CHANGE").strip().upper()
@@ -12589,6 +13760,12 @@ QWidget#ClientUIRoot {{
             self.status.setText(f"{label} failed: no active operator shift to save.")
             self._show_invalid_overlay("No active operator shift to save.")
             return False
+        change_info = job_data.get("change_classification") if isinstance(job_data.get("change_classification"), dict) else {}
+        if change_info:
+            shift_payload["change_classification"] = dict(change_info)
+            shift_payload["change_target_job_code"] = str(job_data.get("job_code") or "").strip()
+            shift_payload["change_target_job_name"] = str(job_data.get("job_name") or "").strip()
+            self._upsert_pending_operator_shift_segment(shift_payload)
 
         operator_id = s.operator_id
         s.job_code = str(job_data.get("job_code") or "").strip()
@@ -12605,11 +13782,13 @@ QWidget#ClientUIRoot {{
             status_tail = " Enter cycle time now."
         else:
             status_tail = ""
+        self._hide_invalid_overlay()
         self.status.setText(f"{label}: new job set for same operator: {s.job_name or s.job_code}.{status_tail}")
         self._refresh_ui()
         self._save_active_session_snapshot()
+        event_type = "MOLD_CHANGE_JOB_SET" if reason_key == "MOLD_CHANGE" else "COLOR_CHANGE_JOB_SET"
         self.push_event(
-            {"type": "COLOR_CHANGE_JOB_SET", "job_payload": s.job_payload},
+            {"type": event_type, "job_payload": s.job_payload},
             f"{label.upper()} JOB {s.job_name or s.job_code}",
             silent=False,
         )
@@ -12632,6 +13811,11 @@ QWidget#ClientUIRoot {{
             self.status.setText(f"{label} failed: no active operator shift to save.")
             self._show_invalid_overlay("No active operator shift to save.")
             return False
+        change_info = self._classify_job_change_reason(s.job_payload or {}, existing_segment.get("job_payload") if isinstance(existing_segment.get("job_payload"), dict) else {}, reason_key)
+        current_segment["change_classification"] = change_info
+        current_segment["change_target_job_code"] = job_code
+        current_segment["change_target_job_name"] = str(existing_segment.get("job_name") or job_code).strip()
+        self._upsert_pending_operator_shift_segment(current_segment)
         operator_id = s.operator_id
         s.job_code = job_code
         s.job_name = str(existing_segment.get("job_name") or job_code).strip()
@@ -12662,11 +13846,13 @@ QWidget#ClientUIRoot {{
         s.pending_color_change_reason = ""
         self._start_operator_shift_tracking()
         self._reset_operator_shift_baseline_to_full_segment(existing_segment)
+        self._hide_invalid_overlay()
         self.status.setText(f"{label}: resumed existing job {s.job_name or s.job_code}.")
         self._refresh_ui()
         self._save_active_session_snapshot()
+        event_type = "MOLD_CHANGE_JOB_SET" if reason_key == "MOLD_CHANGE" else "COLOR_CHANGE_JOB_SET"
         self.push_event(
-            {"type": "COLOR_CHANGE_JOB_SET", "job_payload": s.job_payload},
+            {"type": event_type, "job_payload": s.job_payload},
             f"{label.upper()} RESUME {s.job_name or s.job_code}",
             silent=False,
         )
@@ -13116,9 +14302,230 @@ QWidget#ClientUIRoot {{
             return f"{clean_code} - {clean_name}"
         return clean_code or clean_name
 
-    def _update_current_operator_logs(self, old_code: str, new_operator: str, new_name: str) -> None:
+    def _reset_relief_state(self, keep_history: bool = True) -> None:
+        s = self.state
+        s.active_scan_operator_id = s.operator_id
+        s.active_scan_owner_type = "ORIGINAL"
+        s.reliever_id = None
+        s.reliever_qr_payload = ""
+        s.break_active = False
+        s.current_break_session_id = ""
+        s.break_out_time = None
+        if not keep_history:
+            s.break_sessions = []
+
+    def _close_open_relief_for_operator_handoff(self) -> None:
+        s = self.state
+        if not s.break_active:
+            return
+        now_utc = datetime.now(timezone.utc).isoformat()
+        duration_seconds = 0
+        try:
+            if s.break_out_time:
+                start = datetime.fromisoformat(str(s.break_out_time).replace("Z", "+00:00"))
+                end = datetime.fromisoformat(now_utc)
+                duration_seconds = max(0, int((end - start).total_seconds()))
+        except Exception:
+            duration_seconds = 0
+        rows: List[Dict[str, Any]] = []
+        matched = False
+        for row in list(s.break_sessions or []):
+            if not isinstance(row, dict):
+                continue
+            row = dict(row)
+            if str(row.get("break_session_id") or "") == str(s.current_break_session_id or ""):
+                row["break_in_time"] = now_utc
+                row["duration_seconds"] = duration_seconds
+                row["status"] = "CLOSED_BY_OPERATOR_CHANGE"
+                matched = True
+            rows.append(row)
+        if not matched:
+            rows.append({
+                "break_session_id": str(s.current_break_session_id or ""),
+                "machine_code": s.machine_code,
+                "machine_name": s.machine_name,
+                "job_code": s.job_code,
+                "job_name": s.job_name,
+                "original_operator": str(s.operator_id or "").strip(),
+                "original_operator_name": self._operator_display_name(s.operator_id),
+                "reliever_operator": str(s.reliever_id or "").strip(),
+                "reliever_operator_name": self._operator_display_name(s.reliever_id),
+                "break_out_time": s.break_out_time,
+                "break_in_time": now_utc,
+                "duration_seconds": duration_seconds,
+                "status": "CLOSED_BY_OPERATOR_CHANGE",
+            })
+        s.break_sessions = rows[-100:]
+
+    def _scan_owner_context(self) -> Dict[str, Any]:
+        s = self.state
+        owner_type = str(s.active_scan_owner_type or "ORIGINAL").strip().upper()
+        if owner_type not in ("ORIGINAL", "RELIEVER"):
+            owner_type = "ORIGINAL"
+        active_operator = s.reliever_id if owner_type == "RELIEVER" and s.reliever_id else s.operator_id
+        return {
+            "original_operator": str(s.operator_id or "").strip() or "-",
+            "original_operator_name": self._operator_display_name(s.operator_id),
+            "active_operator": str(active_operator or "").strip() or "-",
+            "active_operator_name": self._operator_display_name(active_operator),
+            "scan_owner_type": owner_type,
+            "break_session_id": str(s.current_break_session_id or ""),
+        }
+
+    def _start_operator_relief(self, reliever_value: str, raw_payload: str = "") -> bool:
+        s = self.state
+        if not (s.machine_code and s.job_code and s.operator_id):
+            self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
+            return False
+        reliever_value = str(reliever_value or "").strip()
+        if not reliever_value:
+            return False
+        if self._operator_code_only(reliever_value) == self._operator_code_only(s.operator_id):
+            return False
+        now_utc = datetime.now(timezone.utc).isoformat()
+        session_id = f"BRK-{uuid.uuid4().hex[:10].upper()}"
+        s.reliever_id = reliever_value
+        s.reliever_qr_payload = self._clean_badge_scan_code(raw_payload) or str(raw_payload or "").strip()
+        s.active_scan_operator_id = reliever_value
+        s.active_scan_owner_type = "RELIEVER"
+        s.break_active = True
+        s.current_break_session_id = session_id
+        s.break_out_time = now_utc
+        row = {
+            "break_session_id": session_id,
+            "machine_code": s.machine_code,
+            "machine_name": s.machine_name,
+            "job_code": s.job_code,
+            "job_name": s.job_name,
+            "original_operator": str(s.operator_id or "").strip(),
+            "original_operator_name": self._operator_display_name(s.operator_id),
+            "reliever_operator": reliever_value,
+            "reliever_operator_name": self._operator_display_name(reliever_value),
+            "break_out_time": now_utc,
+            "break_in_time": None,
+            "duration_seconds": None,
+            "status": "ONGOING",
+        }
+        rows = [r for r in list(s.break_sessions or []) if isinstance(r, dict)]
+        rows.append(row)
+        s.break_sessions = rows[-100:]
+        self.status.setText(
+            f"Break out logged: {self._operator_display_name(s.operator_id)} is away. Active scanner: {self._operator_display_name(reliever_value)}."
+        )
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        self.push_event(
+            {"type": "RELIEF_START", "break_session": row, "operator_qr_payload": s.reliever_qr_payload},
+            f"BREAK OUT {self._operator_display_name(s.operator_id)}",
+        )
+        return True
+
+    def _switch_active_break_cover(self, cover_value: str, raw_payload: str = "") -> bool:
+        s = self.state
+        if not s.break_active:
+            return False
+        cover_value = str(cover_value or "").strip()
+        if not cover_value:
+            return False
+        if self._operator_code_only(cover_value) == self._operator_code_only(s.operator_id):
+            return self._end_operator_relief(raw_payload)
+        s.reliever_id = cover_value
+        s.reliever_qr_payload = self._clean_badge_scan_code(raw_payload) or str(raw_payload or "").strip()
+        s.active_scan_operator_id = cover_value
+        s.active_scan_owner_type = "RELIEVER"
+        for row in reversed(list(s.break_sessions or [])):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("break_session_id") or "") != str(s.current_break_session_id or ""):
+                continue
+            row["reliever_operator"] = cover_value
+            row["reliever_operator_name"] = self._operator_display_name(cover_value)
+            row.setdefault("cover_history", [])
+            if isinstance(row["cover_history"], list):
+                row["cover_history"].append(
+                    {
+                        "operator": cover_value,
+                        "operator_name": self._operator_display_name(cover_value),
+                        "scanned_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+            break
+        self.status.setText(f"Active scanner changed to {self._operator_display_name(cover_value)}.")
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        self.push_event(
+            {
+                "type": "RELIEF_START",
+                "break_session": next(
+                    (dict(row) for row in reversed(list(s.break_sessions or [])) if isinstance(row, dict) and str(row.get("break_session_id") or "") == str(s.current_break_session_id or "")),
+                    {},
+                ),
+                "operator_qr_payload": s.reliever_qr_payload,
+            },
+            f"ACTIVE SCANNER {self._operator_display_name(cover_value)}",
+        )
+        return True
+
+    def _end_operator_relief(self, raw_payload: str = "") -> bool:
+        s = self.state
+        if not s.break_active:
+            return False
+        now_utc = datetime.now(timezone.utc).isoformat()
+        duration_seconds = 0
+        try:
+            if s.break_out_time:
+                start = datetime.fromisoformat(str(s.break_out_time).replace("Z", "+00:00"))
+                end = datetime.fromisoformat(now_utc)
+                duration_seconds = max(0, int((end - start).total_seconds()))
+        except Exception:
+            duration_seconds = 0
+        updated_row: Optional[Dict[str, Any]] = None
+        rows: List[Dict[str, Any]] = []
+        for row in list(s.break_sessions or []):
+            if not isinstance(row, dict):
+                continue
+            row = dict(row)
+            if str(row.get("break_session_id") or "") == str(s.current_break_session_id or ""):
+                row["break_in_time"] = now_utc
+                row["duration_seconds"] = duration_seconds
+                row["status"] = "CLOSED"
+                updated_row = row
+            rows.append(row)
+        if updated_row is None:
+            updated_row = {
+                "break_session_id": str(s.current_break_session_id or ""),
+                "machine_code": s.machine_code,
+                "machine_name": s.machine_name,
+                "job_code": s.job_code,
+                "job_name": s.job_name,
+                "original_operator": str(s.operator_id or "").strip(),
+                "original_operator_name": self._operator_display_name(s.operator_id),
+                "reliever_operator": str(s.reliever_id or "").strip(),
+                "reliever_operator_name": self._operator_display_name(s.reliever_id),
+                "break_out_time": s.break_out_time,
+                "break_in_time": now_utc,
+                "duration_seconds": duration_seconds,
+                "status": "CLOSED",
+            }
+            rows.append(updated_row)
+        self._reset_relief_state(keep_history=True)
+        s.break_sessions = rows[-100:]
+        self.status.setText(
+            f"Break in logged: {self._operator_display_name(s.operator_id)} returned. Active scanner back to original operator."
+        )
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        self.push_event(
+            {"type": "RELIEF_END", "break_session": updated_row, "operator_qr_payload": self._clean_badge_scan_code(raw_payload) or raw_payload},
+            f"BREAK IN {self._operator_display_name(s.operator_id)}",
+        )
+        return True
+
+    def _update_current_operator_logs(self, old_code: str, new_operator: str, new_name: str, raw_payload: str = "") -> None:
         old_code = self._operator_code_only(old_code)
-        if not old_code or not new_operator:
+        raw_code = self._clean_badge_scan_code(raw_payload)
+        match_codes = {v for v in (old_code, raw_code) if v}
+        if not match_codes or not new_operator:
             return
         s = self.state
         for collection_name in (
@@ -13135,16 +14542,24 @@ QWidget#ClientUIRoot {{
                 if not isinstance(row, dict):
                     continue
                 for key in ("operator", "operator_id"):
-                    if self._operator_code_only(row.get(key)) == old_code:
+                    if self._operator_code_only(row.get(key)) in match_codes or self._clean_badge_scan_code(row.get(key)) in match_codes:
                         row[key] = new_operator
-                if self._operator_code_only(row.get("operator_name")) == old_code or str(row.get("operator_name") or "").strip() in ("", old_code):
+                if (
+                    self._operator_code_only(row.get("operator_name")) in match_codes
+                    or self._clean_badge_scan_code(row.get("operator_name")) in match_codes
+                    or str(row.get("operator_name") or "").strip() in ("", *match_codes)
+                ):
                     row["operator_name"] = new_name
         for row in list(s.operator_shift_logs or []):
             if not isinstance(row, dict):
                 continue
-            if self._operator_code_only(row.get("operator_id")) == old_code:
+            if self._operator_code_only(row.get("operator_id")) in match_codes or self._clean_badge_scan_code(row.get("operator_id")) in match_codes:
                 row["operator_id"] = new_operator
-            if self._operator_code_only(row.get("operator_name")) == old_code or str(row.get("operator_name") or "").strip() in ("", old_code):
+            if (
+                self._operator_code_only(row.get("operator_name")) in match_codes
+                or self._clean_badge_scan_code(row.get("operator_name")) in match_codes
+                or str(row.get("operator_name") or "").strip() in ("", *match_codes)
+            ):
                 row["operator_name"] = new_name
 
     def _resolve_pending_operator_profile(self) -> bool:
@@ -13163,14 +14578,17 @@ QWidget#ClientUIRoot {{
         name = str(person.get("name") or "").strip()
         if not name or name == code:
             return False
-        new_operator = self._operator_display_value(code, name)
+        new_operator = name
         if not new_operator or new_operator == s.operator_id:
             return False
         old_operator = str(s.operator_id or "")
         s.operator_id = new_operator
+        if not s.break_active:
+            s.active_scan_operator_id = new_operator
+            s.active_scan_owner_type = "ORIGINAL"
         s.operator_qr_payload = ""
         s.operator_pending_server_validation = False
-        self._update_current_operator_logs(old_operator, new_operator, name)
+        self._update_current_operator_logs(old_operator, new_operator, name, raw_payload=raw_payload)
         self._save_active_session_snapshot()
         self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (OPERATOR RESOLVED)")
         self.status.setText(f"Operator resolved: {name}.")
@@ -13253,6 +14671,36 @@ QWidget#ClientUIRoot {{
         last_seen = self._recent_scan_seen.get(key)
         self._recent_scan_seen[key] = now
         return last_seen is not None and (now - last_seen) <= window
+
+    def _pack_scan_cooldown_remaining(self) -> float:
+        try:
+            interval = max(0.0, float((self.client_config or {}).get("pack_scan_interval_seconds", PACK_SCAN_INTERVAL_SECONDS)))
+        except Exception:
+            interval = max(0.0, float(PACK_SCAN_INTERVAL_SECONDS or 0.0))
+        if interval <= 0:
+            return 0.0
+        last_at = float(getattr(self, "_last_accepted_pack_scan_at", 0.0) or 0.0)
+        if last_at <= 0:
+            return 0.0
+        return max(0.0, interval - (time.monotonic() - last_at))
+
+    def _block_pack_scan_if_too_soon(self) -> bool:
+        remaining = self._pack_scan_cooldown_remaining()
+        if remaining <= 0:
+            return False
+        wait_seconds = max(1, int(math.ceil(remaining)))
+        self.status.setText(f"PACK QR blocked. Wait {wait_seconds}s before scanning next completed pack.")
+        self._show_invalid_overlay(f"Wait {wait_seconds}s before scanning the next PACK QR.")
+        return True
+
+    def _mark_pack_scan_accepted(self) -> None:
+        try:
+            interval = max(0.0, float((self.client_config or {}).get("pack_scan_interval_seconds", PACK_SCAN_INTERVAL_SECONDS)))
+        except Exception:
+            interval = max(0.0, float(PACK_SCAN_INTERVAL_SECONDS or 0.0))
+        if interval <= 0:
+            return
+        self._last_accepted_pack_scan_at = time.monotonic()
 
     def _pack_qr_was_used_permanently(self, pack_key: str) -> bool:
         key = str(pack_key or "").strip()
@@ -14128,6 +15576,7 @@ QWidget#ClientUIRoot {{
             self.filter = ScannerFilter()
             self.installEventFilter(self.filter)
             self.filter.scanned.connect(self.scan_received.emit)
+            self.filter.minimize_requested.connect(self._minimize_to_desktop)
             if mode == "keyboard":
                 self._set_status_text("Scanner input: Keyboard mode")
                 return
@@ -14146,6 +15595,11 @@ QWidget#ClientUIRoot {{
             self._set_status_text(f"Scanner input: Auto mode (keyboard + serial {scanner_port})")
         else:
             self._set_status_text(f"Scanner input: Serial mode ({scanner_port})")
+
+    def _minimize_to_desktop(self):
+        self._hide_invalid_overlay()
+        self.showNormal()
+        self.showMinimized()
 
     def _serial_reader_loop(self):
         while not self._serial_stop.is_set():
@@ -14257,43 +15711,83 @@ QWidget#ClientUIRoot {{
         if raw_s:
             self._append_app_log("SCAN", f"QR scanned: {raw_s}")
 
+        if raw_l == "confirm" and s.supervisor_review_open and not s.waiting_cycle_time_confirm_popup:
+            reviewer = {
+                "code": s.supervisor_review_actor_code or "",
+                "name": s.supervisor_review_actor_name or "",
+                "role": s.supervisor_review_actor_role or "SUPERVISOR",
+            }
+            review = self._start_or_update_supervisor_review(reviewer, action="SUMMARY_CONFIRMED_PENDING_QR")
+            self.status.setText("Supervisor summary confirmed. Scan the same Supervisor QR to close.")
+            self._refresh_reject_summary_overlay()
+            self._save_active_session_snapshot()
+            if review:
+                self.push_event({"type": "SUPERVISOR_REVIEW", "review": review}, f"SUPERVISOR REVIEW CONFIRM {review.get('actor_name') or ''}".strip(), silent=True)
+            return
+
         if self._pending_server_recovery is not None:
             pending = dict(self._pending_server_recovery)
             machine_code = str(pending.get("machine_code") or "").strip()
-            server_snap = pending.get("server_snapshot") if isinstance(pending.get("server_snapshot"), dict) else {}
-            local_snap = pending.get("local_snapshot") if isinstance(pending.get("local_snapshot"), dict) else None
-            if raw_l in ("1", "yes", "num_1"):
-                server_job = self._normalize_job_code(server_snap.get("job_code"))
-                local_job = self._normalize_job_code(local_snap.get("job_code")) if local_snap else ""
-                if local_snap and server_job and local_job and server_job != local_job:
+            server_snap = pending.get("server_snapshot") if isinstance(pending.get("server_snapshot"), dict) else None
+            machine_name = str(pending.get("machine_name") or machine_code)
+            options = [
+                dict(row)
+                for row in (pending.get("options") or [])
+                if isinstance(row, dict)
+            ]
+
+            def _reopen_recovery_prompt(message: Optional[str] = None):
+                if message:
+                    self.status.setText(message)
+                else:
                     self.status.setText(
-                        "Saved server session is for a different job. Scan 0 to remove it and use the current local session."
+                        f"{len(options)} saved session(s) found. Scan the JOB QR / job order to continue."
                     )
-                    self._show_invalid_overlay("Saved session job does not match the current local job. Scan 0 to use current data.")
-                    return
+                self._show_session_recovery_options_prompt(options)
+
+            def _cancel_recovery() -> bool:
                 self._hide_invalid_overlay()
                 QApplication.processEvents()
+                if not self._cancel_session_recovery(machine_code, server_snap):
+                    return False
                 self._pending_server_recovery = None
-                snapshot = self._merge_matching_recovery_snapshots(server_snap, local_snap) if local_snap else server_snap
-                self._resume_snapshot(snapshot, str(pending.get("machine_name") or machine_code), "SESSION SNAPSHOT SYNC (RECOVERY CONFIRMED)")
-                return
-            if raw_l in ("2", "no", "num_2", "0", "num_0"):
-                self._hide_invalid_overlay()
-                QApplication.processEvents()
-                if not self._discard_server_recovery(machine_code):
-                    self._show_session_recovery_prompt(server_snap, local_snap)
-                    return
-                self._pending_server_recovery = None
-                if local_snap:
-                    self._resume_snapshot(local_snap, str(pending.get("machine_name") or machine_code), "SESSION SNAPSHOT SYNC (LOCAL RECOVERY)")
-                    return
-                # Re-enter normal machine setup but skip querying the just-discarded
-                # server record once.  This keeps an explicit No from restoring it.
                 self._skip_server_recovery_machine = machine_code
                 self.on_scanned(machine_code)
+                return True
+
+            if raw_l in ("0", "num_0", "cancel", "no"):
+                if not _cancel_recovery():
+                    _reopen_recovery_prompt("Could not cancel saved sessions. Scan JOB QR to continue, or scan cancel to start fresh.")
                 return
-            self.status.setText("Saved session found. Scan num_1 for server saved data, or num_2 for local/current data.")
-            self._show_session_recovery_prompt(server_snap, local_snap)
+
+            res_recovery = parse_scan(raw_s)
+            if res_recovery is not None and res_recovery.kind in ("JOB", "JOB_STUB"):
+                job_data = self._resolve_scanned_job_data(
+                    res_recovery,
+                    raw_s,
+                    "Getting saved session job data from BMS...",
+                )
+                if not isinstance(job_data, dict):
+                    _reopen_recovery_prompt("Unable to read JOB QR. Scan the job order for one of the listed sessions.")
+                    self._show_invalid_overlay("Unable to read JOB QR.")
+                    return
+                option = self._find_recovery_option_for_job(options, job_data, res_recovery, raw_s)
+                if option is None:
+                    _reopen_recovery_prompt("No job order found on this saved session.")
+                    self._show_invalid_overlay(
+                        "No job order found on this saved session. "
+                        "Scan the JOB QR for one of the listed sessions, or scan cancel to start fresh."
+                    )
+                    return
+                self._hide_invalid_overlay()
+                QApplication.processEvents()
+                self._pending_server_recovery = None
+                self._complete_session_recovery_option(option, machine_name)
+                return
+
+            _reopen_recovery_prompt(
+                "Scan the JOB QR / job order for one of the listed saved sessions, or scan cancel to start fresh."
+            )
             return
 
         if s.waiting_cycle_time_confirm_popup:
@@ -14329,7 +15823,11 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Supervisor cycle review: scan num_0..num_9, backspace, confirm.")
                 return
 
-            if raw_s != (s.cycle_time_confirm_actor_code or ""):
+            same_cycle_confirm_actor = (
+                raw_s == (s.cycle_time_confirm_actor_code or "")
+                or self._clean_badge_scan_code(raw_s) == self._clean_badge_scan_code(s.cycle_time_confirm_actor_code or "")
+            )
+            if not same_cycle_confirm_actor:
                 self.status.setText("Confirmation active: scan the same Supervisor badge again.")
                 return
             actor_name = s.cycle_time_confirm_actor_name or raw_s
@@ -14389,11 +15887,25 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
                     return
                 if reviewer_can_supervisor and s.cycle_time_current:
-                    if s.supervisor_review_open and raw_s == (s.supervisor_review_actor_code or "") and not s.waiting_cycle_time_confirm_popup:
+                    same_supervisor_review_actor = (
+                        raw_s == (s.supervisor_review_actor_code or "")
+                        or self._clean_badge_scan_code(raw_s) == self._clean_badge_scan_code(s.supervisor_review_actor_code or "")
+                        or str(reviewer.get("code") or "").strip() == str(s.supervisor_review_actor_code or "").strip()
+                    )
+                    if s.supervisor_review_open and same_supervisor_review_actor and not s.waiting_cycle_time_confirm_popup:
+                        review = self._close_supervisor_review_snapshot(
+                            s.supervisor_review_actor_code or reviewer.get("code") or raw_s,
+                            s.supervisor_review_actor_name or reviewer.get("name") or raw_s,
+                            s.supervisor_review_actor_role or reviewer.get("role") or "SUPERVISOR",
+                            action="SUMMARY_CONFIRMED",
+                            resolved=True,
+                        )
                         self._hide_supervisor_review()
                         self.status.setText("Supervisor review closed.")
                         self._refresh_ui()
                         self._save_active_session_snapshot()
+                        if review:
+                            self.push_event({"type": "SUPERVISOR_REVIEW", "review": review}, f"SUPERVISOR REVIEW {review.get('actor_name') or ''}".strip(), silent=True)
                         return
                     if s.cycle_time_pending_supervisor:
                         self._show_cycle_time_confirm_popup(reviewer)
@@ -14405,8 +15917,11 @@ QWidget#ClientUIRoot {{
                         s.supervisor_review_actor_role = reviewer.get("role")
                         s.showing_reject_summary = True
                         s.reject_summary_last_scanned_at = datetime.now(timezone.utc).isoformat()
+                        review = self._start_or_update_supervisor_review(reviewer, action="SUMMARY_OPEN")
                         self._show_reject_summary_overlay()
                         self.status.setText("Supervisor review opened. Cycle time is already confirmed.")
+                        if review:
+                            self.push_event({"type": "SUPERVISOR_REVIEW", "review": review}, f"SUPERVISOR REVIEW OPEN {review.get('actor_name') or ''}".strip(), silent=True)
                     self._refresh_ui()
                     self._save_active_session_snapshot()
                     return
@@ -14709,6 +16224,7 @@ QWidget#ClientUIRoot {{
             material_product_id = material_code
             material_sku = self._lookup_product_sku(material_product_id) if material_product_id else ""
             raw_job_code = self._normalize_job_code(meta.get("job_code")) if meta.get("job_code") else None
+            owner_ctx = self._scan_owner_context()
             s.raw_material_scans.append(material_name)
             s.raw_material_logs.append(
                 {
@@ -14725,6 +16241,7 @@ QWidget#ClientUIRoot {{
                     "unique_key": unique_key or None,
                     "raw_job_code": raw_job_code,
                     "scanned_at": datetime.now(timezone.utc).isoformat(),
+                    **owner_ctx,
                 }
             )
             if unique_key:
@@ -14742,6 +16259,12 @@ QWidget#ClientUIRoot {{
                 },
                 f"RAW MATERIAL {material_name} +{qty}",
             )
+            return
+
+        if res_pre and res_pre.kind == "PRODUCTION_DAILY_REPORT_CANCEL":
+            if self._cancel_pending_pdr_start():
+                return
+            self.status.setText("No pending PDR start to cancel.")
             return
 
         # PDR waiting step: scan maintenance to actually start downtime timer.
@@ -15019,9 +16542,16 @@ QWidget#ClientUIRoot {{
         if res.kind != "VOID_TRIGGER" and not suppress_scan_log:
             self.log_last(self._scan_display_text(res, raw_s))
 
+        if res.kind == "PRODUCTION_DAILY_REPORT_CANCEL":
+            if self._cancel_pending_pdr_start():
+                return
+            self.status.setText("No pending PDR start to cancel.")
+            return
+
         if s.waiting_color_change_job_scan and res.kind == "COLOR_CHANGE_TRIGGER":
             s.waiting_color_change_job_scan = False
             s.pending_color_change_reason = ""
+            self._hide_invalid_overlay()
             self.status.setText("Change color/mold cancelled. Continue current job.")
             self._refresh_ui()
             self._save_active_session_snapshot()
@@ -15029,8 +16559,8 @@ QWidget#ClientUIRoot {{
 
         if s.waiting_color_change_job_scan and res.kind not in ("JOB", "JOB_STUB"):
             mode_label = "MOLD CHANGE" if str(s.pending_color_change_reason or "").upper() == "MOLD_CHANGE" else "COLOR CHANGE"
-            self.status.setText(f"{mode_label} mode active. Scan NEW JOB QR now.")
-            self._show_invalid_overlay("Scan the new JOB QR to continue.")
+            self.status.setText(f"{mode_label} mode active. Scan JOB QR for a saved session or a new job order.")
+            self._show_invalid_overlay("Scan the JOB QR / job order to continue a saved session or switch jobs.")
             return
 
         if s.waiting_production_report_reason:
@@ -15192,6 +16722,7 @@ QWidget#ClientUIRoot {{
                     "scanned_at": datetime.now(timezone.utc).isoformat(),
                     "operator": str(s.operator_id or "").strip() or "-",
                     "operator_name": self._operator_display_name(s.operator_id),
+                    **self._scan_owner_context(),
                     "voided": False,
                     "source": "BUTAL_COMPLETION",
                     "carried_qty": int(s.butal_completion_carried_qty or 0),
@@ -15244,9 +16775,12 @@ QWidget#ClientUIRoot {{
                     )
                     self._show_invalid_overlay("This QR is not for this job.")
                     return
+                if self._block_pack_scan_if_too_soon():
+                    return
                 pack_hist["raw_scan"] = raw_s
                 pack_hist["operator"] = str(s.operator_id or "").strip() or "-"
                 pack_hist["operator_name"] = self._operator_display_name(s.operator_id)
+                pack_hist.update(self._scan_owner_context())
                 pack_hist["status"] = "BUTAL_COMPLETED"
                 pack_hist["voided"] = False
                 pack_hist["scanned_at"] = datetime.now(timezone.utc).isoformat()
@@ -15265,6 +16799,7 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Invalid PACK QR: label was already used.")
                     self._show_invalid_overlay("PACK QR was already scanned before.")
                     return
+                self._mark_pack_scan_accepted()
                 s.product_pack_history_logs.append(pack_hist)
                 if pack_key:
                     s.product_pack_history_keys.add(pack_key)
@@ -15348,7 +16883,18 @@ QWidget#ClientUIRoot {{
             s.waiting_linkage_job_scan = False
             self._clear_pending_butal_assignment()
             mode_label = "MOLD CHANGE" if reason_key == "MOLD_CHANGE" else "COLOR CHANGE"
-            self.status.setText(f"{mode_label} mode active. Scan NEW JOB QR now.")
+            saved_options = self._build_recovery_session_options_from_state()
+            if saved_options:
+                self._show_session_recovery_options_prompt(
+                    saved_options,
+                    title=mode_label,
+                    headline=f"{len(saved_options)} saved session(s) available.",
+                    footer=(
+                        "Scan the JOB QR / job order to continue a saved session "
+                        "or switch to that job order."
+                    ),
+                )
+            self.status.setText(f"{mode_label} mode active. Scan JOB QR for a saved session or a new job order.")
             self._refresh_ui()
             self._save_active_session_snapshot()
             return
@@ -15491,6 +17037,7 @@ QWidget#ClientUIRoot {{
                             "reason_text": reason_text,
                             "operator": str(s.operator_id or "").strip() or "-",
                             "operator_name": self._operator_display_name(s.operator_id),
+                            **self._scan_owner_context(),
                             "scanned_at": datetime.now(timezone.utc).isoformat(),
                         }
                     )
@@ -15514,6 +17061,7 @@ QWidget#ClientUIRoot {{
                             "reason_text": "Start Up Reject",
                             "operator": str(s.operator_id or "").strip() or "-",
                             "operator_name": self._operator_display_name(s.operator_id),
+                            **self._scan_owner_context(),
                             "scanned_at": datetime.now(timezone.utc).isoformat(),
                         }
                     )
@@ -15542,6 +17090,7 @@ QWidget#ClientUIRoot {{
                         "reason_text": "Start Up Reject",
                         "operator": str(s.operator_id or "").strip() or "-",
                         "operator_name": self._operator_display_name(s.operator_id),
+                        **self._scan_owner_context(),
                         "scanned_at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
@@ -15576,6 +17125,7 @@ QWidget#ClientUIRoot {{
                         "reason_text": reason_text,
                         "operator": str(s.operator_id or "").strip() or "-",
                         "operator_name": self._operator_display_name(s.operator_id),
+                        **self._scan_owner_context(),
                         "scanned_at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
@@ -15598,19 +17148,7 @@ QWidget#ClientUIRoot {{
                 self._skip_server_recovery_machine = ""
             else:
                 server_snap = self._fetch_active_session_snapshot_from_server(raw_s)
-            if isinstance(server_snap, dict):
-                self._pending_server_recovery = {
-                    "machine_code": raw_s,
-                    "machine_name": _machine_display_name(raw_s, res.value),
-                    "server_snapshot": server_snap,
-                    "local_snapshot": local_snap,
-                }
-                self.status.setText("Saved session found. Scan num_1 for server saved data, or num_2 for local/current data.")
-                self._show_session_recovery_prompt(server_snap, local_snap)
-                return
-            snap = local_snap
-            if snap is not None and str(snap.get("machine_code") or "").strip():
-                self._resume_snapshot(snap, res.value, "SESSION SNAPSHOT SYNC (LOCAL RESUME)")
+            if self._prompt_session_recovery(raw_s, _machine_display_name(raw_s, res.value), server_snap, local_snap):
                 return
             s.machine_code = raw_s
             s.machine_name = _machine_display_name(s.machine_code, res.value)
@@ -15618,6 +17156,7 @@ QWidget#ClientUIRoot {{
             s.job_name = None
             s.job_started_at = None
             s.operator_id = None
+            self._reset_relief_state(keep_history=False)
             s.waiting_reject_reason = False
             s.no_shot_total = 0
             s.reject_multiplier_input = ""
@@ -15664,6 +17203,9 @@ QWidget#ClientUIRoot {{
             s.supervisor_review_actor_code = None
             s.supervisor_review_actor_name = None
             s.supervisor_review_actor_role = None
+            s.supervisor_review_started_at = None
+            s.current_supervisor_review = {}
+            s.supervisor_review_logs = []
             s.cycle_time_confirm_actor_code = None
             s.cycle_time_confirm_actor_name = None
             s.cycle_time_confirm_actor_role = None
@@ -15749,18 +17291,16 @@ QWidget#ClientUIRoot {{
                     self._refresh_ui()
                     self._save_active_session_snapshot()
                     return
-                reason_key = str(s.pending_color_change_reason or "COLOR_CHANGE").strip().upper()
-                existing_segment = None
-                normalized_new_job = self._normalize_job_code(new_job_code)
-                for row in reversed(list(s.operator_shift_logs or [])):
-                    if not isinstance(row, dict):
-                        continue
-                    if self._normalize_job_code(row.get("job_code")) == normalized_new_job:
-                        existing_segment = row
-                        break
+                requested_reason = str(s.pending_color_change_reason or "COLOR_CHANGE").strip().upper()
+                change_info = self._classify_job_change_reason(s.job_payload or {}, job_data.get("job_payload") if isinstance(job_data.get("job_payload"), dict) else {}, requested_reason)
+                reason_key = str(change_info.get("reason") or requested_reason or "COLOR_CHANGE").strip().upper()
+                existing_segment = self._find_shift_segment_for_job(self._normalize_job_code(new_job_code))
                 if isinstance(existing_segment, dict):
+                    self._hide_invalid_overlay()
                     self._change_color_to_existing_shift_segment(existing_segment, reason=reason_key)
                     return
+                self._hide_invalid_overlay()
+                job_data["change_classification"] = change_info
                 self._change_color_to_job(job_data, reason=reason_key)
                 return
             if s.waiting_linkage_job_scan:
@@ -15908,9 +17448,10 @@ QWidget#ClientUIRoot {{
                     or self._safe_text(s.job_payload.get("job_name"), "")
                     or res.value
                     or "Job Stub"
-                )
+            )
             s.job_started_at = datetime.now(timezone.utc).isoformat()
             s.operator_id = None
+            self._reset_relief_state(keep_history=False)
             s.pack_count = 0
             s.good_total = 0
             s.butal_total = 0
@@ -15960,6 +17501,9 @@ QWidget#ClientUIRoot {{
             s.supervisor_review_actor_code = None
             s.supervisor_review_actor_name = None
             s.supervisor_review_actor_role = None
+            s.supervisor_review_started_at = None
+            s.current_supervisor_review = {}
+            s.supervisor_review_logs = []
             s.cycle_time_confirm_actor_code = None
             s.cycle_time_confirm_actor_name = None
             s.cycle_time_confirm_actor_role = None
@@ -16072,15 +17616,6 @@ QWidget#ClientUIRoot {{
                 return
             new_operator_code = self._operator_code_only(res.value)
             current_operator_code = self._operator_code_only(s.operator_id)
-            if current_operator_code and new_operator_code != current_operator_code:
-                self.status.setText('Operator change blocked. Scan "operatorshift~1" first.')
-                self._show_invalid_overlay('Scan "operatorshift~1" first to save current operator shift data.')
-                return
-            if current_operator_code and new_operator_code == current_operator_code:
-                self.status.setText(f"Operator already active: {self._operator_display_name(s.operator_id)}")
-                return
-            s.operator_id = res.value
-            self._start_operator_shift_tracking()
             pending_server_validation = bool(
                 res.kind == "OFFLINE_OPERATOR"
                 or (isinstance(res.meta, dict) and res.meta.get("pending_server_validation"))
@@ -16088,6 +17623,26 @@ QWidget#ClientUIRoot {{
             raw_operator_payload = str(
                 (res.meta or {}).get("operator_qr_payload") if isinstance(res.meta, dict) else raw_s
             ).strip() or raw_s
+            if current_operator_code and new_operator_code == current_operator_code and bool(s.break_active):
+                self._end_operator_relief(raw_operator_payload)
+                return
+            if current_operator_code and new_operator_code != current_operator_code:
+                if self._change_operator_for_active_job(res.value, raw_operator_payload, pending_server_validation):
+                    return
+                self.status.setText("Operator scan could not be applied right now.")
+                return
+            if current_operator_code and new_operator_code == current_operator_code:
+                self.status.setText(f"Operator already active: {self._operator_display_name(s.operator_id)}")
+                return
+            s.operator_id = res.value
+            s.active_scan_operator_id = res.value
+            s.active_scan_owner_type = "ORIGINAL"
+            s.reliever_id = None
+            s.reliever_qr_payload = ""
+            s.break_active = False
+            s.current_break_session_id = ""
+            s.break_out_time = None
+            self._start_operator_shift_tracking()
             s.operator_qr_payload = raw_operator_payload if pending_server_validation else ""
             s.operator_pending_server_validation = pending_server_validation
             if not str(s.cycle_time_current or "").strip():
@@ -16185,6 +17740,8 @@ QWidget#ClientUIRoot {{
                         )
                         self._show_invalid_overlay("This QR is not for this job.")
                         return
+                    if self._block_pack_scan_if_too_soon():
+                        return
                 if is_rm_from_pack:
                     material_name = str(product_name_for_pack or "Raw Material").strip() or "Raw Material"
                     material_product_id = pid
@@ -16212,6 +17769,7 @@ QWidget#ClientUIRoot {{
                         return
                     s.raw_sacks_count += 1
                     s.raw_material_scans.append(material_name)
+                    owner_ctx = self._scan_owner_context()
                     log_row = {
                         "material_name": material_name,
                         "material_product_id": material_product_id or None,
@@ -16219,6 +17777,7 @@ QWidget#ClientUIRoot {{
                         "qty": qty,
                         "scanned_at": datetime.now(timezone.utc).isoformat(),
                         "source": "PACK_QR_ZRM",
+                        **owner_ctx,
                     }
                     if isinstance(pack_hist, dict):
                         log_row.update(
@@ -16244,6 +17803,7 @@ QWidget#ClientUIRoot {{
                     pack_hist["raw_scan"] = raw_s
                     pack_hist["operator"] = str(s.operator_id or "").strip() or "-"
                     pack_hist["operator_name"] = self._operator_display_name(s.operator_id)
+                    pack_hist.update(self._scan_owner_context())
                     pack_hist["status"] = "ACTIVE"
                     pack_hist["voided"] = False
                     scan_idx = str(pack_hist.get("index") or "").strip()
@@ -16280,6 +17840,7 @@ QWidget#ClientUIRoot {{
                         pack_hist["completed_pack_qty"] = int(qty or 0)
                         pack_hist["good_qty"] = new_butal_qty
                         pack_hist["qty_q"] = new_butal_qty
+                        self._mark_pack_scan_accepted()
                         s.product_pack_history_logs.append(pack_hist)
                         if pack_key:
                             s.product_pack_history_keys.add(pack_key)
@@ -16325,6 +17886,7 @@ QWidget#ClientUIRoot {{
                         )
                         self._show_invalid_overlay("Pack qty must be greater than last shift Butal.")
                         return
+                    self._mark_pack_scan_accepted()
                     s.pack_count += 1
                     s.good_total += new_butal_qty
                     self._clear_last_shift_butal_carryover(scanned_job_code or s.job_code)
@@ -16352,6 +17914,7 @@ QWidget#ClientUIRoot {{
                         defer_snapshot=True,
                     )
                     return
+                self._mark_pack_scan_accepted()
                 s.pack_count += 1
                 s.good_total += qty
                 self._mark_live_cycle_scan_event(units=qty if qty > 0 else 1)
@@ -16402,6 +17965,7 @@ QWidget#ClientUIRoot {{
                         "scanned_at": datetime.now(timezone.utc).isoformat(),
                         "operator": str(s.operator_id or "").strip() or "-",
                         "operator_name": self._operator_display_name(s.operator_id),
+                        **self._scan_owner_context(),
                         "voided": False,
                         "source": "BUTAL",
                         "assigned_job_code": s.job_code,

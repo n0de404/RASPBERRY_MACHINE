@@ -196,6 +196,8 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
     # Production daily report trigger
     if s_l in ("productiondailyreport~1", "pdr_start", "pdrstart"):
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_TRIGGER", raw=raw, value="Production daily report mode")
+    if s_l in ("productiondailyreport~0", "pdr_cancel", "pdrcancel"):
+        return ScanResult(kind="PRODUCTION_DAILY_REPORT_CANCEL", raw=raw, value="Production daily report cancel")
     if s_l in ("productiondailyreport~2", "pdr_done", "pdrdone"):
         return ScanResult(kind="PRODUCTION_DAILY_REPORT_RESOLVE", raw=raw, value="Production daily report resolve")
     if s.isdigit() and 1 <= int(s) <= 15:

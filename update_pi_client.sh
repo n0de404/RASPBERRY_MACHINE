@@ -5,6 +5,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_URL="${MACHINE_SERVER_URL:-}"
 SCANNER_PORT="${MACHINE_SCANNER_COM_PORT:-}"
 SCANNER_MODE="${MACHINE_SCANNER_MODE:-}"
+PACK_SCAN_INTERVAL="${MACHINE_PACK_SCAN_INTERVAL_SECONDS:-}"
 DO_PULL=0
 DO_START=1
 DO_INSTALL_LAUNCHER=1
@@ -21,6 +22,7 @@ Options:
   --server-url URL       Update shortcut/autostart launcher server URL
   --scanner-port PATH    Update shortcut/autostart scanner port
   --scanner-mode MODE    Update shortcut/autostart scanner mode: serial, keyboard, or auto
+  --pack-scan-interval N Update PACK QR scan lock interval in seconds
   --no-start             Rebuild only; do not start the client after build
   --no-launcher-install  Do not refresh desktop/autostart launcher
   -h, --help             Show this help
@@ -48,6 +50,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --scanner-mode)
       SCANNER_MODE="${2:?Missing value for --scanner-mode}"
+      shift 2
+      ;;
+    --pack-scan-interval)
+      PACK_SCAN_INTERVAL="${2:?Missing value for --pack-scan-interval}"
       shift 2
       ;;
     --no-start)
@@ -96,7 +102,7 @@ if [[ -f ".venv/bin/activate" ]]; then
   # shellcheck disable=SC1091
   source ".venv/bin/activate"
 fi
-python -m py_compile client.py mappings.py
+python -m py_compile client.py mappings.py ui_theme.py
 
 echo "Rebuilding client from: $PROJECT_DIR/client.py"
 ./build_client_pi.sh
@@ -122,6 +128,9 @@ if [[ "$DO_INSTALL_LAUNCHER" -eq 1 && -x "$PROJECT_DIR/install_pi_client_autosta
   if [[ -n "$SCANNER_MODE" ]]; then
     install_args+=(--scanner-mode "$SCANNER_MODE")
   fi
+  if [[ -n "$PACK_SCAN_INTERVAL" ]]; then
+    install_args+=(--pack-scan-interval "$PACK_SCAN_INTERVAL")
+  fi
   "$PROJECT_DIR/install_pi_client_autostart.sh" "${install_args[@]}"
 fi
 
@@ -133,7 +142,7 @@ fi
 
 echo
 echo "Starting rebuilt client..."
-mkdir -p "$HOME/.local/state/raspberry-machine-client"
+mkdir -p "$HOME/.local/state/raspberry-machine-client" "$PROJECT_DIR/Database"
 export MACHINE_DATA_DIR="$PROJECT_DIR/Database"
 if [[ -n "$SERVER_URL" ]]; then
   export MACHINE_SERVER_URL="$SERVER_URL"
@@ -143,6 +152,9 @@ if [[ -n "$SCANNER_PORT" ]]; then
 fi
 if [[ -n "$SCANNER_MODE" ]]; then
   export MACHINE_SCANNER_MODE="$SCANNER_MODE"
+fi
+if [[ -n "$PACK_SCAN_INTERVAL" ]]; then
+  export MACHINE_PACK_SCAN_INTERVAL_SECONDS="$PACK_SCAN_INTERVAL"
 fi
 nohup "$PROJECT_DIR/dist/RaspberryMachineClient" \
   >>"$HOME/.local/state/raspberry-machine-client/client.log" 2>&1 &

@@ -7,7 +7,6 @@ project_dir = Path.cwd()
 datas = [
     (str(project_dir / "Animations"), "Animations"),
     (str(project_dir / "Assets"), "Assets"),
-    (str(project_dir / "Database"), "Database"),
     (str(project_dir / "Images"), "Images"),
     (str(project_dir / "PDR_Icon"), "PDR_Icon"),
     (str(project_dir / "digital-7.ttf"), "."),
@@ -15,6 +14,8 @@ datas = [
 ]
 
 hiddenimports = [
+    "mappings",
+    "ui_theme",
     "PyQt6",
     "PyQt6.QtCore",
     "PyQt6.QtGui",
