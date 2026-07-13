@@ -292,5 +292,29 @@
     "source": "APP",
     "actor": "-",
     "message": "Writable Database dir: c:\\Users\\IT\\Desktop\\Raspberry_Machine\\Database"
+  },
+  {
+    "timestamp_utc": "2026-07-11T01:10:15.504130+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-07-11T01:10:15.504130+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Writable Database dir: c:\\Users\\IT\\Desktop\\Raspberry_Machine\\Database"
+  },
+  {
+    "timestamp_utc": "2026-07-11T01:17:56.195078+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Application UI initialized"
+  },
+  {
+    "timestamp_utc": "2026-07-11T01:17:56.195078+00:00",
+    "source": "APP",
+    "actor": "-",
+    "message": "Writable Database dir: c:\\Users\\IT\\Desktop\\Raspberry_Machine\\Database"
   }
 ]

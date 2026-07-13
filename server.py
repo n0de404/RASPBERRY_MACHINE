@@ -1503,6 +1503,7 @@ def load_machine_status_overrides() -> Dict[str, Dict[str, Any]]:
             out[code] = {
                 "status": status,
                 "reason": str(v.get("reason") or "").strip(),
+                "remarks": str(v.get("remarks") or "").strip(),
                 "updated_at_utc": str(v.get("updated_at_utc") or ""),
                 "started_at_utc": str(v.get("started_at_utc") or v.get("updated_at_utc") or ""),
                 "set_by_badge": str(v.get("set_by_badge") or "").strip(),
@@ -1536,6 +1537,7 @@ def load_machine_status_archive() -> List[Dict[str, Any]]:
                 "machine_name": str(row.get("machine_name") or "").strip(),
                 "status": status,
                 "reason": str(row.get("reason") or "").strip(),
+                "remarks": str(row.get("remarks") or "").strip(),
                 "set_by_badge": str(row.get("set_by_badge") or "").strip(),
                 "set_by_name": str(row.get("set_by_name") or "").strip(),
                 "set_by_role": str(row.get("set_by_role") or "").strip(),
@@ -2663,6 +2665,25 @@ def _parse_number_like(value: Any) -> float:
             return 0.0
 
 
+def _fifo_used_raw_qty(raw_logs: List[Dict[str, Any]], consumed_units: float, fallback_part_qty_per_unit: float = 0.0) -> float:
+    remaining_units = max(0.0, _parse_number_like(consumed_units))
+    used_qty = 0.0
+    for item in raw_logs if isinstance(raw_logs, list) else []:
+        if not isinstance(item, dict):
+            continue
+        row_qty = max(0.0, _parse_number_like(item.get("qty", item.get("quantity", 0))))
+        source = str(item.get("part_qty_per_unit_source") or "").strip().lower()
+        row_part_qty = _parse_number_like(item.get("part_qty_per_unit_kg")) if source == "app" else 0.0
+        part_qty_per_unit = max(0.0, row_part_qty or _parse_number_like(fallback_part_qty_per_unit))
+        if row_qty <= 0 or part_qty_per_unit <= 0 or remaining_units <= 0:
+            continue
+        row_units_capacity = row_qty / part_qty_per_unit
+        units_used = min(remaining_units, row_units_capacity)
+        used_qty += min(row_qty, units_used * part_qty_per_unit)
+        remaining_units -= units_used
+    return max(0.0, used_qty)
+
+
 def _extract_primary_part_row(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -2688,10 +2709,19 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
     data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     job = data_obj.get("job") if isinstance(data_obj.get("job"), dict) else {}
     part_row = _extract_primary_part_row(payload)
-    part_qty_per_unit = _parse_number_like(part_row.get("part_qty_per_unit"))
+    part_qty_per_unit = _parse_number_like(row.get("external_average_weight_grams")) / 1000.0
     if part_qty_per_unit <= 0:
         part_qty_per_unit = 0.0
-    total_good = max(0.0, _parse_number_like(row.get("total_good", 0)))
+    consumed_units = max(
+        0.0,
+        _parse_number_like(row.get("good_total", 0))
+        + _parse_number_like(row.get("butal_total", 0))
+        + _parse_number_like(row.get("reject_total", 0))
+        + _parse_number_like(row.get("startup_reject_total", 0))
+        + _parse_number_like(row.get("no_shot_total", 0)),
+    )
+    if consumed_units <= 0:
+        consumed_units = max(0.0, _parse_number_like(row.get("total_good", 0)))
     raw_logs = row.get("raw_material_logs") if isinstance(row.get("raw_material_logs"), list) else []
     pack_logs = row.get("product_pack_history_logs") if isinstance(row.get("product_pack_history_logs"), list) else []
     butal_logs = row.get("butal_scan_logs") if isinstance(row.get("butal_scan_logs"), list) else []
@@ -2700,7 +2730,7 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
         if not isinstance(item, dict):
             continue
         scanned_raw_qty += max(0.0, _parse_number_like(item.get("qty", 0)))
-    used_raw_qty = min(scanned_raw_qty, total_good * part_qty_per_unit)
+    used_raw_qty = min(scanned_raw_qty, _fifo_used_raw_qty(raw_logs, consumed_units, part_qty_per_unit))
     available_raw_qty = max(0.0, scanned_raw_qty - used_raw_qty)
     butal_total = max(0, int(round(_parse_number_like(row.get("butal_total", 0)))))
     plan: List[Dict[str, Any]] = []
@@ -3087,9 +3117,21 @@ def load_server_settings() -> Dict[str, Any]:
     raw = _load_server_settings_sql()
     if not isinstance(raw, dict):
         raise RuntimeError("server_settings SQL storage is unavailable")
+    raw_visible = raw.get("visible_machine_codes")
+    visible_machine_codes = []
+    if isinstance(raw_visible, list):
+        seen_codes = set()
+        for value in raw_visible:
+            code = str(value or "").strip()
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                visible_machine_codes.append(code)
+    else:
+        visible_machine_codes = list(MACHINE_NAME_MAP.keys())
     return {
         "theme": str(raw.get("theme", "Default")).strip() or "Default",
         "qrgen_base_url": str(raw.get("qrgen_base_url", QRGEN_BASE_URL)).strip().rstrip("/"),
+        "visible_machine_codes": visible_machine_codes,
     }
 
 
@@ -3976,6 +4018,7 @@ async def broadcast_state():
         "job_queue": _build_job_queue_rows(),
         "machine_status_overrides": MACHINE_STATUS_OVERRIDES,
         "machine_status_archive": MACHINE_STATUS_ARCHIVE,
+        "visible_machine_codes": SERVER_SETTINGS.get("visible_machine_codes", []),
         "planning_board": PLANNING_BOARD,
         "finished_jobs": FINISHED_JOBS,
         "archived_jobs": ARCHIVED_JOBS,
@@ -4217,7 +4260,7 @@ DASHBOARD_HTML = """
     .sub-tab-content { display:none; }
     .sub-tab-content.active { display:block; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(clamp(150px, 11vw, 190px), 1fr)); gap: clamp(10px, 1.2vw, 18px); }
-    #machineGrid { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); align-items:stretch; perspective:1200px; }
+    #machineGrid { grid-template-columns: repeat(auto-fill, minmax(320px, 360px)); justify-content:start; align-items:stretch; perspective:1200px; }
     .card { min-width:0; background: #fff; border-radius: 12px; padding: clamp(10px, 1vw, 16px); border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform .12s ease, box-shadow .12s ease; }
     .card:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(0,0,0,0.12); }
     .card.active { border-color: #4CAF50; animation: cardPulseGreen 1.5s ease-in-out infinite; }
@@ -4230,6 +4273,7 @@ DASHBOARD_HTML = """
     #machineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
     #machineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; animation:none; background:#fffafa; }
     #machineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; animation:none; background:#fffdf8; }
+    #machineGrid .card.status-alert { border-color:#fdba74; border-top-color:#f97316; background:#fff7ed; animation:machineStatusAlertBlink 1.05s ease-in-out infinite; }
     .machine-card-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; }
     .machine-card-title { min-width:0; display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
     #machineGrid .card .machine-card-title h3 { margin:0; padding:0; border:0; color:#0f172a; font-size:1.16rem; line-height:1.15; }
@@ -4262,6 +4306,17 @@ DASHBOARD_HTML = """
     .machine-metric.good .v { color:#047857; }
     .machine-metric.bad .v { color:#b91c1c; }
     .machine-card-foot { margin-top:0; padding-top:8px; border-top:1px solid #edf2f7; color:#64748b; font-size:.8rem; line-height:1.4; display:grid; gap:2px; }
+    .machine-status-flashcard { display:grid; gap:12px; min-height:100%; }
+    .machine-status-flash-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+    .machine-status-flash-title { min-width:0; display:grid; gap:4px; }
+    .machine-status-flash-title .eyebrow { color:#9a3412; font-size:.72rem; font-weight:900; letter-spacing:.08em; text-transform:uppercase; }
+    #machineGrid .card .machine-status-flash-title h3 { margin:0; padding:0; border:0; color:#7c2d12; font-size:1.24rem; line-height:1.1; overflow-wrap:anywhere; }
+    .machine-status-flash-chip { flex:0 0 auto; border:1px solid #fb923c; background:#ffedd5; color:#9a3412; border-radius:7px; padding:7px 9px; font-size:.72rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
+    .machine-status-flash-grid { display:grid; gap:8px; }
+    .machine-status-flash-item { border:1px solid #fed7aa; border-radius:8px; background:rgba(255,255,255,.78); padding:9px 10px; }
+    .machine-status-flash-item .k { color:#9a3412; font-size:.72rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
+    .machine-status-flash-item .v { margin-top:5px; color:#0f172a; font-size:.95rem; line-height:1.25; font-weight:900; overflow-wrap:anywhere; }
+    .machine-status-flash-item .sub { margin-top:4px; color:#7c2d12; font-size:.84rem; line-height:1.3; overflow-wrap:anywhere; }
     #machineGrid .machine-linkage-flag { display:inline-flex; align-items:center; gap:8px; border:1px solid #bfdbfe; background:#eff6ff; color:#1d4ed8; border-radius:6px; padding:5px 6px 5px 8px; font-size:.64rem; font-weight:900; letter-spacing:.04em; width:max-content; max-width:100%; }
     .machine-notif-wrap { position:absolute; right:12px; bottom:12px; z-index:4; }
     .machine-notif-badge { width:30px; height:30px; border-radius:999px; border:1px solid #fdba74; background:#f59e0b; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:900; font-size:.78rem; box-shadow:0 0 0 3px rgba(245,158,11,.14), 0 8px 18px rgba(146,64,14,.20); cursor:help; }
@@ -4622,6 +4677,12 @@ DASHBOARD_HTML = """
     .settings-row input, .settings-row select { width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 10px; padding: 9px 10px; font: inherit; background: #fff; }
     .settings-actions { margin-top: 12px; display: flex; justify-content: flex-end; gap: 8px; }
     .settings-note { font-size: 0.85rem; color: #64748b; line-height: 1.35; }
+    .machine-picker-actions { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
+    .machine-picker-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(145px, 1fr)); gap:8px; max-height:420px; overflow:auto; padding:4px; }
+    .machine-picker-item { display:flex; align-items:center; gap:8px; border:1px solid #dbe4f0; border-radius:10px; background:#fff; padding:8px 10px; cursor:pointer; user-select:none; }
+    .machine-picker-item input { width:auto; margin:0; }
+    .machine-picker-item span { min-width:0; color:#0f172a; font-size:.86rem; font-weight:850; overflow-wrap:anywhere; }
+    .machine-picker-item small { color:#64748b; font-weight:750; }
     .people-role-list { margin-top: 10px; border: 1px solid #dbe4f0; border-radius: 12px; background: #fff; overflow: hidden; }
     .people-role-row { display: grid; grid-template-columns: 1.15fr .75fr .9fr .9fr .9fr; gap: 8px; padding: 8px 10px; border-bottom: 1px solid #eef2f7; font-size: 0.84rem; align-items: center; }
     .people-role-row:last-child { border-bottom: none; }
@@ -4737,6 +4798,10 @@ DASHBOARD_HTML = """
       0% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(255,152,0,0.30); }
       50% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 8px rgba(255,152,0,0.14); }
       100% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(255,152,0,0.00); }
+    }
+    @keyframes machineStatusAlertBlink {
+      0%, 100% { border-color:#fdba74; border-top-color:#f97316; box-shadow:0 8px 20px rgba(15,23,42,.06), 0 0 0 0 rgba(249,115,22,.34); }
+      50% { border-color:#f97316; border-top-color:#ea580c; box-shadow:0 8px 20px rgba(15,23,42,.06), 0 0 0 8px rgba(249,115,22,.14); }
     }
     @keyframes statusBeatGreen {
       0%, 100% { transform:scale(1); box-shadow:0 0 0 3px rgba(34,197,94,.18), 0 0 8px rgba(34,197,94,.28); }
@@ -4986,7 +5051,7 @@ DASHBOARD_HTML = """
     }
     @media (max-width: 1200px) {
       .diagnostics { grid-template-columns: repeat(4, 48px) repeat(2, minmax(150px, 1fr)); }
-      #machineGrid { grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); }
+      #machineGrid { grid-template-columns:repeat(auto-fill, minmax(260px, 320px)); }
       .maintenance-summary { grid-template-columns:repeat(2, minmax(0, 1fr)); }
       #maintenanceTab .maintenance-person { grid-template-columns:64px minmax(0,1fr); }
       #maintenanceTab .maintenance-stats { grid-column:1 / -1; border-left:none; border-top:1px solid #e5ecf4; }
@@ -5473,6 +5538,10 @@ DASHBOARD_HTML = """
           <textarea id="machineDetailStatusReason" placeholder="Enter reason (e.g. waiting parts, no schedule, breakdown details)..."></textarea>
         </div>
         <div class="row" style="grid-template-columns: 160px 1fr;">
+          <label for="machineDetailStatusRemarks">Remarks</label>
+          <textarea id="machineDetailStatusRemarks" placeholder="Add supervisor remarks or action notes..."></textarea>
+        </div>
+        <div class="row" style="grid-template-columns: 160px 1fr;">
           <label for="machineDetailStatusSetterBadge">User QR (Required)</label>
           <input id="machineDetailStatusSetterBadge" type="text" placeholder="Scan user QR badge to confirm..." />
         </div>
@@ -5533,6 +5602,7 @@ DASHBOARD_HTML = """
         <div class="settings-nav">
           <button id="settingsNavGeneral" class="settings-nav-btn active" type="button">Settings</button>
           <button id="settingsNavTheme" class="settings-nav-btn" type="button">Theme</button>
+          <button id="settingsNavMachines" class="settings-nav-btn" type="button">Machines</button>
           <button id="settingsNavApi" class="settings-nav-btn" type="button">API Configuration</button>
           <button id="settingsNavProfile" class="settings-nav-btn" type="button">Profile</button>
         </div>
@@ -5563,6 +5633,19 @@ DASHBOARD_HTML = """
                 </select>
               </div>
               <div class="settings-note">Theme setting is saved on the server and can be used for future dashboard styling variants.</div>
+            </div>
+          </div>
+          <div id="settingsPageMachines" class="settings-page">
+            <div class="settings-form">
+              <div class="settings-note">Select which machines appear on the OPR dashboard. Machines with a live status override still use the same orange alert card when visible.</div>
+              <div class="machine-picker-actions">
+                <button id="settingsMachinesAllBtn" class="btn-secondary" type="button">Show All</button>
+                <button id="settingsMachinesNoneBtn" class="btn-secondary" type="button">Hide All</button>
+              </div>
+              <div id="settingsMachinePickerGrid" class="machine-picker-grid"></div>
+              <div class="settings-actions">
+                <button id="settingsMachinesSaveBtn" class="btn-primary" type="button">Apply Machine View</button>
+              </div>
             </div>
           </div>
           <div id="settingsPageApi" class="settings-page">
@@ -5674,10 +5757,12 @@ DASHBOARD_HTML = """
   const serverSettingsCloseBtn = document.getElementById("serverSettingsCloseBtn");
   const settingsNavGeneral = document.getElementById("settingsNavGeneral");
   const settingsNavTheme = document.getElementById("settingsNavTheme");
+  const settingsNavMachines = document.getElementById("settingsNavMachines");
   const settingsNavApi = document.getElementById("settingsNavApi");
   const settingsNavProfile = document.getElementById("settingsNavProfile");
   const settingsPageGeneral = document.getElementById("settingsPageGeneral");
   const settingsPageTheme = document.getElementById("settingsPageTheme");
+  const settingsPageMachines = document.getElementById("settingsPageMachines");
   const settingsPageApi = document.getElementById("settingsPageApi");
   const settingsPageProfile = document.getElementById("settingsPageProfile");
   const settingsServerHost = document.getElementById("settingsServerHost");
@@ -5689,6 +5774,10 @@ DASHBOARD_HTML = """
   const settingsProductsCacheFile = document.getElementById("settingsProductsCacheFile");
   const settingsProductsStatus = document.getElementById("settingsProductsStatus");
   const settingsProductsRefreshBtn = document.getElementById("settingsProductsRefreshBtn");
+  const settingsMachinePickerGrid = document.getElementById("settingsMachinePickerGrid");
+  const settingsMachinesAllBtn = document.getElementById("settingsMachinesAllBtn");
+  const settingsMachinesNoneBtn = document.getElementById("settingsMachinesNoneBtn");
+  const settingsMachinesSaveBtn = document.getElementById("settingsMachinesSaveBtn");
   const settingsProfilesTableBody = document.getElementById("settingsProfilesTableBody");
   const serverSettingsSaveBtn = document.getElementById("serverSettingsSaveBtn");
   const dailyRolesOverlay = document.getElementById("dailyRolesOverlay");
@@ -5803,6 +5892,7 @@ DASHBOARD_HTML = """
   const machineDetailStatusPanel = document.getElementById("machineDetailStatusPanel");
   const machineDetailStatusSelect = document.getElementById("machineDetailStatusSelect");
   const machineDetailStatusReason = document.getElementById("machineDetailStatusReason");
+  const machineDetailStatusRemarks = document.getElementById("machineDetailStatusRemarks");
   const machineDetailStatusSetterBadge = document.getElementById("machineDetailStatusSetterBadge");
   const machineDetailStatusSaveBtn = document.getElementById("machineDetailStatusSaveBtn");
   const machineStatusSaveFeedback = document.getElementById("machineStatusSaveFeedback");
@@ -5884,6 +5974,7 @@ DASHBOARD_HTML = """
   let dailyRolesState = {};
   let settingsProfilesState = [];
   let machineStatusOverridesState = {};
+  let visibleMachineCodesState = [];
   let activeMachineDetailCode = "";
   let userKpiRoleState = "operator";
   let userKpiLoading = false;
@@ -6471,32 +6562,101 @@ DASHBOARD_HTML = """
     return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
 
+  function consumedUnitCount(item){
+    const row = (item && typeof item === "object") ? item : {};
+    const totalGood = Number(row.total_good ?? row.partial_qty ?? ((Number(row.good_total || 0) + Number(row.butal_total || 0))));
+    return Math.max(0,
+      Number(row.good_total || 0) +
+      Number(row.butal_total || 0) +
+      Number(row.reject_total || 0) +
+      Number(row.startup_reject_total || 0) +
+      Number(row.no_shot_total || 0)
+    ) || totalGood;
+  }
+
+  function rawLogsForPart(materialRows, part, totalPartCount){
+    const rows = Array.isArray(materialRows) ? materialRows.filter(x => x && typeof x === "object") : [];
+    const p = (part && typeof part === "object") ? part : {};
+    const keys = [p.sku, p.name, p.part_name, p.material_name, p.product_name, p.description, p.part_code, p.product_code, p.code]
+      .map(materialKeyText).filter(Boolean);
+    if(!keys.length) return Number(totalPartCount || 0) <= 1 ? rows : [];
+    const matched = rows.filter(raw => {
+      const rawKeys = [
+        raw.material,
+        raw.material_name,
+        raw.material_code,
+        raw.material_product_id,
+        raw.material_sku,
+        raw.lot,
+      ].map(materialKeyText).filter(Boolean);
+      return rawKeys.some(k => keys.some(pk => k.includes(pk) || pk.includes(k)));
+    });
+    return matched.length || Number(totalPartCount || 0) > 1 ? matched : rows;
+  }
+
+  function rawConsumptionForPart(materialRows, part, units, totalPartCount, appPartQtyKg){
+    const rows = rawLogsForPart(materialRows, part, totalPartCount);
+    const sku = String(part?.sku || part?.part_sku || part?.product_sku || "").trim().toUpperCase();
+    const name = String(part?.name || part?.part_name || part?.material_name || "").trim().toUpperCase();
+    const isMaterial = sku.startsWith("Z-RM") || /\bKGS?\b/.test(name);
+    const fallbackPerUnit = isMaterial
+      ? Math.max(0, Number(appPartQtyKg || 0))
+      : Number(part?.part_qty_per_unit || part?.qty_per_unit || 0);
+    const scanned = rows.reduce((sum, raw) => sum + Math.max(0, Number(raw.qty || raw.quantity || 0)), 0);
+    let remainingUnits = Math.max(0, Number(units || 0));
+    let used = 0;
+    let required = 0;
+    rows.forEach(raw => {
+      if(remainingUnits <= 0) return;
+      const rowQty = Math.max(0, Number(raw.qty || raw.quantity || 0));
+      const rowSource = String(raw.part_qty_per_unit_source || "").trim().toLowerCase();
+      const perUnit = isMaterial
+        ? Math.max(0, Number(rowSource === "app" ? raw.part_qty_per_unit_kg : 0) || fallbackPerUnit || 0)
+        : Math.max(0, Number(raw.part_qty_per_unit || fallbackPerUnit || 1));
+      if(rowQty <= 0 || perUnit <= 0) return;
+      const unitCapacity = rowQty / perUnit;
+      const unitsUsed = Math.min(remainingUnits, unitCapacity);
+      const requiredForRow = unitsUsed * perUnit;
+      required += requiredForRow;
+      used += Math.min(rowQty, requiredForRow);
+      remainingUnits -= unitsUsed;
+    });
+    if(remainingUnits > 0 && fallbackPerUnit > 0) required += remainingUnits * fallbackPerUnit;
+    return { scanned, required, used: Math.min(scanned, used), available: Math.max(0, scanned - used) };
+  }
+
   function rawMaterialInsightsHtml(row){
     const item = (row && typeof row === "object") ? row : {};
     const materialRows = archivedMaterialRows(item);
     const parts = rawPartRows(item);
-    const totalGood = Number(item.total_good ?? item.partial_qty ?? ((Number(item.good_total || 0) + Number(item.butal_total || 0))));
+    const consumedUnits = consumedUnitCount(item);
+    const appPartQtyKg = Math.max(0, Number(item.external_average_weight_grams || 0) / 1000);
     const scannedQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
     const expectedQty = parts.reduce((sum, part) => {
-      const perUnit = Number(part.part_qty_per_unit || part.qty_per_unit || 0);
       const fixedQty = Number(part.request_part_qty || part.required_qty || part.qty || part.quantity || 0);
-      return sum + Math.max(0, perUnit > 0 ? perUnit * totalGood : fixedQty);
+      const skuForExpected = String(part.sku || part.part_sku || part.product_sku || "").trim().toUpperCase();
+      const nameForExpected = String(part.name || part.part_name || part.material_name || "").trim().toUpperCase();
+      const isMaterialForExpected = skuForExpected.startsWith("Z-RM") || /\bKGS?\b/.test(nameForExpected);
+      const perUnit = isMaterialForExpected ? appPartQtyKg : Number(part.part_qty_per_unit || part.qty_per_unit || 0);
+      const consumption = rawConsumptionForPart(materialRows, part, consumedUnits, parts.length, appPartQtyKg);
+      return sum + Math.max(0, perUnit > 0 ? consumption.required : fixedQty);
     }, 0);
     const estimatedUsed = expectedQty > 0 ? Math.min(scannedQty, expectedQty) : "";
     const estimatedExcess = expectedQty > 0 ? Math.max(0, scannedQty - expectedQty) : "";
     const partMatches = parts.map(part => {
       const keys = [part.sku, part.name, part.part_name, part.material_name, part.product_name, part.description, part.part_code, part.product_code, part.code]
         .map(materialKeyText).filter(Boolean);
-      const scanned = materialRows.reduce((sum, raw) => {
-        const rawKeys = [raw.material, raw.lot].map(materialKeyText).filter(Boolean);
-        const hit = keys.length && rawKeys.some(k => keys.some(pk => k.includes(pk) || pk.includes(k)));
-        return hit ? sum + Math.max(0, Number(raw.qty || 0)) : sum;
-      }, 0);
-      const perUnit = Number(part.part_qty_per_unit || part.qty_per_unit || 0);
-      const required = Math.max(0, perUnit > 0 ? perUnit * totalGood : Number(part.request_part_qty || part.required_qty || part.qty || part.quantity || 0));
+      const consumption = rawConsumptionForPart(materialRows, part, consumedUnits, parts.length, appPartQtyKg);
+      const scanned = consumption.scanned;
+      const sku = String(part.sku || part.part_sku || part.product_sku || "").trim().toUpperCase();
+      const name = String(part.name || part.part_name || part.material_name || "").trim().toUpperCase();
+      const isMaterial = sku.startsWith("Z-RM") || /\bKGS?\b/.test(name);
+      const perUnit = isMaterial ? appPartQtyKg : Number(part.part_qty_per_unit || part.qty_per_unit || 0);
+      const required = Math.max(0, perUnit > 0 ? consumption.required : Number(part.request_part_qty || part.required_qty || part.qty || part.quantity || 0));
       const status = required <= 0 ? "info" : (scanned >= required ? "good" : (scanned > 0 ? "warn" : "bad"));
       const statusText = required <= 0 ? "No target" : (scanned >= required ? "Covered" : (scanned > 0 ? "Short" : "Missing"));
-      return { part, scanned, required, status, statusText };
+      const displayPerUnit = isMaterial ? (appPartQtyKg > 0 ? `${appPartQtyKg.toFixed(4)} kg` : "-") : (part.part_qty_per_unit || part.qty_per_unit || "-");
+      return { part, scanned, required, status, statusText, displayPerUnit };
     });
     const cards = `
       <div class="raw-insight-grid">
@@ -6517,7 +6677,7 @@ DASHBOARD_HTML = """
             <div class="raw-match-meta">
               <span>Required: ${esc(x.required || "-")}</span>
               <span>Scanned: ${esc(x.scanned || 0)}</span>
-              <span>Per Unit: ${esc(x.part.part_qty_per_unit || x.part.qty_per_unit || "-")}</span>
+              <span>Per Unit: ${esc(x.displayPerUnit || "-")}</span>
               <span>Code: ${esc(x.part.sku || x.part.part_code || x.part.product_code || x.part.code || "-")}</span>
             </div>
           </div>
@@ -6582,7 +6742,9 @@ DASHBOARD_HTML = """
     const scannedRawQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
     const part = primaryRawPart(row);
     const perUnit = Number(part.part_qty_per_unit || 0);
-    const estimatedUsed = perUnit > 0 ? totalGood * perUnit : 0;
+    const consumedUnits = consumedUnitCount(Object.assign({}, session || {}, row || {})) || totalGood;
+    const appPartQtyKg = Math.max(0, Number(row.external_average_weight_grams || session.external_average_weight_grams || 0) / 1000);
+    const estimatedUsed = perUnit > 0 ? rawConsumptionForPart(materialRows, part, consumedUnits, rawPartRows(row).length || 1, appPartQtyKg).used : 0;
     const estimatedExcess = estimatedUsed > 0 ? Math.max(0, scannedRawQty - estimatedUsed) : "";
     const printRows = archivePrintRows(session);
     const reviewLogs = Array.isArray(row.reject_review_logs) ? row.reject_review_logs : [];
@@ -6719,6 +6881,7 @@ DASHBOARD_HTML = """
     const manual = machineStatusOverrideFor(activeMachineDetailCode);
     const manualStatus = String((manual && manual.status) || "").trim();
     const manualReason = String((manual && manual.reason) || "").trim();
+    const manualRemarks = String((manual && manual.remarks) || "").trim();
     const status = manualStatus || statusClass(session.last_seen_utc, activeTtlSeconds, "", session).toUpperCase();
     const maintenanceMode = isMaintenanceSession(session);
     const totalGood = Number(session.good_total || 0) + Number(session.butal_total || 0);
@@ -6770,6 +6933,7 @@ DASHBOARD_HTML = """
     machineDetailTitle.textContent = `${session.machine_name || session.machine_code || "Machine"} Details`;
     if(machineDetailStatusSelect) machineDetailStatusSelect.value = manualStatus;
     if(machineDetailStatusReason) machineDetailStatusReason.value = manualReason;
+    if(machineDetailStatusRemarks) machineDetailStatusRemarks.value = manualRemarks;
     if(machineDetailStatusSetterBadge) machineDetailStatusSetterBadge.value = "";
     if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
     machineDetailBody.innerHTML = `
@@ -6782,6 +6946,7 @@ DASHBOARD_HTML = """
           ${detailItem("Machine Name", session.machine_name || "-")}
           ${detailItem("Status", status)}
           ${detailItem("Status Reason", manualReason || "-")}
+          ${detailItem("Status Remarks", manualRemarks || "-")}
           ${detailItem("Status Set By", (manual && manual.set_by_name) ? `${manual.set_by_name}${manual.set_by_role ? ` (${manual.set_by_role})` : ""}` : "-")}
           ${detailItem("Status Set At", fmtDateLocal((manual && (manual.started_at_utc || manual.updated_at_utc)) || ""))}
           ${detailItem("Client", displayNameForId(session.client_id || "-"))}
@@ -6907,6 +7072,7 @@ DASHBOARD_HTML = """
     const map = {
       general: [settingsNavGeneral, settingsPageGeneral],
       theme: [settingsNavTheme, settingsPageTheme],
+      machines: [settingsNavMachines, settingsPageMachines],
       api: [settingsNavApi, settingsPageApi],
       profile: [settingsNavProfile, settingsPageProfile],
     };
@@ -6915,6 +7081,26 @@ DASHBOARD_HTML = """
       btn?.classList.toggle("active", k === key);
       page?.classList.toggle("active", k === key);
     });
+  }
+
+  function selectedVisibleMachineCodes(){
+    const checks = settingsMachinePickerGrid ? Array.from(settingsMachinePickerGrid.querySelectorAll('input[data-machine-code]')) : [];
+    return checks.filter(x => x.checked).map(x => String(x.dataset.machineCode || "").trim()).filter(Boolean);
+  }
+
+  function renderMachinePicker(){
+    if(!settingsMachinePickerGrid) return;
+    const selected = new Set((Array.isArray(visibleMachineCodesState) ? visibleMachineCodesState : DEFAULT_MACHINE_CODES).map(x => String(x || "").trim()));
+    settingsMachinePickerGrid.innerHTML = DEFAULT_MACHINE_CODES.map(code => {
+      const name = MACHINE_NAME_MAP[code] || code;
+      const checked = selected.has(code) ? "checked" : "";
+      return `
+        <label class="machine-picker-item">
+          <input type="checkbox" data-machine-code="${esc(code)}" ${checked} />
+          <span>${esc(name)}<br><small>${esc(code)}</small></span>
+        </label>
+      `;
+    }).join("");
   }
 
   function normalizeCompanyRoleLabel(role){
@@ -7008,10 +7194,13 @@ DASHBOARD_HTML = """
       serverSettingsState = {
         theme: s.theme || "Default",
         qrgen_base_url: s.qrgen_base_url || "",
+        visible_machine_codes: Array.isArray(s.visible_machine_codes) ? s.visible_machine_codes : [],
       };
+      visibleMachineCodesState = serverSettingsState.visible_machine_codes;
       if(applyTheme) applyDashboardTheme(serverSettingsState.theme);
       if(settingsThemeSelect) settingsThemeSelect.value = serverSettingsState.theme;
       if(settingsQrApiBaseUrl) settingsQrApiBaseUrl.value = serverSettingsState.qrgen_base_url;
+      renderMachinePicker();
     } catch {}
     await loadProductsSettingsInfo(false);
   }
@@ -7048,6 +7237,7 @@ DASHBOARD_HTML = """
     const payload = {
       theme: (settingsThemeSelect?.value || "Default").trim(),
       qrgen_base_url: (settingsQrApiBaseUrl?.value || "").trim(),
+      visible_machine_codes: selectedVisibleMachineCodes(),
     };
     if(!payload.qrgen_base_url){
       alert("QR Print API Base URL is required.");
@@ -7065,7 +7255,10 @@ DASHBOARD_HTML = """
       return;
     }
     serverSettingsState = out.settings || payload;
+    visibleMachineCodesState = Array.isArray(serverSettingsState.visible_machine_codes) ? serverSettingsState.visible_machine_codes : [];
     applyDashboardTheme(serverSettingsState.theme);
+    renderMachinePicker();
+    render(latestState);
     alert("Server settings applied.");
   }
 
@@ -7526,8 +7719,10 @@ DASHBOARD_HTML = """
     const part = primaryRawPart(item);
     const partQtyPerUnit = Number(part.part_qty_per_unit || 0);
     const totalGood = Number(item.total_good ?? ((Number(item.good_total || 0) + Number(item.butal_total || 0))));
+    const consumedUnits = consumedUnitCount(item) || totalGood;
     const scannedRawQty = rawLogs.reduce((sum, x) => sum + Math.max(0, Number(x?.qty || x?.quantity || 0)), 0);
-    const usedRawQty = partQtyPerUnit > 0 ? Math.min(scannedRawQty, totalGood * partQtyPerUnit) : 0;
+    const appPartQtyKg = Math.max(0, Number(item.external_average_weight_grams || 0) / 1000);
+    const usedRawQty = partQtyPerUnit > 0 ? rawConsumptionForPart(rawLogs, part, consumedUnits, rawPartRows(item).length || 1, appPartQtyKg).used : 0;
     const rawExcessQty = Math.max(0, Math.floor(scannedRawQty - usedRawQty));
     const butalQty = Math.max(0, Number(item.butal_total || 0));
     const latestRaw = rawLogs.length ? rawLogs[rawLogs.length - 1] : {};
@@ -8268,6 +8463,7 @@ DASHBOARD_HTML = """
             <th>Machine</th>
             <th>Status</th>
             <th>Reason</th>
+            <th>Remarks</th>
             <th>Set By</th>
             <th>Start</th>
             <th>End</th>
@@ -8284,6 +8480,7 @@ DASHBOARD_HTML = """
                 <td>${esc(machineName)}<br><span class="muted">${esc(machineCode)}</span></td>
                 <td>${esc(r.status || "-")}</td>
                 <td>${esc(r.reason || "-")}</td>
+                <td>${esc(r.remarks || "-")}</td>
                 <td>${esc(by)}<br><span class="muted">${esc(r.set_by_badge || "-")}</span></td>
                 <td>${esc(fmtDateLocal(r.started_at_utc || ""))}</td>
                 <td>${esc(fmtDateLocal(r.ended_at_utc || ""))}</td>
@@ -9763,10 +9960,12 @@ DASHBOARD_HTML = """
     const s = (latestState.sessions || []).find(x => String(x.machine_code || "").trim() === code);
     if(!card || !s) return;
     const activeTtlSeconds = Number((latestState && latestState.active_ttl_seconds) || 30);
-    const manualStatus = machineStatusOverrideFor(code);
+    const manual = machineStatusOverrideFor(code);
+    const manualStatus = String((manual && manual.status) || "").trim();
     const css = statusClass(s.last_seen_utc, activeTtlSeconds, manualStatus, s) || "disconnected";
     const statusLabel = manualStatus || css.toUpperCase();
-    const baseClassName = `card ${css}`;
+    const hasStatusAlert = Boolean(manualStatus);
+    const baseClassName = `card ${css}${hasStatusAlert ? " status-alert" : ""}`;
     const nextClassName = `${baseClassName}${flipLinkage ? " linkage-flip" : ""}`;
     const nextHtml = machineCardHtml(s, code, css, statusLabel, flipLinkage);
     card.className = baseClassName;
@@ -9814,6 +10013,40 @@ DASHBOARD_HTML = """
   }
 
   function machineCardHtml(s, code, css, statusLabel, flipLinkage = false){
+    const manual = machineStatusOverrideFor(code);
+    const manualStatus = String((manual && manual.status) || "").trim();
+    if(manualStatus){
+      const machineName = s.machine_name || MACHINE_NAME_MAP[code] || s.machine_code || code || "-";
+      const supervisor = firstValue(manual.set_by_name, manual.supervisor_name, manual.set_by_badge, "-");
+      const supervisorRole = String(manual.set_by_role || "").trim();
+      const reason = firstValue(manual.reason, manual.status_reason, "-");
+      const remarks = firstValue(manual.remarks, manual.remark, manual.notes, "-");
+      return `
+        <div class="machine-status-flashcard">
+          <div class="machine-status-flash-head">
+            <div class="machine-status-flash-title">
+              <div class="eyebrow">Machine Status</div>
+              <h3>${esc(machineName)}</h3>
+            </div>
+            <span class="machine-status-flash-chip">${esc(manualStatus)}</span>
+          </div>
+          <div class="machine-status-flash-grid">
+            <div class="machine-status-flash-item">
+              <div class="k">Supervisor</div>
+              <div class="v">${esc(supervisor)}${supervisorRole ? ` (${esc(supervisorRole)})` : ""}</div>
+            </div>
+            <div class="machine-status-flash-item">
+              <div class="k">Reason / Status</div>
+              <div class="v">${esc(reason || manualStatus)}</div>
+            </div>
+            <div class="machine-status-flash-item">
+              <div class="k">Remarks</div>
+              <div class="v">${esc(remarks || "-")}</div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
     const linkageJobs = Array.isArray(s.linkage_jobs) ? s.linkage_jobs : [];
     const hasLinkage = Boolean(s.linkage_enabled) && linkageJobs.length > 0;
     const linkageDisplay = hasLinkage ? machineLinkageDisplay(s, code) : null;
@@ -9890,7 +10123,9 @@ DASHBOARD_HTML = """
       });
       machineCardEls.set(code, card);
     }
-    const nextClassName = `card ${css}`;
+    const manual = machineStatusOverrideFor(code);
+    const hasStatusAlert = Boolean(String((manual && manual.status) || "").trim());
+    const nextClassName = `card ${css}${hasStatusAlert ? " status-alert" : ""}`;
     const nextHtml = machineCardHtml(s, code, css, statusLabel);
     const nextRenderSig = `${nextClassName}|${nextHtml}`;
     if(card.dataset.renderSig !== nextRenderSig){
@@ -9909,6 +10144,7 @@ DASHBOARD_HTML = """
     latestState = state || { sessions: [] };
     machineStatusOverridesState = (state && state.machine_status_overrides && typeof state.machine_status_overrides === "object") ? state.machine_status_overrides : {};
     machineStatusArchiveState = (state && Array.isArray(state.machine_status_archive)) ? state.machine_status_archive : [];
+    visibleMachineCodesState = (state && Array.isArray(state.visible_machine_codes)) ? state.visible_machine_codes : visibleMachineCodesState;
     timeEl.textContent = "Server UTC: " + (state.server_time_utc || "-");
     const sessions = state.sessions || [];
     const activeTtlSeconds = Number(state.active_ttl_seconds || 30);
@@ -9916,7 +10152,14 @@ DASHBOARD_HTML = """
     const sessionCodes = sessions
       .map(s => String(s.machine_code || "").trim())
       .filter(Boolean);
-    const allCodes = Array.from(new Set([...DEFAULT_MACHINE_CODES, ...sessionCodes])).sort();
+    const overrideCodes = Object.keys(machineStatusOverridesState || {})
+      .map(code => String(code || "").trim())
+      .filter(Boolean);
+    const configuredVisible = Array.isArray(visibleMachineCodesState) ? visibleMachineCodesState.map(code => String(code || "").trim()).filter(Boolean) : DEFAULT_MACHINE_CODES;
+    const visibleSet = new Set(configuredVisible);
+    const allCodes = Array.from(new Set([...DEFAULT_MACHINE_CODES, ...sessionCodes, ...overrideCodes]))
+      .filter(code => visibleSet.has(code))
+      .sort();
     machineCountEl.textContent = String(allCodes.length);
 
     const desiredCodes = new Set(allCodes);
@@ -10171,10 +10414,22 @@ DASHBOARD_HTML = """
   }
   settingsNavGeneral?.addEventListener("click", () => showServerSettingsPage("general"));
   settingsNavTheme?.addEventListener("click", () => showServerSettingsPage("theme"));
+  settingsNavMachines?.addEventListener("click", () => { renderMachinePicker(); showServerSettingsPage("machines"); });
   settingsNavApi?.addEventListener("click", () => showServerSettingsPage("api"));
   settingsNavProfile?.addEventListener("click", async () => { await loadSettingsProfilesUi(); showServerSettingsPage("profile"); });
   settingsThemeSelect?.addEventListener("change", () => applyDashboardTheme(settingsThemeSelect.value));
   serverSettingsSaveBtn?.addEventListener("click", saveServerSettingsUi);
+  settingsMachinesSaveBtn?.addEventListener("click", saveServerSettingsUi);
+  settingsMachinesAllBtn?.addEventListener("click", () => {
+    visibleMachineCodesState = [...DEFAULT_MACHINE_CODES];
+    renderMachinePicker();
+  });
+  settingsMachinesNoneBtn?.addEventListener("click", () => {
+    visibleMachineCodesState = [];
+    if(settingsMachinePickerGrid){
+      settingsMachinePickerGrid.querySelectorAll('input[data-machine-code]').forEach(x => { x.checked = false; });
+    }
+  });
   settingsProductsRefreshBtn?.addEventListener("click", async () => {
     await loadProductsSettingsInfo(true);
   });
@@ -10275,6 +10530,7 @@ DASHBOARD_HTML = """
     const status = String(machineDetailStatusSelect?.value || "").trim();
     const isClearLikeStatus = (status === "" || status === "Working");
     const reason = String(machineDetailStatusReason?.value || "").trim();
+    const remarks = String(machineDetailStatusRemarks?.value || "").trim();
     const setterBadge = String(machineDetailStatusSetterBadge?.value || "").trim();
     if(!isClearLikeStatus && !reason){
       alert("Reason is required before confirming machine status.");
@@ -10299,7 +10555,7 @@ DASHBOARD_HTML = """
       const r = await fetch('/api/machines/status', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ machine_code: machineCode, status, reason, setter_badge: setterBadge })
+        body: JSON.stringify({ machine_code: machineCode, status, reason, remarks, setter_badge: setterBadge })
       });
       const j = await r.json().catch(() => ({}));
       window.clearInterval(anim);
@@ -11310,6 +11566,7 @@ async def api_machine_status_set(req: Request):
     machine_code = str(data.get("machine_code", "")).strip()
     status = str(data.get("status", "")).strip()
     reason = str(data.get("reason", "")).strip()
+    remarks = str(data.get("remarks", "")).strip()
     setter_badge = str(data.get("setter_badge", "")).strip()
     clear_like = {"", "Working"}
     valid = {"", "Working", "No schedule", "Scheduled for fix", "Not working"}
@@ -11355,6 +11612,7 @@ async def api_machine_status_set(req: Request):
         MACHINE_STATUS_OVERRIDES[machine_code] = {
             "status": status,
             "reason": reason,
+            "remarks": remarks,
             "updated_at_utc": now.isoformat(),
             "started_at_utc": now.isoformat(),
             "set_by_badge": setter["code"],
@@ -11367,6 +11625,7 @@ async def api_machine_status_set(req: Request):
                 "machine_name": machine_name,
                 "status": status,
                 "reason": reason,
+                "remarks": remarks,
                 "set_by_badge": setter["code"],
                 "set_by_name": setter["name"],
                 "set_by_role": setter.get("role", ""),
@@ -11625,6 +11884,55 @@ async def api_event(req: Request):
             ]
             rows.append(shift_payload)
             sess.operator_shift_logs = rows[-40:]
+    elif ev_type == "RAW_MATERIAL":
+        material_name = str(ev.get("material") or ev.get("material_name") or "Raw Material").strip() or "Raw Material"
+        qty = int(ev.get("qty", 1) or 1)
+        raw_row = ev.get("raw_material_log")
+        if isinstance(raw_row, dict):
+            row = dict(raw_row)
+        else:
+            row = {
+                "material": material_name,
+                "material_name": material_name,
+                "qty": qty,
+                "unique_key": ev.get("unique_key") or None,
+                "raw_job_code": ev.get("raw_job_code") or None,
+                "source": ev.get("source") or "RAW_MATERIAL",
+                "scanned_at": utc_now().isoformat(),
+            }
+        row["material"] = str(row.get("material") or row.get("material_name") or material_name).strip() or material_name
+        row["material_name"] = str(row.get("material_name") or row.get("material") or material_name).strip() or material_name
+        row["qty"] = int(row.get("qty", qty) or qty)
+        row.setdefault("scanned_at", utc_now().isoformat())
+        unique_key = str(row.get("unique_key") or ev.get("unique_key") or "").strip()
+        existing_rows = [x for x in (sess.raw_material_logs or []) if isinstance(x, dict)]
+        duplicate = False
+        if unique_key:
+            duplicate = any(str(x.get("unique_key") or "").strip() == unique_key for x in existing_rows)
+        else:
+            row_signature = (
+                str(row.get("material_name") or ""),
+                str(row.get("qty") or ""),
+                str(row.get("index") or ""),
+                str(row.get("lot_number") or ""),
+                str(row.get("po_number") or ""),
+                str(row.get("scanned_at") or ""),
+            )
+            duplicate = any(
+                (
+                    str(x.get("material_name") or ""),
+                    str(x.get("qty") or ""),
+                    str(x.get("index") or ""),
+                    str(x.get("lot_number") or ""),
+                    str(x.get("po_number") or ""),
+                    str(x.get("scanned_at") or ""),
+                ) == row_signature
+                for x in existing_rows
+            )
+        if not duplicate:
+            sess.raw_material_logs = (sess.raw_material_logs or []) + [row]
+            sess.raw_material_scans = (sess.raw_material_scans or []) + [row["material_name"]]
+            sess.raw_sacks_count = int(sess.raw_sacks_count or 0) + 1
     elif ev_type == "MACHINE_STATUS":
         status = str(ev.get("status") or "").strip().upper()
         if status == "NO_JOB_RUNNING":
@@ -12061,6 +12369,7 @@ def api_server_settings():
         "settings": {
             "theme": str(SERVER_SETTINGS.get("theme", "Default")),
             "qrgen_base_url": current_qrgen_base_url(),
+            "visible_machine_codes": SERVER_SETTINGS.get("visible_machine_codes", []),
         },
     }
 
@@ -12114,13 +12423,24 @@ async def api_server_settings_save(req: Request):
     data = await req.json()
     theme = str(data.get("theme", SERVER_SETTINGS.get("theme", "Default"))).strip() or "Default"
     qrgen_base_url = str(data.get("qrgen_base_url", current_qrgen_base_url())).strip().rstrip("/")
+    raw_visible = data.get("visible_machine_codes", SERVER_SETTINGS.get("visible_machine_codes", []))
+    visible_machine_codes: List[str] = []
+    if isinstance(raw_visible, list):
+        seen_codes = set()
+        for value in raw_visible:
+            code = str(value or "").strip()
+            if code and code in MACHINE_NAME_MAP and code not in seen_codes:
+                seen_codes.add(code)
+                visible_machine_codes.append(code)
     if not qrgen_base_url:
         return JSONResponse({"ok": False, "error": "qrgen_base_url is required"}, status_code=400)
     SERVER_SETTINGS = {
         "theme": theme,
         "qrgen_base_url": qrgen_base_url,
+        "visible_machine_codes": visible_machine_codes,
     }
     save_server_settings(SERVER_SETTINGS)
+    await broadcast_state()
     return {"ok": True, "settings": SERVER_SETTINGS}
 
 

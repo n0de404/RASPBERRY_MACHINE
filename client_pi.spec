@@ -9,9 +9,13 @@ datas = [
     (str(project_dir / "Assets"), "Assets"),
     (str(project_dir / "Images"), "Images"),
     (str(project_dir / "PDR_Icon"), "PDR_Icon"),
+    (str(project_dir / "Database"), "Database"),
     (str(project_dir / "digital-7.ttf"), "."),
     (str(project_dir / "bgsteel.jpg"), "."),
 ]
+
+if (project_dir / "qr_api_events.db").exists():
+    datas.append((str(project_dir / "qr_api_events.db"), "."))
 
 hiddenimports = [
     "mappings",

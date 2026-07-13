@@ -282,13 +282,14 @@ chmod +x update_pi_client.sh
 ```
 
 This stops the currently running client, rebuilds `dist/RaspberryMachineClient`, and starts the rebuilt app.
-The rebuild does not include or replace files inside `Database`; those stay as the Pi's live local data.
+The packaged build includes the project assets and local data files present in the project folder.
 
 If the Pi folder is a git checkout, pull and rebuild in one command:
 
 ```bash
 ./update_pi_client.sh --pull
 ```
+
 
 If you also need to refresh the shortcut/autostart server URL:
 

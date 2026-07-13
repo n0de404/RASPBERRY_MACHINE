@@ -580,6 +580,7 @@ def _load_scanned_pack_qr_keys_json() -> Dict[str, Dict[str, Any]]:
             for key, value in rows.items()
             if str(key).strip() and isinstance(value, dict)
         }
+        return payload
     except Exception:
         return {}
 
@@ -1303,6 +1304,9 @@ class ClientState:
     linkage_job_name: Optional[str] = None
     linkage_job_payload: Dict[str, Any] = None
     linkage_jobs: List[Dict[str, Any]] = None
+    prepack_mode_enabled: bool = False
+    prepack_active_job_code: Optional[str] = None
+    prepack_pack_qty: int = 0
     operator_shift_logs: List[Dict[str, Any]] = None
     operator_shift_index: int = 0
     operator_shift_started_at: Optional[str] = None
@@ -2930,7 +2934,8 @@ class ClientUI(QWidget):
         self._marquee_frame_skip = False
         self._recent_scan_seen: Dict[str, float] = {}
         self._last_accepted_pack_scan_at: float = 0.0
-        self._used_pack_qr_keys: Set[str] = set(_load_scanned_pack_qr_keys_json().keys())
+        scanned_pack_keys = _load_scanned_pack_qr_keys_json()
+        self._used_pack_qr_keys: Set[str] = set(scanned_pack_keys.keys() if isinstance(scanned_pack_keys, dict) else [])
         self._server_event_queue_lock = threading.Lock()
         self._server_was_offline = False
         self._server_recovery_snapshot_queued = False
@@ -3282,7 +3287,7 @@ QWidget#ClientUIRoot {{
         self.jobPartsTable = QTableWidget(0, 6)
         self.jobPartsTable.setObjectName("ProductPartsTable")
         self.jobPartsTable.setHorizontalHeaderLabels(
-            ["SKU", "Name", "Part Qty/Unit (kg)", "Available", "Rqst Part Qty", "Remaining"]
+            ["SKU", "Name", "Part Qty/Unit", "Available", "Rqst Part Qty", "Remaining"]
         )
         self.jobPartsTable.setAlternatingRowColors(False)
         self.jobPartsTable.setWordWrap(True)
@@ -5150,7 +5155,7 @@ QWidget#ClientUIRoot {{
         )
         self.finishReviewParts = self._make_finish_summary_table(
             "Product Parts Used",
-            ["SKU", "Name", "Qty/Unit (kg)", "Scanned", "Requested", "Remaining"],
+            ["SKU", "Name", "Part Qty/Unit", "Available", "Requested", "Remaining"],
         )
         self.finishReviewRaw = self._make_finish_summary_table(
             "Raw Materials",
@@ -9461,10 +9466,16 @@ QWidget#ClientUIRoot {{
         if getattr(self, "linkageMirrorOuter", None) is None:
             return
         linked_rows = list(s.linkage_jobs or [])
-        linked_names = [
-            f"{str(r.get('job_name') or r.get('job_code') or '-')}  |  B:{self._butal_qty_for_job(r.get('job_code'))}"
-            for r in linked_rows[:3]
-        ]
+        if s.prepack_mode_enabled:
+            linked_names = [
+                f"{str(r.get('job_name') or r.get('job_code') or '-')}  |  P:{int(r.get('prepack_good_total') or 0)}"
+                for r in linked_rows[:3]
+            ]
+        else:
+            linked_names = [
+                f"{str(r.get('job_name') or r.get('job_code') or '-')}  |  B:{self._butal_qty_for_job(r.get('job_code'))}"
+                for r in linked_rows[:3]
+            ]
         while len(linked_names) < 3:
             linked_names.append("-")
         self._set_linkage_job_label_text(self.linkageMirrorJob1, linked_names[0])
@@ -9802,9 +9813,17 @@ QWidget#ClientUIRoot {{
             shift_payload["linkage_job_name"] = s.linkage_job_name
             shift_payload["linkage_job_payload"] = s.linkage_job_payload or {}
             shift_payload["linkage_jobs"] = list(s.linkage_jobs or [])
-            shift_payload["linkage_note"] = (
-                f"Main shift partial (1 of {total_jobs_in_group}) with {len(s.linkage_jobs or [])} linked job(s)."
-            )
+            shift_payload["prepack_mode_enabled"] = bool(s.prepack_mode_enabled)
+            shift_payload["prepack_pack_qty"] = int(s.prepack_pack_qty or 0)
+            shift_payload["prepack_active_job_code"] = s.prepack_active_job_code
+            if s.prepack_mode_enabled:
+                shift_payload["linkage_note"] = (
+                    f"Multi-color prepack assembly shift partial with {len(s.linkage_jobs or [])} color work order(s)."
+                )
+            else:
+                shift_payload["linkage_note"] = (
+                    f"Main shift partial (1 of {total_jobs_in_group}) with {len(s.linkage_jobs or [])} linked job(s)."
+                )
         return shift_payload
 
     def _finalize_current_operator_shift(self, reason: str, emit_event: bool = True) -> Optional[Dict[str, Any]]:
@@ -9838,15 +9857,22 @@ QWidget#ClientUIRoot {{
             linked_payload["product_sku"] = linked_identity.get("product_sku", "")
             linked_payload["product_name"] = linked_identity.get("product_name", "")
             linked_butal_total = self._shift_butal_qty_for_job(row.get("job_code"))
-            linked_payload["pack_count"] = int(main_payload.get("pack_count") or 0)
-            linked_payload["good_total"] = int(main_payload.get("good_total") or 0)
+            if self.state.prepack_mode_enabled or row.get("prepack_component"):
+                linked_payload["pack_count"] = int(row.get("prepack_units") or 0)
+                linked_payload["good_total"] = int(row.get("prepack_good_total") or 0)
+                linked_payload["prepack_component"] = True
+                linked_payload["prepack_share_qty"] = int(row.get("prepack_share_qty") or 0)
+                linked_payload["prepack_pack_qty"] = int(row.get("prepack_pack_qty") or self.state.prepack_pack_qty or 0)
+            else:
+                linked_payload["pack_count"] = int(main_payload.get("pack_count") or 0)
+                linked_payload["good_total"] = int(main_payload.get("good_total") or 0)
             linked_payload["butal_total"] = int(linked_butal_total or 0)
             linked_payload["reject_total"] = 0
             linked_payload["reject_breakdown"] = {}
             linked_payload["startup_reject_total"] = 0
             linked_payload["no_shot_total"] = 0
-            linked_payload["total_good"] = int(main_payload.get("good_total") or 0) + int(linked_butal_total or 0)
-            linked_payload["partial_qty"] = int(main_payload.get("good_total") or 0) + int(linked_butal_total or 0)
+            linked_payload["total_good"] = int(linked_payload.get("good_total") or 0) + int(linked_butal_total or 0)
+            linked_payload["partial_qty"] = int(linked_payload.get("good_total") or 0) + int(linked_butal_total or 0)
             linked_payload["linkage_enabled"] = True
             linked_payload["linkage_role"] = "LINKED"
             linked_payload["linkage_group_total_jobs"] = total_jobs_in_group
@@ -10066,6 +10092,9 @@ QWidget#ClientUIRoot {{
             "linkage_job_name": s.linkage_job_name,
             "linkage_job_payload": dict(s.linkage_job_payload or {}),
             "linkage_jobs": list(s.linkage_jobs or []),
+            "prepack_mode_enabled": bool(s.prepack_mode_enabled),
+            "prepack_active_job_code": s.prepack_active_job_code,
+            "prepack_pack_qty": int(s.prepack_pack_qty or 0),
             "operator_shift_logs": list(s.operator_shift_logs or []),
             "operator_shift_index": int(s.operator_shift_index or 0),
             "operator_shift_started_at": s.operator_shift_started_at,
@@ -10957,6 +10986,9 @@ QWidget#ClientUIRoot {{
         s.linkage_job_name = snap.get("linkage_job_name")
         s.linkage_job_payload = dict(snap.get("linkage_job_payload") or {})
         s.linkage_jobs = list(snap.get("linkage_jobs") or [])
+        s.prepack_mode_enabled = bool(snap.get("prepack_mode_enabled"))
+        s.prepack_active_job_code = snap.get("prepack_active_job_code")
+        s.prepack_pack_qty = int(snap.get("prepack_pack_qty") or 0)
         s.operator_shift_logs = list(snap.get("operator_shift_logs") or [])
         self._dedupe_pending_operator_shift_segments()
         s.operator_shift_index = int(snap.get("operator_shift_index") or 0)
@@ -11168,6 +11200,9 @@ QWidget#ClientUIRoot {{
             "linkage_job_name": s.linkage_job_name,
             "linkage_job_payload": s.linkage_job_payload or {},
             "linkage_jobs": list(s.linkage_jobs or []),
+            "prepack_mode_enabled": bool(s.prepack_mode_enabled),
+            "prepack_pack_qty": int(s.prepack_pack_qty or 0),
+            "prepack_active_job_code": s.prepack_active_job_code,
             "external_average_weight_grams": s.external_average_weight_grams,
             "external_average_weight_unit": s.external_average_weight_unit,
             "external_average_weight_received_at": s.external_average_weight_received_at,
@@ -11235,14 +11270,25 @@ QWidget#ClientUIRoot {{
             linked_payload["product_sku"] = linked_identity.get("product_sku", "")
             linked_payload["product_name"] = linked_identity.get("product_name", "")
             # Linked jobs mirror only finish-goods counters, not rejects.
-            linked_payload["pack_count"] = int(s.pack_count or 0)
-            linked_payload["good_total"] = int(s.good_total or 0)
+            if s.prepack_mode_enabled or row.get("prepack_component"):
+                linked_payload["pack_count"] = int(row.get("prepack_units") or 0)
+                linked_payload["good_total"] = int(row.get("prepack_good_total") or 0)
+                linked_payload["prepack_component"] = True
+                linked_payload["prepack_share_qty"] = int(row.get("prepack_share_qty") or 0)
+                linked_payload["prepack_pack_qty"] = int(row.get("prepack_pack_qty") or s.prepack_pack_qty or 0)
+                linked_payload["linkage_note"] = (
+                    f"Prepack color component {idx} of {total_jobs_in_group}. "
+                    f"Assembly job is {main_payload.get('job_name') or main_payload.get('job_code') or '-'}."
+                )
+            else:
+                linked_payload["pack_count"] = int(s.pack_count or 0)
+                linked_payload["good_total"] = int(s.good_total or 0)
             linked_butal_total = self._butal_qty_for_job(row.get("job_code"))
             linked_payload["butal_total"] = int(linked_butal_total or 0)
             linked_payload["reject_total"] = 0
             linked_payload["reject_breakdown"] = {}
-            linked_payload["total_good"] = int(s.good_total or 0) + int(linked_butal_total or 0)
-            linked_payload["partial_qty"] = int(s.good_total or 0) + int(linked_butal_total or 0)
+            linked_payload["total_good"] = int(linked_payload.get("good_total") or 0) + int(linked_butal_total or 0)
+            linked_payload["partial_qty"] = int(linked_payload.get("good_total") or 0) + int(linked_butal_total or 0)
             linked_payload["startup_reject_total"] = 0
             linked_payload["no_shot_total"] = 0
             linked_payload["linkage_enabled"] = True
@@ -11250,10 +11296,11 @@ QWidget#ClientUIRoot {{
             linked_payload["linkage_group_total_jobs"] = total_jobs_in_group
             linked_payload["linkage_main_job_code"] = main_payload.get("job_code")
             linked_payload["linkage_main_job_name"] = main_payload.get("job_name")
-            linked_payload["linkage_note"] = (
-                f"Linked job {idx} of {total_jobs_in_group}. "
-                f"Main job is {main_payload.get('job_name') or main_payload.get('job_code') or '-'} (1 of {total_jobs_in_group})."
-            )
+            if not linked_payload.get("linkage_note"):
+                linked_payload["linkage_note"] = (
+                    f"Linked job {idx} of {total_jobs_in_group}. "
+                    f"Main job is {main_payload.get('job_name') or main_payload.get('job_code') or '-'} (1 of {total_jobs_in_group})."
+                )
             out.append(linked_payload)
         return out
 
@@ -11368,6 +11415,9 @@ QWidget#ClientUIRoot {{
         s.linkage_job_name = None
         s.linkage_job_payload = {}
         s.linkage_jobs = []
+        s.prepack_mode_enabled = False
+        s.prepack_active_job_code = None
+        s.prepack_pack_qty = 0
         s.operator_shift_logs = []
         s.operator_shift_index = 0
         s.operator_shift_started_at = None
@@ -12244,15 +12294,32 @@ QWidget#ClientUIRoot {{
 
     def _resolve_part_qty_per_unit(self, part: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         s = self.state
+        unit_kind = self._part_unit_kind(part)
+        if isinstance(part, dict) and unit_kind == "pc":
+            part_qty = self._parse_number(part.get("part_qty_per_unit"))
+            if part_qty > 0:
+                return {
+                    "value": part_qty,
+                    "source": "job_api",
+                    "unit": "pc",
+                    "label": f"Job API ({part_qty:.4f} pc)",
+                }
         ext_weight = s.external_average_weight_grams
         ext_unit = str(s.external_average_weight_unit or "g").strip() or "g"
         if ext_weight is not None and ext_weight > 0:
             ext_kg = float(ext_weight) / 1000.0
             return {
-                "value": float(ext_weight),
+                "value": ext_kg,
                 "source": "app",
-                "unit": ext_unit,
+                "unit": "kg",
                 "label": f"App ({ext_kg:.4f} kg)",
+            }
+        if unit_kind == "kg":
+            return {
+                "value": 0.0,
+                "source": "missing",
+                "unit": "kg",
+                "label": "Waiting for weighing app",
             }
         if isinstance(part, dict):
             part_qty = self._parse_number(part.get("part_qty_per_unit"))
@@ -12260,8 +12327,8 @@ QWidget#ClientUIRoot {{
                 return {
                     "value": part_qty,
                     "source": "job_api",
-                    "unit": "g",
-                    "label": f"Job API ({part_qty:.4f} g)",
+                    "unit": "kg",
+                    "label": f"Job API ({part_qty:.4f} kg)",
                 }
         for row in self._job_part_rows():
             part_qty = self._parse_number((row or {}).get("part_qty_per_unit"))
@@ -12269,21 +12336,34 @@ QWidget#ClientUIRoot {{
                 return {
                     "value": part_qty,
                     "source": "job_api",
-                    "unit": "g",
-                    "label": f"Job API ({part_qty:.4f} g)",
+                    "unit": "kg",
+                    "label": f"Job API ({part_qty:.4f} kg)",
                 }
         return {
             "value": 0.0,
             "source": "missing",
-            "unit": "g",
+            "unit": "kg",
             "label": "No part qty/unit",
         }
 
-    def _format_part_qty_per_unit_display(self, grams_value: float) -> str:
-        grams = float(grams_value or 0.0)
-        if grams <= 0:
+    def _format_part_qty_per_unit_display(self, qty_value: float, unit_kind: str = "") -> str:
+        qty = float(qty_value or 0.0)
+        if qty <= 0:
             return "0.0000"
-        return f"{(grams / 1000.0):.4f}"
+        suffix = "kg" if str(unit_kind or "").lower() == "kg" else "pc"
+        return f"{qty:.4f} {suffix}"
+
+    def _raw_consumption_unit_count(self, source: Dict[str, Any]) -> float:
+        if not isinstance(source, dict):
+            return 0.0
+        return max(
+            0.0,
+            self._parse_number(source.get("good_total"))
+            + self._parse_number(source.get("butal_total"))
+            + self._parse_number(source.get("reject_total"))
+            + self._parse_number(source.get("startup_reject_total"))
+            + self._parse_number(source.get("no_shot_total")),
+        )
 
     def _normalize_material_match_key(self, value: Any) -> str:
         text = str(value or "").strip().upper()
@@ -12368,17 +12448,73 @@ QWidget#ClientUIRoot {{
                 keys.add(norm)
         return keys
 
+    def _part_unit_kind(self, part: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(part, dict):
+            return "pc"
+        unit_text = " ".join(
+            str(part.get(key) or "")
+            for key in (
+                "unit",
+                "uom",
+                "part_unit",
+                "qty_unit",
+                "quantity_unit",
+                "request_part_unit",
+                "request_unit",
+            )
+        ).strip().lower()
+        if re.search(r"\b(kgs?|kilograms?)\b", unit_text):
+            return "kg"
+        if re.search(r"\b(pcs?|pieces?|ea|each|unit|units)\b", unit_text):
+            return "pc"
+        sku = str(part.get("sku") or part.get("part_sku") or part.get("product_sku") or "").strip().upper()
+        name = str(part.get("name") or part.get("part_name") or part.get("material_name") or "").strip().upper()
+        if sku.startswith("Z-RM"):
+            return "kg"
+        if " KG" in f" {name} " or "KGS" in name:
+            return "kg"
+        return "pc"
+
+    def _find_job_part_for_scan_item(self, item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        item_keys = self._raw_material_match_keys(item) | self._raw_material_name_keys(item)
+        if not item_keys:
+            return None
+        for part in self._job_part_rows():
+            part_keys = self._part_material_match_keys(part) | self._part_material_name_keys(part)
+            if item_keys.intersection(part_keys):
+                return part
+        return None
+
     def _raw_material_matches_job_parts(self, row: Optional[Dict[str, Any]]) -> bool:
+        return self._find_job_part_for_scan_item(row) is not None
+
+    def _part_for_raw_material_row(self, row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         raw_name_keys = self._raw_material_name_keys(row)
-        if not raw_name_keys:
-            return False
-        part_rows = self._job_part_rows()
-        if not part_rows:
-            return False
-        for part in part_rows:
-            if raw_name_keys.intersection(self._part_material_name_keys(part)):
-                return True
-        return False
+        raw_match_keys = self._raw_material_match_keys(row)
+        for part in self._job_part_rows():
+            if raw_match_keys and raw_match_keys.intersection(self._part_material_match_keys(part)):
+                return part
+            if raw_name_keys and raw_name_keys.intersection(self._part_material_name_keys(part)):
+                return part
+        return self._job_part_rows()[0] if len(self._job_part_rows()) == 1 else None
+
+    def _raw_logs_for_part(
+        self,
+        raw_logs: List[Dict[str, Any]],
+        part: Optional[Dict[str, Any]],
+        *,
+        total_part_count: int = 0,
+    ) -> List[Dict[str, Any]]:
+        rows = [x for x in (raw_logs or []) if isinstance(x, dict)]
+        if not rows:
+            return []
+        part_keys = self._part_material_match_keys(part)
+        if not part_keys:
+            return rows if total_part_count <= 1 else []
+        matched = [row for row in rows if part_keys.intersection(self._raw_material_match_keys(row))]
+        return matched if matched or total_part_count > 1 else rows
 
     def _raw_qty_for_part(
         self,
@@ -12387,21 +12523,135 @@ QWidget#ClientUIRoot {{
         *,
         total_part_count: int = 0,
     ) -> float:
-        rows = [x for x in (raw_logs or []) if isinstance(x, dict)]
+        rows = self._raw_logs_for_part(raw_logs, part, total_part_count=total_part_count)
         if not rows:
             return 0.0
-        part_keys = self._part_material_match_keys(part)
-        if not part_keys:
-            if total_part_count <= 1:
-                return sum(max(0.0, self._parse_number(x.get("qty"))) for x in rows)
-            return 0.0
-        total = 0.0
+        return sum(max(0.0, self._parse_number(x.get("qty"))) for x in rows)
+
+    def _raw_consumption_for_part(
+        self,
+        raw_logs: List[Dict[str, Any]],
+        part: Optional[Dict[str, Any]],
+        consumed_units: float,
+        *,
+        total_part_count: int = 0,
+        fallback_part_qty_per_unit: float = 0.0,
+    ) -> Dict[str, float]:
+        rows = self._raw_logs_for_part(raw_logs, part, total_part_count=total_part_count)
+        scanned_qty = sum(max(0.0, self._parse_number(row.get("qty"))) for row in rows)
+        remaining_units = max(0.0, float(consumed_units or 0.0))
+        used_qty = 0.0
+        unit_kind = self._part_unit_kind(part)
         for row in rows:
-            if part_keys.intersection(self._raw_material_match_keys(row)):
-                total += max(0.0, self._parse_number(row.get("qty")))
-        if total <= 0 and total_part_count <= 1:
-            return sum(max(0.0, self._parse_number(x.get("qty"))) for x in rows)
-        return total
+            row_qty = max(0.0, self._parse_number(row.get("qty")))
+            if row_qty <= 0:
+                continue
+            if unit_kind == "kg":
+                row_source = str(row.get("part_qty_per_unit_source") or "").strip().lower()
+                part_qty_per_unit = self._parse_number(row.get("part_qty_per_unit_kg")) if row_source == "app" else 0.0
+            else:
+                part_qty_per_unit = self._parse_number(row.get("part_qty_per_unit"))
+            if part_qty_per_unit <= 0:
+                part_qty_per_unit = max(0.0, float(fallback_part_qty_per_unit or 0.0))
+            if part_qty_per_unit <= 0:
+                continue
+            row_units_capacity = row_qty / part_qty_per_unit
+            units_used = min(remaining_units, row_units_capacity)
+            if units_used <= 0:
+                break
+            used_qty += min(row_qty, units_used * part_qty_per_unit)
+            remaining_units -= units_used
+        return {
+            "scanned_qty": scanned_qty,
+            "used_qty": min(scanned_qty, used_qty),
+            "available_qty": max(scanned_qty - used_qty, 0.0),
+        }
+
+    def _record_job_part_scan(
+        self,
+        *,
+        part: Dict[str, Any],
+        material_name: str,
+        qty: int,
+        raw_scan: str,
+        unique_key: str = "",
+        source: str = "JOB_PART_QR",
+        material_product_id: Optional[str] = None,
+        material_sku: Optional[str] = None,
+        pack_hist: Optional[Dict[str, Any]] = None,
+        raw_job_code: Optional[str] = None,
+    ) -> bool:
+        s = self.state
+        unique_key = str(unique_key or "").strip()
+        if unique_key and unique_key in (s.raw_material_unique_keys or set()):
+            self.status.setText("Invalid PART QR: duplicate serial already scanned.")
+            self._show_invalid_overlay("PART QR serial already scanned.")
+            return True
+        self._mark_pack_scan_accepted()
+        unit_kind = self._part_unit_kind(part)
+        part_qty_info = self._resolve_part_qty_per_unit(part)
+        part_name = str(part.get("name") or part.get("part_name") or material_name or "Job Part").strip() or "Job Part"
+        part_sku = str(part.get("sku") or part.get("part_sku") or material_sku or "").strip()
+        owner_ctx = self._scan_owner_context()
+        log_row = {
+            "material": material_name,
+            "material_name": material_name,
+            "material_product_id": material_product_id or None,
+            "material_sku": material_sku or part_sku or None,
+            "qty": int(qty or 0),
+            "unit": unit_kind,
+            "material_type": "RAW_MATERIAL" if unit_kind == "kg" else "COMPONENT_PART",
+            "job_part_name": part_name,
+            "job_part_sku": part_sku or None,
+            "raw_scan": raw_scan,
+            "source": source,
+            "unique_key": unique_key or None,
+            "raw_job_code": raw_job_code,
+            "part_qty_per_unit_kg": float(part_qty_info.get("value") or 0.0),
+            "part_qty_per_unit_source": part_qty_info.get("source"),
+            "raw_consumption_units_at_scan": self._raw_consumption_unit_count(
+                {
+                    "good_total": s.good_total,
+                    "butal_total": s.butal_total,
+                    "reject_total": s.reject_total,
+                    "startup_reject_total": s.startup_reject_total,
+                    "no_shot_total": s.no_shot_total,
+                }
+            ),
+            "scanned_at": datetime.now(timezone.utc).isoformat(),
+            **owner_ctx,
+        }
+        if isinstance(pack_hist, dict):
+            log_row.update(
+                {
+                    "index": str(pack_hist.get("index") or "-"),
+                    "total_labels": str(pack_hist.get("total_labels") or "-"),
+                    "lot_number": str(pack_hist.get("lot_number") or "-"),
+                    "po_number": str(pack_hist.get("po_number") or "-"),
+                }
+            )
+        s.raw_sacks_count += 1
+        s.raw_material_scans.append(material_name)
+        s.raw_material_logs.append(log_row)
+        if unique_key:
+            s.raw_material_unique_keys.add(unique_key)
+        label = "Raw material" if unit_kind == "kg" else "Component part"
+        self.status.setText(f"{label} scanned: {material_name} (+{qty})")
+        self._refresh_ui()
+        self.push_event(
+            {
+                "type": "RAW_MATERIAL",
+                "qty": int(qty or 0),
+                "material": material_name,
+                "source": source,
+                "unit": unit_kind,
+                "raw_material_log": log_row,
+                "unique_key": unique_key or None,
+                "raw_job_code": raw_job_code or None,
+            },
+            f"{label.upper()} {material_name} +{qty}",
+        )
+        return True
 
     def _reject_multiplier_value(self) -> int:
         raw = str(self.state.reject_multiplier_input or "").strip()
@@ -12448,7 +12698,7 @@ QWidget#ClientUIRoot {{
     def _update_product_parts_weight_indicator(self):
         if not hasattr(self, "jobPartsTable") or self.jobPartsTable is None:
             return
-        info = self._resolve_part_qty_per_unit()
+        part_rows = self._job_part_rows()
         row_count = int(self.jobPartsTable.rowCount() or 0)
         has_job = bool(str(self.state.job_code or "").strip())
         if row_count <= 0:
@@ -12463,7 +12713,12 @@ QWidget#ClientUIRoot {{
                 item.setBackground(QBrush(Qt.GlobalColor.transparent))
                 item.setForeground(QBrush(QColor(239, 240, 242, 226)))
                 continue
-            if info.get("source") == "app":
+            part = part_rows[row] if row < len(part_rows) else {}
+            info = self._resolve_part_qty_per_unit(part)
+            if self._part_unit_kind(part) != "kg":
+                item.setBackground(QBrush(Qt.GlobalColor.transparent))
+                item.setForeground(QBrush(QColor(239, 240, 242, 226)))
+            elif info.get("source") == "app":
                 item.setBackground(QBrush(QColor(34, 197, 94, 185)))
                 item.setForeground(QBrush(QColor("#ecfdf5")))
             else:
@@ -13008,7 +13263,7 @@ QWidget#ClientUIRoot {{
         raw_logs = [x for x in (shift_payload.get("raw_material_logs") or []) if isinstance(x, dict)]
         pack_logs = [x for x in (shift_payload.get("product_pack_history_logs") or []) if isinstance(x, dict)]
         reject_breakdown = shift_payload.get("reject_breakdown") if isinstance(shift_payload.get("reject_breakdown"), dict) else {}
-        produced_units = max(0.0, self._parse_number(shift_payload.get("good_total")) + self._parse_number(shift_payload.get("butal_total")))
+        produced_units = self._raw_consumption_unit_count(shift_payload)
         page_h = self._finish_review_available_content_height()
         overview_h = min(320, max(270, int(page_h * 0.30)))
         page_one_section_h = max(220, int((page_h - overview_h - 12) / 2))
@@ -13143,14 +13398,25 @@ QWidget#ClientUIRoot {{
         for part in part_rows:
             request_part_qty = self._parse_number(part.get("request_part_qty"))
             total_requested_part_qty += request_part_qty
-            if shift_external_avg_weight is not None and self._parse_number(shift_external_avg_weight) > 0:
-                part_qty_per_unit = self._parse_number(shift_external_avg_weight)
+            unit_kind = self._part_unit_kind(part)
+            if unit_kind == "kg" and shift_external_avg_weight is not None and self._parse_number(shift_external_avg_weight) > 0:
+                part_qty_per_unit = self._parse_number(shift_external_avg_weight) / 1000.0
             else:
                 part_qty_per_unit = self._parse_number(part.get("part_qty_per_unit"))
+                if unit_kind == "kg":
+                    part_qty_per_unit = 0.0
                 if part_qty_per_unit <= 0:
                     part_qty_per_unit = 0.0
-            scanned_raw_qty_for_part = self._raw_qty_for_part(raw_logs, part, total_part_count=len(part_rows))
-            used_raw_qty = min(scanned_raw_qty_for_part, produced_units * part_qty_per_unit) if scanned_raw_qty_for_part > 0 else 0.0
+            raw_consumption = self._raw_consumption_for_part(
+                raw_logs,
+                part,
+                produced_units,
+                total_part_count=len(part_rows),
+                fallback_part_qty_per_unit=part_qty_per_unit,
+            )
+            scanned_raw_qty_for_part = raw_consumption["scanned_qty"]
+            used_raw_qty = raw_consumption["used_qty"]
+            available_raw_qty = raw_consumption["available_qty"]
             remaining_part_qty = max(request_part_qty - used_raw_qty, 0.0)
             total_used_part_qty += used_raw_qty
             total_remaining_part_qty += remaining_part_qty
@@ -13158,8 +13424,8 @@ QWidget#ClientUIRoot {{
             part_table_rows.append([
                 self._safe_text(part.get("sku")),
                 self._safe_text(part.get("name")),
-                f"{part_qty_per_unit:.4f}" if part_qty_per_unit > 0 else "-",
-                f"{used_raw_qty:.2f}".rstrip("0").rstrip("."),
+                f"{part_qty_per_unit:.4f} {unit_kind}" if part_qty_per_unit > 0 else "-",
+                f"{available_raw_qty:.2f}".rstrip("0").rstrip("."),
                 self._safe_text(part.get("request_part_qty")),
                 f"{remaining_part_qty:.2f}".rstrip("0").rstrip("."),
                 f"{scan_pct:.1f}%",
@@ -13167,7 +13433,7 @@ QWidget#ClientUIRoot {{
         part_page_size = 8
         visible_part_table_rows = part_table_rows[:part_page_size]
         extra_part_table_rows = part_table_rows[part_page_size:]
-        self.finishReviewParts._finish_headers = ["SKU", "Name", "Qty/Unit (kg)", "Used", "Requested", "Remaining", "Scan %"]
+        self.finishReviewParts._finish_headers = ["SKU", "Name", "Part Qty/Unit", "Available", "Requested", "Remaining", "Scan %"]
         self.finishReviewParts._finish_stretch_rows = False
         self._set_finish_summary_table_rows(self.finishReviewParts, visible_part_table_rows)
 
@@ -13193,7 +13459,7 @@ QWidget#ClientUIRoot {{
             page_no = 2 + (idx // 14)
             self._add_finish_review_extra_page(
                 f"Product Parts Continued {page_no}",
-                ["SKU", "Name", "Qty/Unit (kg)", "Used", "Requested", "Remaining", "Scan %"],
+                ["SKU", "Name", "Part Qty/Unit", "Available", "Requested", "Remaining", "Scan %"],
                 chunk,
                 section_height=full_page_section_h,
                 stretch_rows=False,
@@ -13646,6 +13912,9 @@ QWidget#ClientUIRoot {{
         s.linkage_job_name = None
         s.linkage_job_payload = {}
         s.linkage_jobs = []
+        s.prepack_mode_enabled = False
+        s.prepack_active_job_code = None
+        s.prepack_pack_qty = 0
         setattr(self, "_action_logs", [])
         self._clear_external_average_weight()
         self._reset_live_cycle_tracking(start_now=True)
@@ -14043,6 +14312,11 @@ QWidget#ClientUIRoot {{
                     "raw_logs": raw_logs,
                     "good_total": int(s.good_total or 0),
                     "butal_total": int(s.butal_total or 0),
+                    "reject_total": int(s.reject_total or 0),
+                    "startup_reject_total": int(s.startup_reject_total or 0),
+                    "no_shot_total": int(s.no_shot_total or 0),
+                    "external_average_weight_grams": s.external_average_weight_grams,
+                    "external_average_weight_received_at": s.external_average_weight_received_at,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -14066,11 +14340,27 @@ QWidget#ClientUIRoot {{
                     request_part_qty = self._parse_number(part.get("request_part_qty"))
                     part_qty_info = self._resolve_part_qty_per_unit(part)
                     part_qty_per_unit = float(part_qty_info.get("value") or 0.0)
+                    unit_kind = self._part_unit_kind(part)
                     scanned_raw_qty = self._raw_qty_for_part(raw_logs, part, total_part_count=len(part_rows))
-                    produced_units = max(0.0, float(s.good_total or 0) + float(s.butal_total or 0))
-                    projected_used_qty = max(0.0, produced_units * max(part_qty_per_unit, 0.0))
-                    used_raw_qty = min(scanned_raw_qty, projected_used_qty) if scanned_raw_qty > 0 else 0.0
-                    available_raw_qty = max(scanned_raw_qty - used_raw_qty, 0.0)
+                    produced_units = self._raw_consumption_unit_count(
+                        {
+                            "good_total": s.good_total,
+                            "butal_total": s.butal_total,
+                            "reject_total": s.reject_total,
+                            "startup_reject_total": s.startup_reject_total,
+                            "no_shot_total": s.no_shot_total,
+                        }
+                    )
+                    raw_consumption = self._raw_consumption_for_part(
+                        raw_logs,
+                        part,
+                        produced_units,
+                        total_part_count=len(part_rows),
+                        fallback_part_qty_per_unit=part_qty_per_unit,
+                    )
+                    scanned_raw_qty = raw_consumption["scanned_qty"]
+                    used_raw_qty = raw_consumption["used_qty"]
+                    available_raw_qty = raw_consumption["available_qty"]
                     remaining_part_qty = max(request_part_qty - used_raw_qty, 0.0)
                     request_part_display = self._safe_text(part.get("request_part_qty"), "-")
                     if request_part_qty > 0:
@@ -14080,7 +14370,7 @@ QWidget#ClientUIRoot {{
                     values = [
                         self._safe_text(part.get("sku"), "-"),
                         self._safe_text(part.get("name"), "-"),
-                        self._format_part_qty_per_unit_display(part_qty_per_unit),
+                        self._format_part_qty_per_unit_display(part_qty_per_unit, unit_kind),
                         _fmt_number(available_raw_qty),
                         request_part_display,
                         _fmt_number(remaining_part_qty),
@@ -14709,6 +14999,8 @@ QWidget#ClientUIRoot {{
         if key in (self._used_pack_qr_keys or set()):
             return True
         rows = _load_scanned_pack_qr_keys_json()
+        if not isinstance(rows, dict):
+            rows = {}
         if key in rows:
             self._used_pack_qr_keys.add(key)
             return True
@@ -14828,6 +15120,13 @@ QWidget#ClientUIRoot {{
                 self.resolveNewCycle.setText(self._format_resolve_cycle_input_text())
 
     def _format_pack_history_action_text(self, row: Dict[str, Any], *, voided: bool = False) -> str:
+        if str(row.get("source") or "").upper().startswith("PREPACK"):
+            label = str(row.get("index") or "-").strip() or "-"
+            job_name = str(row.get("assigned_job_name") or row.get("assigned_job_code") or "Prepack").strip()
+            qty_text = str(row.get("qty_q") or row.get("good_qty") or row.get("qty") or "-").strip() or "-"
+            time_text = self._format_history_time_short(row.get("voided_at") if voided else row.get("scanned_at"))
+            text = f"{label} | {job_name} | {qty_text} | {time_text}"
+            return f"{text} | VOID" if voided else text
         label = str(row.get("index") or "-").strip() or "-"
         product_id = str(row.get("product_p") or row.get("product_id") or "").strip()
         product_key = product_id.lstrip("0") if product_id.isdigit() else product_id
@@ -14870,6 +15169,133 @@ QWidget#ClientUIRoot {{
         if fallback_current:
             return max(0, int(s.butal_total or 0))
         return 0
+
+    def _prepack_component_rows(self) -> List[Dict[str, Any]]:
+        return [row for row in (self.state.linkage_jobs or []) if isinstance(row, dict)]
+
+    def _prepack_share_qty(self, total_pack_qty: Any = None) -> Optional[int]:
+        rows = self._prepack_component_rows()
+        color_count = len(rows)
+        if color_count <= 0:
+            return None
+        try:
+            total_qty = int(total_pack_qty if total_pack_qty not in (None, "") else self.state.prepack_pack_qty or 0)
+        except Exception:
+            total_qty = 0
+        if total_qty <= 0:
+            return None
+        if total_qty % color_count != 0:
+            return None
+        return max(1, total_qty // color_count)
+
+    def _find_prepack_component_row(self, job_code: Any) -> Optional[Dict[str, Any]]:
+        target = self._normalize_job_code(job_code)
+        if not target:
+            return None
+        for row in self._prepack_component_rows():
+            if self._normalize_job_code(row.get("job_code")) == target:
+                return row
+        return None
+
+    def _select_prepack_component_job(self, job_code: Any) -> bool:
+        row = self._find_prepack_component_row(job_code)
+        if not row:
+            return False
+        self.state.prepack_active_job_code = str(row.get("job_code") or "").strip()
+        self.status.setText(f"Prepack active color/job: {row.get('job_name') or row.get('job_code')}. Scan prepack~PACKQTY.")
+        self._set_banner_text(f"Prepack active: {row.get('job_name') or row.get('job_code')}\nScan generic prepack QR")
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        return True
+
+    def _record_prepack_component_scan(self, target_row: Dict[str, Any], share_qty: int, total_pack_qty: int, raw_scan: str, source: str = "PREPACK_GENERIC") -> bool:
+        if not isinstance(target_row, dict) or share_qty <= 0:
+            return False
+        s = self.state
+        target_row["prepack_units"] = int(target_row.get("prepack_units") or 0) + 1
+        target_row["prepack_good_total"] = int(target_row.get("prepack_good_total") or 0) + int(share_qty)
+        target_row["prepack_pack_qty"] = int(total_pack_qty or s.prepack_pack_qty or 0)
+        target_row["prepack_share_qty"] = int(share_qty)
+        s.prepack_pack_qty = int(total_pack_qty or s.prepack_pack_qty or 0)
+        idx = len([row for row in (s.product_pack_history_logs or []) if isinstance(row, dict) and str(row.get("source") or "").upper().startswith("PREPACK")]) + 1
+        hist = {
+            "raw_scan": raw_scan,
+            "product_name": target_row.get("job_name") or target_row.get("job_code") or "Prepack",
+            "qty_q": str(int(share_qty)),
+            "good_qty": int(share_qty),
+            "completed_pack_qty": int(total_pack_qty or 0),
+            "index": str(idx),
+            "total_labels": "-",
+            "lot_number": "PREPACK",
+            "po_number": str(target_row.get("job_code") or ""),
+            "operator": str(s.operator_id or "").strip() or "-",
+            "operator_name": self._operator_display_name(s.operator_id),
+            **self._scan_owner_context(),
+            "status": "PREPACK_COMPONENT",
+            "voided": False,
+            "scanned_at": datetime.now(timezone.utc).isoformat(),
+            "source": source,
+            "assigned_job_code": target_row.get("job_code"),
+            "assigned_job_name": target_row.get("job_name"),
+            "prepack_total_pack_qty": int(total_pack_qty or 0),
+            "prepack_color_count": len(self._prepack_component_rows()),
+        }
+        s.product_pack_history_logs.append(hist)
+        self.log_last(f"PREPACK {target_row.get('job_name') or target_row.get('job_code')} | Q:{share_qty} | I:{idx}")
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        self.push_event(
+            {"type": "PREPACK_COMPONENT_PACK", "prepack_row": hist, "linkage_jobs": list(s.linkage_jobs or [])},
+            f"PREPACK {target_row.get('job_name') or target_row.get('job_code')} +{share_qty}",
+            defer_snapshot=True,
+        )
+        return True
+
+    def _handle_prepack_generic_scan(self, total_pack_qty: Any, raw_scan: str) -> bool:
+        s = self.state
+        if not (s.prepack_mode_enabled and s.linkage_jobs):
+            self.status.setText("Prepack scan ignored: start multicolorprepack~1 and scan color work orders first.")
+            self._show_invalid_overlay("Start multi-color prepack mode first.")
+            return True
+        if s.waiting_linkage_job_scan:
+            s.waiting_linkage_job_scan = False
+            s.linkage_enabled = True
+        if self._block_pack_scan_if_too_soon():
+            return True
+        share_qty = self._prepack_share_qty(total_pack_qty)
+        if share_qty is None:
+            self.status.setText("Prepack blocked: scan prepack~PACKQTY and make sure PACKQTY divides by color count.")
+            self._show_invalid_overlay("Example: prepack~12 with 3 color jobs records 4 pcs.")
+            return True
+        target = self._find_prepack_component_row(s.prepack_active_job_code)
+        if target is None:
+            target = self._prepack_component_rows()[0] if self._prepack_component_rows() else None
+        if target is None:
+            return True
+        self._mark_pack_scan_accepted()
+        self._record_prepack_component_scan(target, share_qty, int(total_pack_qty or s.prepack_pack_qty or 0), raw_scan, "PREPACK_GENERIC")
+        self.status.setText(f"Prepack recorded: {target.get('job_name') or target.get('job_code')} +{share_qty} pcs.")
+        return True
+
+    def _auto_allocate_prepack_final_color(self, total_pack_qty: Any, raw_scan: str) -> None:
+        s = self.state
+        if not (s.prepack_mode_enabled and s.linkage_jobs):
+            return
+        share_qty = self._prepack_share_qty(total_pack_qty)
+        if share_qty is None:
+            return
+        rows = self._prepack_component_rows()
+        if not rows:
+            return
+        unit_counts = [int(row.get("prepack_units") or 0) for row in rows]
+        min_units = min(unit_counts)
+        max_units = max(unit_counts)
+        if max_units <= min_units:
+            return
+        target = next((row for row in rows if int(row.get("prepack_units") or 0) == min_units), None)
+        if target is None:
+            return
+        self._record_prepack_component_scan(target, share_qty, int(total_pack_qty or s.prepack_pack_qty or 0), raw_scan, "PREPACK_ASSEMBLY_AUTO")
 
     def _shift_butal_qty_for_job(self, job_code: Optional[str], *, fallback_current: bool = False) -> int:
         s = self.state
@@ -16225,25 +16651,37 @@ QWidget#ClientUIRoot {{
             material_sku = self._lookup_product_sku(material_product_id) if material_product_id else ""
             raw_job_code = self._normalize_job_code(meta.get("job_code")) if meta.get("job_code") else None
             owner_ctx = self._scan_owner_context()
+            matched_part = self._part_for_raw_material_row(material_match_row)
+            part_qty_info = self._resolve_part_qty_per_unit(matched_part)
             s.raw_material_scans.append(material_name)
-            s.raw_material_logs.append(
-                {
-                    "material": material_name,
-                    "material_name": material_name,
-                    "material_code": material_code or None,
-                    "material_product_id": material_product_id or None,
-                    "material_sku": material_sku or None,
-                    "qty": qty,
-                    "index": str(meta.get("index") or "") if isinstance(meta, dict) else None,
-                    "total_labels": str(meta.get("total_labels") or "") if isinstance(meta, dict) else None,
-                    "lot_number": str(meta.get("lot_number") or "") if isinstance(meta, dict) else None,
-                    "po_number": str(meta.get("po_number") or "") if isinstance(meta, dict) else None,
-                    "unique_key": unique_key or None,
-                    "raw_job_code": raw_job_code,
-                    "scanned_at": datetime.now(timezone.utc).isoformat(),
-                    **owner_ctx,
-                }
-            )
+            log_row = {
+                "material": material_name,
+                "material_name": material_name,
+                "material_code": material_code or None,
+                "material_product_id": material_product_id or None,
+                "material_sku": material_sku or None,
+                "qty": qty,
+                "index": str(meta.get("index") or "") if isinstance(meta, dict) else None,
+                "total_labels": str(meta.get("total_labels") or "") if isinstance(meta, dict) else None,
+                "lot_number": str(meta.get("lot_number") or "") if isinstance(meta, dict) else None,
+                "po_number": str(meta.get("po_number") or "") if isinstance(meta, dict) else None,
+                "unique_key": unique_key or None,
+                "raw_job_code": raw_job_code,
+                "part_qty_per_unit_kg": float(part_qty_info.get("value") or 0.0),
+                "part_qty_per_unit_source": part_qty_info.get("source"),
+                "raw_consumption_units_at_scan": self._raw_consumption_unit_count(
+                    {
+                        "good_total": s.good_total,
+                        "butal_total": s.butal_total,
+                        "reject_total": s.reject_total,
+                        "startup_reject_total": s.startup_reject_total,
+                        "no_shot_total": s.no_shot_total,
+                    }
+                ),
+                "scanned_at": datetime.now(timezone.utc).isoformat(),
+                **owner_ctx,
+            }
+            s.raw_material_logs.append(log_row)
             if unique_key:
                 s.raw_material_unique_keys.add(unique_key)
             self.log_last(self._scan_display_text(res_pre, raw_s))
@@ -16256,6 +16694,7 @@ QWidget#ClientUIRoot {{
                     "qty": qty,
                     "unique_key": unique_key or None,
                     "raw_job_code": raw_job_code or None,
+                    "raw_material_log": log_row,
                 },
                 f"RAW MATERIAL {material_name} +{qty}",
             )
@@ -16923,9 +17362,14 @@ QWidget#ClientUIRoot {{
                 total_jobs_in_group = 1 + len(self.state.linkage_jobs or [])
                 finished_payload["linkage_role"] = "MAIN"
                 finished_payload["linkage_group_total_jobs"] = total_jobs_in_group
-                finished_payload["linkage_note"] = (
-                    f"Main job (1 of {total_jobs_in_group}) with {len(self.state.linkage_jobs or [])} linked job(s)."
-                )
+                if self.state.prepack_mode_enabled:
+                    finished_payload["linkage_note"] = (
+                        f"Multi-color prepack assembly with {len(self.state.linkage_jobs or [])} color work order(s)."
+                    )
+                else:
+                    finished_payload["linkage_note"] = (
+                        f"Main job (1 of {total_jobs_in_group}) with {len(self.state.linkage_jobs or [])} linked job(s)."
+                    )
             linked_finished_payloads = self._build_linked_finished_job_payloads(finished_payload)
             try:
                 saved_ok = self._save_finished_job_local(finished_payload)
@@ -16952,6 +17396,40 @@ QWidget#ClientUIRoot {{
             self._show_final_job_review_overlay(finished_payload, linked_finished_payloads)
             return
 
+        if res.kind == "PREPACK_LINKAGE_TRIGGER":
+            if not self.can_accept_production_scans():
+                msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
+                self.status.setText(msg[:1].upper() + msg[1:])
+                self._show_invalid_overlay(msg)
+                return
+            if (
+                s.waiting_reject_reason
+                or s.waiting_production_report_reason
+                or s.waiting_downtime_start_maintenance
+                or s.waiting_pdr_maintenance_reason
+                or s.waiting_downtime_end_maintenance
+                or s.downtime_active
+            ):
+                self.status.setText("Cannot start prepack linkage while reject/downtime flow is active.")
+                return
+            s.prepack_mode_enabled = True
+            s.prepack_active_job_code = None
+            s.prepack_pack_qty = 0
+            s.waiting_linkage_job_scan = True
+            s.waiting_color_change_job_scan = False
+            s.pending_color_change_reason = ""
+            s.linkage_enabled = False
+            s.linkage_job_code = None
+            s.linkage_job_name = None
+            s.linkage_job_payload = {}
+            s.linkage_jobs = []
+            self._clear_pending_butal_assignment()
+            self.status.setText("Multi-color prepack mode enabled. Scan color work order QRs, then scan prepack~PACKQTY.")
+            self._set_banner_text("Multi-color prepack: scan color work orders\nThen scan prepack~PACKQTY")
+            self._refresh_ui()
+            self._save_active_session_snapshot()
+            return
+
         if res.kind == "JOB_LINKAGE_TRIGGER":
             if not self.can_accept_production_scans():
                 msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
@@ -16976,6 +17454,9 @@ QWidget#ClientUIRoot {{
             s.linkage_job_name = None
             s.linkage_job_payload = {}
             s.linkage_jobs = []
+            s.prepack_mode_enabled = False
+            s.prepack_active_job_code = None
+            s.prepack_pack_qty = 0
             self._clear_pending_butal_assignment()
             if int(s.butal_total or 0) > 0 and not (s.butal_by_job or {}):
                 job_key = self._normalize_job_code(s.job_code)
@@ -17229,6 +17710,9 @@ QWidget#ClientUIRoot {{
             s.linkage_job_name = None
             s.linkage_job_payload = {}
             s.linkage_jobs = []
+            s.prepack_mode_enabled = False
+            s.prepack_active_job_code = None
+            s.prepack_pack_qty = 0
             s.operator_shift_logs = []
             s.operator_shift_index = 0
             s.operator_shift_started_at = None
@@ -17377,15 +17861,41 @@ QWidget#ClientUIRoot {{
                 s.linkage_job_code = linked_job_code
                 s.linkage_job_name = linked_job_name
                 s.linkage_job_payload = linked_job_payload
-                s.linkage_jobs.append({
+                linked_row = {
                     "job_code": linked_job_code,
                     "job_name": linked_job_name,
                     "job_payload": linked_job_payload,
-                })
-                self.status.setText(f"Linked job added: {linked_job_name or linked_job_code}. Scan more jobs or scan PACK/BUTAL to continue.")
+                }
+                if s.prepack_mode_enabled:
+                    linked_row.update({
+                        "prepack_component": True,
+                        "prepack_units": 0,
+                        "prepack_good_total": 0,
+                        "prepack_share_qty": 0,
+                        "prepack_pack_qty": 0,
+                    })
+                    if not s.prepack_active_job_code:
+                        s.prepack_active_job_code = linked_job_code
+                s.linkage_jobs.append(linked_row)
+                if s.prepack_mode_enabled:
+                    self.status.setText(f"Prepack color job added: {linked_job_name or linked_job_code}. Scan more color jobs, or scan prepack~PACKQTY.")
+                else:
+                    self.status.setText(f"Linked job added: {linked_job_name or linked_job_code}. Scan more jobs or scan PACK/BUTAL to continue.")
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 return
+            if s.prepack_mode_enabled and s.linkage_jobs:
+                candidate_codes = [res.value]
+                if isinstance(res.meta, dict):
+                    candidate_codes.append(res.meta.get("po_number"))
+                matched_row = None
+                for candidate in candidate_codes:
+                    matched_row = self._find_prepack_component_row(candidate)
+                    if matched_row is not None:
+                        break
+                if matched_row is not None:
+                    self._select_prepack_component_job(matched_row.get("job_code"))
+                    return
             if s.machine_code and s.job_code and s.operator_id:
                 self.status.setText('Scan "changecolor~1" or "changemold~1" before scanning the next job.')
                 self._show_invalid_overlay("Use change color/change mold QR first.")
@@ -17530,6 +18040,9 @@ QWidget#ClientUIRoot {{
             s.linkage_job_name = None
             s.linkage_job_payload = {}
             s.linkage_jobs = []
+            s.prepack_mode_enabled = False
+            s.prepack_active_job_code = None
+            s.prepack_pack_qty = 0
             s.operator_shift_logs = []
             s.operator_shift_index = 0
             s.operator_shift_started_at = None
@@ -17668,6 +18181,15 @@ QWidget#ClientUIRoot {{
             )
             return
 
+        if res.kind == "PREPACK_GENERIC_PACK":
+            if not self.can_accept_production_scans():
+                msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
+                self.status.setText(msg[:1].upper() + msg[1:])
+                self._show_invalid_overlay(msg)
+                return
+            self._handle_prepack_generic_scan(res.qty or 0, raw_s)
+            return
+
         if res.kind in ("PACK", "BUTAL", "REJECT_TRIGGER", "PRODUCTION_DAILY_REPORT_TRIGGER"):
             if not self.can_accept_production_scans():
                 msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
@@ -17709,6 +18231,16 @@ QWidget#ClientUIRoot {{
                 product_name_for_pack = ""
                 product_sku_for_pack = ""
                 pid = ""
+                scanned_job_code = self._extract_job_code_from_pack_qr(raw_s)
+                current_job_code = self._normalize_job_code(s.job_code)
+                allowed_pack_job_codes = set()
+                if current_job_code:
+                    allowed_pack_job_codes.add(current_job_code)
+                if s.linkage_enabled:
+                    for row in (s.linkage_jobs or []):
+                        linked_code_norm = self._normalize_job_code((row or {}).get("job_code"))
+                        if linked_code_norm:
+                            allowed_pack_job_codes.add(linked_code_norm)
                 if isinstance(pack_hist, dict):
                     pid_raw = str(pack_hist.get("product_p") or pack_hist.get("product_id") or "").strip()
                     pid = pid_raw.lstrip("0") if pid_raw.isdigit() else pid_raw
@@ -17718,43 +18250,29 @@ QWidget#ClientUIRoot {{
                         product_sku_for_pack = self._lookup_product_sku(pid)
                         if not product_name_for_pack or not product_sku_for_pack:
                             self._trigger_product_catalog_cache_refresh_async()
-                is_rm_from_pack = bool(str(product_sku_for_pack).strip().upper().startswith("Z-RM"))
-                if not is_rm_from_pack:
-                    scanned_job_code = self._extract_job_code_from_pack_qr(raw_s)
-                    current_job_code = self._normalize_job_code(s.job_code)
-                    if scanned_job_code is None:
-                        self.status.setText("Invalid PACK QR format: missing job code segment.")
-                        self._show_invalid_overlay("PACK QR format is invalid.")
-                        return
-                    allowed_pack_job_codes = set()
-                    if current_job_code:
-                        allowed_pack_job_codes.add(current_job_code)
-                    if s.linkage_enabled:
-                        for row in (s.linkage_jobs or []):
-                            linked_code_norm = self._normalize_job_code((row or {}).get("job_code"))
-                            if linked_code_norm:
-                                allowed_pack_job_codes.add(linked_code_norm)
-                    if allowed_pack_job_codes and scanned_job_code not in allowed_pack_job_codes:
-                        self.status.setText(
-                            f"Invalid PACK QR: job code {scanned_job_code} does not match main/linked job."
-                        )
-                        self._show_invalid_overlay("This QR is not for this job.")
+                pack_job_allowed = bool(scanned_job_code and (not allowed_pack_job_codes or scanned_job_code in allowed_pack_job_codes))
+                scan_item = {
+                    "material_product_id": pid or None,
+                    "product_id": pid or None,
+                    "material_code": pid or None,
+                    "material_sku": product_sku_for_pack or None,
+                    "sku": product_sku_for_pack or None,
+                    "material_name": product_name_for_pack or None,
+                    "product_name": product_name_for_pack or None,
+                }
+                matched_part = self._find_job_part_for_scan_item(scan_item)
+                if not pack_job_allowed:
+                    if matched_part is None:
+                        if scanned_job_code is None:
+                            self.status.setText("Invalid PACK QR: missing job code and product is not in job parts.")
+                            self._show_invalid_overlay("PACK QR is not a running job pack or job part.")
+                        else:
+                            self.status.setText(
+                                f"Invalid PACK QR: job code {scanned_job_code} does not match and product is not in job parts."
+                            )
+                            self._show_invalid_overlay("This QR is not for this job or its parts.")
                         return
                     if self._block_pack_scan_if_too_soon():
-                        return
-                if is_rm_from_pack:
-                    material_name = str(product_name_for_pack or "Raw Material").strip() or "Raw Material"
-                    material_product_id = pid
-                    material_sku = str(product_sku_for_pack or "").strip()
-                    material_match_row = {
-                        "material_product_id": material_product_id or None,
-                        "material_code": material_product_id or None,
-                        "material_sku": material_sku or None,
-                        "material_name": material_name,
-                    }
-                    if not self._raw_material_matches_job_parts(material_match_row):
-                        self.status.setText("Invalid RAW MATERIAL QR: material code does not match Job API product parts.")
-                        self._show_invalid_overlay("Raw material does not match product parts.")
                         return
                     unique_key = ""
                     if isinstance(pack_hist, dict):
@@ -17762,41 +18280,22 @@ QWidget#ClientUIRoot {{
                         scan_lot = str(pack_hist.get("lot_number") or "").strip()
                         pid_raw = str(pack_hist.get("product_p") or "").strip()
                         if scan_idx and scan_lot:
-                            unique_key = f"PACKRM:{pid_raw}:{scan_idx}:{scan_lot}"
-                    if unique_key and unique_key in (s.raw_material_unique_keys or set()):
-                        self.status.setText("Invalid RAW MATERIAL QR: duplicate serial already scanned.")
-                        self._show_invalid_overlay("RAW MATERIAL QR serial already scanned.")
-                        return
-                    s.raw_sacks_count += 1
-                    s.raw_material_scans.append(material_name)
-                    owner_ctx = self._scan_owner_context()
-                    log_row = {
-                        "material_name": material_name,
-                        "material_product_id": material_product_id or None,
-                        "material_sku": material_sku or None,
-                        "qty": qty,
-                        "scanned_at": datetime.now(timezone.utc).isoformat(),
-                        "source": "PACK_QR_ZRM",
-                        **owner_ctx,
-                    }
-                    if isinstance(pack_hist, dict):
-                        log_row.update(
-                            {
-                                "index": str(pack_hist.get("index") or "-"),
-                                "total_labels": str(pack_hist.get("total_labels") or "-"),
-                                "lot_number": str(pack_hist.get("lot_number") or "-"),
-                                "po_number": str(pack_hist.get("po_number") or "-"),
-                            }
-                        )
-                    s.raw_material_logs.append(log_row)
-                    if unique_key:
-                        s.raw_material_unique_keys.add(unique_key)
-                    self.status.setText(f"Raw material scanned: {material_name} (+{qty})")
-                    self._refresh_ui()
-                    self.push_event(
-                        {"type": "RAW_MATERIAL", "qty": qty, "material": material_name, "source": "PACK_QR_ZRM"},
-                        f"RAW MATERIAL {material_name} +{qty}",
+                            unique_key = f"PARTQR:{pid_raw}:{scan_idx}:{scan_lot}"
+                    material_name = str(product_name_for_pack or matched_part.get("name") or matched_part.get("part_name") or "Job Part").strip()
+                    self._record_job_part_scan(
+                        part=matched_part,
+                        material_name=material_name,
+                        qty=qty,
+                        raw_scan=raw_s,
+                        unique_key=unique_key,
+                        source="PACK_QR_JOB_PART",
+                        material_product_id=pid or None,
+                        material_sku=product_sku_for_pack or None,
+                        pack_hist=pack_hist if isinstance(pack_hist, dict) else None,
+                        raw_job_code=scanned_job_code,
                     )
+                    return
+                if self._block_pack_scan_if_too_soon():
                     return
 
                 if pack_hist is not None:
@@ -17841,6 +18340,7 @@ QWidget#ClientUIRoot {{
                         pack_hist["good_qty"] = new_butal_qty
                         pack_hist["qty_q"] = new_butal_qty
                         self._mark_pack_scan_accepted()
+                        self._auto_allocate_prepack_final_color(qty, raw_s)
                         s.product_pack_history_logs.append(pack_hist)
                         if pack_key:
                             s.product_pack_history_keys.add(pack_key)
@@ -17887,6 +18387,7 @@ QWidget#ClientUIRoot {{
                         self._show_invalid_overlay("Pack qty must be greater than last shift Butal.")
                         return
                     self._mark_pack_scan_accepted()
+                    self._auto_allocate_prepack_final_color(qty, raw_s)
                     s.pack_count += 1
                     s.good_total += new_butal_qty
                     self._clear_last_shift_butal_carryover(scanned_job_code or s.job_code)
@@ -17915,6 +18416,7 @@ QWidget#ClientUIRoot {{
                     )
                     return
                 self._mark_pack_scan_accepted()
+                self._auto_allocate_prepack_final_color(qty, raw_s)
                 s.pack_count += 1
                 s.good_total += qty
                 self._mark_live_cycle_scan_event(units=qty if qty > 0 else 1)

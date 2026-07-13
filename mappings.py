@@ -206,6 +206,12 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="FINISH_JOB", raw=raw, value="Finish current job session")
     if s_l == "joblinkage~1":
         return ScanResult(kind="JOB_LINKAGE_TRIGGER", raw=raw, value="Linkage mode")
+    if s_l in ("multicolorprepack~1", "multi_color_prepack~1", "prepacklinkage~1", "prepack_linkage~1"):
+        return ScanResult(kind="PREPACK_LINKAGE_TRIGGER", raw=raw, value="Multi-color prepack mode")
+    m_prepack = re.fullmatch(r"(?:prepack|prepackpack|genericprepack|generic_prepack)(?:~(\d+))?", s_l)
+    if m_prepack:
+        qty = int(m_prepack.group(1) or "0")
+        return ScanResult(kind="PREPACK_GENERIC_PACK", raw=raw, value="Generic prepack scan", qty=qty)
     if s_l in ("changecolor~1", "change_color~1", "colorchange~1", "color_change~1"):
         return ScanResult(kind="COLOR_CHANGE_TRIGGER", raw=raw, value="Color change")
     if s_l in ("changemold~1", "change_mold~1", "moldchange~1", "mold_change~1"):
