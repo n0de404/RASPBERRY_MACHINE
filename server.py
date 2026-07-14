@@ -37,6 +37,8 @@ async def _app_lifespan(app: FastAPI):
         STATE_TICK_TASK = asyncio.create_task(_state_tick_loop())
     try:
         yield
+    except asyncio.CancelledError:
+        pass
     finally:
         if STATE_TICK_TASK is not None:
             STATE_TICK_TASK.cancel()
@@ -60,6 +62,7 @@ PRODUCT_API_CONFIG_FILE = Path(__file__).resolve().parent / "Database" / "produc
 PRODUCT_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "product_catalog_cache.json"
 LOW_STOCK_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "low_stock_recommendations.json"
 ACTIVE_MACHINE_SESSIONS_FILE = Path(__file__).resolve().parent / "Database" / "active_machine_sessions.json"
+SERVER_APP_LOG_FILE = Path(__file__).resolve().parent / "Database" / "server_app_logs.jsonl"
 PLANNING_BOARD_FILE = Path(__file__).resolve().parent / "Database" / "planning_board.json"
 PROFILE_REPRINT_ADMIN_PASSWORD = "adminphiltop"
 QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.11.173:5000").strip().rstrip("/")
@@ -198,6 +201,68 @@ def _save_json_list(path: Path, rows: List[Dict[str, Any]]) -> bool:
     except Exception as e:
         print(f"[JSON] Failed to save {path.name}: {e}")
         return False
+
+
+def _append_server_app_log(kind: str, row: Dict[str, Any]) -> None:
+    try:
+        item = {"at_utc": utc_now().isoformat(), "kind": str(kind or "").strip(), **dict(row or {})}
+        SERVER_APP_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with SERVER_APP_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _fallback_pack_history_logs_from_server_events(session_row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    try:
+        if not SERVER_APP_LOG_FILE.exists():
+            return []
+        machine_code = str(session_row.get("machine_code") or "").strip()
+        if not machine_code:
+            return []
+        client_id = str(session_row.get("client_id") or "").strip()
+        pack_total = int(session_row.get("pack_total", session_row.get("pack_count", 0)) or 0)
+        if pack_total <= 0:
+            return []
+        good_total = int(session_row.get("good_total", 0) or 0)
+        qty_each = int(good_total / pack_total) if good_total > 0 and good_total % pack_total == 0 else 0
+        started_at = _parse_iso_utc(session_row.get("job_started_at"))
+        rows: List[Dict[str, Any]] = []
+        with SERVER_APP_LOG_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if str(item.get("kind") or "") != "api_event_received":
+                    continue
+                if str(item.get("event_type") or "").strip().upper() != "PACK":
+                    continue
+                if str(item.get("machine_code") or "").strip() != machine_code:
+                    continue
+                if client_id and str(item.get("client_id") or "").strip() != client_id:
+                    continue
+                at_utc = str(item.get("at_utc") or "").strip()
+                if started_at:
+                    event_at = _parse_iso_utc(at_utc)
+                    if event_at and event_at < started_at:
+                        continue
+                rows.append(
+                    {
+                        "source": "PACK_EVENT_FALLBACK",
+                        "status": "ACTIVE",
+                        "voided": False,
+                        "qty_q": qty_each if qty_each > 0 else "",
+                        "qty": qty_each if qty_each > 0 else "",
+                        "operator": str(session_row.get("operator_id") or "").strip() or "-",
+                        "operator_name": str(session_row.get("operator_id") or "").strip() or "-",
+                        "scanned_at": at_utc,
+                        "fallback_from_server_event": True,
+                    }
+                )
+        return rows[-pack_total:]
+    except Exception:
+        return []
 
 
 def _ensure_sql_schema() -> bool:
@@ -1064,6 +1129,35 @@ def _machine_display_name(machine_code: str, machine_name: Any = "") -> str:
     return name or code
 
 
+def _normalize_machine_code_from_scan(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    upper = raw.upper()
+    if upper in MACHINE_NAME_MAP:
+        return upper
+    for code, name in MACHINE_NAME_MAP.items():
+        if upper == str(name or "").strip().upper():
+            return code
+    digits = re.sub(r"\D+", "", raw)
+    if not digits:
+        return ""
+    if re.fullmatch(r"M0*\d+", upper):
+        code = f"M{int(digits):05d}"
+        return code if code in MACHINE_NAME_MAP else ""
+    machine_no = int(digits)
+    if 301 <= machine_no <= 321:
+        code = f"M{machine_no - 300:05d}"
+        return code if code in MACHINE_NAME_MAP else ""
+    if 1 <= machine_no <= len(MACHINE_NAME_MAP):
+        code = f"M{machine_no:05d}"
+        return code if code in MACHINE_NAME_MAP else ""
+    for code, name in MACHINE_NAME_MAP.items():
+        if digits and digits == re.sub(r"\D+", "", str(name or "")):
+            return code
+    return ""
+
+
 def _parse_int_or_none(value: Any) -> Optional[int]:
     try:
         if value in (None, ""):
@@ -1159,6 +1253,8 @@ class MachineSession:
         d["raw_material_scans"] = d["raw_material_scans"] or []
         d["raw_material_logs"] = d["raw_material_logs"] or []
         d["product_pack_history_logs"] = d["product_pack_history_logs"] or []
+        if not d["product_pack_history_logs"]:
+            d["product_pack_history_logs"] = _fallback_pack_history_logs_from_server_events(d)
         d["job_payload"] = d["job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
         d["operator_shift_logs"] = d["operator_shift_logs"] or []
@@ -1256,12 +1352,40 @@ def _active_shift_segment_key(row: Dict[str, Any], fallback_session: Optional[Ma
     ])
 
 
+def _clean_operator_shift_logs_for_session(
+    rows: Any,
+    *,
+    client_id: str,
+    machine_code: str,
+) -> List[Dict[str, Any]]:
+    expected_client_id = str(client_id or "").strip()
+    expected_machine_code = str(machine_code or "").strip()
+    clean_rows: List[Dict[str, Any]] = []
+    if not isinstance(rows, list):
+        return clean_rows
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_client_id = str(row.get("client_id") or expected_client_id).strip()
+        row_machine_code = str(row.get("machine_code") or expected_machine_code).strip()
+        if expected_client_id and row_client_id and row_client_id != expected_client_id:
+            continue
+        if expected_machine_code and row_machine_code and row_machine_code != expected_machine_code:
+            continue
+        item = dict(row)
+        item["client_id"] = row_client_id or expected_client_id
+        item["machine_code"] = row_machine_code or expected_machine_code
+        clean_rows.append(item)
+    return clean_rows[-40:]
+
+
 def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSession]:
     if not isinstance(raw, dict):
         return None
     machine_code = str(raw.get("machine_code") or "").strip()
     if not machine_code:
         return None
+    client_id = str(raw.get("client_id") or "SNAPSHOT").strip() or "SNAPSHOT"
     external_weight = None
     try:
         raw_external_weight = raw.get("external_average_weight_grams")
@@ -1270,7 +1394,7 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         external_weight = None
     last_seen_utc = str(raw.get("last_seen_utc") or raw.get("saved_at_utc") or "").strip()
     return MachineSession(
-        client_id=str(raw.get("client_id") or "SNAPSHOT").strip() or "SNAPSHOT",
+        client_id=client_id,
         machine_code=machine_code,
         machine_name=_machine_display_name(machine_code, raw.get("machine_name", machine_code)),
         job_code=str(raw.get("job_code") or "").strip() or None,
@@ -1334,7 +1458,11 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         job_payload=dict(raw.get("job_payload") or {}),
         linkage_enabled=bool(raw.get("linkage_enabled", False)),
         linkage_jobs=list(raw.get("linkage_jobs") or []),
-        operator_shift_logs=list(raw.get("operator_shift_logs") or []),
+        operator_shift_logs=_clean_operator_shift_logs_for_session(
+            raw.get("operator_shift_logs") or [],
+            client_id=client_id,
+            machine_code=machine_code,
+        ),
         butal_by_job={str(k): int(v or 0) for k, v in dict(raw.get("butal_by_job") or {}).items()},
         last_shift_butal_qty=int(raw.get("last_shift_butal_qty", 0) or 0),
         last_shift_butal_raw=str(raw.get("last_shift_butal_raw") or ""),
@@ -1354,12 +1482,21 @@ def _active_sessions_backup_file() -> Path:
 def _read_active_sessions_payload(path: Path) -> Dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(str(path))
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return {}
+    raw = json.loads(text)
     return raw if isinstance(raw, dict) else {}
 
 
 def _backup_active_sessions_file() -> None:
     if not ACTIVE_MACHINE_SESSIONS_FILE.exists():
+        return
+    try:
+        current = _read_active_sessions_payload(ACTIVE_MACHINE_SESSIONS_FILE)
+        if not current:
+            return
+    except Exception:
         return
     backup = _active_sessions_backup_file()
     with ACTIVE_MACHINE_SESSIONS_FILE.open("rb") as src, backup.open("wb") as dst:
@@ -1470,6 +1607,7 @@ WS_CLIENTS: List[WebSocket] = []
 STATE_TICK_TASK: Optional[asyncio.Task] = None
 MACHINE_STATUS_OVERRIDES: Dict[str, Dict[str, Any]] = {}
 MACHINE_STATUS_ARCHIVE: List[Dict[str, Any]] = []
+CLIENT_STATUSES: Dict[str, Dict[str, Any]] = {}
 ACTIVE_SESSIONS_FILE_MTIME: Optional[float] = None
 
 
@@ -1487,6 +1625,46 @@ def refresh_active_sessions_from_file() -> None:
         if not code:
             continue
         SESSIONS[code] = sess
+
+
+def _client_status_key(client_id: str, remote_host: str) -> str:
+    cid = str(client_id or "").strip()
+    host = str(remote_host or "").strip()
+    return cid or host or "UNKNOWN"
+
+
+def _update_client_status(
+    client_id: str,
+    remote_host: str,
+    *,
+    machine_code: str = "",
+    machine_name: str = "",
+    event_type: str = "",
+    last_event: str = "",
+    machine_scanned: bool = False,
+) -> Dict[str, Any]:
+    now = utc_now().isoformat()
+    key = _client_status_key(client_id, remote_host)
+    row = dict(CLIENT_STATUSES.get(key) or {})
+    code = str(machine_code or "").strip()
+    row.update({
+        "client_id": str(client_id or "").strip() or row.get("client_id") or "UNKNOWN",
+        "remote_host": str(remote_host or "").strip(),
+        "machine_code": code,
+        "machine_name": _machine_display_name(code, machine_name) if code else str(machine_name or "").strip(),
+        "machine_scanned": bool(machine_scanned and code),
+        "last_event_type": str(event_type or "").strip().upper(),
+        "last_event": str(last_event or "").strip(),
+        "last_seen_utc": now,
+    })
+    CLIENT_STATUSES[key] = row
+    return row
+
+
+def _client_status_rows() -> List[Dict[str, Any]]:
+    rows = [dict(x) for x in CLIENT_STATUSES.values() if isinstance(x, dict)]
+    rows.sort(key=lambda r: str(r.get("last_seen_utc") or ""), reverse=True)
+    return rows
 
 
 def load_machine_status_overrides() -> Dict[str, Dict[str, Any]]:
@@ -2951,6 +3129,252 @@ def _parse_qr_segments(qr_value: str) -> Dict[str, str]:
     }
 
 
+def _job_payload_data(sess: Optional[MachineSession]) -> Dict[str, Any]:
+    payload = sess.job_payload if sess is not None and isinstance(sess.job_payload, dict) else {}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    return data if isinstance(data, dict) else {}
+
+
+def _active_session_parts(sess: Optional[MachineSession]) -> List[Dict[str, Any]]:
+    data = _job_payload_data(sess)
+    details = data.get("job_details") if isinstance(data.get("job_details"), dict) else {}
+    if isinstance(data.get("parts"), list):
+        return [dict(x) for x in data.get("parts") or [] if isinstance(x, dict)]
+    if isinstance(details.get("parts"), list):
+        return [dict(x) for x in details.get("parts") or [] if isinstance(x, dict)]
+    return []
+
+
+def _raw_material_session_summary(sess: MachineSession) -> Dict[str, Any]:
+    _fill_session_product_identity(sess)
+    data = _job_payload_data(sess)
+    job = data.get("job") if isinstance(data.get("job"), dict) else {}
+    details = data.get("job_details") if isinstance(data.get("job_details"), dict) else {}
+    parts = _active_session_parts(sess)
+    return {
+        "machine_code": sess.machine_code,
+        "machine_name": _machine_display_name(sess.machine_code, sess.machine_name),
+        "machine_number": re.sub(r"\D+", "", str(_machine_display_name(sess.machine_code, sess.machine_name) or "")),
+        "active_job": bool(str(sess.job_code or "").strip()),
+        "work_order": str(sess.job_code or job.get("id") or job.get("job_id") or "").strip(),
+        "job_code": str(sess.job_code or job.get("id") or job.get("job_id") or "").strip(),
+        "job_name": str(sess.job_name or job.get("ref_no") or job.get("job_name") or "").strip(),
+        "job_ref": str(job.get("ref_no") or sess.job_name or sess.job_code or "").strip(),
+        "product_id": str(sess.product_id or details.get("product_id") or job.get("product_id") or "").strip(),
+        "product_sku": str(sess.product_sku or "").strip(),
+        "product_name": str(sess.product_name or "").strip(),
+        "sku_running": str(sess.product_sku or "").strip(),
+        "operator_id": sess.operator_id,
+        "raw_sacks_count": int(sess.raw_sacks_count or 0),
+        "raw_material_logs": list(sess.raw_material_logs or []),
+        "raw_material_scans": list(sess.raw_material_scans or []),
+        "parts": parts,
+        "job_details": details,
+    }
+
+
+def _format_qty_display(value: Any) -> str:
+    qty = _parse_number_like(value)
+    if qty <= 0:
+        return "0"
+    if abs(qty - round(qty)) < 0.0001:
+        return str(int(round(qty)))
+    return f"{qty:.3f}".rstrip("0").rstrip(".")
+
+
+def _raw_material_machine_list_row(machine_code: str, sess: Optional[MachineSession]) -> Dict[str, Any]:
+    machine_name = _machine_display_name(machine_code, getattr(sess, "machine_name", machine_code) if sess else machine_code)
+    if sess is None:
+        return {
+            "machine_code": machine_code,
+            "machine_name": machine_name,
+            "machine_number": re.sub(r"\D+", "", machine_name),
+            "mach": machine_name,
+            "active_job": False,
+            "job": "-",
+            "job_code": "",
+            "job_name": "",
+            "raw_z": "-",
+            "raw_materials": [],
+            "used_scan": "0/0",
+            "used_qty": 0,
+            "scanned_qty": 0,
+            "scan_count": 0,
+        }
+
+    _fill_session_product_identity(sess)
+    parts = _active_session_parts(sess)
+    raw_logs = [x for x in (sess.raw_material_logs or []) if isinstance(x, dict)]
+    scanned_qty = sum(max(0.0, _parse_number_like(x.get("qty", x.get("quantity", 0)))) for x in raw_logs)
+    consumed_units = max(
+        0.0,
+        _parse_number_like(sess.good_total)
+        + _parse_number_like(sess.butal_total)
+        + _parse_number_like(sess.reject_total)
+        + _parse_number_like(sess.startup_reject_total)
+        + _parse_number_like(sess.no_shot_total),
+    )
+    if consumed_units <= 0:
+        consumed_units = max(0.0, _parse_number_like(sess.good_total) + _parse_number_like(sess.butal_total))
+    part_qty_per_unit = _parse_number_like(sess.external_average_weight_grams) / 1000.0
+    used_qty = min(scanned_qty, _fifo_used_raw_qty(raw_logs, consumed_units, part_qty_per_unit))
+    raw_materials: List[Dict[str, Any]] = []
+    for part in parts:
+        sku = str(part.get("sku") or part.get("product_sku") or "").strip()
+        name = str(part.get("name") or part.get("product_name") or "").strip()
+        product_id = str(part.get("part_product_id") or part.get("product_id") or part.get("id") or "").strip()
+        raw_materials.append({
+            "product_id": product_id,
+            "sku": sku,
+            "name": name,
+            "display": " - ".join([x for x in (sku, name) if x]) or product_id or "-",
+            "request_part_qty": part.get("request_part_qty") or part.get("required_qty") or part.get("qty") or part.get("quantity") or "",
+            "part_qty_per_unit": part.get("part_qty_per_unit") or part.get("qty_per_unit") or "",
+        })
+    raw_z = ", ".join(x.get("display", "-") for x in raw_materials[:3]) if raw_materials else "-"
+    if len(raw_materials) > 3:
+        raw_z = f"{raw_z} +{len(raw_materials) - 3}"
+    job_label = str(sess.job_name or sess.job_code or "").strip() or "-"
+    if str(sess.job_code or "").strip() and str(sess.job_name or "").strip() and str(sess.job_code) != str(sess.job_name):
+        job_label = f"{sess.job_code} - {sess.job_name}"
+    return {
+        "machine_code": machine_code,
+        "machine_name": machine_name,
+        "machine_number": re.sub(r"\D+", "", machine_name),
+        "mach": machine_name,
+        "active_job": bool(str(sess.job_code or "").strip()),
+        "job": job_label,
+        "job_code": str(sess.job_code or "").strip(),
+        "job_name": str(sess.job_name or "").strip(),
+        "work_order": str(sess.job_code or "").strip(),
+        "product_id": str(sess.product_id or "").strip(),
+        "product_sku": str(sess.product_sku or "").strip(),
+        "sku_running": str(sess.product_sku or "").strip(),
+        "raw_z": raw_z,
+        "raw_materials": raw_materials,
+        "used_scan": f"{_format_qty_display(used_qty)}/{_format_qty_display(scanned_qty)}",
+        "used_qty": used_qty,
+        "scanned_qty": scanned_qty,
+        "scan_count": len(raw_logs),
+        "raw_sacks_count": int(sess.raw_sacks_count or 0),
+    }
+
+
+def _append_raw_material_scan_to_session(sess: MachineSession, ev: Dict[str, Any], *, commit: bool = True) -> Dict[str, Any]:
+    raw_scan = str(
+        ev.get("raw_scan")
+        or ev.get("qr_payload")
+        or ev.get("material_qr")
+        or ev.get("scan")
+        or ""
+    ).strip()
+    parsed = _parse_qr_segments(raw_scan) if raw_scan else {}
+    material_product_id = str(
+        ev.get("material_product_id")
+        or ev.get("product_id")
+        or parsed.get("product")
+        or ""
+    ).strip()
+    material_meta = _lookup_product_meta(material_product_id) if material_product_id else {"id": "", "name": "", "sku": ""}
+    material_name = str(
+        ev.get("material")
+        or ev.get("material_name")
+        or material_meta.get("name")
+        or material_meta.get("sku")
+        or "Raw Material"
+    ).strip() or "Raw Material"
+    qty_value = _parse_number_like(ev.get("qty", ev.get("quantity", parsed.get("qty") or 1)))
+    qty = int(round(qty_value)) if qty_value > 0 else 1
+    row = ev.get("raw_material_log")
+    if isinstance(row, dict):
+        row = dict(row)
+    else:
+        row = {
+            "material": material_name,
+            "material_name": material_name,
+            "material_product_id": material_product_id or material_meta.get("id", ""),
+            "material_sku": str(ev.get("material_sku") or ev.get("sku") or material_meta.get("sku") or "").strip(),
+            "qty": qty,
+            "unique_key": ev.get("unique_key") or raw_scan or None,
+            "raw_job_code": ev.get("raw_job_code") or parsed.get("po_number") or sess.job_code or None,
+            "po_number": ev.get("po_number") or parsed.get("po_number") or "",
+            "lot_number": ev.get("lot_number") or parsed.get("lot_number") or "",
+            "index": ev.get("index") or parsed.get("index") or "",
+            "total": ev.get("total") or parsed.get("total") or "",
+            "raw_scan": raw_scan,
+            "parsed": parsed,
+            "source": ev.get("source") or "RAW_MATERIAL",
+            "scanner_id": ev.get("scanner_id") or ev.get("device") or "",
+            "scanned_at": ev.get("scanned_at") or ev.get("timestamp") or utc_now().isoformat(),
+        }
+    row["material"] = str(row.get("material") or row.get("material_name") or material_name).strip() or material_name
+    row["material_name"] = str(row.get("material_name") or row.get("material") or material_name).strip() or material_name
+    row["qty"] = int(round(_parse_number_like(row.get("qty", qty)))) or qty
+    row.setdefault("material_product_id", material_product_id or material_meta.get("id", ""))
+    row.setdefault("material_sku", str(ev.get("material_sku") or ev.get("sku") or material_meta.get("sku") or "").strip())
+    row.setdefault("raw_scan", raw_scan)
+    row.setdefault("parsed", parsed)
+    row.setdefault("scanned_at", utc_now().isoformat())
+
+    unique_key = str(row.get("unique_key") or ev.get("unique_key") or raw_scan or "").strip()
+    existing_rows = [x for x in (sess.raw_material_logs or []) if isinstance(x, dict)]
+    duplicate = False
+    if unique_key:
+        duplicate = any(str(x.get("unique_key") or x.get("raw_scan") or "").strip() == unique_key for x in existing_rows)
+    else:
+        row_signature = (
+            str(row.get("material_name") or ""),
+            str(row.get("qty") or ""),
+            str(row.get("index") or ""),
+            str(row.get("lot_number") or ""),
+            str(row.get("po_number") or ""),
+            str(row.get("scanned_at") or ""),
+        )
+        duplicate = any(
+            (
+                str(x.get("material_name") or ""),
+                str(x.get("qty") or ""),
+                str(x.get("index") or ""),
+                str(x.get("lot_number") or ""),
+                str(x.get("po_number") or ""),
+                str(x.get("scanned_at") or ""),
+            ) == row_signature
+            for x in existing_rows
+        )
+    if commit and not duplicate:
+        sess.raw_material_logs = (sess.raw_material_logs or []) + [row]
+        sess.raw_material_scans = (sess.raw_material_scans or []) + [row["material_name"]]
+        sess.raw_sacks_count = int(sess.raw_sacks_count or 0) + 1
+    return {"row": row, "duplicate": duplicate}
+
+
+def _match_raw_material_row_to_parts(row: Dict[str, Any], parts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(row, dict) or not isinstance(parts, list):
+        return []
+    row_product_id = str(row.get("material_product_id") or row.get("product_id") or "").strip().lstrip("0")
+    row_sku = str(row.get("material_sku") or row.get("sku") or "").strip().casefold()
+    row_name = str(row.get("material_name") or row.get("material") or "").strip().casefold()
+    matched: List[Dict[str, Any]] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        part_product_id = str(
+            part.get("part_product_id")
+            or part.get("product_id")
+            or part.get("id")
+            or ""
+        ).strip().lstrip("0")
+        part_sku = str(part.get("sku") or part.get("product_sku") or "").strip().casefold()
+        part_name = str(part.get("name") or part.get("product_name") or "").strip().casefold()
+        if (
+            (row_product_id and part_product_id and row_product_id == part_product_id)
+            or (row_sku and part_sku and row_sku == part_sku)
+            or (row_name and part_name and row_name == part_name)
+        ):
+            matched.append(part)
+    return matched
+
+
 def _fit_font(draw: ImageDraw.ImageDraw, text: str, max_w: int, max_h: int, start: int, min_px: int = 10) -> ImageFont.ImageFont:
     font_candidates = [
         "arial.ttf",
@@ -4018,6 +4442,7 @@ async def broadcast_state():
         "job_queue": _build_job_queue_rows(),
         "machine_status_overrides": MACHINE_STATUS_OVERRIDES,
         "machine_status_archive": MACHINE_STATUS_ARCHIVE,
+        "client_statuses": _client_status_rows(),
         "visible_machine_codes": SERVER_SETTINGS.get("visible_machine_codes", []),
         "planning_board": PLANNING_BOARD,
         "finished_jobs": FINISHED_JOBS,
@@ -6440,7 +6865,11 @@ DASHBOARD_HTML = """
   }
 
   function productPackMissingSeriesRows(session){
-    const rows = productPackHistoryRows(session);
+    const rows = productPackHistoryRows(session).filter(row => {
+      const source = String(row.source || "").trim().toUpperCase();
+      const hasSeries = Number(row.series || 0) > 0;
+      return hasSeries && source !== "PACK_EVENT_FALLBACK";
+    });
     const groups = new Map();
     rows.forEach(row => {
       const key = [row.product || "-", row.po || "-", row.total_labels || "-"].join("|");
@@ -10158,7 +10587,7 @@ DASHBOARD_HTML = """
     const configuredVisible = Array.isArray(visibleMachineCodesState) ? visibleMachineCodesState.map(code => String(code || "").trim()).filter(Boolean) : DEFAULT_MACHINE_CODES;
     const visibleSet = new Set(configuredVisible);
     const allCodes = Array.from(new Set([...DEFAULT_MACHINE_CODES, ...sessionCodes, ...overrideCodes]))
-      .filter(code => visibleSet.has(code))
+      .filter(code => visibleSet.has(code) || sessionCodes.includes(code) || overrideCodes.includes(code))
       .sort();
     machineCountEl.textContent = String(allCodes.length);
 
@@ -11650,6 +12079,68 @@ async def api_machine_status_set(req: Request):
     }
 
 
+def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_code: str) -> bool:
+    if not isinstance(snap, dict):
+        return False
+    snap_machine = str(snap.get("machine_code") or machine_code or "").strip()
+    if snap_machine and machine_code and snap_machine != machine_code:
+        return False
+
+    snap_started = _parse_iso_utc(snap.get("job_started_at"))
+    current_started = _parse_iso_utc(sess.job_started_at)
+    snap_job_key = str(snap.get("job_code") or snap.get("job_name") or "").strip()
+    current_job_key = str(sess.job_code or sess.job_name or "").strip()
+    stale_snapshot_segment = bool(
+        snap_started
+        and current_started
+        and snap_started < current_started
+        and (not snap_job_key or not current_job_key or snap_job_key == current_job_key)
+    )
+    if stale_snapshot_segment:
+        return False
+
+    sess.machine_name = _machine_display_name(machine_code, snap.get("machine_name") or sess.machine_name or machine_code)
+    sess.job_code = snap.get("job_code", sess.job_code)
+    sess.job_name = snap.get("job_name", sess.job_name)
+    sess.product_id = str(snap.get("product_id", sess.product_id) or "")
+    sess.product_sku = str(snap.get("product_sku", sess.product_sku) or "")
+    sess.product_name = str(snap.get("product_name", sess.product_name) or "")
+    sess.job_started_at = snap.get("job_started_at", sess.job_started_at)
+    sess.operator_id = snap.get("operator_id", sess.operator_id)
+    sess.active_scan_operator_id = snap.get("active_scan_operator_id", sess.active_scan_operator_id or sess.operator_id)
+    sess.active_scan_owner_type = str(snap.get("active_scan_owner_type", sess.active_scan_owner_type or "ORIGINAL") or "ORIGINAL").strip().upper()
+
+    try:
+        sess.pack_total = int(snap.get("pack_total", snap.get("pack_count", sess.pack_total)) or 0)
+        sess.good_total = int(snap.get("good_total", sess.good_total) or 0)
+        sess.butal_total = int(snap.get("butal_total", sess.butal_total) or 0)
+        sess.reject_total = int(snap.get("reject_total", sess.reject_total) or 0)
+        sess.no_shot_total = int(snap.get("no_shot_total", sess.no_shot_total) or 0)
+        sess.raw_sacks_count = int(snap.get("raw_sacks_count", sess.raw_sacks_count) or 0)
+        sess.startup_reject_total = int(snap.get("startup_reject_total", sess.startup_reject_total) or 0)
+    except Exception:
+        pass
+
+    if isinstance(snap.get("reject_breakdown"), dict):
+        sess.reject_breakdown = dict(snap.get("reject_breakdown") or {})
+    if isinstance(snap.get("raw_material_scans"), list):
+        sess.raw_material_scans = list(snap.get("raw_material_scans") or [])
+    if isinstance(snap.get("raw_material_logs"), list):
+        sess.raw_material_logs = list(snap.get("raw_material_logs") or [])
+    if isinstance(snap.get("product_pack_history_logs"), list):
+        sess.product_pack_history_logs = list(snap.get("product_pack_history_logs") or [])
+    if isinstance(snap.get("job_payload"), dict):
+        sess.job_payload = dict(snap.get("job_payload") or {})
+        _fill_session_product_identity(sess)
+    if isinstance(snap.get("operator_shift_logs"), list):
+        sess.operator_shift_logs = _clean_operator_shift_logs_for_session(
+            snap.get("operator_shift_logs") or [],
+            client_id=sess.client_id,
+            machine_code=sess.machine_code,
+        )
+    return True
+
+
 @APP.post("/api/event")
 async def api_event(req: Request):
     """
@@ -11665,15 +12156,54 @@ async def api_event(req: Request):
       "last_event": "PACK +1"
     }
     """
-    data = await req.json()
+    remote_host = ""
+    try:
+        remote_host = str(req.client.host if req.client else "")
+    except Exception:
+        remote_host = ""
+    try:
+        data = await req.json()
+    except asyncio.CancelledError:
+        _append_server_app_log("api_event_cancelled", {"remote_host": remote_host})
+        return JSONResponse(
+            {"ok": False, "error": "Request body was cancelled or incomplete; client should retry"},
+            status_code=503,
+        )
+    except Exception as e:
+        _append_server_app_log("api_event_bad_json", {"remote_host": remote_host, "error": str(e)})
+        return JSONResponse({"ok": False, "error": f"Invalid JSON body: {e}"}, status_code=400)
+    if not isinstance(data, dict):
+        _append_server_app_log("api_event_bad_body", {"remote_host": remote_host, "body_type": type(data).__name__})
+        return JSONResponse({"ok": False, "error": "JSON body must be an object"}, status_code=400)
 
+    client_id = str(data.get("client_id", "UNKNOWN")).strip() or "UNKNOWN"
+    ev = data.get("event") or {}
+    if not isinstance(ev, dict):
+        _append_server_app_log("api_event_bad_event", {"remote_host": remote_host, "machine_code": str(data.get("machine_code", "")).strip(), "event_type": type(ev).__name__})
+        return JSONResponse({"ok": False, "error": "event must be an object"}, status_code=400)
+    ev_type = str(ev.get("type", "")).upper()
     machine_code = str(data.get("machine_code", "")).strip()
     if not machine_code:
-        return JSONResponse({"ok": False, "error": "machine_code required"}, status_code=400)
-    client_id = str(data.get("client_id", "UNKNOWN")).strip() or "UNKNOWN"
+        _update_client_status(
+            client_id,
+            remote_host,
+            event_type=ev_type or "PING",
+            last_event=str(data.get("last_event") or ev.get("message") or "CLIENT ONLINE"),
+            machine_scanned=False,
+        )
+        _append_server_app_log(
+            "api_event_client_ping",
+            {"remote_host": remote_host, "client_id": client_id, "event_type": ev_type, "machine_code": ""},
+        )
+        await broadcast_state()
+        if ev_type in ("", "HEARTBEAT", "PING", "CLIENT_STATUS", "SESSION_SYNC"):
+            return {"ok": True, "client_online": True, "machine_scanned": False}
+        return JSONResponse({"ok": False, "error": "machine_code required for machine/job events"}, status_code=400)
 
+    created_session_for_event = False
     sess = SESSIONS.get(machine_code)
     if sess is None:
+        created_session_for_event = True
         sess = MachineSession(
             client_id=client_id,
             machine_code=machine_code,
@@ -11691,24 +12221,43 @@ async def api_event(req: Request):
     # update common fields
     sess.client_id = client_id
     sess.machine_name = _machine_display_name(machine_code, data.get("machine_name", sess.machine_name))
+    _update_client_status(
+        client_id,
+        remote_host,
+        machine_code=machine_code,
+        machine_name=sess.machine_name,
+        event_type=ev_type,
+        last_event=str(data.get("last_event", "")),
+        machine_scanned=True,
+    )
     incoming_job_code = data.get("job_code")
     incoming_job_name = data.get("job_name")
     incoming_operator_id = data.get("operator_id")
-    if str(incoming_job_code or "").strip():
-        sess.job_code = incoming_job_code
-    if str(incoming_job_name or "").strip():
-        sess.job_name = incoming_job_name
-    if str(incoming_operator_id or "").strip():
-        sess.operator_id = incoming_operator_id
-        if not sess.break_active:
-            sess.active_scan_operator_id = incoming_operator_id
-            sess.active_scan_owner_type = "ORIGINAL"
+    allow_common_identity_update = ev_type not in ("FINISH_SHIFT", "FINISH_JOB")
+    if allow_common_identity_update:
+        if str(incoming_job_code or "").strip():
+            sess.job_code = incoming_job_code
+        if str(incoming_job_name or "").strip():
+            sess.job_name = incoming_job_name
+        if str(incoming_operator_id or "").strip():
+            sess.operator_id = incoming_operator_id
+            if not sess.break_active:
+                sess.active_scan_operator_id = incoming_operator_id
+                sess.active_scan_owner_type = "ORIGINAL"
     sess.last_seen_utc = utc_now().isoformat()
     sess.last_event = str(data.get("last_event", sess.last_event))
 
     # apply event counters if provided
-    ev = data.get("event") or {}
-    ev_type = str(ev.get("type", "")).upper()
+    _append_server_app_log(
+        "api_event_received",
+        {
+            "remote_host": remote_host,
+            "client_id": client_id,
+            "machine_code": machine_code,
+            "event_type": ev_type,
+            "last_event": str(data.get("last_event", ""))[:120],
+        },
+    )
     if ev_type == "OPERATOR_SET":
         raw_operator_qr = str(ev.get("operator_qr_payload") or "").strip()
         if raw_operator_qr:
@@ -11734,7 +12283,11 @@ async def api_event(req: Request):
                 )
             ]
             rows.append(dict(shift_payload))
-            sess.operator_shift_logs = rows[-40:]
+            sess.operator_shift_logs = _clean_operator_shift_logs_for_session(
+                rows,
+                client_id=sess.client_id,
+                machine_code=sess.machine_code,
+            )
         new_operator = str(ev.get("new_operator") or incoming_operator_id or "").strip()
         if new_operator:
             sess.operator_id = new_operator
@@ -11817,6 +12370,8 @@ async def api_event(req: Request):
             }, sess)
             if finished_segment_key and finished_segment_key == current_segment_key and not (sess.operator_shift_logs or []):
                 _clear_active_session_job_keep_machine(sess)
+        if created_session_for_event and machine_code in SESSIONS and not str(SESSIONS[machine_code].job_code or "").strip():
+            del SESSIONS[machine_code]
     elif ev_type == "FINISH_JOB":
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
@@ -11883,56 +12438,13 @@ async def api_event(req: Request):
                 )
             ]
             rows.append(shift_payload)
-            sess.operator_shift_logs = rows[-40:]
+            sess.operator_shift_logs = _clean_operator_shift_logs_for_session(
+                rows,
+                client_id=sess.client_id,
+                machine_code=sess.machine_code,
+            )
     elif ev_type == "RAW_MATERIAL":
-        material_name = str(ev.get("material") or ev.get("material_name") or "Raw Material").strip() or "Raw Material"
-        qty = int(ev.get("qty", 1) or 1)
-        raw_row = ev.get("raw_material_log")
-        if isinstance(raw_row, dict):
-            row = dict(raw_row)
-        else:
-            row = {
-                "material": material_name,
-                "material_name": material_name,
-                "qty": qty,
-                "unique_key": ev.get("unique_key") or None,
-                "raw_job_code": ev.get("raw_job_code") or None,
-                "source": ev.get("source") or "RAW_MATERIAL",
-                "scanned_at": utc_now().isoformat(),
-            }
-        row["material"] = str(row.get("material") or row.get("material_name") or material_name).strip() or material_name
-        row["material_name"] = str(row.get("material_name") or row.get("material") or material_name).strip() or material_name
-        row["qty"] = int(row.get("qty", qty) or qty)
-        row.setdefault("scanned_at", utc_now().isoformat())
-        unique_key = str(row.get("unique_key") or ev.get("unique_key") or "").strip()
-        existing_rows = [x for x in (sess.raw_material_logs or []) if isinstance(x, dict)]
-        duplicate = False
-        if unique_key:
-            duplicate = any(str(x.get("unique_key") or "").strip() == unique_key for x in existing_rows)
-        else:
-            row_signature = (
-                str(row.get("material_name") or ""),
-                str(row.get("qty") or ""),
-                str(row.get("index") or ""),
-                str(row.get("lot_number") or ""),
-                str(row.get("po_number") or ""),
-                str(row.get("scanned_at") or ""),
-            )
-            duplicate = any(
-                (
-                    str(x.get("material_name") or ""),
-                    str(x.get("qty") or ""),
-                    str(x.get("index") or ""),
-                    str(x.get("lot_number") or ""),
-                    str(x.get("po_number") or ""),
-                    str(x.get("scanned_at") or ""),
-                ) == row_signature
-                for x in existing_rows
-            )
-        if not duplicate:
-            sess.raw_material_logs = (sess.raw_material_logs or []) + [row]
-            sess.raw_material_scans = (sess.raw_material_scans or []) + [row["material_name"]]
-            sess.raw_sacks_count = int(sess.raw_sacks_count or 0) + 1
+        _append_raw_material_scan_to_session(sess, ev)
     elif ev_type == "MACHINE_STATUS":
         status = str(ev.get("status") or "").strip().upper()
         if status == "NO_JOB_RUNNING":
@@ -11940,13 +12452,24 @@ async def api_event(req: Request):
     elif ev_type in ("SESSION_SYNC", "HEARTBEAT"):
         snap = ev.get("session_snapshot")
         if isinstance(snap, dict):
+            snap_started = _parse_iso_utc(snap.get("job_started_at"))
+            current_started = _parse_iso_utc(sess.job_started_at)
+            snap_job_key = str(snap.get("job_code") or snap.get("job_name") or "").strip()
+            current_job_key = str(sess.job_code or sess.job_name or "").strip()
+            stale_snapshot_segment = bool(
+                snap_started
+                and current_started
+                and snap_started < current_started
+                and (not snap_job_key or not current_job_key or snap_job_key == current_job_key)
+            )
             sess.machine_name = _machine_display_name(machine_code, snap.get("machine_name") or sess.machine_name or machine_code)
             sess.job_code = snap.get("job_code", sess.job_code)
             sess.job_name = snap.get("job_name", sess.job_name)
             sess.product_id = str(snap.get("product_id", sess.product_id) or "")
             sess.product_sku = str(snap.get("product_sku", sess.product_sku) or "")
             sess.product_name = str(snap.get("product_name", sess.product_name) or "")
-            sess.job_started_at = snap.get("job_started_at", sess.job_started_at)
+            if not stale_snapshot_segment:
+                sess.job_started_at = snap.get("job_started_at", sess.job_started_at)
             sess.operator_id = snap.get("operator_id", sess.operator_id)
             sess.active_scan_operator_id = snap.get("active_scan_operator_id", sess.active_scan_operator_id or sess.operator_id)
             sess.active_scan_owner_type = str(snap.get("active_scan_owner_type", sess.active_scan_owner_type or "ORIGINAL") or "ORIGINAL").strip().upper()
@@ -11957,21 +12480,33 @@ async def api_event(req: Request):
             sess.break_out_time = snap.get("break_out_time", sess.break_out_time)
             if isinstance(snap.get("break_sessions"), list):
                 sess.break_sessions = list(snap.get("break_sessions") or [])
-            sess.pack_total = int(snap.get("pack_total", snap.get("pack_count", sess.pack_total)) or 0)
-            sess.good_total = int(snap.get("good_total", sess.good_total) or 0)
-            sess.butal_total = int(snap.get("butal_total", sess.butal_total) or 0)
-            sess.reject_total = int(snap.get("reject_total", sess.reject_total) or 0)
-            sess.no_shot_total = int(snap.get("no_shot_total", sess.no_shot_total) or 0)
-            if isinstance(snap.get("reject_breakdown"), dict):
-                sess.reject_breakdown = dict(snap.get("reject_breakdown") or {})
-            sess.raw_sacks_count = int(snap.get("raw_sacks_count", sess.raw_sacks_count) or 0)
-            if isinstance(snap.get("raw_material_scans"), list):
-                sess.raw_material_scans = list(snap.get("raw_material_scans") or [])
-            if isinstance(snap.get("raw_material_logs"), list):
-                sess.raw_material_logs = list(snap.get("raw_material_logs") or [])
-            if isinstance(snap.get("product_pack_history_logs"), list):
-                sess.product_pack_history_logs = list(snap.get("product_pack_history_logs") or [])
-            sess.startup_reject_total = int(snap.get("startup_reject_total", sess.startup_reject_total) or 0)
+            if not stale_snapshot_segment:
+                sess.pack_total = int(snap.get("pack_total", snap.get("pack_count", sess.pack_total)) or 0)
+                sess.good_total = int(snap.get("good_total", sess.good_total) or 0)
+                sess.butal_total = int(snap.get("butal_total", sess.butal_total) or 0)
+                sess.reject_total = int(snap.get("reject_total", sess.reject_total) or 0)
+                sess.no_shot_total = int(snap.get("no_shot_total", sess.no_shot_total) or 0)
+                if isinstance(snap.get("reject_breakdown"), dict):
+                    sess.reject_breakdown = dict(snap.get("reject_breakdown") or {})
+                sess.raw_sacks_count = int(snap.get("raw_sacks_count", sess.raw_sacks_count) or 0)
+                if isinstance(snap.get("raw_material_scans"), list):
+                    sess.raw_material_scans = list(snap.get("raw_material_scans") or [])
+                if isinstance(snap.get("raw_material_logs"), list):
+                    sess.raw_material_logs = list(snap.get("raw_material_logs") or [])
+                if isinstance(snap.get("product_pack_history_logs"), list):
+                    sess.product_pack_history_logs = list(snap.get("product_pack_history_logs") or [])
+                sess.startup_reject_total = int(snap.get("startup_reject_total", sess.startup_reject_total) or 0)
+            elif ev_type == "SESSION_SYNC":
+                _append_server_app_log(
+                    "api_event_stale_session_sync_ignored",
+                    {
+                        "remote_host": remote_host,
+                        "client_id": client_id,
+                        "machine_code": machine_code,
+                        "snapshot_job_started_at": str(snap.get("job_started_at") or ""),
+                        "current_job_started_at": str(sess.job_started_at or ""),
+                    },
+                )
             sess.downtime_reason_code = snap.get("downtime_reason_code", sess.downtime_reason_code)
             sess.downtime_reason_text = snap.get("downtime_reason_text", sess.downtime_reason_text)
             sess.downtime_started_at = snap.get("downtime_started_at", sess.downtime_started_at)
@@ -12010,7 +12545,11 @@ async def api_event(req: Request):
             if isinstance(snap.get("linkage_jobs"), list):
                 sess.linkage_jobs = list(snap.get("linkage_jobs") or [])
             if isinstance(snap.get("operator_shift_logs"), list):
-                sess.operator_shift_logs = list(snap.get("operator_shift_logs") or [])
+                sess.operator_shift_logs = _clean_operator_shift_logs_for_session(
+                    snap.get("operator_shift_logs") or [],
+                    client_id=sess.client_id,
+                    machine_code=sess.machine_code,
+                )
             if isinstance(snap.get("butal_by_job"), dict):
                 sess.butal_by_job = {str(k): int(v or 0) for k, v in dict(snap.get("butal_by_job") or {}).items()}
             sess.last_shift_butal_qty = int(snap.get("last_shift_butal_qty", sess.last_shift_butal_qty) or 0)
@@ -12095,10 +12634,33 @@ async def api_event(req: Request):
         if reason:
             sess.reject_breakdown[reason] = sess.reject_breakdown.get(reason, 0) + qty
 
+    if ev_type not in ("SESSION_SYNC", "HEARTBEAT", "FINISH_JOB", "FINISH_SHIFT"):
+        if _apply_embedded_session_snapshot(sess, ev.get("session_snapshot"), machine_code):
+            _append_server_app_log(
+                "api_event_embedded_session_snapshot_applied",
+                {
+                    "remote_host": remote_host,
+                    "client_id": client_id,
+                    "machine_code": machine_code,
+                    "event_type": ev_type,
+                    "pack_history_count": len(sess.product_pack_history_logs or []),
+                },
+            )
+
     if ev_type not in ("SESSION_SYNC", "HEARTBEAT", "FINISH_JOB"):
         _persist_active_sessions_state()
 
     await broadcast_state()
+    _append_server_app_log(
+        "api_event_ok",
+        {
+            "remote_host": remote_host,
+            "client_id": client_id,
+            "machine_code": machine_code,
+            "event_type": ev_type,
+            "sessions_count": len(SESSIONS),
+        },
+    )
     return {"ok": True}
 
 
@@ -12121,6 +12683,204 @@ def api_active_sessions(client_id: str = "", machine_code: str = ""):
         rows.append(sess.to_dict())
     rows.sort(key=lambda r: str(r.get("last_seen_utc") or r.get("saved_at_utc") or ""), reverse=True)
     return {"ok": True, "items": rows}
+
+
+@APP.get("/api/client-status")
+@APP.get("/api/clients/status")
+def api_client_status(client_id: str = "", remote_host: str = ""):
+    cid = str(client_id or "").strip()
+    host = str(remote_host or "").strip()
+    rows = []
+    for row in _client_status_rows():
+        if cid and str(row.get("client_id") or "").strip() != cid:
+            continue
+        if host and str(row.get("remote_host") or "").strip() != host:
+            continue
+        rows.append(row)
+    return {"ok": True, "items": rows}
+
+
+def _machine_lookup_response(machine_scan: Any) -> Any:
+    refresh_active_sessions_from_file()
+    machine_code = _normalize_machine_code_from_scan(machine_scan)
+    if not machine_code:
+        return JSONResponse(
+            {"ok": False, "error": "Unknown machine. Send machine_code like M00010 or machine_number like 310."},
+            status_code=404,
+        )
+    sess = SESSIONS.get(machine_code)
+    if sess is None:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Machine has no active dashboard session",
+                "machine_code": machine_code,
+                "machine_name": _machine_display_name(machine_code, machine_code),
+            },
+            status_code=404,
+        )
+    summary = _raw_material_session_summary(sess)
+    return {"ok": True, **summary}
+
+
+@APP.get("/api/raw-material-scanning/machine/{machine_scan}")
+@APP.get("/raw-material-scanning/machine/{machine_scan}")
+def api_raw_material_scanning_machine_path(machine_scan: str):
+    """Lookup active work order, running SKU, and expected raw materials by scanned machine."""
+    return _machine_lookup_response(machine_scan)
+
+
+@APP.get("/api/raw-material-scanning/machine")
+@APP.get("/raw-material-scanning/machine")
+def api_raw_material_scanning_machine_query(machine_code: str = "", machine_number: str = "", machine: str = ""):
+    """Lookup active work order, running SKU, and expected raw materials by scanned machine."""
+    return _machine_lookup_response(machine_code or machine_number or machine)
+
+
+@APP.get("/api/raw-material-scanning/machines")
+@APP.get("/api/raw-material-scanning/machines/")
+@APP.get("/api/raw-material-scanning/available-machines")
+@APP.get("/api/raw-material-scanning/available-machines/")
+@APP.get("/raw-material-scanning/machines")
+@APP.get("/raw-material-scanning/machines/")
+@APP.get("/raw-material-scanning/available-machines")
+@APP.get("/raw-material-scanning/available-machines/")
+def api_raw_material_scanning_machines(active_only: int = 0):
+    """List machines for the external raw-material scanner app."""
+    refresh_active_sessions_from_file()
+    visible_codes = SERVER_SETTINGS.get("visible_machine_codes")
+    if not isinstance(visible_codes, list) or not visible_codes:
+        visible_codes = list(MACHINE_NAME_MAP.keys())
+    session_codes = [
+        str(sess.machine_code or "").strip()
+        for sess in SESSIONS.values()
+        if str(sess.machine_code or "").strip()
+    ]
+    codes = []
+    seen = set()
+    for code in [*visible_codes, *session_codes]:
+        code = str(code or "").strip()
+        if code and code not in seen:
+            seen.add(code)
+            codes.append(code)
+    rows = []
+    for code in codes:
+        sess = SESSIONS.get(code)
+        if active_only and (sess is None or not str(sess.job_code or "").strip()):
+            continue
+        rows.append(_raw_material_machine_list_row(code, sess))
+    rows.sort(key=lambda r: str(r.get("machine_name") or r.get("machine_code") or ""))
+    return {
+        "ok": True,
+        "columns": ["MACH", "JOB", "RAW Z", "USED/SCAN"],
+        "items": rows,
+    }
+
+
+@APP.get("/api/raw-material-scanning/status")
+@APP.get("/api/raw-material-scanning/status/")
+@APP.get("/raw-material-scanning/status")
+@APP.get("/raw-material-scanning/status/")
+@APP.get("/raw-material-scanning")
+@APP.get("/raw-material-scanning/")
+def api_raw_material_scanning_status():
+    return {
+        "ok": True,
+        "service": "raw-material-scanning",
+        "routes": {
+            "machines": "/api/raw-material-scanning/machines",
+            "machine_lookup": "/api/raw-material-scanning/machine/{machine_scan}",
+            "scan_submit": "/api/raw-material-scanning/scan",
+        },
+    }
+
+
+@APP.post("/api/raw-material-scanning/scan")
+@APP.post("/api/raw-material-scan")
+@APP.post("/raw-material-scanning/scan")
+@APP.post("/raw-material-scan")
+async def api_raw_material_scanning_scan(req: Request):
+    """
+    External raw material scanner endpoint.
+
+    Body accepts:
+      machine_code / machine_number / machine: M00010, IMM 310, or 310
+      raw_scan / qr_payload / material_qr / scan: raw material QR text
+      optional material_name, material_product_id/product_id, material_sku/sku, qty, scanner_id
+    """
+    data = await req.json()
+    machine_input = (
+        data.get("machine_code")
+        or data.get("machine_number")
+        or data.get("machine_no")
+        or data.get("machine")
+        or data.get("machine_id")
+        or ""
+    )
+    machine_code = _normalize_machine_code_from_scan(machine_input)
+    if not machine_code:
+        return JSONResponse(
+            {"ok": False, "error": "Unknown machine. Send machine_code like M00010 or machine_number like 310."},
+            status_code=404,
+        )
+    refresh_active_sessions_from_file()
+    sess = SESSIONS.get(machine_code)
+    if sess is None or not str(sess.job_code or "").strip():
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Machine has no active job",
+                "machine_code": machine_code,
+                "machine_name": _machine_display_name(machine_code, machine_code),
+            },
+            status_code=404,
+        )
+
+    ev = dict(data)
+    ev["source"] = str(data.get("source") or "EXTERNAL_RAW_MATERIAL_SCANNER").strip() or "EXTERNAL_RAW_MATERIAL_SCANNER"
+    preview = _append_raw_material_scan_to_session(sess, ev, commit=False)
+    row = preview.get("row") if isinstance(preview.get("row"), dict) else {}
+    parts = _active_session_parts(sess)
+    if not parts:
+        return JSONResponse(
+            {
+                "ok": False,
+                "accepted": False,
+                "error": "Active job has no raw material parts to validate against",
+                "machine": _raw_material_session_summary(sess),
+                "raw_material_log": row,
+            },
+            status_code=409,
+        )
+    matched_parts = _match_raw_material_row_to_parts(row, parts)
+    if not matched_parts:
+        return JSONResponse(
+            {
+                "ok": False,
+                "accepted": False,
+                "error": "Raw material does not match any expected part for this active job",
+                "machine": _raw_material_session_summary(sess),
+                "raw_material_log": row,
+                "expected_parts": parts,
+            },
+            status_code=409,
+        )
+    result = _append_raw_material_scan_to_session(sess, ev)
+    row = result.get("row") if isinstance(result.get("row"), dict) else row
+    received_at = utc_now().isoformat()
+    sess.last_seen_utc = received_at
+    sess.last_event = f"RAW MATERIAL SCAN {row.get('material_name') or row.get('material') or ''}".strip()
+    _persist_active_sessions_state()
+    await broadcast_state()
+    return {
+        "ok": True,
+        "accepted": not bool(result.get("duplicate")),
+        "duplicate": bool(result.get("duplicate")),
+        "machine": _raw_material_session_summary(sess),
+        "raw_material_log": row,
+        "matches_expected_part": True,
+        "matched_parts": matched_parts,
+    }
 
 
 def _normalize_weight_to_grams(value: Any, unit: Any = "g") -> tuple[float, str]:
@@ -12151,6 +12911,50 @@ async def api_active_session_discard(req: Request):
     _remove_persisted_active_session(machine_code)
     await broadcast_state()
     return {"ok": True, "discarded": True}
+
+
+@APP.post("/api/active-sessions/reset-fresh")
+async def api_active_session_reset_fresh(req: Request):
+    """Reset production counters/logs for a fresh shift while keeping active machine/job identity."""
+    data = await req.json()
+    machine_code = str(data.get("machine_code") or "").strip()
+    client_id = str(data.get("client_id") or "").strip()
+    if not machine_code:
+        return JSONResponse({"ok": False, "error": "machine_code is required"}, status_code=400)
+    sess = SESSIONS.get(machine_code)
+    if sess is None:
+        return JSONResponse({"ok": False, "error": "active session not found"}, status_code=404)
+    if client_id and str(sess.client_id or "").strip() != client_id:
+        return JSONResponse({"ok": False, "error": "session belongs to another client"}, status_code=403)
+    now = utc_now().isoformat()
+    sess.job_started_at = now
+    sess.pack_total = 0
+    sess.good_total = 0
+    sess.butal_total = 0
+    sess.reject_total = 0
+    sess.reject_breakdown = {}
+    sess.no_shot_total = 0
+    sess.startup_reject_total = 0
+    sess.raw_sacks_count = 0
+    sess.raw_material_scans = []
+    sess.raw_material_logs = []
+    sess.product_pack_history_logs = []
+    sess.operator_shift_logs = []
+    sess.butal_by_job = {}
+    sess.last_shift_butal_qty = 0
+    sess.last_shift_butal_raw = ""
+    sess.last_shift_butal_saved_at = None
+    sess.last_shift_butal_job_code = None
+    sess.last_shift_butal_job_name = None
+    sess.last_shift_butal_by_job = {}
+    sess.machine_counter_shift_start = sess.machine_counter_current
+    sess.machine_counter_shift_end = None
+    sess.live_cycle_avg_seconds = None
+    sess.last_seen_utc = now
+    sess.last_event = str(data.get("last_event") or "FRESH SHIFT RESET ON SERVER").strip()
+    _persist_active_sessions_state()
+    await broadcast_state()
+    return {"ok": True, "item": sess.to_dict()}
 
 
 @APP.post("/api/average-weight")
@@ -12629,8 +13433,14 @@ async def api_finished_jobs_archive(req: Request):
 
 
 @APP.get("/api/products")
-def api_products(refresh: int = 0):
-    result = get_products(force_refresh=bool(refresh))
+async def api_products(refresh: int = 0):
+    try:
+        result = await asyncio.to_thread(get_products, force_refresh=bool(refresh))
+    except asyncio.CancelledError:
+        return JSONResponse(
+            {"ok": False, "error": "Product refresh was cancelled; retry after server restart completes"},
+            status_code=503,
+        )
     return {
         "ok": True,
         "items": result["items"],
@@ -12776,4 +13586,6 @@ async def ws_endpoint(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:APP", host="0.0.0.0", port=8000, reload=False)
+    host = os.environ.get("MACHINE_SERVER_HOST", "192.168.10.49").strip() or "192.168.10.49"
+    port = int(os.environ.get("MACHINE_SERVER_PORT", "8000") or 8000)
+    uvicorn.run("server:APP", host=host, port=port, reload=False)

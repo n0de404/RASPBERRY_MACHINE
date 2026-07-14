@@ -130,7 +130,8 @@ AVERAGE_WEIGHT_API_PORT = int(os.environ.get("MACHINE_AVG_WEIGHT_PORT", "5000"))
 AVERAGE_WEIGHT_API_ENDPOINT = "/average-weight"
 HEARTBEAT_INTERVAL_MS = int(os.environ.get("MACHINE_HEARTBEAT_INTERVAL_MS", "5000"))
 IDENTITY_SYNC_INTERVAL_MS = int(os.environ.get("MACHINE_IDENTITY_SYNC_INTERVAL_MS", "15000"))
-SERVER_EVENT_QUEUE_MAXSIZE = int(os.environ.get("MACHINE_SERVER_EVENT_QUEUE_MAXSIZE", "256"))
+SERVER_EVENT_QUEUE_MAXSIZE = int(os.environ.get("MACHINE_SERVER_EVENT_QUEUE_MAXSIZE", "1024"))
+SERVER_EVENT_QUEUE_DISK_MAX_ENTRIES = int(os.environ.get("MACHINE_SERVER_EVENT_QUEUE_DISK_MAX_ENTRIES", "10000"))
 JOB_API_PENDING_RETRY_INTERVAL_MS = int(os.environ.get("MACHINE_JOB_API_PENDING_RETRY_INTERVAL_MS", "3000"))
 JOB_API_PENDING_MAX_RETRIES = int(os.environ.get("MACHINE_JOB_API_PENDING_MAX_RETRIES", "0"))
 SCANNER_MIN_TIMEOUT_SECONDS = float(os.environ.get("MACHINE_SCANNER_MIN_TIMEOUT", "0.2"))
@@ -545,6 +546,22 @@ def _load_server_event_queue_json() -> List[Dict[str, Any]]:
         return []
 
 
+def _server_event_queue_type(row: Dict[str, Any]) -> str:
+    payload = row.get("payload") if isinstance(row, dict) else {}
+    event = payload.get("event") if isinstance(payload, dict) else {}
+    if isinstance(event, dict):
+        return str(event.get("type") or "").strip().upper()
+    return ""
+
+
+def _trim_server_event_queue_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    clean = [row for row in (rows or []) if isinstance(row, dict) and isinstance(row.get("payload"), dict)]
+    max_rows = max(100, int(SERVER_EVENT_QUEUE_DISK_MAX_ENTRIES or 10000))
+    if len(clean) <= max_rows:
+        return clean
+    return clean[-max_rows:]
+
+
 def _save_server_event_queue_json(rows: List[Dict[str, Any]]) -> bool:
     try:
         os.makedirs(DATABASE_DIR, exist_ok=True)
@@ -552,8 +569,9 @@ def _save_server_event_queue_json(rows: List[Dict[str, Any]]) -> bool:
         # power loss cannot leave a partially-written JSON file and discard
         # scans that have not reached the server yet.
         tmp = f"{SERVER_EVENT_QUEUE_FILE}.tmp"
+        payload = _trim_server_event_queue_rows(rows)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(list(rows or []), f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, SERVER_EVENT_QUEUE_FILE)
@@ -18661,6 +18679,21 @@ QWidget#ClientUIRoot {{
             except queue.Full:
                 break
 
+    def _make_room_for_server_event(self, incoming: Dict[str, Any]) -> bool:
+        try:
+            dropped = self._event_queue.get_nowait()
+        except queue.Empty:
+            return True
+        except Exception:
+            return False
+        try:
+            self._event_queue.task_done()
+        except Exception:
+            pass
+        if isinstance(dropped, dict) and self._should_persist_server_event(dropped):
+            self._persist_server_event_item(dropped)
+        return True
+
     def _event_dispatch_loop(self):
         while not self._event_worker_stop.is_set():
             try:
@@ -18709,8 +18742,10 @@ QWidget#ClientUIRoot {{
                 try:
                     self._event_queue.put(item, timeout=1.0)
                 except Exception:
+                    if self._should_persist_server_event(item):
+                        self._persist_server_event_item(item)
                     if not bool(item.get("silent")):
-                        self.scanner_status.emit("Server retry queue is full. Event will retry on next scan/sync.")
+                        self.scanner_status.emit("Server retry queue is full. Event is saved and will retry.")
 
     def _enqueue_server_event(self, payload: Dict[str, Any], *, silent: bool) -> bool:
         item = self._normalize_server_event_item({"payload": payload, "silent": bool(silent)}, silent=silent)
@@ -18721,31 +18756,9 @@ QWidget#ClientUIRoot {{
                 self._event_queue.put_nowait(item)
                 return True
             except queue.Full:
-                if silent:
-                    # Silent events include reconnect/session recovery syncs. If the
-                    # queue is full of retrying heartbeats, make room; persisted
-                    # dropped events remain on disk and will be retried.
-                    if persistent:
-                        try:
-                            self._event_queue.get_nowait()
-                        except queue.Empty:
-                            return False
-                        else:
-                            self._event_queue.task_done()
-                            continue
+                if not self._make_room_for_server_event(item):
                     return False
-                try:
-                    dropped = self._event_queue.get_nowait()
-                except queue.Empty:
-                    return False
-                else:
-                    self._event_queue.task_done()
-                    if not bool(dropped.get("silent")):
-                        try:
-                            self._event_queue.put_nowait(item)
-                            return True
-                        except queue.Full:
-                            return False
+                continue
         return False
 
     def _app_log_persist_loop(self):
@@ -18820,7 +18833,14 @@ QWidget#ClientUIRoot {{
         s = self.state
         if not s.machine_code:
             return
+        event_payload = dict(event or {})
         if defer_snapshot:
+            snapshot = self._state_to_active_snapshot()
+            if (
+                self._snapshot_is_recoverable(snapshot)
+                and "session_snapshot" not in event_payload
+            ):
+                event_payload["session_snapshot"] = snapshot
             self._schedule_active_session_snapshot_save()
         else:
             self._save_active_session_snapshot()
@@ -18832,7 +18852,7 @@ QWidget#ClientUIRoot {{
             "job_code": s.job_code,
             "job_name": s.job_name,
             "operator_id": s.operator_id,
-            "event": event,
+            "event": event_payload,
             "last_event": last_event,
         }
         self._enqueue_server_event(payload, silent=silent)
