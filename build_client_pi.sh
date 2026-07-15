@@ -9,7 +9,7 @@ if [[ -f ".venv/bin/activate" ]]; then
 fi
 
 python -m pip install --upgrade pip setuptools wheel
-python -m pip install pyinstaller requests pyserial PyMySQL cryptography
+python -m pip install pyinstaller requests pyserial PyMySQL cryptography "qrcode[pil]"
 python -m py_compile client.py mappings.py ui_theme.py
 
 if ! python - <<'PY'

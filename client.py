@@ -1,6 +1,7 @@
 # client.py
 from __future__ import annotations
 import html
+import io
 import json
 import os
 import re
@@ -17,6 +18,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Set
 import requests
+
+try:
+    import qrcode
+except Exception:
+    qrcode = None
 
 try:
     import pymysql
@@ -4980,6 +4986,49 @@ QWidget#ClientUIRoot {{
         self.productHistoryOverlay.hide()
         self.productHistoryOverlay.raise_()
 
+        self.floatingPackQrPanel = QFrame(self.partsHistoryOuter if hasattr(self, "partsHistoryOuter") else self)
+        self.floatingPackQrPanel.setObjectName("FloatingPackQrPanel")
+        self.floatingPackQrPanel.setLayout(QVBoxLayout())
+        self.floatingPackQrPanel.layout().setContentsMargins(10, 8, 10, 8)
+        self.floatingPackQrPanel.layout().setSpacing(5)
+        self.floatingPackQrPanel.setStyleSheet(
+            "QFrame#FloatingPackQrPanel {"
+            " background: rgba(248,250,252,246);"
+            " border: 2px solid rgba(15,23,42,0.42);"
+            " border-radius: 10px;"
+            "}"
+            "QLabel#FloatingPackQrTitle { color:#0f172a; font-size:13px; font-weight:900; }"
+            "QLabel#FloatingPackQrMeta { color:#334155; font-size:11px; font-weight:800; }"
+        )
+        self.floatingPackQrTitle = QLabel("AUTO PACK QR")
+        self.floatingPackQrTitle.setObjectName("FloatingPackQrTitle")
+        self.floatingPackQrTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.floatingPackQrImage = QLabel()
+        self.floatingPackQrImage.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.floatingPackQrMeta = QLabel("")
+        self.floatingPackQrMeta.setObjectName("FloatingPackQrMeta")
+        self.floatingPackQrMeta.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.floatingPackQrMeta.setWordWrap(True)
+        self.floatingPackQrPanel.layout().addWidget(self.floatingPackQrTitle)
+        self.floatingPackQrPanel.layout().addWidget(self.floatingPackQrImage, 0, Qt.AlignmentFlag.AlignCenter)
+        self.floatingPackQrPanel.layout().addWidget(self.floatingPackQrMeta)
+        self._floating_pack_qr_shadow = QGraphicsDropShadowEffect(self.floatingPackQrPanel)
+        self._floating_pack_qr_shadow.setBlurRadius(16)
+        self._floating_pack_qr_shadow.setOffset(0, 4)
+        self._floating_pack_qr_shadow.setColor(QColor(15, 23, 42, 80))
+        self.floatingPackQrPanel.setGraphicsEffect(self._floating_pack_qr_shadow)
+        self.floatingPackQrPanel.hide()
+        self.floatingPackQrPanel.raise_()
+        self._floating_pack_qr_payload = ""
+        self._floating_pack_qr_context_key = ""
+        self._floating_pack_qr_suppressed_job_code = ""
+        self._floating_pack_qr_last_lot_second = ""
+        self._floating_pack_qr_last_job_code = ""
+        self._floating_pack_qr_recent_payloads: List[str] = []
+        self.floatingPackQrTimer = QTimer(self)
+        self.floatingPackQrTimer.timeout.connect(self._refresh_floating_pack_qr_panel)
+        self.floatingPackQrTimer.start(1000)
+
         # Center overlay for reject confirmation by Supervisor/QC.
         self.rejectReviewOverlay = QFrame(self)
         self.rejectReviewOverlay.setObjectName("ProductionOverlay")
@@ -5950,6 +5999,7 @@ QWidget#ClientUIRoot {{
         self._position_raw_mats_overlay()
         self._position_reject_summary_overlay()
         self._position_product_history_overlay()
+        self._position_floating_pack_qr_panel()
         self._position_reject_review_overlay()
         self._position_finish_overlay()
         self._position_bms_loading_overlay()
@@ -6852,6 +6902,24 @@ QWidget#ClientUIRoot {{
             if self.productHistoryOrderNote.isVisible():
                 self.productHistoryOrderNote.raise_()
 
+    def _position_floating_pack_qr_panel(self):
+        if not hasattr(self, "floatingPackQrPanel") or self.floatingPackQrPanel is None:
+            return
+        parent = self.floatingPackQrPanel.parentWidget()
+        if parent is not None and parent is getattr(self, "partsHistoryOuter", None):
+            margin = 14
+            header_h = 58
+            w = max(180, int(parent.width()) - (margin * 2))
+            h = max(220, int(parent.height()) - header_h - margin)
+            self.floatingPackQrPanel.setGeometry(margin, header_h, w, h)
+            return
+        w = 248
+        h = 316
+        margin = 12
+        x = max(margin, self.width() - w - margin)
+        y = max(margin, int(self.height() * 0.42))
+        self.floatingPackQrPanel.setGeometry(x, y, w, h)
+
     def _position_reject_review_overlay(self):
         self.rejectReviewOverlay.adjustSize()
         hint_h = self.rejectReviewOverlay.sizeHint().height()
@@ -7467,6 +7535,8 @@ QWidget#ClientUIRoot {{
             ts_text = _fmt_scan_time(str(item.get("scanned_at") or "").strip())
             if bool(item.get("voided")):
                 ts_text = f"{ts_text} | VOID"
+            elif bool(item.get("reprinted")):
+                ts_text = f"{ts_text} | REPRINTED"
             product_name_text = product_name if product_name and product_name != "-" else (product_id or "-")
             entry_text = f"#{label_number} | {product_name_text} | {qty_text} | {operator_text} | {ts_text}"
             pack_entry_rows.append(entry_text)
@@ -8935,6 +9005,7 @@ QWidget#ClientUIRoot {{
         cavity_count = job_details.get("no_of_cavity") or job.get("custom_11") or 1
         self.lblActivityCavities.setText(f"Cavities: {self._safe_text(cavity_count, '-')}")
         self.lblActivitySticker.setText(f"Sticker Label: {self._safe_text(job_details.get('sticker_label'), '-')}")
+        self._refresh_floating_pack_qr_panel()
 
         self.lblPack.set_value(s.pack_count)
         self.lblGood.set_value(s.good_total)
@@ -14950,6 +15021,195 @@ QWidget#ClientUIRoot {{
             "po_number": po_digits,    # preserve QR formatting
         }
 
+    def _zpad_digits(self, value: Any, width: int) -> str:
+        digits = "".join(ch for ch in str(value or "").strip() if ch.isdigit())
+        if not digits:
+            digits = "0"
+        return digits[-width:].zfill(width)
+
+    def _generated_pack_qty_from_job_payload(self) -> Optional[int]:
+        ctx = self._extract_job_payload_context(self.state.job_payload if isinstance(self.state.job_payload, dict) else {})
+        job = ctx.get("job") if isinstance(ctx.get("job"), dict) else {}
+        job_details = ctx.get("job_details") if isinstance(ctx.get("job_details"), dict) else {}
+        raw = (
+            job.get("custom_03")
+            or job_details.get("custom_03")
+            or job.get("packing_per_sales")
+            or job_details.get("packing_per_sales")
+        )
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        try:
+            value = int(float(text))
+        except Exception:
+            return None
+        return value if value > 0 else None
+
+    def _generated_pack_total_qty_from_job_payload(self) -> int:
+        ctx = self._extract_job_payload_context(self.state.job_payload if isinstance(self.state.job_payload, dict) else {})
+        job = ctx.get("job") if isinstance(ctx.get("job"), dict) else {}
+        for key in ("approve_qty", "request_qty", "qty", "quantity", "total_qty"):
+            try:
+                value = int(float(str(job.get(key) or "").strip()))
+            except Exception:
+                value = 0
+            if value > 0:
+                return value
+        return 1
+
+    def _generated_pack_product_id(self) -> str:
+        payload = self.state.job_payload if isinstance(self.state.job_payload, dict) else {}
+        ctx = self._extract_job_payload_context(payload)
+        job = ctx.get("job") if isinstance(ctx.get("job"), dict) else {}
+        details = ctx.get("job_details") if isinstance(ctx.get("job_details"), dict) else {}
+        product = self._job_product_identity_from_payload(payload)
+        raw = (
+            product.get("product_id")
+            or details.get("product_id")
+            or job.get("product_id")
+            or self.state.job_code
+        )
+        return self._zpad_digits(raw, 11)
+
+    def _next_generated_pack_index(self) -> int:
+        current_job = self._normalize_job_code(self.state.job_code)
+        max_idx = 0
+        for row in self.state.product_pack_history_logs or []:
+            if not isinstance(row, dict) or bool(row.get("voided")):
+                continue
+            row_job = self._normalize_job_code(row.get("po_number"))
+            if current_job and row_job and row_job != current_job:
+                continue
+            try:
+                max_idx = max(max_idx, int(str(row.get("index") or "0").strip()))
+            except Exception:
+                pass
+        return max_idx + 1
+
+    def _build_generated_pack_qr_payload(self, lot_stamp: Optional[str] = None) -> Optional[str]:
+        qty = self._generated_pack_qty_from_job_payload()
+        if qty is None:
+            return None
+        job_code = str(self.state.job_code or "").strip()
+        if not job_code:
+            return None
+        lot = lot_stamp or datetime.now().strftime("%Y%m%d%H%M%S")
+        total_qty = self._generated_pack_total_qty_from_job_payload()
+        idx = self._next_generated_pack_index()
+        return (
+            "O00000000024"
+            f"{self._zpad_digits(job_code, 11)}"
+            "00000000000"
+            "V2"
+            f"P{self._generated_pack_product_id()}"
+            f"Q{self._zpad_digits(qty, 11)}"
+            f"I{self._zpad_digits(idx, 11)}"
+            f"T{self._zpad_digits(total_qty, 11)}"
+            f"L{lot}-{self._zpad_digits(job_code, 12)}"
+        )
+
+    def _qr_pixmap_for_payload(self, payload: str, size: int = 210) -> QPixmap:
+        pm = QPixmap()
+        if qrcode is None:
+            return pm
+        try:
+            qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=2)
+            qr.add_data(str(payload or ""))
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white").convert("RGB").resize((size, size))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            pm.loadFromData(buf.getvalue(), "PNG")
+        except Exception:
+            pm = QPixmap()
+        return pm
+
+    def _hide_floating_pack_qr_panel(self):
+        if hasattr(self, "floatingPackQrPanel") and self.floatingPackQrPanel is not None:
+            self.floatingPackQrPanel.hide()
+        if hasattr(self, "historyRawCol") and self.historyRawCol is not None:
+            self.historyRawCol.show()
+
+    def _show_floating_pack_qr_panel(self):
+        if hasattr(self, "historyRawCol") and self.historyRawCol is not None:
+            self.historyRawCol.hide()
+        self._position_floating_pack_qr_panel()
+        self.floatingPackQrPanel.show()
+        self.floatingPackQrPanel.raise_()
+
+    def _refresh_floating_pack_qr_panel(self):
+        if not hasattr(self, "floatingPackQrPanel") or self.floatingPackQrPanel is None:
+            return
+        job_code = self._normalize_job_code(self.state.job_code)
+        if job_code != self._normalize_job_code(getattr(self, "_floating_pack_qr_last_job_code", "")):
+            self._floating_pack_qr_last_job_code = str(self.state.job_code or "").strip()
+            self._floating_pack_qr_suppressed_job_code = ""
+            self._floating_pack_qr_payload = ""
+            self._floating_pack_qr_context_key = ""
+            self._floating_pack_qr_recent_payloads = []
+        if not job_code or self._normalize_job_code(self._floating_pack_qr_suppressed_job_code) == job_code:
+            self._hide_floating_pack_qr_panel()
+            return
+        qty = self._generated_pack_qty_from_job_payload()
+        if qty is None:
+            self._floating_pack_qr_payload = ""
+            self._floating_pack_qr_context_key = ""
+            self._hide_floating_pack_qr_panel()
+            return
+        lot_second = datetime.now().strftime("%Y%m%d%H%M%S")
+        payload = self._build_generated_pack_qr_payload(lot_second)
+        if not payload:
+            self._hide_floating_pack_qr_panel()
+            return
+        context_key = f"{job_code}|{qty}|{self._next_generated_pack_index()}|{lot_second}"
+        if context_key != self._floating_pack_qr_context_key:
+            self._floating_pack_qr_context_key = context_key
+            self._floating_pack_qr_payload = payload
+            recent = list(getattr(self, "_floating_pack_qr_recent_payloads", []) or [])
+            recent.append(payload)
+            self._floating_pack_qr_recent_payloads = recent[-5:]
+            pm = self._qr_pixmap_for_payload(payload, 210)
+            if pm.isNull():
+                self.floatingPackQrImage.setText("QR renderer missing")
+            else:
+                self.floatingPackQrImage.setPixmap(pm)
+            self.floatingPackQrTitle.setText(f"AUTO PACK QR  |  QTY {qty}")
+            self.floatingPackQrMeta.setText(f"INDEX {self._next_generated_pack_index()}  |  TOTAL {self._generated_pack_total_qty_from_job_payload()}")
+        self._show_floating_pack_qr_panel()
+
+    def _handle_pack_scan_floating_qr_state(self, raw_scan: str):
+        if not hasattr(self, "floatingPackQrPanel") or self.floatingPackQrPanel is None:
+            return
+        current_payload = str(getattr(self, "_floating_pack_qr_payload", "") or "").strip()
+        recent_payloads = {str(x).strip() for x in (getattr(self, "_floating_pack_qr_recent_payloads", []) or []) if str(x).strip()}
+        if not current_payload and not recent_payloads:
+            return
+        raw = str(raw_scan or "").strip()
+        if raw == current_payload or raw in recent_payloads:
+            self._floating_pack_qr_context_key = ""
+            self._floating_pack_qr_last_lot_second = ""
+            QTimer.singleShot(250, self._refresh_floating_pack_qr_panel)
+            return
+        parsed = self._extract_pack_history_fields(raw)
+        if not isinstance(parsed, dict):
+            return
+        scanned_job = self._normalize_job_code(parsed.get("po_number"))
+        current_job = self._normalize_job_code(self.state.job_code)
+        scanned_product = str(parsed.get("product_p") or "").strip()
+        current_product = self._generated_pack_product_id()
+        if scanned_product.isdigit():
+            scanned_product = scanned_product.lstrip("0") or "0"
+        if current_product.isdigit():
+            current_product = current_product.lstrip("0") or "0"
+        if scanned_job != current_job or scanned_product != current_product:
+            return
+        self._floating_pack_qr_suppressed_job_code = str(self.state.job_code or "").strip()
+        self._floating_pack_qr_payload = ""
+        self._hide_floating_pack_qr_panel()
+
     def _pack_history_key(self, row: Dict[str, Any]) -> str:
         if not isinstance(row, dict):
             return ""
@@ -14960,12 +15220,34 @@ QWidget#ClientUIRoot {{
             if isinstance(parsed, dict):
                 fields = parsed
         idx = str(fields.get("index") or "").strip()
-        lot = str(fields.get("lot_number") or "").strip()
         pid = str(fields.get("product_p") or fields.get("product_id") or "").strip()
-        po = str(fields.get("po_number") or "").strip()
-        if idx and lot:
-            return f"{pid}|{idx}|{lot}|{po}".strip("|")
+        po = self._normalize_job_code(fields.get("po_number"))
+        if idx and (pid or po):
+            return f"{pid}|{idx}|{po}".strip("|")
         return raw_scan
+
+    def _mark_pack_reprint_if_lot_changed(self, row: Dict[str, Any]) -> None:
+        if not isinstance(row, dict):
+            return
+        series_key = self._pack_gap_series_key(row)
+        lot = str(row.get("lot_number") or "").strip()
+        idx = str(row.get("index") or "").strip()
+        if not series_key or not lot or not idx:
+            return
+        for old in self.state.product_pack_history_logs or []:
+            if not isinstance(old, dict) or bool(old.get("voided")):
+                continue
+            if self._pack_gap_series_key(old) != series_key:
+                continue
+            old_idx = str(old.get("index") or "").strip()
+            old_lot = str(old.get("lot_number") or "").strip()
+            if old_idx and old_idx == idx:
+                continue
+            if old_lot and old_lot != lot:
+                row["reprinted"] = True
+                row["reprint_reason"] = "LOT_CHANGED"
+                row["previous_lot_number"] = old_lot
+                return
 
     def _should_ignore_duplicate_transport_scan(self, raw: str) -> bool:
         key = re.sub(r"\s+", "", str(raw or "")).strip()
@@ -15152,6 +15434,8 @@ QWidget#ClientUIRoot {{
         qty_text = str(row.get("qty_q") or row.get("qty") or "-").strip() or "-"
         time_text = self._format_history_time_short(row.get("voided_at") if voided else row.get("scanned_at"))
         text = f"{label} | {product_name} | {qty_text} | {time_text}"
+        if bool(row.get("reprinted")):
+            text = f"{text} | REPRINTED"
         return f"{text} | VOID" if voided else text
 
     def _format_butal_history_action_text(self, row: Dict[str, Any], *, voided: bool = False) -> str:
@@ -17249,13 +17533,14 @@ QWidget#ClientUIRoot {{
                 pack_hist["qty_q"] = 0
                 pack_key = self._pack_history_key(pack_hist)
                 if pack_key and pack_key in (s.product_pack_history_keys or set()):
-                    self.status.setText("Invalid PACK QR: duplicate index and lot.")
-                    self._show_invalid_overlay("PACK QR index and lot number already scanned.")
+                    self.status.setText("Invalid PACK QR: duplicate product, job, and index.")
+                    self._show_invalid_overlay("PACK QR index already scanned for this product and job.")
                     return
                 if pack_key and self._pack_qr_was_used_permanently(pack_key):
-                    self.status.setText("Invalid PACK QR: label was already used.")
+                    self.status.setText("Invalid PACK QR: product, job, and index were already used.")
                     self._show_invalid_overlay("PACK QR was already scanned before.")
                     return
+                self._mark_pack_reprint_if_lot_changed(pack_hist)
                 self._mark_pack_scan_accepted()
                 s.product_pack_history_logs.append(pack_hist)
                 if pack_key:
@@ -18245,6 +18530,7 @@ QWidget#ClientUIRoot {{
 
             if res.kind == "PACK":
                 qty = int(res.qty or 0)
+                self._handle_pack_scan_floating_qr_state(raw_s)
                 pack_hist = self._extract_pack_history_fields(raw_s)
                 product_name_for_pack = ""
                 product_sku_for_pack = ""
@@ -18328,16 +18614,17 @@ QWidget#ClientUIRoot {{
                     pack_key = self._pack_history_key(pack_hist)
                     if pack_key and pack_key in (s.product_pack_history_keys or set()):
                         self.status.setText(
-                            f"Invalid PACK QR: duplicate index {scan_idx} and lot {scan_lot}."
+                            f"Invalid PACK QR: duplicate index {scan_idx} for this product and job."
                         )
-                        self._show_invalid_overlay("PACK QR index and lot number already scanned.")
+                        self._show_invalid_overlay("PACK QR index already scanned for this product and job.")
                         return
                     if pack_key and self._pack_qr_was_used_permanently(pack_key):
                         self.status.setText(
-                            f"Invalid PACK QR: index {scan_idx} and lot {scan_lot} were already used."
+                            f"Invalid PACK QR: index {scan_idx} for this product and job was already used."
                         )
                         self._show_invalid_overlay("PACK QR was already scanned before.")
                         return
+                    self._mark_pack_reprint_if_lot_changed(pack_hist)
                     pack_hist["scanned_at"] = datetime.now(timezone.utc).isoformat()
                     carryover = self._current_job_last_shift_butal(scanned_job_code or s.job_code)
                     carried_butal_qty = int(carryover.get("qty") or 0)
