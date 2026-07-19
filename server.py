@@ -2852,6 +2852,8 @@ def _fifo_used_raw_qty(raw_logs: List[Dict[str, Any]], consumed_units: float, fa
         row_qty = max(0.0, _parse_number_like(item.get("qty", item.get("quantity", 0))))
         source = str(item.get("part_qty_per_unit_source") or "").strip().lower()
         row_part_qty = _parse_number_like(item.get("part_qty_per_unit_kg")) if source == "app" else 0.0
+        if source == "app" and row_part_qty <= 0:
+            row_part_qty = _parse_number_like(item.get("part_qty_per_unit_grams")) / 1000.0
         part_qty_per_unit = max(0.0, row_part_qty or _parse_number_like(fallback_part_qty_per_unit))
         if row_qty <= 0 or part_qty_per_unit <= 0 or remaining_units <= 0:
             continue
@@ -3182,6 +3184,34 @@ def _format_qty_display(value: Any) -> str:
     return f"{qty:.3f}".rstrip("0").rstrip(".")
 
 
+def _is_weighed_raw_material(*values: Any) -> bool:
+    text = " ".join(str(value or "") for value in values).strip().upper()
+    return text.startswith("Z-") or " Z-" in text or bool(re.search(r"\bKGS?\b", text))
+
+
+def _stamp_raw_material_weight_from_session(row: Dict[str, Any], sess: MachineSession) -> None:
+    if not isinstance(row, dict):
+        return
+    if not _is_weighed_raw_material(row.get("material_sku"), row.get("sku"), row.get("material_name"), row.get("material")):
+        return
+    average_grams = _parse_number_like(getattr(sess, "external_average_weight_grams", 0))
+    if average_grams <= 0:
+        return
+    existing_source = str(row.get("part_qty_per_unit_source") or "").strip().lower()
+    existing_kg = _parse_number_like(row.get("part_qty_per_unit_kg"))
+    existing_grams = _parse_number_like(row.get("part_qty_per_unit_grams"))
+    if existing_source == "app" and (existing_kg > 0 or existing_grams > 0):
+        return
+    row["part_qty_per_unit_source"] = "app"
+    row["part_qty_per_unit_kg"] = average_grams / 1000.0
+    row["part_qty_per_unit_grams"] = average_grams
+    row["part_qty_per_unit_unit"] = "kg"
+    row["part_qty_per_unit_received_at"] = getattr(sess, "external_average_weight_received_at", None)
+    row["part_qty_per_unit_sent_at"] = getattr(sess, "external_average_weight_sent_at", None)
+    row["part_qty_per_unit_app_source"] = getattr(sess, "external_average_weight_source", None)
+    row["part_qty_per_unit_sender"] = getattr(sess, "external_average_weight_sender", None)
+
+
 def _raw_material_machine_list_row(machine_code: str, sess: Optional[MachineSession]) -> Dict[str, Any]:
     machine_name = _machine_display_name(machine_code, getattr(sess, "machine_name", machine_code) if sess else machine_code)
     if sess is None:
@@ -3315,6 +3345,7 @@ def _append_raw_material_scan_to_session(sess: MachineSession, ev: Dict[str, Any
     row.setdefault("raw_scan", raw_scan)
     row.setdefault("parsed", parsed)
     row.setdefault("scanned_at", utc_now().isoformat())
+    _stamp_raw_material_weight_from_session(row, sess)
 
     unique_key = str(row.get("unique_key") or ev.get("unique_key") or raw_scan or "").strip()
     existing_rows = [x for x in (sess.raw_material_logs or []) if isinstance(x, dict)]
@@ -6494,7 +6525,7 @@ DASHBOARD_HTML = """
     const cleanSku = value => {
       const text = String(value || "").trim();
       if(!text) return "";
-      if(/^Z-RM-/i.test(text)) return "";
+      if(/^Z-/i.test(text)) return "";
       return text;
     };
     const explicitSku = firstValue(
@@ -6982,6 +7013,12 @@ DASHBOARD_HTML = """
     return [];
   }
 
+  function isRawMaterialPart(part){
+    const p = (part && typeof part === "object") ? part : {};
+    const sku = String(p.sku || p.part_sku || p.product_sku || p.material_sku || p.part_code || p.product_code || p.code || "").trim().toUpperCase();
+    return sku.startsWith("Z-RM");
+  }
+
   function materialLabel(row){
     const x = row || {};
     return firstValue(x.material_name, x.material, x.name, x.part_name, x.product_name, x.description, x.sku, x.part_code, x.product_code, x.code, x.value, "-");
@@ -7027,7 +7064,7 @@ DASHBOARD_HTML = """
     const rows = rawLogsForPart(materialRows, part, totalPartCount);
     const sku = String(part?.sku || part?.part_sku || part?.product_sku || "").trim().toUpperCase();
     const name = String(part?.name || part?.part_name || part?.material_name || "").trim().toUpperCase();
-    const isMaterial = sku.startsWith("Z-RM") || /\bKGS?\b/.test(name);
+    const isMaterial = sku.startsWith("Z-") || /\bKGS?\b/.test(name);
     const fallbackPerUnit = isMaterial
       ? Math.max(0, Number(appPartQtyKg || 0))
       : Number(part?.part_qty_per_unit || part?.qty_per_unit || 0);
@@ -7057,7 +7094,7 @@ DASHBOARD_HTML = """
   function rawMaterialInsightsHtml(row){
     const item = (row && typeof row === "object") ? row : {};
     const materialRows = archivedMaterialRows(item);
-    const parts = rawPartRows(item);
+    const parts = rawPartRows(item).filter(isRawMaterialPart);
     const consumedUnits = consumedUnitCount(item);
     const appPartQtyKg = Math.max(0, Number(item.external_average_weight_grams || 0) / 1000);
     const scannedQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
@@ -7065,7 +7102,7 @@ DASHBOARD_HTML = """
       const fixedQty = Number(part.request_part_qty || part.required_qty || part.qty || part.quantity || 0);
       const skuForExpected = String(part.sku || part.part_sku || part.product_sku || "").trim().toUpperCase();
       const nameForExpected = String(part.name || part.part_name || part.material_name || "").trim().toUpperCase();
-      const isMaterialForExpected = skuForExpected.startsWith("Z-RM") || /\bKGS?\b/.test(nameForExpected);
+      const isMaterialForExpected = skuForExpected.startsWith("Z-") || /\bKGS?\b/.test(nameForExpected);
       const perUnit = isMaterialForExpected ? appPartQtyKg : Number(part.part_qty_per_unit || part.qty_per_unit || 0);
       const consumption = rawConsumptionForPart(materialRows, part, consumedUnits, parts.length, appPartQtyKg);
       return sum + Math.max(0, perUnit > 0 ? consumption.required : fixedQty);
@@ -7079,7 +7116,7 @@ DASHBOARD_HTML = """
       const scanned = consumption.scanned;
       const sku = String(part.sku || part.part_sku || part.product_sku || "").trim().toUpperCase();
       const name = String(part.name || part.part_name || part.material_name || "").trim().toUpperCase();
-      const isMaterial = sku.startsWith("Z-RM") || /\bKGS?\b/.test(name);
+      const isMaterial = sku.startsWith("Z-") || /\bKGS?\b/.test(name);
       const perUnit = isMaterial ? appPartQtyKg : Number(part.part_qty_per_unit || part.qty_per_unit || 0);
       const required = Math.max(0, perUnit > 0 ? consumption.required : Number(part.request_part_qty || part.required_qty || part.qty || part.quantity || 0));
       const status = required <= 0 ? "info" : (scanned >= required ? "good" : (scanned > 0 ? "warn" : "bad"));
@@ -13588,4 +13625,4 @@ if __name__ == "__main__":
     import uvicorn
     host = os.environ.get("MACHINE_SERVER_HOST", "192.168.10.49").strip() or "192.168.10.49"
     port = int(os.environ.get("MACHINE_SERVER_PORT", "8000") or 8000)
-    uvicorn.run("server:APP", host=host, port=port, reload=False)
+    uvicorn.run("server:APP", host=host, port=port, reload=False, ws_ping_interval=None)

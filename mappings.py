@@ -208,6 +208,8 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         return ScanResult(kind="JOB_LINKAGE_TRIGGER", raw=raw, value="Linkage mode")
     if s_l in ("multicolorprepack~1", "multi_color_prepack~1", "prepacklinkage~1", "prepack_linkage~1"):
         return ScanResult(kind="PREPACK_LINKAGE_TRIGGER", raw=raw, value="Multi-color prepack mode")
+    if s_l in ("virtualqr~1", "virtualpackqr~1", "virtual_pack_qr~1", "autopackqr~1", "auto_pack_qr~1", "autoqr~1"):
+        return ScanResult(kind="VIRTUAL_PACK_QR_TRIGGER", raw=raw, value="Show virtual pack QR")
     m_prepack = re.fullmatch(r"(?:prepack|prepackpack|genericprepack|generic_prepack)(?:~(\d+))?", s_l)
     if m_prepack:
         qty = int(m_prepack.group(1) or "0")

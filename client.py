@@ -636,6 +636,17 @@ def _upsert_scanned_pack_qr_key(key: str, row: Dict[str, Any]) -> bool:
     return _save_scanned_pack_qr_keys_json(rows)
 
 
+def _delete_scanned_pack_qr_key(key: str) -> bool:
+    k = str(key or "").strip()
+    if not k:
+        return False
+    rows = _load_scanned_pack_qr_keys_json()
+    if k not in rows:
+        return True
+    rows.pop(k, None)
+    return _save_scanned_pack_qr_keys_json(rows)
+
+
 def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
     machine_code = str((row or {}).get("machine_code") or "").strip()
     if not machine_code:
@@ -2958,6 +2969,7 @@ class ClientUI(QWidget):
         self._marquee_frame_skip = False
         self._recent_scan_seen: Dict[str, float] = {}
         self._last_accepted_pack_scan_at: float = 0.0
+        self._last_accepted_pack_scan_cooldown_seconds: float = 0.0
         scanned_pack_keys = _load_scanned_pack_qr_keys_json()
         self._used_pack_qr_keys: Set[str] = set(scanned_pack_keys.keys() if isinstance(scanned_pack_keys, dict) else [])
         self._server_event_queue_lock = threading.Lock()
@@ -3219,7 +3231,7 @@ QWidget#ClientUIRoot {{
         self.machineAnim.setFixedHeight(36)
         self.machineAnim.setMinimumWidth(0)
         self.machineAnim.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.machineAnim.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.machineAnim.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         _machine_status_spacer = QWidget()
         _machine_status_spacer.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         sessionGrid.addWidget(_machine_status_spacer, 0, 0)
@@ -3236,7 +3248,7 @@ QWidget#ClientUIRoot {{
             value_lbl.setFixedHeight(36)
             value_lbl.setWordWrap(True)
             value_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-            value_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            value_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             session_value_widget = value_lbl
             sessionGrid.addWidget(session_value_widget, i, 0, 1, 2)
         self.cardSession.layout().addLayout(sessionGrid)
@@ -3345,7 +3357,29 @@ QWidget#ClientUIRoot {{
         self.jobPartsTableShell.layout().setSpacing(0)
         self.jobPartsTableShell.layout().addWidget(self.jobPartsTable)
         self.cardJobDetails.layout().addWidget(self.jobPartsTableShell)
+        self.jobPartsInlineError = QLabel("")
+        self.jobPartsInlineError.setObjectName("ProductPartsInlineError")
+        self.jobPartsInlineError.setWordWrap(True)
+        self.jobPartsInlineError.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.jobPartsInlineError.setStyleSheet(
+            "QLabel#ProductPartsInlineError {"
+            " background: rgba(127,29,29,0.92);"
+            " color: #fff7ed;"
+            " border-top: 1px solid rgba(254,202,202,0.65);"
+            " padding: 7px 10px;"
+            " font-size: 12px;"
+            " font-weight: 900;"
+            "}"
+        )
+        self.jobPartsInlineError.hide()
+        self.cardJobDetails.layout().addWidget(self.jobPartsInlineError)
         self.cardJobDetails.layout().addStretch(1)
+        self._product_parts_missing_names: List[str] = []
+        self._product_parts_missing_keys: Set[str] = set()
+        self._product_parts_error_blink_remaining = 0
+        self._product_parts_error_blink_on = False
+        self.productPartsErrorBlinkTimer = QTimer(self)
+        self.productPartsErrorBlinkTimer.timeout.connect(self._tick_product_parts_error_blink)
         _product_parts_title = self.cardJobDetails.findChild(QLabel, "SectionTitle")
         if _product_parts_title is not None:
             _product_parts_title.setMinimumHeight(38)
@@ -3468,7 +3502,7 @@ QWidget#ClientUIRoot {{
             value_lbl.setMinimumWidth(0)
             value_lbl.setFixedHeight(36)
             value_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-            value_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            value_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             activityGrid.addWidget(value_lbl, i, 0, 1, 2, Qt.AlignmentFlag.AlignVCenter)
         self.cardActivity.layout().addLayout(activityGrid)
         self.cardActivityOuter.setMinimumHeight(196)
@@ -3534,15 +3568,19 @@ QWidget#ClientUIRoot {{
         self.topCycleCount = QLabel("Confirmed by: -")
         self.topCycleCount.setObjectName("MetaValue")
         self.topCycleCount.setFixedHeight(36)
+        self.topCycleCount.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.topCycleCurrent = QLabel("Act Cycle Time: ")
         self.topCycleCurrent.setObjectName("MetaValue")
         self.topCycleCurrent.setFixedHeight(36)
+        self.topCycleCurrent.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.topCycleStd = QLabel("Std Cycle Time: -")
         self.topCycleStd.setObjectName("MetaValue")
         self.topCycleStd.setFixedHeight(36)
+        self.topCycleStd.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.topCycleQtyShift = QLabel("Pack Cycle Time: -")
         self.topCycleQtyShift.setObjectName("MetaValue")
         self.topCycleQtyShift.setFixedHeight(36)
+        self.topCycleQtyShift.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
         unified_fields_grid = QGridLayout()
         unified_fields_grid.setContentsMargins(18, 0, 18, 0)
@@ -3551,6 +3589,8 @@ QWidget#ClientUIRoot {{
         unified_fields_grid.setColumnStretch(0, 1)
         unified_fields_grid.setColumnStretch(1, 1)
         unified_fields_grid.setColumnStretch(2, 1)
+        for row_idx in range(4):
+            unified_fields_grid.setRowMinimumHeight(row_idx, 36)
 
         unified_fields_grid.addWidget(self.machineAnim, 0, 0)
         unified_fields_grid.addWidget(self.lblActivityMold, 0, 1)
@@ -3577,9 +3617,9 @@ QWidget#ClientUIRoot {{
         self.cardSessionActivity.layout().addSpacing(6)
         self.cardSessionActivity.layout().addWidget(self.rejectDetailTable)
 
-        self.cardSessionActivityOuter.setMinimumHeight(326)
-        self.cardSessionActivityOuter.setMaximumHeight(402)
-        self.cardSessionActivityOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.cardSessionActivityOuter.setMinimumHeight(374)
+        self.cardSessionActivityOuter.setMaximumHeight(374)
+        self.cardSessionActivityOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         grid.addWidget(self.cardSessionActivityOuter, 1, 0, 1, 2)
         # Machine status now lives in the unified frame, so pulse overlay must follow that parent.
         self.machinePulseOverlay.setParent(self.cardSessionActivity)
@@ -5021,10 +5061,12 @@ QWidget#ClientUIRoot {{
         self.floatingPackQrPanel.raise_()
         self._floating_pack_qr_payload = ""
         self._floating_pack_qr_context_key = ""
+        self._floating_pack_qr_enabled_job_code = ""
         self._floating_pack_qr_suppressed_job_code = ""
         self._floating_pack_qr_last_lot_second = ""
         self._floating_pack_qr_last_job_code = ""
         self._floating_pack_qr_recent_payloads: List[str] = []
+        self._floating_pack_qr_scan_pending_payload = ""
         self.floatingPackQrTimer = QTimer(self)
         self.floatingPackQrTimer.timeout.connect(self._refresh_floating_pack_qr_panel)
         self.floatingPackQrTimer.start(1000)
@@ -12403,31 +12445,31 @@ QWidget#ClientUIRoot {{
                 "unit": "kg",
                 "label": f"App ({ext_kg:.4f} kg)",
             }
-        if unit_kind == "kg":
-            return {
-                "value": 0.0,
-                "source": "missing",
-                "unit": "kg",
-                "label": "Waiting for weighing app",
-            }
         if isinstance(part, dict):
             part_qty = self._parse_number(part.get("part_qty_per_unit"))
             if part_qty > 0:
                 return {
                     "value": part_qty,
-                    "source": "job_api",
+                    "source": "standard",
                     "unit": "kg",
-                    "label": f"Job API ({part_qty:.4f} kg)",
+                    "label": f"Standard ({part_qty:.4f} kg)",
                 }
         for row in self._job_part_rows():
             part_qty = self._parse_number((row or {}).get("part_qty_per_unit"))
             if part_qty > 0:
                 return {
                     "value": part_qty,
-                    "source": "job_api",
+                    "source": "standard",
                     "unit": "kg",
-                    "label": f"Job API ({part_qty:.4f} kg)",
+                    "label": f"Standard ({part_qty:.4f} kg)",
                 }
+        if unit_kind == "kg":
+            return {
+                "value": 0.0,
+                "source": "missing",
+                "unit": "kg",
+                "label": "Waiting for part qty/unit",
+            }
         return {
             "value": 0.0,
             "source": "missing",
@@ -12564,6 +12606,21 @@ QWidget#ClientUIRoot {{
             return "kg"
         return "pc"
 
+    def _is_raw_material_job_part(self, part: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(part, dict):
+            return False
+        sku = str(
+            part.get("sku")
+            or part.get("part_sku")
+            or part.get("product_sku")
+            or part.get("material_sku")
+            or part.get("part_code")
+            or part.get("product_code")
+            or part.get("code")
+            or ""
+        ).strip().upper()
+        return sku.startswith("Z-RM")
+
     def _find_job_part_for_scan_item(self, item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not isinstance(item, dict):
             return None
@@ -12625,9 +12682,50 @@ QWidget#ClientUIRoot {{
         *,
         total_part_count: int = 0,
         fallback_part_qty_per_unit: float = 0.0,
+        pack_logs: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, float]:
         rows = self._raw_logs_for_part(raw_logs, part, total_part_count=total_part_count)
         scanned_qty = sum(max(0.0, self._parse_number(row.get("qty"))) for row in rows)
+        part_keys = self._part_material_match_keys(part)
+        stamped_pack_used_qty = 0.0
+        stamped_pack_units = 0.0
+        has_stamped_pack_rows = False
+        for pack_row in (pack_logs or []):
+            if not isinstance(pack_row, dict) or bool(pack_row.get("voided")):
+                continue
+            entries = pack_row.get("raw_part_consumption")
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                entry_keys = self._part_material_match_keys(entry)
+                if part_keys and entry_keys and not part_keys.intersection(entry_keys):
+                    continue
+                if part_keys and not entry_keys and total_part_count > 1:
+                    continue
+                per_unit = self._parse_number(entry.get("part_qty_per_unit_kg"))
+                produced = self._parse_number(entry.get("produced_units"))
+                used = self._parse_number(entry.get("used_qty_kg"))
+                if used <= 0 and per_unit > 0 and produced > 0:
+                    used = produced * per_unit
+                if used <= 0:
+                    continue
+                has_stamped_pack_rows = True
+                stamped_pack_used_qty += used
+                stamped_pack_units += max(0.0, produced)
+        if has_stamped_pack_rows:
+            extra_units = max(0.0, float(consumed_units or 0.0) - stamped_pack_units)
+            extra_used_qty = 0.0
+            fallback_per_unit = max(0.0, float(fallback_part_qty_per_unit or 0.0))
+            if extra_units > 0 and fallback_per_unit > 0:
+                extra_used_qty = extra_units * fallback_per_unit
+            used_qty = stamped_pack_used_qty + extra_used_qty
+            return {
+                "scanned_qty": scanned_qty,
+                "used_qty": min(scanned_qty, used_qty),
+                "available_qty": max(scanned_qty - used_qty, 0.0),
+            }
         remaining_units = max(0.0, float(consumed_units or 0.0))
         used_qty = 0.0
         unit_kind = self._part_unit_kind(part)
@@ -12638,6 +12736,8 @@ QWidget#ClientUIRoot {{
             if unit_kind == "kg":
                 row_source = str(row.get("part_qty_per_unit_source") or "").strip().lower()
                 part_qty_per_unit = self._parse_number(row.get("part_qty_per_unit_kg")) if row_source == "app" else 0.0
+                if row_source == "app" and part_qty_per_unit <= 0:
+                    part_qty_per_unit = self._parse_number(row.get("part_qty_per_unit_grams")) / 1000.0
             else:
                 part_qty_per_unit = self._parse_number(row.get("part_qty_per_unit"))
             if part_qty_per_unit <= 0:
@@ -12655,6 +12755,262 @@ QWidget#ClientUIRoot {{
             "used_qty": min(scanned_qty, used_qty),
             "available_qty": max(scanned_qty - used_qty, 0.0),
         }
+
+    def _pack_raw_consumption_entries(self, qty: Any) -> List[Dict[str, Any]]:
+        try:
+            produced_qty = max(0, int(qty or 0))
+        except Exception:
+            produced_qty = 0
+        if produced_qty <= 0:
+            return []
+        entries: List[Dict[str, Any]] = []
+        for part in self._job_part_rows():
+            if not self._is_raw_material_job_part(part):
+                continue
+            info = self._resolve_part_qty_per_unit(part)
+            per_unit_kg = float(info.get("value") or 0.0)
+            if per_unit_kg <= 0:
+                continue
+            source = str(info.get("source") or "").strip().lower()
+            pending_weight = source != "app"
+            entries.append(
+                {
+                    "sku": part.get("sku") or part.get("part_sku") or part.get("product_sku") or None,
+                    "name": part.get("name") or part.get("part_name") or part.get("material_name") or None,
+                    "part_qty_per_unit_kg": per_unit_kg,
+                    "part_qty_per_unit_grams": per_unit_kg * 1000.0,
+                    "part_qty_per_unit_source": source or "standard",
+                    "standard_pending_weight": pending_weight,
+                    "produced_units": produced_qty,
+                    "used_qty_kg": produced_qty * per_unit_kg,
+                }
+            )
+        return entries
+
+    def _stamp_pack_raw_consumption(self, pack_hist: Optional[Dict[str, Any]], qty: Any) -> None:
+        if not isinstance(pack_hist, dict):
+            return
+        entries = self._pack_raw_consumption_entries(qty)
+        if not entries:
+            return
+        pack_hist["raw_part_consumption"] = entries
+        first = entries[0]
+        pack_hist["raw_part_qty_per_unit_kg"] = first.get("part_qty_per_unit_kg")
+        pack_hist["raw_part_qty_per_unit_grams"] = first.get("part_qty_per_unit_grams")
+        pack_hist["raw_part_qty_per_unit_source"] = first.get("part_qty_per_unit_source")
+        pack_hist["raw_part_qty_standard_pending_weight"] = bool(first.get("standard_pending_weight"))
+
+    def _apply_weight_to_standard_pack_consumption(self, grams: float) -> int:
+        kg_value = float(grams or 0.0) / 1000.0
+        if kg_value <= 0:
+            return 0
+        changed = 0
+        s = self.state
+        for row in (s.product_pack_history_logs or []):
+            if not isinstance(row, dict):
+                continue
+            entries = row.get("raw_part_consumption")
+            if not isinstance(entries, list):
+                continue
+            row_changed = False
+            for entry in entries:
+                if not isinstance(entry, dict) or not bool(entry.get("standard_pending_weight")):
+                    continue
+                produced_units = self._parse_number(entry.get("produced_units"))
+                entry["standard_part_qty_per_unit_kg"] = entry.get("part_qty_per_unit_kg")
+                entry["part_qty_per_unit_kg"] = kg_value
+                entry["part_qty_per_unit_grams"] = float(grams or 0.0)
+                entry["part_qty_per_unit_source"] = "app"
+                entry["standard_pending_weight"] = False
+                entry["used_qty_kg"] = produced_units * kg_value
+                row_changed = True
+            if row_changed:
+                first = next((entry for entry in entries if isinstance(entry, dict)), {})
+                row["raw_part_qty_per_unit_kg"] = first.get("part_qty_per_unit_kg")
+                row["raw_part_qty_per_unit_grams"] = first.get("part_qty_per_unit_grams")
+                row["raw_part_qty_per_unit_source"] = first.get("part_qty_per_unit_source")
+                row["raw_part_qty_standard_pending_weight"] = False
+                changed += 1
+        return changed
+
+    def _apply_weight_to_standard_raw_material_logs(self, grams: float) -> int:
+        kg_value = float(grams or 0.0) / 1000.0
+        if kg_value <= 0:
+            return 0
+        changed = 0
+        for row in (self.state.raw_material_logs or []):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("unit") or "").strip().lower() != "kg":
+                continue
+            source = str(row.get("part_qty_per_unit_source") or "").strip().lower()
+            if source == "app":
+                continue
+            row["standard_part_qty_per_unit_kg"] = row.get("part_qty_per_unit_kg")
+            row["part_qty_per_unit_kg"] = kg_value
+            row["part_qty_per_unit_grams"] = float(grams or 0.0)
+            row["part_qty_per_unit_source"] = "app"
+            row["part_qty_per_unit_weight_applied_at"] = datetime.now(timezone.utc).isoformat()
+            changed += 1
+        return changed
+
+    def _pack_blocked_by_missing_part_availability(self) -> Optional[str]:
+        missing_names, missing_keys = self._current_missing_part_availability()
+        if not missing_names:
+            self._product_parts_missing_names = []
+            self._product_parts_missing_keys = set()
+            self._hide_product_parts_missing_error()
+            return None
+        self._product_parts_missing_names = missing_names
+        self._product_parts_missing_keys = missing_keys
+        shown = ", ".join(missing_names[:2])
+        if len(missing_names) > 2:
+            shown += f" (+{len(missing_names) - 2})"
+        return shown
+
+    def _current_missing_part_availability(self) -> tuple[List[str], Set[str]]:
+        part_rows = [part for part in self._job_part_rows() if self._is_raw_material_job_part(part)]
+        if not part_rows:
+            return [], set()
+        raw_logs = [x for x in (self.state.raw_material_logs or []) if isinstance(x, dict)]
+        produced_units = self._raw_consumption_unit_count(
+            {
+                "good_total": self.state.good_total,
+                "butal_total": self.state.butal_total,
+                "reject_total": self.state.reject_total,
+                "startup_reject_total": self.state.startup_reject_total,
+                "no_shot_total": self.state.no_shot_total,
+            }
+        )
+        missing_names: List[str] = []
+        missing_keys: Set[str] = set()
+        for part in part_rows:
+            part_qty_info = self._resolve_part_qty_per_unit(part)
+            raw_consumption = self._raw_consumption_for_part(
+                raw_logs,
+                part,
+                produced_units,
+                total_part_count=len(part_rows),
+                fallback_part_qty_per_unit=float(part_qty_info.get("value") or 0.0),
+                pack_logs=self.state.product_pack_history_logs,
+            )
+            if float(raw_consumption.get("available_qty") or 0.0) <= 0:
+                name = str(part.get("name") or part.get("part_name") or part.get("sku") or "part").strip()
+                missing_names.append(name or "part")
+                missing_keys.update(self._part_material_match_keys(part))
+                missing_keys.update(self._part_material_name_keys(part))
+        return missing_names, {key for key in missing_keys if key}
+
+    def _set_product_parts_error_style(self, blink_on: bool = False):
+        if not hasattr(self, "jobPartsInlineError") or self.jobPartsInlineError is None:
+            return
+        if blink_on:
+            self.jobPartsInlineError.setStyleSheet(
+                "QLabel#ProductPartsInlineError {"
+                " background: rgba(250,204,21,0.98);"
+                " color: #111827;"
+                " border-top: 2px solid rgba(127,29,29,0.95);"
+                " padding: 7px 10px;"
+                " font-size: 12px;"
+                " font-weight: 900;"
+                "}"
+            )
+        else:
+            self.jobPartsInlineError.setStyleSheet(
+                "QLabel#ProductPartsInlineError {"
+                " background: rgba(127,29,29,0.92);"
+                " color: #fff7ed;"
+                " border-top: 1px solid rgba(254,202,202,0.65);"
+                " padding: 7px 10px;"
+                " font-size: 12px;"
+                " font-weight: 900;"
+                "}"
+            )
+
+    def _hide_product_parts_missing_error(self):
+        if hasattr(self, "productPartsErrorBlinkTimer") and self.productPartsErrorBlinkTimer is not None:
+            self.productPartsErrorBlinkTimer.stop()
+        self._product_parts_error_blink_remaining = 0
+        self._product_parts_error_blink_on = False
+        if hasattr(self, "jobPartsInlineError") and self.jobPartsInlineError is not None:
+            self._set_product_parts_error_style(False)
+            self.jobPartsInlineError.hide()
+        self._apply_product_parts_missing_highlight(False)
+
+    def _tick_product_parts_error_blink(self):
+        if not hasattr(self, "jobPartsInlineError") or self.jobPartsInlineError is None:
+            return
+        remaining = int(getattr(self, "_product_parts_error_blink_remaining", 0) or 0)
+        if remaining <= 0:
+            self.productPartsErrorBlinkTimer.stop()
+            self._product_parts_error_blink_on = False
+            self._set_product_parts_error_style(False)
+            self._apply_product_parts_missing_highlight(True)
+            return
+        self._product_parts_error_blink_remaining = remaining - 1
+        self._product_parts_error_blink_on = not bool(getattr(self, "_product_parts_error_blink_on", False))
+        self._set_product_parts_error_style(self._product_parts_error_blink_on)
+        self._apply_product_parts_missing_highlight(self._product_parts_error_blink_on)
+
+    def _apply_product_parts_missing_highlight(self, blink_on: Optional[bool] = None):
+        if not hasattr(self, "jobPartsTable") or self.jobPartsTable is None:
+            return
+        missing = set(getattr(self, "_product_parts_missing_keys", set()) or set())
+        if not missing:
+            blink_on = False
+        if blink_on is None:
+            blink_on = bool(getattr(self, "_product_parts_error_blink_on", False)) or bool(missing)
+        warn_bg = QBrush(QColor(127, 29, 29, 215))
+        warn_fg = QBrush(QColor(255, 247, 237))
+        clear_bg = QBrush()
+        clear_fg = QBrush()
+        for row in range(int(self.jobPartsTable.rowCount() or 0)):
+            row_keys = set()
+            for col in (0, 1):
+                item = self.jobPartsTable.item(row, col)
+                if item is not None:
+                    key = self._normalize_material_match_key(item.text())
+                    if key:
+                        row_keys.add(key)
+            row_missing = bool(row_keys.intersection(missing))
+            for col in range(int(self.jobPartsTable.columnCount() or 0)):
+                item = self.jobPartsTable.item(row, col)
+                if item is not None:
+                    if row_missing and blink_on:
+                        item.setBackground(warn_bg)
+                        item.setForeground(warn_fg)
+                    else:
+                        item.setBackground(clear_bg)
+                        item.setForeground(clear_fg)
+
+    def _sync_product_parts_missing_error_after_refresh(self):
+        if not getattr(self, "_product_parts_missing_names", None):
+            return
+        missing_names, missing_keys = self._current_missing_part_availability()
+        self._product_parts_missing_names = missing_names
+        self._product_parts_missing_keys = missing_keys
+        if not missing_names:
+            self._hide_product_parts_missing_error()
+            return
+        if hasattr(self, "jobPartsInlineError") and self.jobPartsInlineError is not None:
+            shown = ", ".join(missing_names[:2])
+            if len(missing_names) > 2:
+                shown += f" (+{len(missing_names) - 2})"
+            self.jobPartsInlineError.setText(f"Scan parts first: {shown} has no available quantity.")
+        self._apply_product_parts_missing_highlight()
+
+    def _show_product_parts_missing_error(self, missing_part: str):
+        msg = f"Scan parts first: {missing_part} has no available quantity."
+        if hasattr(self, "jobPartsInlineError") and self.jobPartsInlineError is not None:
+            self.jobPartsInlineError.setText(msg)
+            self._set_product_parts_error_style(True)
+            self.jobPartsInlineError.show()
+        self._product_parts_error_blink_remaining = 8
+        self._product_parts_error_blink_on = True
+        if hasattr(self, "productPartsErrorBlinkTimer") and self.productPartsErrorBlinkTimer is not None:
+            self.productPartsErrorBlinkTimer.stop()
+            self.productPartsErrorBlinkTimer.start(220)
+        self._apply_product_parts_missing_highlight(True)
 
     def _record_job_part_scan(
         self,
@@ -12676,7 +13032,6 @@ QWidget#ClientUIRoot {{
             self.status.setText("Invalid PART QR: duplicate serial already scanned.")
             self._show_invalid_overlay("PART QR serial already scanned.")
             return True
-        self._mark_pack_scan_accepted()
         unit_kind = self._part_unit_kind(part)
         part_qty_info = self._resolve_part_qty_per_unit(part)
         part_name = str(part.get("name") or part.get("part_name") or material_name or "Job Part").strip() or "Job Part"
@@ -12697,6 +13052,11 @@ QWidget#ClientUIRoot {{
             "unique_key": unique_key or None,
             "raw_job_code": raw_job_code,
             "part_qty_per_unit_kg": float(part_qty_info.get("value") or 0.0),
+            "part_qty_per_unit_grams": (
+                float(part_qty_info.get("value") or 0.0) * 1000.0
+                if str(part_qty_info.get("source") or "").strip().lower() == "app"
+                else None
+            ),
             "part_qty_per_unit_source": part_qty_info.get("source"),
             "raw_consumption_units_at_scan": self._raw_consumption_unit_count(
                 {
@@ -12828,7 +13188,14 @@ QWidget#ClientUIRoot {{
         s.external_average_weight_sent_at = str(sent_at or "").strip() or None
         s.external_average_weight_source = str(source or "app").strip() or "app"
         s.external_average_weight_sender = str(sender or "").strip() or None
-        self.status.setText(f"Average weight received from app: {kg_value:.4f} kg")
+        converted_packs = self._apply_weight_to_standard_pack_consumption(grams)
+        converted_raw_logs = self._apply_weight_to_standard_raw_material_logs(grams)
+        if converted_packs or converted_raw_logs:
+            self.status.setText(
+                f"Average weight received: {kg_value:.4f} kg. Updated {converted_packs} standard pack(s)."
+            )
+        else:
+            self.status.setText(f"Average weight received from app: {kg_value:.4f} kg")
         self._refresh_ui()
         if s.machine_code:
             self._save_active_session_snapshot()
@@ -13492,8 +13859,6 @@ QWidget#ClientUIRoot {{
                 part_qty_per_unit = self._parse_number(shift_external_avg_weight) / 1000.0
             else:
                 part_qty_per_unit = self._parse_number(part.get("part_qty_per_unit"))
-                if unit_kind == "kg":
-                    part_qty_per_unit = 0.0
                 if part_qty_per_unit <= 0:
                     part_qty_per_unit = 0.0
             raw_consumption = self._raw_consumption_for_part(
@@ -13502,6 +13867,7 @@ QWidget#ClientUIRoot {{
                 produced_units,
                 total_part_count=len(part_rows),
                 fallback_part_qty_per_unit=part_qty_per_unit,
+                pack_logs=pack_logs,
             )
             scanned_raw_qty_for_part = raw_consumption["scanned_qty"]
             used_raw_qty = raw_consumption["used_qty"]
@@ -14046,6 +14412,7 @@ QWidget#ClientUIRoot {{
         self._clear_pending_butal_assignment()
         setattr(self, "_action_logs", [])
         self._last_accepted_pack_scan_at = 0.0
+        self._last_accepted_pack_scan_cooldown_seconds = 0.0
         self._hide_reject_summary_overlay()
         self._hide_product_history_overlay()
         self._hide_reject_review_overlay()
@@ -14446,6 +14813,7 @@ QWidget#ClientUIRoot {{
                         produced_units,
                         total_part_count=len(part_rows),
                         fallback_part_qty_per_unit=part_qty_per_unit,
+                        pack_logs=s.product_pack_history_logs,
                     )
                     scanned_raw_qty = raw_consumption["scanned_qty"]
                     used_raw_qty = raw_consumption["used_qty"]
@@ -14481,6 +14849,7 @@ QWidget#ClientUIRoot {{
                             else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
                         )
                         self.jobPartsTable.setItem(0, c, item)
+                self._sync_product_parts_missing_error_after_refresh()
             self._update_product_parts_weight_indicator()
 
         # Cycle monitor values are computed live in _refresh_ui from:
@@ -15146,38 +15515,48 @@ QWidget#ClientUIRoot {{
         job_code = self._normalize_job_code(self.state.job_code)
         if job_code != self._normalize_job_code(getattr(self, "_floating_pack_qr_last_job_code", "")):
             self._floating_pack_qr_last_job_code = str(self.state.job_code or "").strip()
+            self._floating_pack_qr_enabled_job_code = ""
             self._floating_pack_qr_suppressed_job_code = ""
             self._floating_pack_qr_payload = ""
             self._floating_pack_qr_context_key = ""
             self._floating_pack_qr_recent_payloads = []
-        if not job_code or self._normalize_job_code(self._floating_pack_qr_suppressed_job_code) == job_code:
+            self._floating_pack_qr_scan_pending_payload = ""
+        enabled_job = self._normalize_job_code(getattr(self, "_floating_pack_qr_enabled_job_code", ""))
+        if (
+            not job_code
+            or enabled_job != job_code
+            or self._normalize_job_code(self._floating_pack_qr_suppressed_job_code) == job_code
+        ):
             self._hide_floating_pack_qr_panel()
             return
         qty = self._generated_pack_qty_from_job_payload()
         if qty is None:
             self._floating_pack_qr_payload = ""
             self._floating_pack_qr_context_key = ""
+            self._floating_pack_qr_scan_pending_payload = ""
             self._hide_floating_pack_qr_panel()
             return
-        lot_second = datetime.now().strftime("%Y%m%d%H%M%S")
-        payload = self._build_generated_pack_qr_payload(lot_second)
-        if not payload:
-            self._hide_floating_pack_qr_panel()
-            return
-        context_key = f"{job_code}|{qty}|{self._next_generated_pack_index()}|{lot_second}"
+        next_index = self._next_generated_pack_index()
+        total_qty = self._generated_pack_total_qty_from_job_payload()
+        product_id = self._generated_pack_product_id()
+        context_key = f"{job_code}|{product_id}|{qty}|{next_index}|{total_qty}"
         if context_key != self._floating_pack_qr_context_key:
+            lot_second = datetime.now().strftime("%Y%m%d%H%M%S")
+            payload = self._build_generated_pack_qr_payload(lot_second)
+            if not payload:
+                self._hide_floating_pack_qr_panel()
+                return
             self._floating_pack_qr_context_key = context_key
             self._floating_pack_qr_payload = payload
-            recent = list(getattr(self, "_floating_pack_qr_recent_payloads", []) or [])
-            recent.append(payload)
-            self._floating_pack_qr_recent_payloads = recent[-5:]
+            self._floating_pack_qr_recent_payloads = [payload]
+            self._floating_pack_qr_scan_pending_payload = ""
             pm = self._qr_pixmap_for_payload(payload, 210)
             if pm.isNull():
                 self.floatingPackQrImage.setText("QR renderer missing")
             else:
                 self.floatingPackQrImage.setPixmap(pm)
             self.floatingPackQrTitle.setText(f"AUTO PACK QR  |  QTY {qty}")
-            self.floatingPackQrMeta.setText(f"INDEX {self._next_generated_pack_index()}  |  TOTAL {self._generated_pack_total_qty_from_job_payload()}")
+            self.floatingPackQrMeta.setText(f"INDEX {next_index}  |  TOTAL {total_qty}")
         self._show_floating_pack_qr_panel()
 
     def _handle_pack_scan_floating_qr_state(self, raw_scan: str):
@@ -15189,9 +15568,7 @@ QWidget#ClientUIRoot {{
             return
         raw = str(raw_scan or "").strip()
         if raw == current_payload or raw in recent_payloads:
-            self._floating_pack_qr_context_key = ""
-            self._floating_pack_qr_last_lot_second = ""
-            QTimer.singleShot(250, self._refresh_floating_pack_qr_panel)
+            self._floating_pack_qr_scan_pending_payload = raw
             return
         parsed = self._extract_pack_history_fields(raw)
         if not isinstance(parsed, dict):
@@ -15207,8 +15584,63 @@ QWidget#ClientUIRoot {{
         if scanned_job != current_job or scanned_product != current_product:
             return
         self._floating_pack_qr_suppressed_job_code = str(self.state.job_code or "").strip()
+        self._floating_pack_qr_enabled_job_code = ""
         self._floating_pack_qr_payload = ""
+        self._floating_pack_qr_scan_pending_payload = ""
         self._hide_floating_pack_qr_panel()
+
+    def _enable_floating_pack_qr_from_trigger(self):
+        if not self.can_accept_production_scans():
+            msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
+            self.status.setText(msg[:1].upper() + msg[1:])
+            self._show_invalid_overlay(msg)
+            return
+        current_job = self._normalize_job_code(self.state.job_code)
+        enabled_job = self._normalize_job_code(getattr(self, "_floating_pack_qr_enabled_job_code", ""))
+        suppressed_job = self._normalize_job_code(getattr(self, "_floating_pack_qr_suppressed_job_code", ""))
+        if (
+            current_job
+            and enabled_job == current_job
+            and suppressed_job != current_job
+            and hasattr(self, "floatingPackQrPanel")
+            and self.floatingPackQrPanel is not None
+            and self.floatingPackQrPanel.isVisible()
+        ):
+            self._floating_pack_qr_suppressed_job_code = str(self.state.job_code or "").strip()
+            self._floating_pack_qr_enabled_job_code = ""
+            self._floating_pack_qr_payload = ""
+            self._floating_pack_qr_context_key = ""
+            self._floating_pack_qr_recent_payloads = []
+            self._floating_pack_qr_scan_pending_payload = ""
+            self._hide_floating_pack_qr_panel()
+            self.status.setText("Virtual PACK QR hidden. Scan physical PACK QR or scan virtual QR again to show.")
+            return
+        qty = self._generated_pack_qty_from_job_payload()
+        if qty is None:
+            self.status.setText("Virtual PACK QR unavailable: this job has no packing value.")
+            self._show_invalid_overlay("No packing value found for this job.")
+            return
+        self._floating_pack_qr_enabled_job_code = str(self.state.job_code or "").strip()
+        self._floating_pack_qr_suppressed_job_code = ""
+        self._floating_pack_qr_payload = ""
+        self._floating_pack_qr_context_key = ""
+        self._floating_pack_qr_recent_payloads = []
+        self._floating_pack_qr_scan_pending_payload = ""
+        self._refresh_floating_pack_qr_panel()
+        self.status.setText("Virtual PACK QR opened.")
+
+    def _advance_floating_pack_qr_after_virtual_scan(self, raw_scan: str):
+        raw = str(raw_scan or "").strip()
+        current_payload = str(getattr(self, "_floating_pack_qr_payload", "") or "").strip()
+        pending_payload = str(getattr(self, "_floating_pack_qr_scan_pending_payload", "") or "").strip()
+        recent_payloads = {str(x).strip() for x in (getattr(self, "_floating_pack_qr_recent_payloads", []) or []) if str(x).strip()}
+        if not raw or (raw != current_payload and raw != pending_payload and raw not in recent_payloads):
+            return
+        self._floating_pack_qr_context_key = ""
+        self._floating_pack_qr_payload = ""
+        self._floating_pack_qr_recent_payloads = []
+        self._floating_pack_qr_scan_pending_payload = ""
+        QTimer.singleShot(250, self._refresh_floating_pack_qr_panel)
 
     def _pack_history_key(self, row: Dict[str, Any]) -> str:
         if not isinstance(row, dict):
@@ -15262,11 +15694,21 @@ QWidget#ClientUIRoot {{
         self._recent_scan_seen[key] = now
         return last_seen is not None and (now - last_seen) <= window
 
+    def _pack_scan_cooldown_seconds_for_qty(self, qty: Any) -> float:
+        cycle_seconds = self._parse_cycle_seconds(self.state.cycle_time_current)
+        try:
+            pack_qty = max(0, int(qty or 0))
+        except Exception:
+            pack_qty = 0
+        if cycle_seconds is None or pack_qty <= 0:
+            return 0.0
+        return max(0.0, (float(pack_qty) * float(cycle_seconds)) - 60.0)
+
     def _pack_scan_cooldown_remaining(self) -> float:
         try:
-            interval = max(0.0, float((self.client_config or {}).get("pack_scan_interval_seconds", PACK_SCAN_INTERVAL_SECONDS)))
+            interval = max(0.0, float(getattr(self, "_last_accepted_pack_scan_cooldown_seconds", 0.0) or 0.0))
         except Exception:
-            interval = max(0.0, float(PACK_SCAN_INTERVAL_SECONDS or 0.0))
+            interval = 0.0
         if interval <= 0:
             return 0.0
         last_at = float(getattr(self, "_last_accepted_pack_scan_at", 0.0) or 0.0)
@@ -15279,16 +15721,15 @@ QWidget#ClientUIRoot {{
         if remaining <= 0:
             return False
         wait_seconds = max(1, int(math.ceil(remaining)))
-        self.status.setText(f"PACK QR blocked. Wait {wait_seconds}s before scanning next completed pack.")
+        self.status.setText(f"PACK QR blocked by cycle time. Wait {wait_seconds}s before scanning next completed pack.")
         self._show_invalid_overlay(f"Wait {wait_seconds}s before scanning the next PACK QR.")
         return True
 
-    def _mark_pack_scan_accepted(self) -> None:
-        try:
-            interval = max(0.0, float((self.client_config or {}).get("pack_scan_interval_seconds", PACK_SCAN_INTERVAL_SECONDS)))
-        except Exception:
-            interval = max(0.0, float(PACK_SCAN_INTERVAL_SECONDS or 0.0))
+    def _mark_pack_scan_accepted(self, qty: Any = 0) -> None:
+        interval = self._pack_scan_cooldown_seconds_for_qty(qty)
+        self._last_accepted_pack_scan_cooldown_seconds = interval
         if interval <= 0:
+            self._last_accepted_pack_scan_at = 0.0
             return
         self._last_accepted_pack_scan_at = time.monotonic()
 
@@ -15562,8 +16003,6 @@ QWidget#ClientUIRoot {{
         if s.waiting_linkage_job_scan:
             s.waiting_linkage_job_scan = False
             s.linkage_enabled = True
-        if self._block_pack_scan_if_too_soon():
-            return True
         share_qty = self._prepack_share_qty(total_pack_qty)
         if share_qty is None:
             self.status.setText("Prepack blocked: scan prepack~PACKQTY and make sure PACKQTY divides by color count.")
@@ -15574,30 +16013,9 @@ QWidget#ClientUIRoot {{
             target = self._prepack_component_rows()[0] if self._prepack_component_rows() else None
         if target is None:
             return True
-        self._mark_pack_scan_accepted()
         self._record_prepack_component_scan(target, share_qty, int(total_pack_qty or s.prepack_pack_qty or 0), raw_scan, "PREPACK_GENERIC")
         self.status.setText(f"Prepack recorded: {target.get('job_name') or target.get('job_code')} +{share_qty} pcs.")
         return True
-
-    def _auto_allocate_prepack_final_color(self, total_pack_qty: Any, raw_scan: str) -> None:
-        s = self.state
-        if not (s.prepack_mode_enabled and s.linkage_jobs):
-            return
-        share_qty = self._prepack_share_qty(total_pack_qty)
-        if share_qty is None:
-            return
-        rows = self._prepack_component_rows()
-        if not rows:
-            return
-        unit_counts = [int(row.get("prepack_units") or 0) for row in rows]
-        min_units = min(unit_counts)
-        max_units = max(unit_counts)
-        if max_units <= min_units:
-            return
-        target = next((row for row in rows if int(row.get("prepack_units") or 0) == min_units), None)
-        if target is None:
-            return
-        self._record_prepack_component_scan(target, share_qty, int(total_pack_qty or s.prepack_pack_qty or 0), raw_scan, "PREPACK_ASSEMBLY_AUTO")
 
     def _shift_butal_qty_for_job(self, job_code: Optional[str], *, fallback_current: bool = False) -> int:
         s = self.state
@@ -15911,6 +16329,10 @@ QWidget#ClientUIRoot {{
             row["voided"] = True
             row["voided_at"] = datetime.now(timezone.utc).isoformat()
             row["status"] = "VOID"
+            if row_key:
+                s.product_pack_history_keys.discard(row_key)
+                self._used_pack_qr_keys.discard(row_key)
+                _delete_scanned_pack_qr_key(row_key)
             s.pack_count = max(0, int(s.pack_count or 0) - 1)
             s.good_total = max(0, int(s.good_total or 0) - qty)
             self._append_adjustment_log(
@@ -16061,6 +16483,8 @@ QWidget#ClientUIRoot {{
             return "Operator shift handoff requested"
         if res.kind == "COLOR_CHANGE_TRIGGER":
             return str(res.value or "Change job segment")
+        if res.kind == "VIRTUAL_PACK_QR_TRIGGER":
+            return "Show virtual PACK QR"
         if res.kind == "PRODUCTION_DAILY_REPORT_TRIGGER":
             return "Production daily report mode enabled"
         if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
@@ -16719,6 +17143,10 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Raw materials summary opened.")
             return
 
+        if res_pre is not None and res_pre.kind == "VIRTUAL_PACK_QR_TRIGGER":
+            self._enable_floating_pack_qr_from_trigger()
+            return
+
         if self.productHistoryOverlay.isVisible() and raw_l in ("next", "prev", "previous", "preview"):
             pack_count = len([x for x in (self.state.product_pack_history_logs or []) if isinstance(x, dict)])
             butal_count = len([x for x in (self.state.butal_scan_logs or []) if isinstance(x, dict)])
@@ -16970,6 +17398,11 @@ QWidget#ClientUIRoot {{
                 "unique_key": unique_key or None,
                 "raw_job_code": raw_job_code,
                 "part_qty_per_unit_kg": float(part_qty_info.get("value") or 0.0),
+                "part_qty_per_unit_grams": (
+                    float(part_qty_info.get("value") or 0.0) * 1000.0
+                    if str(part_qty_info.get("source") or "").strip().lower() == "app"
+                    else None
+                ),
                 "part_qty_per_unit_source": part_qty_info.get("source"),
                 "raw_consumption_units_at_scan": self._raw_consumption_unit_count(
                     {
@@ -17541,11 +17974,13 @@ QWidget#ClientUIRoot {{
                     self._show_invalid_overlay("PACK QR was already scanned before.")
                     return
                 self._mark_pack_reprint_if_lot_changed(pack_hist)
-                self._mark_pack_scan_accepted()
+                self._mark_pack_scan_accepted(pack_hist.get("completed_pack_qty"))
+                self._stamp_pack_raw_consumption(pack_hist, pack_hist.get("completed_pack_qty"))
                 s.product_pack_history_logs.append(pack_hist)
                 if pack_key:
                     s.product_pack_history_keys.add(pack_key)
                     self._mark_pack_qr_used_permanently(pack_key, pack_hist)
+                self._advance_floating_pack_qr_after_virtual_scan(raw_s)
             s.pack_count += 1
             carried_qty = int(s.butal_completion_carried_qty or 0)
             new_qty = int(s.butal_completion_new_qty or 0)
@@ -18576,8 +19011,6 @@ QWidget#ClientUIRoot {{
                             )
                             self._show_invalid_overlay("This QR is not for this job or its parts.")
                         return
-                    if self._block_pack_scan_if_too_soon():
-                        return
                     unique_key = ""
                     if isinstance(pack_hist, dict):
                         scan_idx = str(pack_hist.get("index") or "").strip()
@@ -18598,6 +19031,11 @@ QWidget#ClientUIRoot {{
                         pack_hist=pack_hist if isinstance(pack_hist, dict) else None,
                         raw_job_code=scanned_job_code,
                     )
+                    return
+                missing_part = self._pack_blocked_by_missing_part_availability()
+                if missing_part:
+                    self.status.setText("Scan product parts/raw materials first before PACK.")
+                    self._show_product_parts_missing_error(missing_part)
                     return
                 if self._block_pack_scan_if_too_soon():
                     return
@@ -18644,12 +19082,13 @@ QWidget#ClientUIRoot {{
                         pack_hist["completed_pack_qty"] = int(qty or 0)
                         pack_hist["good_qty"] = new_butal_qty
                         pack_hist["qty_q"] = new_butal_qty
-                        self._mark_pack_scan_accepted()
-                        self._auto_allocate_prepack_final_color(qty, raw_s)
+                        self._mark_pack_scan_accepted(qty)
+                        self._stamp_pack_raw_consumption(pack_hist, new_butal_qty)
                         s.product_pack_history_logs.append(pack_hist)
                         if pack_key:
                             s.product_pack_history_keys.add(pack_key)
                             self._mark_pack_qr_used_permanently(pack_key, pack_hist)
+                        self._advance_floating_pack_qr_after_virtual_scan(raw_s)
                         s.pack_count += 1
                         s.good_total += new_butal_qty
                         self._clear_last_shift_butal_carryover(scanned_job_code or s.job_code)
@@ -18677,6 +19116,7 @@ QWidget#ClientUIRoot {{
                             defer_snapshot=True,
                         )
                         return
+                    self._stamp_pack_raw_consumption(pack_hist, qty)
                     s.product_pack_history_logs.append(pack_hist)
                     if pack_key:
                         s.product_pack_history_keys.add(pack_key)
@@ -18691,10 +19131,10 @@ QWidget#ClientUIRoot {{
                         )
                         self._show_invalid_overlay("Pack qty must be greater than last shift Butal.")
                         return
-                    self._mark_pack_scan_accepted()
-                    self._auto_allocate_prepack_final_color(qty, raw_s)
+                    self._mark_pack_scan_accepted(qty)
                     s.pack_count += 1
                     s.good_total += new_butal_qty
+                    self._advance_floating_pack_qr_after_virtual_scan(raw_s)
                     self._clear_last_shift_butal_carryover(scanned_job_code or s.job_code)
                     self._mark_live_cycle_scan_event(units=1)
                     self.status.setText(
@@ -18720,10 +19160,10 @@ QWidget#ClientUIRoot {{
                         defer_snapshot=True,
                     )
                     return
-                self._mark_pack_scan_accepted()
-                self._auto_allocate_prepack_final_color(qty, raw_s)
+                self._mark_pack_scan_accepted(qty)
                 s.pack_count += 1
                 s.good_total += qty
+                self._advance_floating_pack_qr_after_virtual_scan(raw_s)
                 self._mark_live_cycle_scan_event(units=qty if qty > 0 else 1)
                 self.status.setText("Pack +1")
                 self.lblPack.add_points(1)
