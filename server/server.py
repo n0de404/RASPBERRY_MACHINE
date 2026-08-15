@@ -14790,7 +14790,13 @@ async def api_event(req: Request):
                 "api_event_duplicate_ignored",
                 {"remote_host": remote_host, "event_id": event_id},
             )
-        return {"ok": True, "duplicate": True}
+        duplicate_machine = str(data.get("machine_code") or "").strip()
+        duplicate_session = SESSIONS.get(duplicate_machine)
+        return {
+            "ok": True,
+            "duplicate": True,
+            "session": duplicate_session.to_dict() if duplicate_session is not None else None,
+        }
 
     client_id = str(data.get("client_id", "UNKNOWN")).strip() or "UNKNOWN"
     identity_owner = _active_client_identity_conflict(client_id, remote_host)
@@ -15484,7 +15490,11 @@ async def api_event(req: Request):
         },
     )
     _mark_event_id_processed(event_id)
-    return {"ok": True}
+    resulting_session = SESSIONS.get(machine_code)
+    return {
+        "ok": True,
+        "session": resulting_session.to_dict() if resulting_session is not None else None,
+    }
 
 
 @APP.get("/api/finished-jobs")

@@ -3210,6 +3210,7 @@ class ClientUI(QWidget):
     scanner_status = pyqtSignal(str)
     average_weight_received = pyqtSignal(float, str, str, str, str)
     server_average_weight_received = pyqtSignal(str, float, str, str, str, str, str)
+    server_session_received = pyqtSignal(dict)
 
     @staticmethod
     def _load_digital_font_family() -> str:
@@ -6340,6 +6341,7 @@ QWidget#ClientUIRoot {{
         self.scanner_status.connect(self._set_status_text)
         self.average_weight_received.connect(self._apply_external_average_weight)
         self.server_average_weight_received.connect(self._apply_server_average_weight)
+        self.server_session_received.connect(self._apply_acknowledged_server_session)
         self._ui_refresh_timer = QTimer(self)
         self._ui_refresh_timer.setSingleShot(True)
         self._ui_refresh_timer.timeout.connect(self._refresh_ui_now)
@@ -11682,6 +11684,24 @@ QWidget#ClientUIRoot {{
         if isinstance(local_snap, dict):
             return local_snap
         return dict(server_snap or {})
+
+    def _apply_acknowledged_server_session(self, server_snap: Dict[str, Any]) -> None:
+        """Reconcile the UI with the state produced by an acknowledged delta."""
+        if not isinstance(server_snap, dict):
+            return
+        local_snap = self._state_to_active_snapshot()
+        server_machine = str(server_snap.get("machine_code") or "").strip()
+        local_machine = str(local_snap.get("machine_code") or "").strip()
+        server_job = self._normalize_job_code(server_snap.get("job_code") or server_snap.get("job_name"))
+        local_job = self._normalize_job_code(local_snap.get("job_code") or local_snap.get("job_name"))
+        if not server_machine or server_machine != local_machine:
+            return
+        if not server_job or not local_job or server_job != local_job:
+            return
+        merged = self._merge_matching_recovery_snapshots(server_snap, local_snap)
+        self._restore_state_from_snapshot(merged)
+        self._refresh_ui()
+        self._save_active_session_snapshot(force=True)
 
     def _recovery_shift_segment_key_from_row(self, row: Dict[str, Any], base_snap: Dict[str, Any]) -> str:
         job_key = self._normalize_job_code(row.get("job_code"))
@@ -24571,6 +24591,12 @@ QWidget#ClientUIRoot {{
                     self._load_persisted_server_events()
                 event_payload = item.get("payload") if isinstance(item, dict) else {}
                 event_body = event_payload.get("event") if isinstance(event_payload, dict) else {}
+                acknowledged_session = response_body.get("session") if isinstance(response_body, dict) else None
+                if not discard_item and isinstance(acknowledged_session, dict):
+                    # Network dispatch runs off the Qt thread. Reconcile the
+                    # acknowledged authoritative state through a queued signal
+                    # so labels and local recovery storage update safely.
+                    self.server_session_received.emit(dict(acknowledged_session))
                 if event_type == "HEARTBEAT":
                     self.sync_local_finish_shifts_to_server(force=False)
                     self.sync_local_finished_jobs_to_server()
