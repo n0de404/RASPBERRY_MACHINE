@@ -218,7 +218,9 @@ def _save_job_details_cache_json(rows: List[Dict[str, Any]]) -> bool:
         os.makedirs(DATABASE_DIR, exist_ok=True)
         payload = {
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "entries": list(rows or [])[-500:],
+            # Job responses can be fairly rich. Keep a bounded offline working
+            # set so this fallback never grows with the lifetime of the Pi.
+            "entries": list(rows or [])[-100:],
         }
         tmp = f"{JOB_DETAILS_CACHE_FILE}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -3226,10 +3228,9 @@ class ClientUI(QWidget):
         self.state = ClientState()
         self.client_config = _load_client_config()
         self.job_api_config = _load_job_api_config()
-        # Job details must come from BMS while online.  Offline production uses
-        # the scanned job id plus operator-confirmed QR classifications instead
-        # of restoring potentially stale job-detail payloads.
-        self._job_details_cache: List[Dict[str, Any]] = []
+        # The server remains authoritative. Successful lookups populate a
+        # bounded local cache used only when that server lookup is unavailable.
+        self._job_details_cache: List[Dict[str, Any]] = _load_job_details_cache_json()
         self._last_job_payload_source = ""
         self._pending_job_api_retry: Optional[Dict[str, Any]] = None
         self._pending_no_zrm_job_confirmation: Optional[Dict[str, Any]] = None
@@ -17275,13 +17276,55 @@ QWidget#ClientUIRoot {{
         return aliases
 
     def _cache_job_payload(self, payload: Any, *identifiers: Any) -> bool:
-        # Deliberately disabled.  Do not persist BMS job-detail responses on
-        # the client; offline scans are handled by the QR classification flow.
-        return False
+        if not isinstance(payload, dict) or not payload:
+            return False
+        aliases = self._job_payload_aliases(payload, list(identifiers))
+        if not aliases:
+            return False
+        alias_set = set(aliases)
+        rows = []
+        for row in list(getattr(self, "_job_details_cache", []) or []):
+            if not isinstance(row, dict):
+                continue
+            existing_aliases = {
+                self._job_cache_key(value) for value in (row.get("aliases") or [])
+                if self._job_cache_key(value)
+            }
+            if alias_set.intersection(existing_aliases):
+                continue
+            rows.append(row)
+        rows.append({
+            "aliases": aliases,
+            "payload": dict(payload),
+            "cached_at_utc": datetime.now(timezone.utc).isoformat(),
+            "cached_at_epoch": int(time.time()),
+        })
+        self._job_details_cache = rows[-100:]
+        return _save_job_details_cache_json(self._job_details_cache)
 
     def _cached_job_payload(self, *identifiers: Any) -> Optional[Dict[str, Any]]:
-        # Kept as a compatibility method for older call sites.  A stale cached
-        # job definition must never control current offline production.
+        wanted = {self._job_cache_key(value) for value in identifiers if self._job_cache_key(value)}
+        if not wanted:
+            return None
+        ttl_seconds = max(60, int((self.job_api_config or {}).get("ttl_seconds", 604800) or 604800))
+        now_epoch = int(time.time())
+        for row in reversed(list(getattr(self, "_job_details_cache", []) or [])):
+            if not isinstance(row, dict) or not isinstance(row.get("payload"), dict):
+                continue
+            aliases = {
+                self._job_cache_key(value) for value in (row.get("aliases") or [])
+                if self._job_cache_key(value)
+            }
+            if not wanted.intersection(aliases):
+                continue
+            try:
+                cached_at = int(float(row.get("cached_at_epoch") or 0))
+            except Exception:
+                cached_at = 0
+            if cached_at <= 0 or now_epoch - cached_at > ttl_seconds:
+                continue
+            self._last_job_payload_source = "CACHE"
+            return dict(row["payload"])
         return None
 
     def _job_api_body_is_unauthorized(self, data: Any) -> bool:
@@ -17529,16 +17572,20 @@ QWidget#ClientUIRoot {{
             )
             if resp.status_code != 200:
                 self._append_job_api_log(f"SERVER JOB LOOKUP unavailable HTTP {resp.status_code}")
-                return None
+                return self._cached_job_payload(raw_job_id)
             out = resp.json()
             payload = out.get("payload") if isinstance(out, dict) else None
             if isinstance(payload, dict):
                 self._last_job_payload_source = "SERVER"
+                self._cache_job_payload(payload, raw_job_id)
                 return payload
-            return None
+            return self._cached_job_payload(raw_job_id)
         except Exception as e:
             self._append_job_api_log(f"SERVER JOB LOOKUP unavailable: {e}")
-            return None
+            cached = self._cached_job_payload(raw_job_id)
+            if isinstance(cached, dict):
+                self._append_job_api_log(f"OFFLINE CACHE HIT {raw_job_id}")
+            return cached
 
     def _refresh_job_details(self):
         payload = self.state.job_payload or {}

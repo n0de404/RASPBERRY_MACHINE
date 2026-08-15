@@ -48,6 +48,11 @@ Successful server acknowledgements remove the matching finished record locally.
 and temporary last-weight information. It is keyed by machine and job: another
 job cannot consume it, and finishing the matching job clears it.
 
+`job_details_cache.json` stores at most 100 recent server job responses for
+temporary offline fallback. Online scans still ask the server first, successful
+responses refresh the cache, and entries expire according to the configured
+job-cache TTL (seven days by default).
+
 ## Useful commands
 
 Run from source:
