@@ -22936,7 +22936,27 @@ QWidget#ClientUIRoot {{
                 self._skip_server_recovery_machine = ""
             else:
                 server_snap = self._fetch_active_session_snapshot_from_server(raw_s)
-            if self._prompt_session_recovery(raw_s, _machine_display_name(raw_s, res.value), server_snap, local_snap):
+            server_ok = isinstance(server_snap, dict) and self._snapshot_is_recoverable(server_snap)
+            local_ok = isinstance(local_snap, dict) and self._snapshot_is_recoverable(local_snap)
+            if server_ok or local_ok:
+                # MACHINE scan is the explicit recovery action. Restore
+                # immediately: server-only/local-only uses that copy; matching
+                # jobs merge highest cumulative counters and unique scans;
+                # different jobs use the later saved timestamp.
+                recovered = self._resolve_recovery_snapshot(
+                    server_snap if server_ok else None,
+                    local_snap if local_ok else None,
+                )
+                source_label = "SERVER + LOCAL" if server_ok and local_ok else ("SERVER" if server_ok else "LOCAL")
+                self._resume_snapshot(
+                    recovered,
+                    _machine_display_name(raw_s, res.value),
+                    f"SESSION SNAPSHOT SYNC (MACHINE AUTO RECOVERY: {source_label})",
+                )
+                self.status.setText(
+                    f"Machine recovered automatically from {source_label.lower()}: "
+                    f"{self.state.job_name or self.state.job_code}."
+                )
                 return
             s.machine_code = raw_s
             s.machine_name = _machine_display_name(s.machine_code, res.value)
