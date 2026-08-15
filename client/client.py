@@ -22829,9 +22829,19 @@ QWidget#ClientUIRoot {{
 
         if res.kind == "MACHINE":
             if s.machine_code:
-                self.status.setText("Finish your current job first before changing machine.")
-                self._show_invalid_overlay("Cannot change machine while current job is active.")
-                return
+                current_snapshot = self._state_to_active_snapshot()
+                if self._snapshot_is_recoverable(current_snapshot):
+                    self.status.setText("Finish your current job first before changing machine.")
+                    self._show_invalid_overlay("Cannot change machine while current job is active.")
+                    return
+                # This client is an interchangeable terminal. A machine-only
+                # idle shell must not pin the Raspberry Pi to that machine.
+                # Remove only the old local shell; any real server session for
+                # the newly scanned machine is fetched and offered for recovery
+                # below.
+                self._clear_active_session_snapshot(s.machine_code)
+                s.machine_code = None
+                s.machine_name = None
             local_snap = self._load_local_active_session_snapshot(raw_s)
             server_snap = None
             if self._skip_server_recovery_machine == raw_s:
@@ -24169,13 +24179,12 @@ QWidget#ClientUIRoot {{
         if not self.state.machine_code:
             return
         snapshot = self._state_to_active_snapshot()
-        event: Dict[str, Any] = {"type": "SESSION_SYNC"}
         # Only attach a full snapshot when the client has recoverable session data.
         # This keeps empty/reset states from wiping richer server rows, while still
         # letting explicit syncs (job set, color change, resume) push fresh totals.
-        if self._snapshot_is_recoverable(snapshot):
-            event["session_snapshot"] = snapshot
-        self.push_event(event, note)
+        if not self._snapshot_is_recoverable(snapshot):
+            return
+        self.push_event({"type": "SESSION_SYNC", "session_snapshot": snapshot}, note)
 
     def _enqueue_reconnect_session_snapshot_sync(self, note: str = "SESSION SNAPSHOT SYNC (RECONNECT)"):
         if bool(getattr(self, "_server_recovery_snapshot_queued", False)):
