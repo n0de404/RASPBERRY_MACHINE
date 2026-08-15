@@ -11513,10 +11513,15 @@ QWidget#ClientUIRoot {{
         server_url = str((self.client_config or {}).get("server_url", SERVER_URL) or SERVER_URL).strip().rstrip("/")
         if not server_url:
             return None
-        params = {"client_id": self._current_client_id()}
+        params: Dict[str, Any] = {}
         code = str(machine_code or "").strip()
         if code:
+            # A scanned machine is an explicit handoff lookup. Do not restrict
+            # it to this Pi's client_id: another interchangeable Pi may have
+            # been the last terminal that saved the machine session.
             params["machine_code"] = code
+        else:
+            params["client_id"] = self._current_client_id()
         try:
             resp = self._request_with_ui_events(
                 requests.get,
@@ -11534,7 +11539,9 @@ QWidget#ClientUIRoot {{
             snaps = [
                 dict(row)
                 for row in items
-                if isinstance(row, dict) and self._belongs_to_current_client(row) and self._snapshot_is_recoverable(row)
+                if isinstance(row, dict)
+                and (bool(code) or self._belongs_to_current_client(row))
+                and self._snapshot_is_recoverable(row)
             ]
             snaps.sort(key=self._snapshot_sort_key, reverse=True)
             return snaps[0] if snaps else None
@@ -11653,6 +11660,20 @@ QWidget#ClientUIRoot {{
         local_snap: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         if isinstance(server_snap, dict) and isinstance(local_snap, dict):
+            server_job = self._normalize_job_code(server_snap.get("job_code") or server_snap.get("job_name"))
+            local_job = self._normalize_job_code(local_snap.get("job_code") or local_snap.get("job_name"))
+            if server_job and local_job and server_job != local_job:
+                # Counts from different jobs are unrelated and must never be
+                # maximized or combined. Prefer the later saved session; if a
+                # timestamp is unavailable/tied, the server is authoritative
+                # for an explicit machine handoff.
+                server_ts = self._snapshot_timestamp_value(server_snap)
+                local_ts = self._snapshot_timestamp_value(local_snap)
+                if server_ts is not None and local_ts is not None:
+                    return dict(local_snap if local_ts > server_ts else server_snap)
+                if local_ts is not None and server_ts is None:
+                    return dict(local_snap)
+                return dict(server_snap)
             server_score = self._recovery_snapshot_total_score(server_snap)
             local_score = self._recovery_snapshot_total_score(local_snap)
             if local_score > server_score:
