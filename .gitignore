@@ -1,0 +1,19 @@
+# Python/build output
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+
+# Machine-local runtime state. Raspberry Pi clients store this outside the repo
+# through MACHINE_DATA_DIR; server runtime data must also not be versioned.
+Database/
+server/Database/
+*.log
+*.db
+
+# Local editor/OS files
+.vscode/
+.DS_Store
+Thumbs.db
+Archive_NotRuntime/

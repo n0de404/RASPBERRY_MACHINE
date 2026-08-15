@@ -1,8 +1,0 @@
-fastapi>=0.110
-uvicorn[standard]>=0.29
-requests>=2.31
-PyQt6>=6.6
-pyserial>=3.5
-qrcode[pil]>=7.4
-PyMySQL>=1.1
-cryptography>=44
