@@ -3321,6 +3321,19 @@ class ClientUI(QWidget):
         self._product_catalog_default_qty_by_id: Optional[Dict[str, float]] = None
         self._product_catalog_last_refresh_attempt = 0.0
         self._product_catalog_refresh_inflight = False
+        cached_profiles = self._load_json_file(USER_QR_PROFILES_FILE, [])
+        self._user_qr_profiles_cache: List[Dict[str, Any]] = (
+            [row for row in cached_profiles if isinstance(row, dict)]
+            if isinstance(cached_profiles, list)
+            else []
+        )
+        cached_daily_roles = self._load_json_file(DAILY_ROLE_ASSIGNMENTS_FILE, {})
+        self._daily_role_assignments_cache: Dict[str, Any] = (
+            cached_daily_roles if isinstance(cached_daily_roles, dict) else {}
+        )
+        # Build the local product lookup during application construction so a
+        # first product/part scan never pays the JSON parsing cost.
+        self._ensure_product_catalog_index()
         self._last_finish_shift_sync_signature = ""
         self._action_logs: List[str] = []
         self._app_logs: List[Dict[str, Any]] = _load_app_logs_json()
@@ -8529,6 +8542,7 @@ QWidget#ClientUIRoot {{
                     out_profiles = resp_profiles.json()
                     items = out_profiles.get("items") if isinstance(out_profiles, dict) else None
                     if isinstance(items, list):
+                        self._user_qr_profiles_cache = [row for row in items if isinstance(row, dict)]
                         os.makedirs(DATABASE_DIR, exist_ok=True)
                         with open(USER_QR_PROFILES_FILE, "w", encoding="utf-8") as f:
                             json.dump(items, f, ensure_ascii=False, indent=2)
@@ -8554,6 +8568,7 @@ QWidget#ClientUIRoot {{
                             local_daily = {}
                         if date_key and isinstance(items, dict):
                             local_daily[date_key] = items
+                            self._daily_role_assignments_cache = local_daily
                             os.makedirs(DATABASE_DIR, exist_ok=True)
                             with open(DAILY_ROLE_ASSIGNMENTS_FILE, "w", encoding="utf-8") as f:
                                 json.dump(local_daily, f, ensure_ascii=False, indent=2)
@@ -8748,25 +8763,9 @@ QWidget#ClientUIRoot {{
             display_name = display_name or QC_BADGES[code]
 
         # Profile-based role from local JSON cache synced from the server.
-        profiles: List[Dict[str, Any]] = []
-        try:
-            if os.path.exists(USER_QR_PROFILES_FILE):
-                with open(USER_QR_PROFILES_FILE, "r", encoding="utf-8-sig") as f:
-                    loaded_profiles = json.load(f)
-                if isinstance(loaded_profiles, list):
-                    profiles = [row for row in loaded_profiles if isinstance(row, dict)]
-        except Exception:
-            profiles = []
-        if not profiles:
-            profiles = _load_user_qr_profiles_sql()
-            if profiles:
-                try:
-                    os.makedirs(DATABASE_DIR, exist_ok=True)
-                    with open(USER_QR_PROFILES_FILE, "w", encoding="utf-8") as f:
-                        json.dump(profiles, f, ensure_ascii=False, indent=2)
-                    self._save_local_operator_cache_from_profiles(profiles)
-                except Exception:
-                    pass
+        # Scan handling must remain UI-local and non-blocking. The background
+        # identity sync refreshes this cache; never open SQL/network here.
+        profiles = list(getattr(self, "_user_qr_profiles_cache", []) or [])
         for row in profiles:
             if not isinstance(row, dict):
                 continue
@@ -8777,15 +8776,7 @@ QWidget#ClientUIRoot {{
             break
 
         # Daily assignments can grant temporary rights (including both).
-        daily_map: Dict[str, Any] = {}
-        try:
-            if os.path.exists(DAILY_ROLE_ASSIGNMENTS_FILE):
-                with open(DAILY_ROLE_ASSIGNMENTS_FILE, "r", encoding="utf-8-sig") as f:
-                    loaded_daily = json.load(f)
-                if isinstance(loaded_daily, dict):
-                    daily_map = loaded_daily
-        except Exception:
-            daily_map = {}
+        daily_map = dict(getattr(self, "_daily_role_assignments_cache", {}) or {})
         if isinstance(daily_map, dict):
             today_key = datetime.now().date().isoformat()
             today_rows = daily_map.get(today_key)
@@ -23874,6 +23865,11 @@ QWidget#ClientUIRoot {{
                         pid_raw = str(pack_hist.get("product_p") or "").strip()
                         if scan_idx and scan_lot:
                             unique_key = f"PARTQR:{pid_raw}:{scan_idx}:{scan_lot}"
+                    if not unique_key:
+                        unique_key = (
+                            f"PARTQR:{self._normalize_job_code(s.job_code)}:"
+                            f"{str(raw_s).strip()}"
+                        )
                     material_name = str(product_name_for_pack or matched_part.get("name") or matched_part.get("part_name") or "Job Part").strip()
                     self._record_job_part_scan(
                         part=matched_part,
