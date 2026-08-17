@@ -9812,7 +9812,12 @@ QWidget#ClientUIRoot {{
         self._restore_job_payload_from_active_snapshot()
         self.lblMachine.setText(f"Machine: {_machine_display_name(s.machine_code, s.machine_name)}")
         self.lblJob.setText(f"Job: {s.job_name or '-'}")
-        self.lblOperator.setText(f"Operator: {self._operator_display_name(s.operator_id)}")
+        if s.break_active and s.reliever_id:
+            self.lblOperator.setText(f"RELIEVER: {self._operator_display_name(s.reliever_id)}")
+            self.lblOperator.setStyleSheet("color: #f59e0b; font-weight: 900;")
+        else:
+            self.lblOperator.setText(f"OPERATOR: {self._operator_display_name(s.operator_id)}")
+            self.lblOperator.setStyleSheet("")
         payload = s.job_payload or {}
         data_obj = payload.get("data") if isinstance(payload, dict) else {}
         job = data_obj.get("job") if isinstance(data_obj, dict) else {}
@@ -12511,6 +12516,8 @@ QWidget#ClientUIRoot {{
             "supervisor_name": s.supervisor_name,
             "supervisor_review_logs": list(s.supervisor_review_logs or []),
             "reprint_qr_logs": list(s.reprint_qr_logs or []),
+            "break_sessions": list(s.break_sessions or []),
+            "has_reliever": bool(s.break_sessions),
             "operator_shift_logs": list(s.operator_shift_logs or []),
             "partial_qty": int((s.good_total or 0) + (main_butal_total or 0)),
             "review_status": REVIEW_STATUS_CLOSED,
@@ -18381,7 +18388,10 @@ QWidget#ClientUIRoot {{
         name = str(person.get("name") or "").strip()
         if not name or name == code:
             return False
-        new_operator = name
+        # Keep a stable badge identity for later original/reliever comparisons;
+        # storing only the resolved name makes the original QR look like a new
+        # operator when it returns from relief.
+        new_operator = self._operator_display_value(code, name)
         if not new_operator or new_operator == s.operator_id:
             return False
         old_operator = str(s.operator_id or "")
@@ -22143,10 +22153,42 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay("Operator badge is not registered on server.")
                 return
         elif res is not None and res.kind == "OPERATOR":
-            # Reject legacy/static operator QR unless it exists in the server profile data with Operator role.
-            self.status.setText("Invalid operator QR: badge is not registered as Operator.")
-            self._show_invalid_overlay("Operator badge is not registered on server.")
-            return
+            # During an active shift, retain an unknown operator badge as a
+            # reliever ID. The server can resolve its profile later; the raw QR
+            # remains attached for audit and retry.
+            known_auth = self._authorized_person_from_scan(raw_s)
+            if known_auth is not None and str(known_auth.get("can_operator", "0")) != "1":
+                self.status.setText("Invalid reliever QR: badge is not an Operator role.")
+                self._show_invalid_overlay("Only Operator role can be used as a reliever.")
+                return
+            if known_auth is not None:
+                reliever_code = self._operator_display_value(
+                    str(known_auth.get("code") or raw_s),
+                    str(known_auth.get("name") or ""),
+                )
+                pending_reliever_validation = False
+            else:
+                offline_operator = self._offline_operator_from_scan(raw_s)
+                reliever_code = str(
+                    (offline_operator or {}).get("code")
+                    or self._clean_badge_scan_code(res.value)
+                    or self._clean_badge_scan_code(raw_s)
+                ).strip()
+                pending_reliever_validation = True
+            if s.operator_id and reliever_code:
+                res = ScanResult(
+                    kind="OFFLINE_OPERATOR" if pending_reliever_validation else "OPERATOR",
+                    raw=raw_s,
+                    value=reliever_code,
+                    meta={
+                        "operator_qr_payload": raw_s,
+                        "pending_server_validation": pending_reliever_validation,
+                    },
+                )
+            else:
+                self.status.setText("Invalid operator QR: badge is not registered as Operator.")
+                self._show_invalid_overlay("Operator badge is not registered on server.")
+                return
         if res is None and str(s.reject_multiplier_input or "").strip() and raw_l != "backspace" and not (raw_l.startswith("num_") and raw_l[-1:].isdigit()):
             self._clear_reject_multiplier()
             self._refresh_ui()
@@ -23606,9 +23648,13 @@ QWidget#ClientUIRoot {{
                 self._end_operator_relief(raw_operator_payload)
                 return
             if current_operator_code and new_operator_code != current_operator_code:
-                if self._change_operator_for_active_job(res.value, raw_operator_payload, pending_server_validation):
+                if s.break_active:
+                    changed = self._switch_active_break_cover(res.value, raw_operator_payload)
+                else:
+                    changed = self._start_operator_relief(res.value, raw_operator_payload)
+                if changed:
                     return
-                self.status.setText("Operator scan could not be applied right now.")
+                self.status.setText("Reliever scan could not be applied right now.")
                 return
             if current_operator_code and new_operator_code == current_operator_code:
                 self.status.setText(f"Operator already active: {self._operator_display_name(s.operator_id)}")
