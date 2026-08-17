@@ -11138,7 +11138,11 @@ DASHBOARD_HTML = """
 
   function renderFinishedJobs(rows){
     const allItems = Array.isArray(rows) ? rows : [];
-    const shiftItems = allItems.filter(isShiftPartialRecord);
+    const shiftItems = allItems.filter(row => {
+      if(!isShiftPartialRecord(row)) return false;
+      const stamp = String(row?.finished_at_utc || row?.ended_at_utc || "").trim();
+      return stamp >= "2026-06-01";
+    });
     const finalItems = allItems.filter(r => !isShiftPartialRecord(r));
     finishedShiftState = shiftItems;
     renderFinishedShiftQueue(shiftItems);
