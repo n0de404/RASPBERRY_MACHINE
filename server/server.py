@@ -7890,6 +7890,74 @@ DASHBOARD_HTML = """
     `;
   }
 
+  function operatorReliefTabsHtml(session){
+    const breaks = Array.isArray(session?.break_sessions) ? session.break_sessions.filter(x => x && typeof x === "object") : [];
+    const packLogs = Array.isArray(session?.product_pack_history_logs) ? session.product_pack_history_logs.filter(x => x && typeof x === "object") : [];
+    const rejectLogs = Array.isArray(session?.reject_review_logs) ? session.reject_review_logs.filter(x => x && typeof x === "object") : [];
+    const rawLogs = Array.isArray(session?.raw_material_logs) ? session.raw_material_logs.filter(x => x && typeof x === "object") : [];
+    const relieverIds = [];
+    breaks.forEach(row => {
+      const value = String(row.reliever_operator || "").trim();
+      if(value && !relieverIds.includes(value)) relieverIds.push(value);
+      (Array.isArray(row.cover_history) ? row.cover_history : []).forEach(cover => {
+        const coverValue = String(cover?.operator || "").trim();
+        if(coverValue && !relieverIds.includes(coverValue)) relieverIds.push(coverValue);
+      });
+    });
+    [...packLogs, ...rejectLogs, ...rawLogs].forEach(row => {
+      if(String(row.scan_owner_type || "").trim().toUpperCase() !== "RELIEVER") return;
+      const value = String(row.active_operator || "").trim();
+      if(value && !relieverIds.includes(value)) relieverIds.push(value);
+    });
+    if(!relieverIds.length) return "";
+    const originalId = String(session?.operator_id || breaks[0]?.original_operator || "").trim();
+    const people = [{id: originalId, role: "ORIGINAL", label: `Original Operator: ${displayNameForId(originalId || "-")}`}]
+      .concat(relieverIds.map(id => ({id, role: "RELIEVER", label: `Reliever: ${displayNameForId(id)}`})));
+    const owns = (row, person) => {
+      const ownerType = String(row?.scan_owner_type || "ORIGINAL").trim().toUpperCase() || "ORIGINAL";
+      if(person.role === "ORIGINAL") return ownerType !== "RELIEVER";
+      return ownerType === "RELIEVER" && String(row?.active_operator || "").trim() === person.id;
+    };
+    const panel = person => {
+      const packs = packLogs.filter(row => owns(row, person));
+      const rejects = rejectLogs.filter(row => owns(row, person));
+      const materials = rawLogs.filter(row => owns(row, person));
+      const goodQty = packs.reduce((sum, row) => sum + Number(firstValue(row.good_qty, row.qty_q, row.qty, row.completed_pack_qty, 0) || 0), 0);
+      const rejectQty = rejects.reduce((sum, row) => sum + Number(firstValue(row.qty, row.reject_qty, row.multiplier, 1) || 0), 0);
+      return `
+        <div class="archive-metric-grid">
+          ${archiveMetric("Pack Scans", packs.length)}
+          ${archiveMetric("Good Qty", goodQty, "good")}
+          ${archiveMetric("Reject Qty", rejectQty, rejectQty > 0 ? "bad" : "")}
+          ${archiveMetric("Material Scans", materials.length)}
+        </div>
+        <div class="review-group-list">
+          <div class="review-group-card wide"><div class="review-group-head">Pack Scans</div><div class="review-group-body">${tableFromRows(packs, [
+            {label:"Series", value:x => firstValue(x.index, x.series, x.label_index, "-")},
+            {label:"Qty", value:x => firstValue(x.good_qty, x.qty_q, x.qty, x.completed_pack_qty, "-")},
+            {label:"Scanned At", value:x => fmtDateLocal(firstValue(x.scanned_at, x.timestamp_utc, ""))},
+          ], "No pack scans recorded for this person.", 12)}</div></div>
+          <div class="review-group-card"><div class="review-group-head">Rejects</div><div class="review-group-body">${tableFromRows(rejects, [
+            {label:"Reason", value:x => firstValue(x.reason_text, x.reason_code, x.reason, "-")},
+            {label:"Qty", value:x => firstValue(x.qty, x.reject_qty, x.multiplier, 1)},
+            {label:"Scanned At", value:x => fmtDateLocal(firstValue(x.scanned_at, x.timestamp_utc, ""))},
+          ], "No rejects recorded for this person.", 12)}</div></div>
+          <div class="review-group-card"><div class="review-group-head">Materials</div><div class="review-group-body">${tableFromRows(materials, [
+            {label:"Material", value:x => firstValue(x.material_name, x.material, "-")},
+            {label:"Qty", value:x => firstValue(x.qty, x.quantity, "-")},
+            {label:"Scanned At", value:x => fmtDateLocal(firstValue(x.scanned_at, x.timestamp_utc, ""))},
+          ], "No material scans recorded for this person.", 12)}</div></div>
+        </div>`;
+    };
+    const groupId = `relief-${String(session?.machine_code || "machine").replace(/[^A-Za-z0-9_-]/g, "")}-${String(session?.finished_at_utc || session?.job_code || "shift").replace(/[^A-Za-z0-9_-]/g, "")}`;
+    return `
+      <div class="shift-job-tabs" data-shift-tabs="${esc(groupId)}">
+        <div class="shift-job-tabs-head"><div class="shift-job-tabs-title">Original Operator / Reliever Activity</div><div class="shift-job-tabs-meta">${esc(people.length)} people</div></div>
+        <div class="shift-job-tabbar">${people.map((person, idx) => `<button type="button" class="shift-job-tab-button${idx === 0 ? " active" : ""}" data-shift-tab="${esc(groupId)}-${idx}">${esc(person.label)}</button>`).join("")}</div>
+        ${people.map((person, idx) => `<div class="shift-job-tab-panel${idx === 0 ? " active" : ""}" data-shift-panel="${esc(groupId)}-${idx}">${panel(person)}</div>`).join("")}
+      </div>`;
+  }
+
   function detailItem(label, value){
     return `<div class="machine-detail-item"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
   }
@@ -8031,7 +8099,7 @@ DASHBOARD_HTML = """
         total_labels: firstValue(x.total_labels, x.total, "-"),
         lot: firstValue(x.lot_number, x.lot, "-"),
         po: firstValue(x.po_number, x.po, "-"),
-        operator: firstValue(x.operator_name, x.operator, "-"),
+        operator: firstValue(x.active_operator_name, x.active_operator, x.operator_name, x.operator, "-"),
         time: firstValue(x.scanned_at, x.timestamp_utc, ""),
         raw_scan: String(x.raw_scan || ""),
         _raw: x,
@@ -8678,6 +8746,7 @@ DASHBOARD_HTML = """
     machineDetailBody.innerHTML = `
       ${activeJobSummaryHtml}
       ${operatorShiftTabsHtml(session)}
+      ${operatorReliefTabsHtml(session)}
       <div class="machine-detail-section">
         <h4>Overview</h4>
         <div class="machine-detail-grid">
@@ -10632,6 +10701,7 @@ DASHBOARD_HTML = """
     return {
       summary: [
         { title: "", kind: "html", wide: true, content: shiftHero },
+        { title: "", kind: "html", wide: true, content: operatorReliefTabsHtml(item) },
         { title: "Production", kind: "metrics", wide: true, content: [
           { label: "Pack", value: item.pack_count ?? 0 },
           { label: "Good", value: item.good_total ?? 0, tone: "good" },

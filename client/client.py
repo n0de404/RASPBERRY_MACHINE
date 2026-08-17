@@ -22486,9 +22486,10 @@ QWidget#ClientUIRoot {{
                 if self._block_pack_scan_if_too_soon():
                     return
                 pack_hist["raw_scan"] = raw_s
-                pack_hist["operator"] = str(s.operator_id or "").strip() or "-"
-                pack_hist["operator_name"] = self._operator_display_name(s.operator_id)
-                pack_hist.update(self._scan_owner_context())
+                owner_context = self._scan_owner_context()
+                pack_hist.update(owner_context)
+                pack_hist["operator"] = owner_context["active_operator"]
+                pack_hist["operator_name"] = owner_context["active_operator_name"]
                 pack_hist["status"] = "BUTAL_COMPLETED"
                 pack_hist["voided"] = False
                 pack_hist["scanned_at"] = datetime.now(timezone.utc).isoformat()
@@ -24003,9 +24004,10 @@ QWidget#ClientUIRoot {{
                 if pack_hist is not None:
                     pack_hist["raw_scan"] = raw_s
                     pack_hist["scanned_pack_qty"] = int(qty or 0)
-                    pack_hist["operator"] = str(s.operator_id or "").strip() or "-"
-                    pack_hist["operator_name"] = self._operator_display_name(s.operator_id)
-                    pack_hist.update(self._scan_owner_context())
+                    owner_context = self._scan_owner_context()
+                    pack_hist.update(owner_context)
+                    pack_hist["operator"] = owner_context["active_operator"]
+                    pack_hist["operator_name"] = owner_context["active_operator_name"]
                     pack_hist["status"] = "ACTIVE"
                     pack_hist["voided"] = False
                     pack_hist["linkage_output_allocation"] = dict(pack_allocation)
