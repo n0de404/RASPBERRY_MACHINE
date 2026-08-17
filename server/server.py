@@ -9985,22 +9985,8 @@ DASHBOARD_HTML = """
       ["Product", item.product_name || job.product_name || item.job_name || "-"],
       ["Remarks", item.approved_remarks || item.change_remarks || ""],
     ].filter(([key,value]) => key !== "Remarks" || String(value || "").trim() !== "");
-    const relieverIds = [];
-    const addReliever = value => {
-      const id = String(value || "").trim();
-      if(id && !relieverIds.includes(id)) relieverIds.push(id);
-    };
-    (Array.isArray(item.break_sessions) ? item.break_sessions : []).forEach(session => {
-      addReliever(session?.reliever_operator);
-      (Array.isArray(session?.cover_history) ? session.cover_history : []).forEach(cover => addReliever(cover?.operator));
-    });
-    (Array.isArray(item.product_pack_history_logs) ? item.product_pack_history_logs : []).forEach(scan => {
-      if(String(scan?.scan_owner_type || "").trim().toUpperCase() === "RELIEVER") addReliever(scan?.active_operator);
-    });
-    const relieverPersonnel = item.reliever_name || item.reliever_id
-      || relieverIds.map(displayNameForId).join(", ") || "-";
     const personnelRows = [
-      ["Reliever Operator/s", relieverPersonnel],
+      ["Reliever Operator/s", item.reliever_name || item.reliever_id || "-"],
       ["Maintenance - Mold Setter", item.mold_setter_name || item.maintenance_mold_setter_name || "-"],
       ["Maintenance - Adjustment/Repair", item.adjustment_repair_name || item.maintenance_adjustment_name || item.maintenance_name || "-"],
       ["Material Loader", item.material_loader_name || item.loader_name || "-"],
@@ -10028,14 +10014,13 @@ DASHBOARD_HTML = """
     const linkedJobs = linkedJobsForShift(item);
     const sameJobShifts = shiftsForSameJob(item);
     const activeShiftIndex = Math.max(0, sameJobShifts.findIndex(shift => jobKeyOf(shift) === jobKeyOf(item)));
-    const displayShiftIndex = activeShiftIndex + 1;
     const shiftPicker = sameJobShifts.length > 1 ? `
       <label class="same-job-shift-picker">
         <span>View Shift</span>
         <select class="same-job-shift-select" aria-label="View another shift for this job">
           ${sameJobShifts.map((shift, idx) => `
             <option value="${idx}" ${idx === activeShiftIndex ? "selected" : ""}>
-              ${esc(`Shift ${idx + 1} | ${fmtDateLocal(shift.finished_at_utc || shift.ended_at_utc || "")} | ${displayNameForId(shift.operator_id || "-")} | Qty ${shift.total_good ?? shift.partial_qty ?? 0} | ${shift.review_status || "PENDING"}`)}
+              ${esc(`Shift ${shift.shift_index ?? idx + 1} | ${fmtDateLocal(shift.finished_at_utc || shift.ended_at_utc || "")} | ${displayNameForId(shift.operator_id || "-")} | Qty ${shift.total_good ?? shift.partial_qty ?? 0} | ${shift.review_status || "PENDING"}`)}
             </option>
           `).join("")}
         </select>
@@ -10045,7 +10030,7 @@ DASHBOARD_HTML = """
       <div class="pdr-sheet pdr-portrait">
         <header class="pdr-topbar">
           <h2>PRODUCTION SHIFT REPORT</h2>
-          <div class="pdr-top-meta"><span>DATE: ${esc(reportDate)}</span><span>DAY: ${esc(reportDay)}</span><span>SHIFT: ${esc(displayShiftIndex)}</span></div>
+          <div class="pdr-top-meta"><span>DATE: ${esc(reportDate)}</span><span>DAY: ${esc(reportDay)}</span><span>SHIFT: ${esc(item.shift_index ?? "-")}</span></div>
         </header>
         <div class="pdr-info">${infoRows.map(([key,value]) => key === "__TIME_SPLIT__"
           ? `<div class="pdr-info-item pdr-time-item">
@@ -10195,11 +10180,9 @@ DASHBOARD_HTML = """
   function shiftsForSameJob(row){
     const item = (row && typeof row === "object") ? row : {};
     const code = String(item.job_code || "").trim();
-    const machine = String(item.machine_code || item.machine_name || "").trim();
     if(!code) return [item];
     const rows = (finishedShiftState || []).filter(shift =>
       String(shift?.job_code || "").trim() === code
-      && String(shift?.machine_code || shift?.machine_name || "").trim() === machine
     );
     if(!rows.some(shift => jobKeyOf(shift) === jobKeyOf(item))) rows.push(item);
     return rows.sort((a, b) =>

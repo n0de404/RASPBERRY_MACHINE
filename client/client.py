@@ -10832,8 +10832,6 @@ QWidget#ClientUIRoot {{
             "reject_review_logs": list((s.reject_review_logs or [])[review_from:]),
             "supervisor_review_logs": list(s.supervisor_review_logs or []),
             "reprint_qr_logs": list(s.reprint_qr_logs or []),
-            "break_sessions": list(s.break_sessions or []),
-            "has_reliever": bool(s.break_sessions),
             "production_adjustment_logs": list((s.production_adjustment_logs or [])[adjustment_from:]),
             "action_logs": list(getattr(self, "_action_logs", []) or []),
             "client_app_logs": list(getattr(self, "_app_logs", []) or []),
