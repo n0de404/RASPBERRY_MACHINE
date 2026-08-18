@@ -1448,6 +1448,9 @@ class ClientState:
     job_code: Optional[str] = None
     job_name: Optional[str] = None
     job_started_at: Optional[str] = None
+    # Unique identity for one production run. Machine + job is not enough:
+    # the same work order can legitimately run again on a later shift.
+    production_session_id: Optional[str] = None
     operator_id: Optional[str] = None
     operator_qr_payload: str = ""
     operator_pending_server_validation: bool = False
@@ -10805,6 +10808,7 @@ QWidget#ClientUIRoot {{
             "client_id": self._current_client_id(),
             "job_code": s.job_code,
             "job_name": s.job_name,
+            "production_session_id": s.production_session_id,
             "product_id": product_identity.get("product_id", ""),
             "product_sku": product_identity.get("product_sku", ""),
             "product_name": product_identity.get("product_name", ""),
@@ -11115,8 +11119,25 @@ QWidget#ClientUIRoot {{
                 seen.add(key)
         return rows
 
+    @staticmethod
+    def _legacy_production_session_id(machine_code: Any, job_code: Any, started_at: Any, client_id: Any = "") -> str:
+        """Give pre-migration snapshots a stable identity without combining shifts."""
+        seed = "|".join(
+            str(value or "").strip().upper()
+            for value in (machine_code, job_code, started_at, client_id)
+        )
+        return f"LEGACY-{uuid.uuid5(uuid.NAMESPACE_URL, seed).hex.upper()}"
+
+    @staticmethod
+    def _new_production_session_id() -> str:
+        return f"PS-{uuid.uuid4().hex.upper()}"
+
     def _state_to_active_snapshot(self) -> Dict[str, Any]:
         s = self.state
+        if s.job_code and not str(s.production_session_id or "").strip():
+            s.production_session_id = self._legacy_production_session_id(
+                s.machine_code, s.job_code, s.job_started_at, self._current_client_id()
+            )
         product_identity = self._job_product_identity_from_payload(s.job_payload or {})
         return {
             "saved_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -11129,6 +11150,7 @@ QWidget#ClientUIRoot {{
             "product_sku": product_identity.get("product_sku", ""),
             "product_name": product_identity.get("product_name", ""),
             "job_started_at": s.job_started_at,
+            "production_session_id": s.production_session_id,
             "operator_id": s.operator_id,
             "operator_qr_payload": str(s.operator_qr_payload or ""),
             "operator_pending_server_validation": bool(s.operator_pending_server_validation),
@@ -11581,6 +11603,16 @@ QWidget#ClientUIRoot {{
         Client counters are cumulative, so the highest value is the safe value;
         events/logs are merged by their serialized content.
         """
+        server_session_id = str(server_snap.get("production_session_id") or "").strip()
+        local_session_id = str(local_snap.get("production_session_id") or "").strip()
+        if server_session_id and local_session_id and server_session_id != local_session_id:
+            # Never maximize counters across two runs of the same work order.
+            server_ts = self._snapshot_timestamp_value(server_snap)
+            local_ts = self._snapshot_timestamp_value(local_snap)
+            if local_ts is not None and (server_ts is None or local_ts > server_ts):
+                return dict(local_snap)
+            return dict(server_snap)
+
         merged = dict(server_snap or {})
         merged.update(dict(local_snap or {}))
         server_pack = server_snap.get("pack_count", server_snap.get("pack_total", 0))
@@ -11674,6 +11706,14 @@ QWidget#ClientUIRoot {{
                 if local_ts is not None and server_ts is None:
                     return dict(local_snap)
                 return dict(server_snap)
+            server_session_id = str(server_snap.get("production_session_id") or "").strip()
+            local_session_id = str(local_snap.get("production_session_id") or "").strip()
+            if server_session_id and local_session_id and server_session_id != local_session_id:
+                server_ts = self._snapshot_timestamp_value(server_snap)
+                local_ts = self._snapshot_timestamp_value(local_snap)
+                if local_ts is not None and (server_ts is None or local_ts > server_ts):
+                    return dict(local_snap)
+                return dict(server_snap)
             server_score = self._recovery_snapshot_total_score(server_snap)
             local_score = self._recovery_snapshot_total_score(local_snap)
             if local_score > server_score:
@@ -11695,6 +11735,14 @@ QWidget#ClientUIRoot {{
         if not server_machine or server_machine != local_machine:
             return
         if not server_job or not local_job or server_job != local_job:
+            return
+        server_session_id = str(server_snap.get("production_session_id") or "").strip()
+        local_session_id = str(local_snap.get("production_session_id") or "").strip()
+        if server_session_id and local_session_id and server_session_id != local_session_id:
+            self._append_app_log(
+                "SESSION FENCE",
+                f"Ignored acknowledgement for {server_session_id}; active session is {local_session_id}",
+            )
             return
         merged = self._merge_matching_recovery_snapshots(server_snap, local_snap)
         self._restore_state_from_snapshot(merged)
@@ -11932,6 +11980,12 @@ QWidget#ClientUIRoot {{
             or segment.get("ended_at_utc")
             or datetime.now(timezone.utc).isoformat()
         )
+        s.production_session_id = (
+            str(segment.get("production_session_id") or "").strip()
+            or self._legacy_production_session_id(
+                s.machine_code, s.job_code, s.job_started_at, segment.get("client_id")
+            )
+        )
         self._reset_production_for_color_change_segment()
         s.operator_id = operator_id
         s.pack_count = int(segment.get("pack_count") or 0)
@@ -12105,6 +12159,11 @@ QWidget#ClientUIRoot {{
         s.job_code = snap.get("job_code")
         s.job_name = snap.get("job_name")
         s.job_started_at = snap.get("job_started_at")
+        s.production_session_id = str(snap.get("production_session_id") or "").strip() or None
+        if s.job_code and not s.production_session_id:
+            s.production_session_id = self._legacy_production_session_id(
+                s.machine_code, s.job_code, s.job_started_at, snap.get("client_id")
+            )
         s.operator_id = snap.get("operator_id")
         s.operator_qr_payload = str(snap.get("operator_qr_payload") or "")
         s.operator_pending_server_validation = bool(snap.get("operator_pending_server_validation"))
@@ -12459,6 +12518,7 @@ QWidget#ClientUIRoot {{
             "machine_name": _machine_display_name(s.machine_code, s.machine_name),
             "job_code": s.job_code,
             "job_name": s.job_name,
+            "production_session_id": s.production_session_id,
             "product_id": product_identity.get("product_id", ""),
             "product_sku": product_identity.get("product_sku", ""),
             "product_name": product_identity.get("product_name", ""),
@@ -12654,6 +12714,7 @@ QWidget#ClientUIRoot {{
         s.job_code = None
         s.job_name = None
         s.job_started_at = None
+        s.production_session_id = None
         s.operator_id = None
         s.operator_qr_payload = ""
         s.operator_pending_server_validation = False
@@ -17194,6 +17255,7 @@ QWidget#ClientUIRoot {{
         s.job_name = str(job_data.get("job_name") or s.job_code or "").strip()
         s.job_payload = job_data.get("job_payload") if isinstance(job_data.get("job_payload"), dict) else {}
         s.job_started_at = datetime.now(timezone.utc).isoformat()
+        s.production_session_id = self._new_production_session_id()
         s.operator_id = operator_id
         self._reset_production_for_color_change_segment()
         s.waiting_color_change_job_scan = False
@@ -17243,6 +17305,10 @@ QWidget#ClientUIRoot {{
         s.job_name = str(existing_segment.get("job_name") or job_code).strip()
         s.job_payload = dict(existing_segment.get("job_payload") or {})
         s.job_started_at = datetime.now(timezone.utc).isoformat()
+        s.production_session_id = (
+            str(existing_segment.get("production_session_id") or "").strip()
+            or self._new_production_session_id()
+        )
         self._reset_production_for_color_change_segment()
         s.operator_id = operator_id
         s.pack_count = int(existing_segment.get("pack_count") or 0)
@@ -23444,6 +23510,7 @@ QWidget#ClientUIRoot {{
                 self._pending_no_zrm_job_confirmation = None
                 self._hide_invalid_overlay()
             s.job_started_at = datetime.now(timezone.utc).isoformat()
+            s.production_session_id = self._new_production_session_id()
             s.operator_id = None
             self._reset_relief_state(keep_history=False)
             s.pack_count = 0
@@ -24359,6 +24426,7 @@ QWidget#ClientUIRoot {{
             "job_code": self.state.job_code,
             "job_name": self.state.job_name,
             "operator_id": self.state.operator_id,
+            "production_session_id": snapshot.get("production_session_id"),
             "event": {"type": "SESSION_SYNC", "session_snapshot": snapshot},
             "last_event": note,
         }
@@ -24411,7 +24479,12 @@ QWidget#ClientUIRoot {{
                 "job_code": row.get("job_code"),
                 "job_name": row.get("job_name"),
                 "operator_id": row.get("operator_id"),
-                "event": {"type": "FINISH_SHIFT", "finished_job": row},
+                "production_session_id": row.get("production_session_id"),
+                "event": {
+                    "type": "FINISH_SHIFT",
+                    "production_session_id": row.get("production_session_id"),
+                    "finished_job": row,
+                },
                 "last_event": f"FINISH SHIFT SYNC {row.get('job_name') or row.get('job_code') or ''}".strip(),
             }
             self._enqueue_server_event(payload, silent=True)
@@ -24434,7 +24507,12 @@ QWidget#ClientUIRoot {{
                 "job_code": row.get("job_code"),
                 "job_name": row.get("job_name"),
                 "operator_id": row.get("operator_id"),
-                "event": {"type": "FINISH_JOB", "finished_job": row},
+                "production_session_id": row.get("production_session_id"),
+                "event": {
+                    "type": "FINISH_JOB",
+                    "production_session_id": row.get("production_session_id"),
+                    "finished_job": row,
+                },
                 "last_event": f"FINISH JOB SYNC {row.get('job_name') or row.get('job_code') or ''}".strip(),
             }
             self._enqueue_server_event(payload, silent=True)
@@ -24577,6 +24655,24 @@ QWidget#ClientUIRoot {{
                 self._remove_persisted_server_event(str(item.get("id") or ""))
                 self._event_queue.task_done()
                 continue
+            item_payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            item_session_id = str(item_payload.get("production_session_id") or "").strip()
+            current_session_id = str(self.state.production_session_id or "").strip()
+            same_machine = (
+                str(item_payload.get("machine_code") or "").strip()
+                == str(self.state.machine_code or "").strip()
+            )
+            if (
+                same_machine
+                and item_session_id
+                and current_session_id
+                and item_session_id != current_session_id
+                and self._server_event_type_from_item(item) not in ("FINISH_SHIFT", "FINISH_JOB")
+            ):
+                self._remove_persisted_server_event(str(item.get("id") or ""))
+                self._append_app_log("SESSION FENCE", f"Discarded queued event for closed session {item_session_id}")
+                self._event_queue.task_done()
+                continue
             self._persist_server_event_item(item)
             event_type = self._server_event_type_from_item(item)
             retry_item = False
@@ -24590,7 +24686,8 @@ QWidget#ClientUIRoot {{
                     outbound_payload = dict(item["payload"])
                     outbound_payload["event_id"] = str(item.get("id") or "")
                     outbound_payload["event_created_at_utc"] = str(item.get("created_at_utc") or "")
-                    resp = requests.post(f"{server_url}/api/event", json=outbound_payload, timeout=3)
+                    endpoint = "/api/heartbeat" if event_type == "HEARTBEAT" else "/api/event"
+                    resp = requests.post(f"{server_url}{endpoint}", json=outbound_payload, timeout=3)
                     status_code = int(resp.status_code or 0)
                     response_body: Dict[str, Any] = {}
                     try:
@@ -24813,6 +24910,19 @@ QWidget#ClientUIRoot {{
         if not s.machine_code:
             return
         event_payload = dict(event or {})
+        session_id = str(s.production_session_id or "").strip()
+        if s.job_code and not session_id:
+            session_id = self._legacy_production_session_id(
+                s.machine_code, s.job_code, s.job_started_at, self._current_client_id()
+            )
+            s.production_session_id = session_id
+        if session_id:
+            event_payload.setdefault("production_session_id", session_id)
+            finished_row = event_payload.get("finished_job")
+            if isinstance(finished_row, dict):
+                finished_row = dict(finished_row)
+                finished_row.setdefault("production_session_id", session_id)
+                event_payload["finished_job"] = finished_row
         if defer_snapshot:
             snapshot = self._state_to_active_snapshot()
             if (
@@ -24831,6 +24941,7 @@ QWidget#ClientUIRoot {{
             "job_code": s.job_code,
             "job_name": s.job_name,
             "operator_id": s.operator_id,
+            "production_session_id": session_id,
             "event": event_payload,
             "last_event": last_event,
         }
