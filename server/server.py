@@ -6,11 +6,8 @@ import io
 import json
 import math
 import os
-import queue
 import re
-import threading
 import time
-import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
@@ -56,44 +53,6 @@ async def _app_lifespan(app: FastAPI):
 
 APP = FastAPI(title="Machine Dashboard Server", lifespan=_app_lifespan)
 APP.mount("/Images", StaticFiles(directory=str(Path(__file__).resolve().parent / "Images")), name="images")
-MACHINE_EVENT_LOCKS: Dict[str, asyncio.Lock] = {}
-
-
-@APP.middleware("http")
-async def _request_timing_middleware(request: Request, call_next):
-    started = time.perf_counter()
-    machine_code = ""
-    lock_wait_ms = 0.0
-    if request.method == "POST" and request.url.path == "/api/event":
-        try:
-            body = await request.body()
-            parsed = json.loads(body) if body else {}
-            if isinstance(parsed, dict):
-                machine_code = str(parsed.get("machine_code") or "").strip()
-        except Exception:
-            machine_code = ""
-    if machine_code:
-        lock = MACHINE_EVENT_LOCKS.setdefault(machine_code, asyncio.Lock())
-        lock_started = time.perf_counter()
-        async with lock:
-            lock_wait_ms = (time.perf_counter() - lock_started) * 1000.0
-            response = await call_next(request)
-    else:
-        response = await call_next(request)
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-    response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}, machine-lock;dur={lock_wait_ms:.1f}"
-    if request.url.path.startswith("/api/") and elapsed_ms >= 100.0:
-        _append_server_app_log(
-            "slow_api_request",
-            {
-                "path": request.url.path,
-                "method": request.method,
-                "machine_code": machine_code,
-                "lock_wait_ms": round(lock_wait_ms, 1),
-                "elapsed_ms": round(elapsed_ms, 1),
-            },
-        )
-    return response
 
 ACTIVE_TTL_SECONDS = 15  # allow several 5s client heartbeat intervals before marking disconnected
 JOB_QUEUE_STALE_SECONDS = 24 * 60 * 60  # hide abandoned active-session snapshots after one day
@@ -228,26 +187,13 @@ def _load_sql_config() -> Dict[str, Any]:
     return cfg
 
 
-SQL_POOL_SIZE = max(2, int(os.environ.get("MACHINE_SQL_POOL_SIZE", "10") or 10))
-SQL_POOL_WAIT_SECONDS = max(0.1, float(os.environ.get("MACHINE_SQL_POOL_WAIT_SECONDS", "3") or 3))
-
-
-class _SqlConnectionPool:
-    """Small bounded PyMySQL pool; ``close()`` returns a lease to the pool."""
-
-    def __init__(self, max_size: int):
-        self.max_size = max(1, int(max_size or 1))
-        self._available: "queue.LifoQueue[Any]" = queue.LifoQueue(maxsize=self.max_size)
-        self._state_lock = threading.Lock()
-        self._created = 0
-
-    @staticmethod
-    def _new_connection():
-        if pymysql is None:
-            return None
-        cfg = _load_sql_config()
-        if not cfg.get("enabled"):
-            return None
+def _sql_conn():
+    if pymysql is None:
+        return None
+    cfg = _load_sql_config()
+    if not cfg.get("enabled"):
+        return None
+    try:
         return pymysql.connect(
             host=str(cfg.get("host", "localhost")),
             port=int(cfg.get("port", 3306)),
@@ -259,95 +205,6 @@ class _SqlConnectionPool:
             autocommit=False,
             connect_timeout=int(cfg.get("connect_timeout", 5) or 5),
         )
-
-    def acquire(self):
-        try:
-            raw = self._available.get_nowait()
-        except queue.Empty:
-            raw = None
-        if raw is None:
-            with self._state_lock:
-                if self._created < self.max_size:
-                    self._created += 1
-                    create_new = True
-                else:
-                    create_new = False
-            if create_new:
-                try:
-                    raw = self._new_connection()
-                except Exception:
-                    with self._state_lock:
-                        self._created = max(0, self._created - 1)
-                    raise
-            else:
-                raw = self._available.get(timeout=SQL_POOL_WAIT_SECONDS)
-        if raw is None:
-            return None
-        try:
-            raw.ping(reconnect=True)
-        except Exception:
-            try:
-                raw.close()
-            except Exception:
-                pass
-            with self._state_lock:
-                self._created = max(0, self._created - 1)
-            raw = self._new_connection()
-            if raw is None:
-                return None
-            with self._state_lock:
-                self._created += 1
-        return _PooledSqlConnection(self, raw)
-
-    def release(self, raw: Any, *, broken: bool = False) -> None:
-        if raw is None:
-            return
-        try:
-            raw.rollback()
-        except Exception:
-            broken = True
-        if not broken:
-            try:
-                self._available.put_nowait(raw)
-                return
-            except queue.Full:
-                pass
-        try:
-            raw.close()
-        except Exception:
-            pass
-        with self._state_lock:
-            self._created = max(0, self._created - 1)
-
-
-class _PooledSqlConnection:
-    def __init__(self, pool: _SqlConnectionPool, raw: Any):
-        self._pool = pool
-        self._raw = raw
-        self._closed = False
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._raw, name)
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        raw, self._raw = self._raw, None
-        self._pool.release(raw)
-
-
-_SQL_POOL = _SqlConnectionPool(SQL_POOL_SIZE)
-
-
-def _sql_conn():
-    if pymysql is None:
-        return None
-    cfg = _load_sql_config()
-    if not cfg.get("enabled"):
-        return None
-    try:
-        return _SQL_POOL.acquire()
     except Exception:
         return None
 
@@ -1668,7 +1525,6 @@ class MachineSession:
     product_sku: str = ""
     product_name: str = ""
     job_started_at: Optional[str] = None
-    production_session_id: Optional[str] = None
     operator_id: Optional[str] = None
     # Keep the original badge payload for operator scans accepted by a client
     # while it was offline.  The display/operator_id is derived from it, but
@@ -1861,7 +1717,6 @@ def _clear_active_session_job_keep_machine(sess: MachineSession) -> None:
     sess.product_sku = ""
     sess.product_name = ""
     sess.job_started_at = None
-    sess.production_session_id = None
     sess.operator_id = None
     sess.job_payload = {}
     _reset_active_session_for_new_job_segment(sess, preserve_operator_shift_logs=False)
@@ -2010,19 +1865,6 @@ def _clean_operator_shift_logs_for_session(
     return clean_rows[-40:]
 
 
-def _legacy_production_session_id(
-    machine_code: Any,
-    job_code: Any,
-    started_at: Any,
-    client_id: Any = "",
-) -> str:
-    seed = "|".join(
-        str(value or "").strip().upper()
-        for value in (machine_code, job_code, started_at, client_id)
-    )
-    return f"LEGACY-{uuid.uuid5(uuid.NAMESPACE_URL, seed).hex.upper()}"
-
-
 def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSession]:
     if not isinstance(raw, dict):
         return None
@@ -2037,24 +1879,16 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
     except Exception:
         external_weight = None
     last_seen_utc = str(raw.get("last_seen_utc") or raw.get("saved_at_utc") or "").strip()
-    raw_job_code = str(raw.get("job_code") or "").strip()
-    raw_job_started_at = str(raw.get("job_started_at") or "").strip()
-    production_session_id = str(raw.get("production_session_id") or "").strip()
-    if raw_job_code and not production_session_id:
-        production_session_id = _legacy_production_session_id(
-            machine_code, raw_job_code, raw_job_started_at, client_id
-        )
     return MachineSession(
         client_id=client_id,
         machine_code=machine_code,
         machine_name=_machine_display_name(machine_code, raw.get("machine_name", machine_code)),
-        job_code=raw_job_code or None,
+        job_code=str(raw.get("job_code") or "").strip() or None,
         job_name=str(raw.get("job_name") or "").strip() or None,
         product_id=str(raw.get("product_id") or "").strip(),
         product_sku=str(raw.get("product_sku") or "").strip(),
         product_name=str(raw.get("product_name") or "").strip(),
-        job_started_at=raw_job_started_at or None,
-        production_session_id=production_session_id or None,
+        job_started_at=str(raw.get("job_started_at") or "").strip() or None,
         operator_id=str(raw.get("operator_id") or "").strip() or None,
         operator_qr_payload=str(raw.get("operator_qr_payload") or "").strip() or None,
         active_scan_operator_id=str(raw.get("active_scan_operator_id") or raw.get("operator_id") or "").strip() or None,
@@ -2270,38 +2104,10 @@ def _delete_active_session_sql(machine_code: str) -> bool:
         conn.close()
 
 
-ACTIVE_SESSIONS_JSON_DIRTY = False
-ACTIVE_SESSIONS_JSON_LAST_FLUSH = 0.0
-ACTIVE_SESSIONS_JSON_FLUSH_SECONDS = max(
-    0.5,
-    float(os.environ.get("MACHINE_ACTIVE_JSON_FLUSH_SECONDS", "2") or 2),
-)
-
-
-def _persist_active_sessions_state(machine_code: Optional[str] = None) -> None:
-    """Durably commit changed SQL state and defer the full JSON backup."""
-    global ACTIVE_SESSIONS_JSON_DIRTY
-    code = str(machine_code or "").strip()
-    if code and code in SESSIONS:
-        _upsert_active_session_sql(SESSIONS[code].to_dict())
-    else:
-        for sess in SESSIONS.values():
-            _upsert_active_session_sql(sess.to_dict())
-    ACTIVE_SESSIONS_JSON_DIRTY = True
-
-
-def _flush_active_sessions_json_if_due(force: bool = False) -> bool:
-    global ACTIVE_SESSIONS_JSON_DIRTY, ACTIVE_SESSIONS_JSON_LAST_FLUSH
-    if not ACTIVE_SESSIONS_JSON_DIRTY:
-        return False
-    now = time.monotonic()
-    if not force and now - ACTIVE_SESSIONS_JSON_LAST_FLUSH < ACTIVE_SESSIONS_JSON_FLUSH_SECONDS:
-        return False
-    if not _save_active_sessions_json(SESSIONS):
-        return False
-    ACTIVE_SESSIONS_JSON_DIRTY = False
-    ACTIVE_SESSIONS_JSON_LAST_FLUSH = now
-    return True
+def _persist_active_sessions_state() -> None:
+    _save_active_sessions_json(SESSIONS)
+    for sess in SESSIONS.values():
+        _upsert_active_session_sql(sess.to_dict())
 
 
 def _remove_persisted_active_session(machine_code: str) -> None:
@@ -5494,10 +5300,6 @@ async def _state_tick_loop():
     while True:
         try:
             await broadcast_state()
-        except Exception:
-            pass
-        try:
-            await asyncio.to_thread(_flush_active_sessions_json_if_due)
         except Exception:
             pass
         await asyncio.sleep(STATE_TICK_SECONDS)
@@ -14998,13 +14800,6 @@ def _session_snapshot_is_stale(sess: MachineSession, snap: Dict[str, Any]) -> bo
     forward while the client correctly keeps the original job start.  In that
     case the client's counters prove whether its snapshot is current.
     """
-    snap_session_id = str(snap.get("production_session_id") or "").strip()
-    current_session_id = str(sess.production_session_id or "").strip()
-    if snap_session_id and current_session_id and snap_session_id != current_session_id:
-        return True
-    if snap_session_id and current_session_id and snap_session_id == current_session_id:
-        # The session fence is stronger than timestamp/counter heuristics.
-        return False
     snap_started = _parse_iso_utc(snap.get("job_started_at"))
     current_started = _parse_iso_utc(sess.job_started_at)
     if not (snap_started and current_started and snap_started < current_started):
@@ -15044,10 +14839,6 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
 
     if _session_snapshot_is_stale(sess, snap):
         return False
-
-    incoming_session_id = str(snap.get("production_session_id") or "").strip()
-    if incoming_session_id and not str(sess.production_session_id or "").strip():
-        sess.production_session_id = incoming_session_id
 
     sess.machine_name = _machine_display_name(machine_code, snap.get("machine_name") or sess.machine_name or machine_code)
     sess.job_code = snap.get("job_code", sess.job_code)
@@ -15129,43 +14920,6 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
         ]
     _clear_completed_stale_pdr_wait(sess)
     return True
-
-
-@APP.post("/api/heartbeat")
-async def api_heartbeat(req: Request):
-    """Lightweight client presence update; never mutates production counters."""
-    started = time.perf_counter()
-    try:
-        data = await req.json()
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": f"Invalid JSON body: {exc}"}, status_code=400)
-    if not isinstance(data, dict):
-        return JSONResponse({"ok": False, "error": "JSON body must be an object"}, status_code=400)
-    remote_host = str(req.client.host if req.client else "")
-    client_id = str(data.get("client_id") or "UNKNOWN").strip() or "UNKNOWN"
-    machine_code = str(data.get("machine_code") or "").strip()
-    identity_owner = _active_client_identity_conflict(client_id, remote_host)
-    if identity_owner is not None:
-        return JSONResponse(
-            {"ok": False, "error_code": "CLIENT_IDENTITY_CONFLICT", "error": f"Client ID {client_id} is already active"},
-            status_code=409,
-        )
-    _update_client_status(
-        client_id,
-        remote_host,
-        event_type="HEARTBEAT",
-        last_event="HEARTBEAT",
-        machine_scanned=bool(machine_code),
-    )
-    session = SESSIONS.get(machine_code) if machine_code else None
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-    return {
-        "ok": True,
-        "client_online": True,
-        "machine_scanned": bool(machine_code),
-        "elapsed_ms": round(elapsed_ms, 1),
-        "session": session.to_dict() if session is not None else None,
-    }
 
 
 @APP.post("/api/event")
@@ -15325,92 +15079,6 @@ async def api_event(req: Request):
         )
         SESSIONS[machine_code] = sess
 
-    session_snapshot = ev.get("session_snapshot") if isinstance(ev.get("session_snapshot"), dict) else {}
-    finished_payload = ev.get("finished_job") if isinstance(ev.get("finished_job"), dict) else {}
-    incoming_session_id = str(
-        data.get("production_session_id")
-        or ev.get("production_session_id")
-        or session_snapshot.get("production_session_id")
-        or finished_payload.get("production_session_id")
-        or ""
-    ).strip()
-    current_session_id = str(sess.production_session_id or "").strip()
-    segment_start_event = ev_type in {
-        "JOB_SET", "JOB_STUB_SET", "COLOR_CHANGE_JOB_SET", "MOLD_CHANGE_JOB_SET"
-    }
-    finish_event = ev_type in {"FINISH_SHIFT", "FINISH_JOB"}
-    if created_session_for_event and incoming_session_id:
-        sess.production_session_id = incoming_session_id
-        current_session_id = incoming_session_id
-    if (
-        current_session_id
-        and incoming_session_id
-        and current_session_id != incoming_session_id
-        and segment_start_event
-    ):
-        incoming_started = _parse_iso_utc(
-            session_snapshot.get("job_started_at") or data.get("event_created_at_utc")
-        )
-        current_started = _parse_iso_utc(sess.job_started_at)
-        if current_started is not None and (
-            incoming_started is None or incoming_started <= current_started
-        ):
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error_code": "STALE_PRODUCTION_SESSION",
-                    "error": "Older job-start event cannot replace the current production session",
-                    "incoming_production_session_id": incoming_session_id,
-                    "current_production_session_id": current_session_id,
-                    "session": sess.to_dict(),
-                },
-                status_code=409,
-            )
-    if (
-        current_session_id
-        and incoming_session_id
-        and current_session_id != incoming_session_id
-        and not segment_start_event
-        and not finish_event
-    ):
-        _append_server_app_log(
-            "stale_production_session_rejected",
-            {
-                "client_id": client_id,
-                "machine_code": machine_code,
-                "event_type": ev_type,
-                "incoming_production_session_id": incoming_session_id,
-                "current_production_session_id": current_session_id,
-            },
-        )
-        return JSONResponse(
-            {
-                "ok": False,
-                "error_code": "STALE_PRODUCTION_SESSION",
-                "error": "Event belongs to an older production session",
-                "incoming_production_session_id": incoming_session_id,
-                "current_production_session_id": current_session_id,
-                "session": sess.to_dict(),
-            },
-            status_code=409,
-        )
-    if (
-        current_session_id.startswith("PS-")
-        and not incoming_session_id
-        and not finish_event
-        and ev_type not in {"", "PING", "CLIENT_STATUS"}
-    ):
-        return JSONResponse(
-            {
-                "ok": False,
-                "error_code": "MISSING_PRODUCTION_SESSION",
-                "error": "production_session_id is required for this active session",
-                "current_production_session_id": current_session_id,
-                "session": sess.to_dict(),
-            },
-            status_code=409,
-        )
-
     # update common fields
     sess.client_id = client_id
     sess.machine_name = _machine_display_name(machine_code, data.get("machine_name", sess.machine_name))
@@ -15466,6 +15134,8 @@ async def api_event(req: Request):
                 sess.active_scan_owner_type = "ORIGINAL"
         # HEARTBEAT events are normally not persisted. Save this repair before
         # broadcast_state() reloads the active-session snapshot from disk.
+        if stale_live_context_cleared:
+            _persist_active_sessions_state()
     sess.last_seen_utc = utc_now().isoformat()
     sess.last_event = str(data.get("last_event", sess.last_event))
 
@@ -15591,17 +15261,7 @@ async def api_event(req: Request):
                 "job_code": sess.job_code,
                 "operator_id": sess.operator_id,
             }, sess)
-            finish_matches_active_session = bool(
-                not incoming_session_id
-                or not str(sess.production_session_id or "").strip()
-                or incoming_session_id == str(sess.production_session_id or "").strip()
-            )
-            if (
-                finish_matches_active_session
-                and finished_segment_key
-                and finished_segment_key == current_segment_key
-                and not (sess.operator_shift_logs or [])
-            ):
+            if finished_segment_key and finished_segment_key == current_segment_key and not (sess.operator_shift_logs or []):
                 _clear_active_session_job_keep_machine(sess)
         if created_session_for_event and machine_code in SESSIONS and not str(SESSIONS[machine_code].job_code or "").strip():
             del SESSIONS[machine_code]
@@ -15613,12 +15273,7 @@ async def api_event(req: Request):
                 save_finished_jobs(FINISHED_JOBS)
             except Exception as e:
                 return JSONResponse({"ok": False, "error": str(e)}, status_code=503)
-        finish_matches_active_session = bool(
-            not incoming_session_id
-            or not str(sess.production_session_id or "").strip()
-            or incoming_session_id == str(sess.production_session_id or "").strip()
-        )
-        if machine_code in SESSIONS and finish_matches_active_session:
+        if machine_code in SESSIONS:
             del SESSIONS[machine_code]
     elif ev_type == "PRODUCTION_DAILY_REPORT_RESOLVED":
         pdr_row = dict(ev)
@@ -15745,21 +15400,11 @@ async def api_event(req: Request):
         )
     elif ev_type in ("JOB_SET", "JOB_STUB_SET", "COLOR_CHANGE_JOB_SET", "MOLD_CHANGE_JOB_SET"):
         _reset_active_session_for_new_job_segment(sess, preserve_operator_shift_logs=(ev_type in ("COLOR_CHANGE_JOB_SET", "MOLD_CHANGE_JOB_SET")))
-        sess.production_session_id = incoming_session_id or _legacy_production_session_id(
-            machine_code,
-            data.get("job_code") or data.get("job_name"),
-            data.get("event_created_at_utc") or utc_now().isoformat(),
-            client_id,
-        )
         job_payload = ev.get("job_payload") or ev.get("stub")
         if isinstance(job_payload, dict):
             sess.job_payload = dict(job_payload or {})
             _fill_session_product_identity(sess)
-        sess.job_started_at = str(
-            session_snapshot.get("job_started_at")
-            or data.get("event_created_at_utc")
-            or utc_now().isoformat()
-        )
+        sess.job_started_at = utc_now().isoformat()
     elif ev_type == "OPERATOR_SHIFT_SAVE":
         shift_payload = ev.get("operator_shift")
         if isinstance(shift_payload, dict):
@@ -15789,9 +15434,6 @@ async def api_event(req: Request):
         snap = ev.get("session_snapshot")
         if isinstance(snap, dict):
             stale_snapshot_segment = _session_snapshot_is_stale(sess, snap)
-            snapshot_session_id = str(snap.get("production_session_id") or incoming_session_id or "").strip()
-            if snapshot_session_id and not str(sess.production_session_id or "").strip():
-                sess.production_session_id = snapshot_session_id
             sess.machine_name = _machine_display_name(machine_code, snap.get("machine_name") or sess.machine_name or machine_code)
             sess.job_code = snap.get("job_code", sess.job_code)
             sess.job_name = snap.get("job_name", sess.job_name)
@@ -15930,6 +15572,7 @@ async def api_event(req: Request):
             sess.external_average_weight_sent_at = snap.get("external_average_weight_sent_at") or sess.external_average_weight_sent_at
             sess.external_average_weight_source = str(snap.get("external_average_weight_source") or sess.external_average_weight_source or "").strip() or None
             sess.external_average_weight_sender = str(snap.get("external_average_weight_sender") or sess.external_average_weight_sender or "").strip() or None
+            _persist_active_sessions_state()
     elif ev_type == "SUPERVISOR_REVIEW":
         review = ev.get("review")
         if isinstance(review, dict):
@@ -15950,6 +15593,7 @@ async def api_event(req: Request):
                 sess.current_supervisor_review = {}
             sess.last_event = f"SUPERVISOR REVIEW {review.get('actor_name') or ''}".strip()
             sess.last_seen_utc = utc_now().isoformat()
+            _persist_active_sessions_state()
     elif ev_type == "PACK":
         qty = int(ev.get("qty", 0) or 0)
         pack_qty = int(ev.get("pack_qty", 1) or 1)
@@ -16009,7 +15653,7 @@ async def api_event(req: Request):
             )
 
     if ev_type not in ("HEARTBEAT", "FINISH_JOB"):
-        _persist_active_sessions_state(machine_code)
+        _persist_active_sessions_state()
 
     if ev_type != "HEARTBEAT":
         await broadcast_state()
