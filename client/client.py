@@ -15319,10 +15319,11 @@ QWidget#ClientUIRoot {{
                 default="",
             )
             storage_key = self._normalize_material_match_key(
-                part.get("part_product_id")
-                or part.get("product_id")
-                or part.get("sku")
+                part.get("sku")
                 or part.get("part_sku")
+                or part.get("product_sku")
+                or part.get("part_product_id")
+                or part.get("product_id")
                 or part.get("name")
                 or part.get("part_name")
             )
@@ -15338,7 +15339,7 @@ QWidget#ClientUIRoot {{
                 "available_qty": float(raw_consumption.get("available_qty") or 0.0),
                 "latest_part_scan": latest_part_scan,
             })
-        if self._multi_output_linkage_enabled():
+        if self._shared_product_part_storage_enabled():
             shared_rows: Dict[str, Dict[str, Any]] = {}
             for row in statuses:
                 key = str(row.get("storage_key") or "").strip()
@@ -17732,13 +17733,33 @@ QWidget#ClientUIRoot {{
                 return str(int(v))
             return f"{v:.2f}".rstrip("0").rstrip(".")
 
-        # Keep one visible requirement row per job.  Two linked outputs may use
-        # the same scanned raw-material stock but have different qty/unit, so
-        # combining them hides the actual requirement and applies the wrong
-        # information to operators.
-        display_part_groups: List[List[Dict[str, Any]]] = [
-            [part] for part in part_rows
-        ]
+        # Linked production shares one physical stock pool per Product ID/SKU.
+        # Show that pool once even when both the main and packing job require it.
+        # Validation-only linked jobs never enter part_rows.
+        display_part_groups: List[List[Dict[str, Any]]] = []
+        if self._shared_product_part_storage_enabled():
+            grouped_parts: Dict[str, List[Dict[str, Any]]] = {}
+            grouped_order: List[str] = []
+            for part in part_rows:
+                product_id = self._normalize_material_match_key(
+                    part.get("part_product_id") or part.get("product_id")
+                )
+                sku = self._normalize_material_match_key(
+                    part.get("sku") or part.get("part_sku") or part.get("product_sku")
+                )
+                name = self._normalize_material_match_key(
+                    part.get("name") or part.get("part_name")
+                )
+                storage_key = f"SKU:{sku}" if sku else (
+                    f"ID:{product_id}" if product_id else f"NAME:{name}"
+                )
+                if storage_key not in grouped_parts:
+                    grouped_parts[storage_key] = []
+                    grouped_order.append(storage_key)
+                grouped_parts[storage_key].append(part)
+            display_part_groups = [grouped_parts[key] for key in grouped_order]
+        else:
+            display_part_groups = [[part] for part in part_rows]
 
         if hasattr(self, "jobPartsTable") and self.jobPartsTable is not None:
             if table_refresh_key != self._job_parts_table_refresh_key:
@@ -17777,7 +17798,7 @@ QWidget#ClientUIRoot {{
                         )
                         for group_part in part_group
                     ]
-                    if self._multi_output_linkage_enabled():
+                    if self._shared_product_part_storage_enabled():
                         storage_keys = set()
                         for group_part in part_group:
                             storage_keys.update(self._part_material_match_keys(group_part))
@@ -17816,8 +17837,10 @@ QWidget#ClientUIRoot {{
                         scanned_raw_qty = float(group_consumption[0].get("scanned_qty") or 0.0)
                         used_raw_qty = float(group_consumption[0].get("used_qty") or 0.0)
                     available_raw_qty = scanned_raw_qty - used_raw_qty
-                    job_used_raw_qty = float(
-                        group_consumption[0].get("used_qty") or 0.0
+                    job_used_raw_qty = (
+                        used_raw_qty
+                        if self._shared_product_part_storage_enabled()
+                        else float(group_consumption[0].get("used_qty") or 0.0)
                     )
                     part_keys = self._part_material_match_keys(part) | self._part_material_name_keys(part)
                     if auto_part_keys.intersection(part_keys):
@@ -17838,7 +17861,7 @@ QWidget#ClientUIRoot {{
                     remaining_part_qty = max(request_part_qty - job_used_raw_qty, 0.0)
                     request_part_display = self._safe_text(part.get("request_part_qty"), "-")
                     if request_part_qty > 0:
-                        request_part_display = f"{_fmt_number(job_used_raw_qty)} / {request_part_display}"
+                        request_part_display = f"{_fmt_number(job_used_raw_qty)} / {_fmt_number(request_part_qty)}"
                     else:
                         request_part_display = _fmt_number(job_used_raw_qty)
                     values = [
@@ -19613,6 +19636,20 @@ QWidget#ClientUIRoot {{
             and self._normal_linkage_packing_row() is None
         )
 
+    def _shared_product_part_storage_enabled(self) -> bool:
+        """Share matching SKU stock across the production-bearing linked jobs.
+
+        Normal linkage includes only the main job and its explicit P packing
+        work order in the product-parts table. Other linked work orders remain
+        validation-only. Multi-output linkage shares the same SKU pool across
+        its participating outputs as before.
+        """
+        return bool(
+            self.state.linkage_enabled
+            and self.state.linkage_jobs
+            and not self.state.prepack_mode_enabled
+        )
+
     def _linked_job_codes(self) -> Set[str]:
         codes = {
             self._normalize_job_code(self.state.job_code)
@@ -20331,7 +20368,7 @@ QWidget#ClientUIRoot {{
             material_sku=sku or None,
             pack_hist=pack_hist,
             raw_job_code=self._extract_job_code_from_pack_qr(raw_scan),
-            shared_storage=self._multi_output_linkage_enabled(),
+            shared_storage=self._shared_product_part_storage_enabled(),
         )
 
     def _void_pack_scan(self, raw_scan: str) -> bool:
@@ -21775,7 +21812,7 @@ QWidget#ClientUIRoot {{
             owner_ctx = self._scan_owner_context()
             matched_part = self._part_for_raw_material_row(material_match_row)
             part_qty_info = self._resolve_part_qty_per_unit(matched_part)
-            shared_storage = self._multi_output_linkage_enabled()
+            shared_storage = self._shared_product_part_storage_enabled()
             s.raw_material_scans.append(material_name)
             log_row = {
                 "material": material_name,
@@ -23954,7 +23991,7 @@ QWidget#ClientUIRoot {{
                         material_sku=product_sku_for_pack or None,
                         pack_hist=pack_hist if isinstance(pack_hist, dict) else None,
                         raw_job_code=scanned_job_code,
-                        shared_storage=self._multi_output_linkage_enabled(),
+                        shared_storage=self._shared_product_part_storage_enabled(),
                     )
                     return
                 if not routed_job_code and not multi_output_mode:
