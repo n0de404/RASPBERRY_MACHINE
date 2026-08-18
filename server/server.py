@@ -5388,6 +5388,25 @@ _ensure_sql_schema()
 _migrate_legacy_server_json_to_sql()
 FINISHED_JOBS: List[Dict[str, Any]] = load_finished_jobs()
 ARCHIVED_JOBS: List[Dict[str, Any]] = load_archived_jobs()
+
+
+def _stored_production_session_ids(*row_sets: List[Dict[str, Any]]) -> set[str]:
+    session_ids: set[str] = set()
+    for rows in row_sets:
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            session_id = str(row.get("production_session_id") or "").strip()
+            if session_id:
+                session_ids.add(session_id)
+    return session_ids
+
+
+# Finished records are the durable closed-session registry. Rebuilding this set
+# at startup prevents delayed events from reopening a completed production run.
+CLOSED_PRODUCTION_SESSION_IDS: set[str] = _stored_production_session_ids(
+    FINISHED_JOBS, ARCHIVED_JOBS
+)
 PROFILES: List[Dict[str, Any]] = load_profiles()
 PLANNING_BOARD: Dict[str, Any] = load_planning_board()
 MACHINE_STATUS_OVERRIDES = load_machine_status_overrides()
@@ -15339,6 +15358,41 @@ async def api_event(req: Request):
         "JOB_SET", "JOB_STUB_SET", "COLOR_CHANGE_JOB_SET", "MOLD_CHANGE_JOB_SET"
     }
     finish_event = ev_type in {"FINISH_SHIFT", "FINISH_JOB"}
+    closing_session_id = incoming_session_id or (current_session_id if finish_event else "")
+    if incoming_session_id and incoming_session_id in CLOSED_PRODUCTION_SESSION_IDS:
+        if created_session_for_event and machine_code in SESSIONS:
+            del SESSIONS[machine_code]
+        if finish_event:
+            # The finish record was already committed. Acknowledge the replay so
+            # the client can remove it from its durable queue.
+            _mark_event_id_processed(event_id)
+            return {
+                "ok": True,
+                "ignored": True,
+                "discarded": True,
+                "reason": "production session is already closed",
+                "production_session_id": incoming_session_id,
+                "session": None,
+            }
+        _append_server_app_log(
+            "closed_production_session_rejected",
+            {
+                "client_id": client_id,
+                "machine_code": machine_code,
+                "event_type": ev_type,
+                "production_session_id": incoming_session_id,
+            },
+        )
+        return JSONResponse(
+            {
+                "ok": False,
+                "error_code": "CLOSED_PRODUCTION_SESSION",
+                "error": "Event belongs to an acknowledged finished production session",
+                "production_session_id": incoming_session_id,
+                "session": None,
+            },
+            status_code=409,
+        )
     if created_session_for_event and incoming_session_id:
         sess.production_session_id = incoming_session_id
         current_session_id = incoming_session_id
@@ -15567,6 +15621,8 @@ async def api_event(req: Request):
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
             finished_job = dict(finished_job)
+            if closing_session_id:
+                finished_job["production_session_id"] = closing_session_id
             finished_job["record_type"] = "SHIFT_PARTIAL"
             finished_job = _enrich_finished_job_identity(finished_job)
             key = _finished_job_key(finished_job)
@@ -15585,29 +15641,26 @@ async def api_event(req: Request):
                     row for row in (sess.operator_shift_logs or [])
                     if not (isinstance(row, dict) and _active_shift_segment_key(row, sess) == finished_segment_key)
                 ]
-            current_segment_key = _active_shift_segment_key({
-                "client_id": sess.client_id,
-                "machine_code": sess.machine_code,
-                "job_code": sess.job_code,
-                "operator_id": sess.operator_id,
-            }, sess)
             finish_matches_active_session = bool(
                 not incoming_session_id
                 or not str(sess.production_session_id or "").strip()
                 or incoming_session_id == str(sess.production_session_id or "").strip()
             )
-            if (
-                finish_matches_active_session
-                and finished_segment_key
-                and finished_segment_key == current_segment_key
-                and not (sess.operator_shift_logs or [])
-            ):
-                _clear_active_session_job_keep_machine(sess)
+            if closing_session_id:
+                CLOSED_PRODUCTION_SESSION_IDS.add(closing_session_id)
+            if finish_matches_active_session and machine_code in SESSIONS:
+                # Acknowledged Finish Shift closes this exact production run.
+                # The next scan starts with a fresh ID and zero counters.
+                del SESSIONS[machine_code]
+                _remove_persisted_active_session(machine_code)
         if created_session_for_event and machine_code in SESSIONS and not str(SESSIONS[machine_code].job_code or "").strip():
             del SESSIONS[machine_code]
     elif ev_type == "FINISH_JOB":
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
+            finished_job = dict(finished_job)
+            if closing_session_id:
+                finished_job["production_session_id"] = closing_session_id
             FINISHED_JOBS.append(finished_job)
             try:
                 save_finished_jobs(FINISHED_JOBS)
@@ -15618,8 +15671,11 @@ async def api_event(req: Request):
             or not str(sess.production_session_id or "").strip()
             or incoming_session_id == str(sess.production_session_id or "").strip()
         )
+        if closing_session_id:
+            CLOSED_PRODUCTION_SESSION_IDS.add(closing_session_id)
         if machine_code in SESSIONS and finish_matches_active_session:
             del SESSIONS[machine_code]
+            _remove_persisted_active_session(machine_code)
     elif ev_type == "PRODUCTION_DAILY_REPORT_RESOLVED":
         pdr_row = dict(ev)
         pdr_row.update({
