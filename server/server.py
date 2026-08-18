@@ -5166,6 +5166,48 @@ def prune_dead_sessions():
     return
 
 
+FINISHED_SHIFT_DISPLAY_CUTOFF_UTC = datetime(2026, 6, 1, tzinfo=timezone.utc)
+
+
+def _dashboard_finished_summary(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Small list row; large logs/payloads are fetched only when opened."""
+    fields = (
+        "record_type", "reason", "shift_index", "started_at_utc", "ended_at_utc", "finished_at_utc",
+        "client_id", "machine_code", "machine_name", "job_code", "job_name",
+        "product_id", "product_sku", "product_name", "operator_id", "operator_name",
+        "pack_count", "good_total", "butal_total", "reject_total", "total_good", "partial_qty",
+        "startup_reject_total", "no_shot_total", "raw_sacks_count", "downtime_last_seconds",
+        "downtime_reason_code", "downtime_reason_text", "cycle_time_current",
+        "maintenance_name", "supervisor_name", "review_status", "approved_by", "approved_by_code",
+        "approved_by_role", "approved_remarks", "approved_at_utc", "changed_by", "changed_by_code",
+        "changed_by_role", "change_remarks", "changed_at_utc", "linkage_enabled", "linkage_role",
+        "linkage_group_total_jobs", "linkage_main_job_code", "linkage_main_job_name",
+        "linkage_job_code", "linkage_job_name", "linkage_note",
+    )
+    return {key: row.get(key) for key in fields if key in row}
+
+
+def _dashboard_finished_history() -> List[Dict[str, Any]]:
+    now = utc_now()
+    shifts: List[Dict[str, Any]] = []
+    final_jobs: List[Dict[str, Any]] = []
+    for row in FINISHED_JOBS:
+        if not isinstance(row, dict):
+            continue
+        record_type = str(row.get("record_type") or "").strip().upper()
+        if record_type == "SHIFT_PARTIAL":
+            stamp = _parse_iso_utc(row.get("finished_at_utc") or row.get("ended_at_utc"))
+            if stamp is None or stamp < FINISHED_SHIFT_DISPLAY_CUTOFF_UTC or stamp > now:
+                continue
+            shifts.append(_dashboard_finished_summary(row))
+        else:
+            final_jobs.append(_dashboard_finished_summary(row))
+    limit = DASHBOARD_INITIAL_HISTORY_LIMIT
+    if limit:
+        final_jobs = final_jobs[-limit:]
+    return shifts + final_jobs
+
+
 def _state_payload(*, include_history: bool = False) -> Dict[str, Any]:
     refresh_active_sessions_from_file()
     payload = {
@@ -5186,10 +5228,11 @@ def _state_payload(*, include_history: bool = False) -> Dict[str, Any]:
         "server_time_utc": utc_now().isoformat(),
     }
     if include_history:
+        payload["finished_jobs"] = _dashboard_finished_history()
         limit = DASHBOARD_INITIAL_HISTORY_LIMIT
-        payload["finished_jobs"] = FINISHED_JOBS[-limit:] if limit else []
         payload["archived_jobs"] = ARCHIVED_JOBS[-limit:] if limit else []
-        payload["history_limited"] = True
+        payload["history_limited"] = False
+        payload["finished_shift_cutoff_utc"] = FINISHED_SHIFT_DISPLAY_CUTOFF_UTC.isoformat()
         payload["finished_jobs_total"] = len(FINISHED_JOBS)
         payload["archived_jobs_total"] = len(ARCHIVED_JOBS)
     return payload
@@ -13408,7 +13451,7 @@ DASHBOARD_HTML = """
   });
   // The shift queue is rebuilt by live polling. Handle the initial pointer
   // press so replacement of the button cannot swallow the action.
-  finishedShiftQueueList?.addEventListener("pointerdown", (ev) => {
+  finishedShiftQueueList?.addEventListener("pointerdown", async (ev) => {
     if(ev.button !== undefined && ev.button !== 0) return;
     const target = ev.target instanceof Element ? ev.target : null;
     const btn = target?.closest(".shift-review-btn");
@@ -13419,10 +13462,23 @@ DASHBOARD_HTML = """
     const sorted = [...(finishedShiftState || [])].reverse();
     const row = sorted[idx];
     if(!row) return;
-    openApprovePrintOverlay(row);
+    let detailRow = row;
+    try {
+      btn.disabled = true;
+      btn.textContent = "Loading...";
+      const resp = await fetch(`/api/finished-jobs/detail?job_key=${encodeURIComponent(jobKeyOf(row))}`);
+      const out = await resp.json();
+      if(!resp.ok || !out.ok || !out.item) throw new Error(out.error || `HTTP ${resp.status}`);
+      detailRow = out.item;
+    } catch(err) {
+      alert(`Unable to load finished-shift details: ${err?.message || err}`);
+      renderFinishedShiftQueue(finishedShiftState);
+      return;
+    }
+    openApprovePrintOverlay(detailRow);
     setOverlayStep("review");
     if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = "none";
-    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = isApprovedShiftRecord(row) ? "Save Changes" : "Approve & Continue";
+    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = isApprovedShiftRecord(detailRow) ? "Save Changes" : "Approve & Continue";
   });
   function toggleLinkedJobComparison(ev, root){
     const target = ev.target instanceof Element ? ev.target : null;
@@ -15574,6 +15630,17 @@ async def api_event(req: Request):
 @APP.get("/api/finished-jobs")
 def api_finished_jobs():
     return {"ok": True, "items": FINISHED_JOBS}
+
+
+@APP.get("/api/finished-jobs/detail")
+def api_finished_job_detail(job_key: str = ""):
+    key = str(job_key or "").strip()
+    if not key:
+        return JSONResponse({"ok": False, "error": "job_key is required"}, status_code=400)
+    for row in reversed(FINISHED_JOBS):
+        if isinstance(row, dict) and _finished_job_key(row) == key:
+            return {"ok": True, "item": row}
+    return JSONResponse({"ok": False, "error": "finished shift was not found"}, status_code=404)
 
 
 @APP.get("/api/active-sessions")
