@@ -11346,7 +11346,10 @@ QWidget#ClientUIRoot {{
             serialized = ""
         if not force and serialized and serialized == self._last_active_session_snapshot_serialized:
             return
-        _upsert_active_session_json(snapshot)
+        # Disk I/O grows with the session histories and must not block the Qt
+        # scanner callback.  The persistence worker coalesces older snapshots
+        # while preserving the newest complete state.
+        self._enqueue_active_session_file_persist({"op": "upsert", "snapshot": snapshot})
         if serialized:
             self._last_active_session_snapshot_serialized = serialized
         self._trigger_active_session_sql_sync(force=False)
@@ -11724,7 +11727,12 @@ QWidget#ClientUIRoot {{
         return dict(server_snap or {})
 
     def _apply_acknowledged_server_session(self, server_snap: Dict[str, Any]) -> None:
-        """Reconcile the UI with the state produced by an acknowledged delta."""
+        """Apply only authoritative downward adjustments during live operation.
+
+        Higher-counter reconciliation belongs to explicit recovery/reconnect.
+        Applying it after every ordinary event can resurrect a locally voided
+        production scan while its correction is still travelling in the queue.
+        """
         if not isinstance(server_snap, dict):
             return
         local_snap = self._state_to_active_snapshot()
@@ -11744,7 +11752,26 @@ QWidget#ClientUIRoot {{
                 f"Ignored acknowledgement for {server_session_id}; active session is {local_session_id}",
             )
             return
-        merged = self._merge_matching_recovery_snapshots(server_snap, local_snap)
+        ack_event_type = str(server_snap.get("_ack_event_type") or "").strip().upper()
+        if ack_event_type not in {"PACK_VOID", "PRODUCT_PART_VOID", "BUTAL_VOID", "REJECT_VOID"}:
+            return
+        merged = dict(local_snap)
+        if ack_event_type == "PACK_VOID":
+            for key in ("pack_count", "pack_total", "good_total", "product_pack_history_logs"):
+                if key in server_snap:
+                    merged[key] = server_snap.get(key)
+        elif ack_event_type == "PRODUCT_PART_VOID":
+            for key in ("raw_sacks_count", "raw_material_scans", "raw_material_logs"):
+                if key in server_snap:
+                    merged[key] = server_snap.get(key)
+        elif ack_event_type == "BUTAL_VOID":
+            for key in ("butal_total", "butal_by_job"):
+                if key in server_snap:
+                    merged[key] = server_snap.get(key)
+        elif ack_event_type == "REJECT_VOID":
+            for key in ("reject_total", "startup_reject_total", "no_shot_total", "reject_breakdown"):
+                if key in server_snap:
+                    merged[key] = server_snap.get(key)
         self._restore_state_from_snapshot(merged)
         self._refresh_ui()
         self._save_active_session_snapshot(force=True)
@@ -20589,8 +20616,7 @@ QWidget#ClientUIRoot {{
             norm_pid = norm_pid or ""
             product_name = self._lookup_product_name(norm_pid) if norm_pid else ""
             if norm_pid and not product_name:
-                if self._refresh_product_catalog_cache_from_api():
-                    product_name = self._lookup_product_name(norm_pid)
+                self._trigger_product_catalog_cache_refresh_async()
             display_name = product_name or (f"Product {norm_pid}" if norm_pid else "Pack")
             return f"{display_name}  Q:{qty_text}  I:{idx_text}"
         if res.kind == "BUTAL":
@@ -21812,7 +21838,7 @@ QWidget#ClientUIRoot {{
                 self._clear_void_modes()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
-                self.push_event({"type": "PRODUCT_PART_VOID"}, "PRODUCT PART VOID")
+                self.push_event({"type": "PRODUCT_PART_VOID"}, "PRODUCT PART VOID", defer_snapshot=True)
                 return
             meta = res_pre.meta if isinstance(res_pre.meta, dict) else {}
             material_code = str(meta.get("material_code") or "").strip() if isinstance(meta, dict) else ""
@@ -22488,7 +22514,7 @@ QWidget#ClientUIRoot {{
                 self._clear_void_modes()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
-                self.push_event({"type": "PRODUCT_PART_VOID"}, "PRODUCT PART VOID")
+                self.push_event({"type": "PRODUCT_PART_VOID"}, "PRODUCT PART VOID", defer_snapshot=True)
                 return
             if res.kind == "PACK":
                 if s.supervisor_review_open and not s.cycle_time_pending_supervisor:
@@ -22508,7 +22534,7 @@ QWidget#ClientUIRoot {{
                 self._save_active_session_snapshot()
                 event_type = "PACK_VOID" if voided_kind == "PACK" else "PRODUCT_PART_VOID"
                 event_label = "PACK VOID" if voided_kind == "PACK" else "PRODUCT PART VOID"
-                self.push_event({"type": event_type}, event_label)
+                self.push_event({"type": event_type}, event_label, defer_snapshot=True)
                 return
             if res.kind == "BUTAL":
                 if s.supervisor_review_open and not s.cycle_time_pending_supervisor:
@@ -22521,7 +22547,7 @@ QWidget#ClientUIRoot {{
                 self._clear_void_modes()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
-                self.push_event({"type": "BUTAL_VOID"}, "BUTAL VOID")
+                self.push_event({"type": "BUTAL_VOID"}, "BUTAL VOID", defer_snapshot=True)
                 return
             if res.kind in ("REJECT_REASON", "STARTUP_REJECT"):
                 void_raw = "SUR" if res.kind == "STARTUP_REJECT" else str(raw_s).strip().upper()
@@ -22532,7 +22558,11 @@ QWidget#ClientUIRoot {{
                 self._clear_void_modes()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
-                self.push_event({"type": "REJECT_VOID", "reason": void_raw}, f"REJECT VOID {void_raw}")
+                self.push_event(
+                    {"type": "REJECT_VOID", "reason": void_raw},
+                    f"REJECT VOID {void_raw}",
+                    defer_snapshot=True,
+                )
                 return
             if s.supervisor_review_open and not s.cycle_time_pending_supervisor:
                 self.status.setText("Supervisor review void: scan the wrong REJECT QR.")
@@ -23103,6 +23133,8 @@ QWidget#ClientUIRoot {{
                 self._clear_active_session_snapshot(s.machine_code)
                 s.machine_code = None
                 s.machine_name = None
+            self.status.setText("Machine scanned. Checking saved session...")
+            QApplication.processEvents()
             local_snap = self._load_local_active_session_snapshot(raw_s)
             server_snap = None
             if self._skip_server_recovery_machine == raw_s:
@@ -24810,7 +24842,9 @@ QWidget#ClientUIRoot {{
                     # Network dispatch runs off the Qt thread. Reconcile the
                     # acknowledged authoritative state through a queued signal
                     # so labels and local recovery storage update safely.
-                    self.server_session_received.emit(dict(acknowledged_session))
+                    acknowledged_session = dict(acknowledged_session)
+                    acknowledged_session["_ack_event_type"] = event_type
+                    self.server_session_received.emit(acknowledged_session)
                 if event_type == "HEARTBEAT":
                     self.sync_local_finish_shifts_to_server(force=False)
                     self.sync_local_finished_jobs_to_server()

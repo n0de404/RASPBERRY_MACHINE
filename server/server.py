@@ -1805,6 +1805,8 @@ class MachineSession:
     raw_material_scans: List[str] = None
     raw_material_logs: List[Dict[str, Any]] = None
     product_pack_history_logs: List[Dict[str, Any]] = None
+    butal_scan_logs: List[Dict[str, Any]] = None
+    reject_review_logs: List[Dict[str, Any]] = None
     startup_reject_total: int = 0
     downtime_reason_code: Optional[str] = None
     downtime_reason_text: Optional[str] = None
@@ -1867,6 +1869,8 @@ class MachineSession:
             if isinstance(row, dict)
             and str(row.get("source") or "").strip().upper() != "PACK_EVENT_FALLBACK"
         ]
+        d["butal_scan_logs"] = d["butal_scan_logs"] or []
+        d["reject_review_logs"] = d["reject_review_logs"] or []
         d["job_payload"] = d["job_payload"] or {}
         d["linkage_job_payload"] = d["linkage_job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
@@ -2193,6 +2197,8 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
             if isinstance(row, dict)
             and str(row.get("source") or "").strip().upper() != "PACK_EVENT_FALLBACK"
         ],
+        butal_scan_logs=[dict(row) for row in (raw.get("butal_scan_logs") or []) if isinstance(row, dict)],
+        reject_review_logs=[dict(row) for row in (raw.get("reject_review_logs") or []) if isinstance(row, dict)],
         startup_reject_total=int(raw.get("startup_reject_total", 0) or 0),
         downtime_reason_code=raw.get("downtime_reason_code"),
         downtime_reason_text=raw.get("downtime_reason_text"),
@@ -15239,8 +15245,18 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
         sess.raw_material_logs = list(snap.get("raw_material_logs") or [])
     if isinstance(snap.get("product_pack_history_logs"), list):
         incoming_pack_logs = list(snap.get("product_pack_history_logs") or [])
-        if incoming_pack_logs or not (sess.product_pack_history_logs or []):
-            sess.product_pack_history_logs = incoming_pack_logs
+        # An acknowledged PACK void may legitimately remove the final row.
+        # Session-ID fencing already protects this assignment from other runs.
+        sess.product_pack_history_logs = incoming_pack_logs
+    if isinstance(snap.get("butal_scan_logs"), list):
+        sess.butal_scan_logs = list(snap.get("butal_scan_logs") or [])
+    if isinstance(snap.get("butal_by_job"), dict):
+        sess.butal_by_job = {
+            str(key): int(value or 0)
+            for key, value in dict(snap.get("butal_by_job") or {}).items()
+        }
+    if isinstance(snap.get("reject_review_logs"), list):
+        sess.reject_review_logs = list(snap.get("reject_review_logs") or [])
     if isinstance(snap.get("job_payload"), dict):
         sess.job_payload = dict(snap.get("job_payload") or {})
         _fill_session_product_identity(sess)
