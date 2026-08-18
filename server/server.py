@@ -97,7 +97,7 @@ async def _request_timing_middleware(request: Request, call_next):
 
 ACTIVE_TTL_SECONDS = 15  # allow several 5s client heartbeat intervals before marking disconnected
 JOB_QUEUE_STALE_SECONDS = 24 * 60 * 60  # hide abandoned active-session snapshots after one day
-STATE_TICK_SECONDS = 1.0
+STATE_TICK_SECONDS = 3.0
 OPERATOR_BREAK_WINDOW_SECONDS = float(os.environ.get("MACHINE_OPERATOR_BREAK_WINDOW_SECONDS", "1800"))
 PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"  # legacy fallback
 PRODUCT_API_CONFIG_FILE = Path(__file__).resolve().parent / "Database" / "product_api_config.json"
@@ -1436,6 +1436,113 @@ def _save_machine_status_archive_sql(rows: List[Dict[str, Any]]) -> bool:
                         json.dumps(row, ensure_ascii=False),
                     ),
                 )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+_FINISHED_SQL_COLUMNS = (
+    "record_type", "reason", "shift_index", "started_at_utc", "ended_at_utc", "finished_at_utc",
+    "client_id", "machine_code", "machine_name", "job_code", "job_name", "operator_id",
+    "pack_count", "good_total", "butal_total", "reject_total", "total_good", "partial_qty",
+    "startup_reject_total", "no_shot_total", "raw_sacks_count", "downtime_last_seconds",
+    "downtime_reason_code", "downtime_reason_text", "cycle_time_current", "machine_counter_start",
+    "machine_counter_end", "machine_counter_app_delta", "machine_counter_app_end",
+    "machine_counter_difference", "cycle_time_shift_avg_seconds", "qty_per_shift_avg_cycle",
+    "external_average_weight_grams", "external_average_weight_unit", "external_average_weight_received_at",
+    "external_average_weight_sent_at", "external_average_weight_source", "external_average_weight_sender",
+    "maintenance_name", "supervisor_name", "approved_by", "approved_by_code", "approved_by_role",
+    "changed_by", "changed_by_code", "changed_by_role", "approved_remarks", "change_remarks",
+    "approved_at_utc", "changed_at_utc", "review_status", "linkage_enabled", "linkage_job_code",
+    "linkage_job_name", "linkage_role", "linkage_group_total_jobs", "linkage_main_job_code",
+    "linkage_main_job_name", "linkage_note", "reject_breakdown", "raw_material_scans",
+    "raw_material_logs", "part_availability_carryover_logs", "product_part_excess_logs", "job_payload",
+    "reject_review_logs", "linkage_job_payload", "linkage_jobs", "linkage_mirror", "review_history", "raw_json",
+)
+_FINISHED_SQL_JSON_COLUMNS = {
+    "reject_breakdown", "raw_material_scans", "raw_material_logs", "part_availability_carryover_logs",
+    "product_part_excess_logs", "job_payload", "reject_review_logs", "linkage_job_payload",
+    "linkage_jobs", "linkage_mirror", "review_history", "raw_json",
+}
+_FINISHED_SQL_INT_COLUMNS = {
+    "pack_count", "good_total", "butal_total", "reject_total", "total_good", "partial_qty",
+    "startup_reject_total", "no_shot_total", "raw_sacks_count",
+}
+
+
+def _finished_sql_value(row: Dict[str, Any], column: str) -> Any:
+    if column == "raw_json":
+        return json.dumps(row, ensure_ascii=False)
+    if column in _FINISHED_SQL_JSON_COLUMNS:
+        default: Any = {} if column in {"reject_breakdown", "job_payload"} else []
+        return json.dumps(row.get(column, default), ensure_ascii=False)
+    if column in _FINISHED_SQL_INT_COLUMNS:
+        return int(row.get(column, 0) or 0)
+    if column == "linkage_enabled":
+        return 1 if row.get(column) else 0
+    return row.get(column)
+
+
+def _upsert_finished_job_sql(row: Dict[str, Any]) -> bool:
+    """Insert/update one finished record without rewriting the history tables."""
+    if not isinstance(row, dict):
+        return False
+    table_name = "finish_shift" if str(row.get("record_type") or "").strip().upper() == "SHIFT_PARTIAL" else "finished_jobs"
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        values = [_finished_sql_value(row, column) for column in _FINISHED_SQL_COLUMNS]
+        expressions = ["CAST(%s AS JSON)" if column in _FINISHED_SQL_JSON_COLUMNS else "%s" for column in _FINISHED_SQL_COLUMNS]
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT `id` FROM `{table_name}` WHERE `finished_at_utc` <=> %s "
+                "AND `machine_code` <=> %s AND `job_code` <=> %s AND `operator_id` <=> %s "
+                "ORDER BY `id` DESC LIMIT 1",
+                (row.get("finished_at_utc"), row.get("machine_code"), row.get("job_code"), row.get("operator_id")),
+            )
+            existing = cur.fetchone()
+            if existing and existing.get("id") is not None:
+                assignments = ",".join(
+                    f"`{column}`={expression}"
+                    for column, expression in zip(_FINISHED_SQL_COLUMNS, expressions)
+                )
+                cur.execute(
+                    f"UPDATE `{table_name}` SET {assignments} WHERE `id`=%s",
+                    tuple(values) + (existing.get("id"),),
+                )
+            else:
+                column_sql = ",".join(f"`{column}`" for column in _FINISHED_SQL_COLUMNS)
+                cur.execute(
+                    f"INSERT INTO `{table_name}` ({column_sql}) VALUES ({','.join(expressions)})",
+                    tuple(values),
+                )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[SQL] Failed to upsert finished record: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def _delete_finished_job_sql(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    table_name = "finish_shift" if str(row.get("record_type") or "").strip().upper() == "SHIFT_PARTIAL" else "finished_jobs"
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM `{table_name}` WHERE `finished_at_utc` <=> %s "
+                "AND `machine_code` <=> %s AND `job_code` <=> %s AND `operator_id` <=> %s",
+                (row.get("finished_at_utc"), row.get("machine_code"), row.get("job_code"), row.get("operator_id")),
+            )
         conn.commit()
         return True
     except Exception:
@@ -2931,8 +3038,8 @@ def load_finished_jobs() -> List[Dict[str, Any]]:
             current_rows = fallback_rows
         else:
             raise RuntimeError("finished_jobs SQL storage is unavailable")
-    elif fallback_rows:
-        current_rows = list(current_rows) + fallback_rows
+    # MySQL is authoritative whenever it is available.  The JSON file is only a
+    # disaster-recovery fallback and may be older than a record updated in SQL.
     merged: List[Dict[str, Any]] = []
     index_by_key: Dict[str, int] = {}
     for row in current_rows:
@@ -2952,6 +3059,12 @@ def save_finished_jobs(rows: List[Dict[str, Any]]):
     json_ok = _save_json_list(FINISHED_JOBS_FALLBACK_FILE, rows)
     sql_ok = _save_finished_jobs_sql(rows)
     if not sql_ok and not json_ok:
+        raise RuntimeError("finished_jobs SQL storage is unavailable")
+
+
+def save_finished_job(row: Dict[str, Any]) -> None:
+    """Persist one changed record; the full JSON export is no longer on the request path."""
+    if not _upsert_finished_job_sql(row):
         raise RuntimeError("finished_jobs SQL storage is unavailable")
 
 
@@ -5469,10 +5582,29 @@ def _dashboard_finished_history() -> List[Dict[str, Any]]:
 
 def _state_payload(*, include_history: bool = False) -> Dict[str, Any]:
     refresh_active_sessions_from_file()
+    sessions = [s.to_dict() for s in SESSIONS.values()]
+    if not include_history:
+        heavy_session_fields = {
+            "product_pack_history_logs",
+            "raw_material_logs",
+            "raw_material_scans",
+            "reject_review_logs",
+            "operator_shift_logs",
+            "break_sessions",
+            "pdr_downtime_logs",
+            "cycle_time_change_logs",
+            "machine_counter_overwrite_logs",
+            "supervisor_review_logs",
+            "butal_scan_logs",
+        }
+        for row in sessions:
+            for field in heavy_session_fields:
+                row.pop(field, None)
+            row["summary_only"] = True
     payload = {
         "type": "STATE",
         "active_ttl_seconds": ACTIVE_TTL_SECONDS,
-        "sessions": [s.to_dict() for s in SESSIONS.values()],
+        "sessions": sessions,
         "daily_roles": get_today_role_assignments(),
         "maintenance_profiles": [
             dict(p) for p in PROFILES
@@ -13339,9 +13471,18 @@ DASHBOARD_HTML = """
       planningDeferredState = state || null;
       return;
     }
+    const previousSessions = new Map(
+      (latestState?.sessions || []).map(row => [String(row?.machine_code || "").trim(), row])
+    );
+    const incomingSessions = Array.isArray(state?.sessions) ? state.sessions : (latestState?.sessions || []);
+    const mergedSessions = incomingSessions.map(row => {
+      const code = String(row?.machine_code || "").trim();
+      return row?.summary_only ? { ...(previousSessions.get(code) || {}), ...row } : row;
+    });
     state = {
       ...(latestState || {}),
       ...(state || {}),
+      sessions: mergedSessions,
       finished_jobs: Array.isArray(state?.finished_jobs) ? state.finished_jobs : (latestState?.finished_jobs || []),
       archived_jobs: Array.isArray(state?.archived_jobs) ? state.archived_jobs : (latestState?.archived_jobs || []),
     };
@@ -15632,7 +15773,7 @@ async def api_event(req: Request):
             else:
                 FINISHED_JOBS.append(finished_job)
             try:
-                save_finished_jobs(FINISHED_JOBS)
+                await asyncio.to_thread(save_finished_job, finished_job)
             except Exception as e:
                 return JSONResponse({"ok": False, "error": str(e)}, status_code=503)
             finished_segment_key = _active_shift_segment_key(finished_job, sess)
@@ -15663,7 +15804,7 @@ async def api_event(req: Request):
                 finished_job["production_session_id"] = closing_session_id
             FINISHED_JOBS.append(finished_job)
             try:
-                save_finished_jobs(FINISHED_JOBS)
+                await asyncio.to_thread(save_finished_job, finished_job)
             except Exception as e:
                 return JSONResponse({"ok": False, "error": str(e)}, status_code=503)
         finish_matches_active_session = bool(
@@ -16088,8 +16229,21 @@ async def api_event(req: Request):
 
 
 @APP.get("/api/finished-jobs")
-def api_finished_jobs():
-    return {"ok": True, "items": FINISHED_JOBS}
+def api_finished_jobs(page: int = 1, page_size: int = 50):
+    safe_page = max(1, int(page or 1))
+    safe_size = min(200, max(1, int(page_size or 50)))
+    summaries = [_dashboard_finished_summary(row) for row in FINISHED_JOBS if isinstance(row, dict)]
+    summaries.reverse()
+    start = (safe_page - 1) * safe_size
+    end = start + safe_size
+    return {
+        "ok": True,
+        "items": summaries[start:end],
+        "page": safe_page,
+        "page_size": safe_size,
+        "total": len(summaries),
+        "has_more": end < len(summaries),
+    }
 
 
 @APP.get("/api/finished-jobs/detail")
@@ -16871,7 +17025,7 @@ async def api_finished_jobs_review(req: Request):
             })
 
     FINISHED_JOBS[idx] = row
-    save_finished_jobs(FINISHED_JOBS)
+    await asyncio.to_thread(save_finished_job, row)
     await broadcast_state()
     return {"ok": True, "item": row}
 
@@ -16910,8 +17064,9 @@ async def api_finished_jobs_archive(req: Request):
     next_archived_jobs.append(row)
     del next_finished_jobs[idx]
     try:
-        save_archived_jobs(next_archived_jobs)
-        save_finished_jobs(next_finished_jobs)
+        await asyncio.to_thread(save_archived_jobs, next_archived_jobs)
+        if not await asyncio.to_thread(_delete_finished_job_sql, row):
+            raise RuntimeError("finished record could not be removed after archive")
     except Exception as e:
         try:
             save_archived_jobs(ARCHIVED_JOBS)

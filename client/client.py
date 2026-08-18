@@ -16668,7 +16668,7 @@ QWidget#ClientUIRoot {{
             if self._fulfilled_notice_job_code == job_code:
                 self._fulfilled_notice_job_code = ""
             return
-        if self._fulfilled_notice_active and self._fulfilled_notice_job_code == job_code:
+        if self._fulfilled_notice_job_code == job_code:
             return
         self._fulfilled_notice_active = True
         self._fulfilled_notice_job_code = job_code
@@ -16679,7 +16679,6 @@ QWidget#ClientUIRoot {{
         self._fulfilled_notice_active = False
         if str(self.state.job_code or "").strip() != self._fulfilled_notice_job_code:
             return
-        self._fulfilled_notice_job_code = ""
         self.status.setText("Ready: request fulfilled. You can still scan or finish the job.")
 
     def _parse_cycle_seconds(self, v: Any) -> Optional[float]:
