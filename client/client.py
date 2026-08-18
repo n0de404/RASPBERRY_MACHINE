@@ -14433,17 +14433,31 @@ QWidget#ClientUIRoot {{
             or item.get("product_id")
             or item.get("material_code")
         )
-        if item_product_id:
-            for part in self._job_part_rows():
-                part_product_id = self._normalize_material_match_key(
-                    part.get("part_product_id")
-                    or part.get("product_id")
-                    or part.get("material_code")
-                )
-                if part_product_id and part_product_id == item_product_id:
-                    return part
-            # A QR carrying a product ID must match a listed part by that ID;
-            # do not accept it merely because a generic material name matches.
+        item_sku = self._normalize_material_match_key(
+            item.get("material_sku")
+            or item.get("sku")
+            or item.get("product_sku")
+            or item.get("part_sku")
+        )
+        for part in self._job_part_rows():
+            part_product_id = self._normalize_material_match_key(
+                part.get("part_product_id")
+                or part.get("product_id")
+                or part.get("material_code")
+            )
+            part_sku = self._normalize_material_match_key(
+                part.get("sku")
+                or part.get("part_sku")
+                or part.get("product_sku")
+                or part.get("material_sku")
+            )
+            if item_product_id and part_product_id and item_product_id == part_product_id:
+                return part
+            if item_sku and part_sku and item_sku == part_sku:
+                return part
+        if item_product_id or item_sku:
+            # Identified products must match a required part by Product ID or
+            # Product SKU. A similar display name is not sufficient.
             return None
         item_keys = self._raw_material_match_keys(item) | self._raw_material_name_keys(item)
         if not item_keys:
@@ -15328,7 +15342,14 @@ QWidget#ClientUIRoot {{
                 or part.get("part_name")
             )
             statuses.append({
-                "name": str(part.get("name") or part.get("part_name") or part.get("sku") or "part").strip() or "part",
+                "name": str(
+                    part.get("sku")
+                    or part.get("part_sku")
+                    or part.get("product_sku")
+                    or part.get("name")
+                    or part.get("part_name")
+                    or "part"
+                ).strip() or "part",
                 "keys": {key for key in keys if key},
                 "storage_key": storage_key,
                 "required_from_job_code": self._normalize_job_code(
@@ -23994,11 +24015,6 @@ QWidget#ClientUIRoot {{
                         shared_storage=self._shared_product_part_storage_enabled(),
                     )
                     return
-                if not routed_job_code and not multi_output_mode:
-                    routed_job_code = self._pack_output_job_code_from_product(
-                        pid,
-                        product_sku_for_pack,
-                    )
                 if (
                     offline_mode
                     and not routed_job_code
@@ -24019,14 +24035,14 @@ QWidget#ClientUIRoot {{
                     if offline_mode and self._offline_qr_rule(raw_s) == "PRODUCT_PART":
                         self._record_offline_product_part_scan(raw_s, qty)
                         return
-                    if scanned_job_code is None:
+                    if not scanned_job_code:
                         self.status.setText("Invalid PACK QR: missing job code and product is not in job parts.")
-                        self._show_invalid_overlay("PACK QR is not a running job pack or job part.")
+                        self._show_invalid_overlay("This QR is not for the running job or its required product parts.")
                     else:
                         self.status.setText(
                             f"Invalid PACK QR: job code {scanned_job_code} does not match and product is not in job parts."
                         )
-                        self._show_invalid_overlay("This QR is not for this job or its parts.")
+                        self._show_invalid_overlay("This QR is not for the running job or its required product parts.")
                     return
                 if self._gate_pack_start_prerequisites(raw_s):
                     return
