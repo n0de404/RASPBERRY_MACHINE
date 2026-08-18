@@ -19682,6 +19682,20 @@ QWidget#ClientUIRoot {{
         )
         return {code for code in codes if code}
 
+    def _production_pack_job_codes(self) -> Set[str]:
+        """Job IDs allowed to create PACK output, excluding validation-only links."""
+        codes = {self._normalize_job_code(self.state.job_code)}
+        packing_row = self._normal_linkage_packing_row()
+        if isinstance(packing_row, dict):
+            codes.add(self._normalize_job_code(packing_row.get("job_code")))
+        elif self._multi_output_linkage_enabled() or self.state.prepack_mode_enabled:
+            codes.update(
+                self._normalize_job_code(row.get("job_code"))
+                for row in (self.state.linkage_jobs or [])
+                if isinstance(row, dict)
+            )
+        return {code for code in codes if code}
+
     def _job_payload_for_output_code(self, job_code: Any) -> Dict[str, Any]:
         target = self._normalize_job_code(job_code)
         if target and target == self._normalize_job_code(self.state.job_code):
@@ -19758,9 +19772,11 @@ QWidget#ClientUIRoot {{
             "job_code": self.state.job_code,
             "job_payload": self.state.job_payload or {},
         }]
+        allowed_codes = self._production_pack_job_codes()
         jobs.extend(
             row for row in (self.state.linkage_jobs or [])
             if isinstance(row, dict)
+            and self._normalize_job_code(row.get("job_code")) in allowed_codes
         )
         for row in jobs:
             payload = row.get("job_payload") if isinstance(row.get("job_payload"), dict) else {}
@@ -22586,17 +22602,12 @@ QWidget#ClientUIRoot {{
             pack_hist = self._extract_pack_history_fields(raw_s)
             if pack_hist is not None:
                 scanned_job_code = self._extract_job_code_from_pack_qr(raw_s)
-                current_job_code = self._normalize_job_code(s.job_code)
                 if scanned_job_code is None:
                     self.status.setText("Invalid PACK QR format: missing job code segment.")
                     self._show_invalid_overlay("PACK QR format is invalid.")
                     return
-                allowed_pack_job_codes = {current_job_code} if current_job_code else set()
-                if s.linkage_enabled:
-                    for row in (s.linkage_jobs or []):
-                        linked_code_norm = self._normalize_job_code((row or {}).get("job_code"))
-                        if linked_code_norm:
-                            allowed_pack_job_codes.add(linked_code_norm)
+                scanned_job_code = self._normalize_job_code(scanned_job_code)
+                allowed_pack_job_codes = self._production_pack_job_codes()
                 if allowed_pack_job_codes and scanned_job_code not in allowed_pack_job_codes:
                     self.status.setText(
                         f"Invalid PACK QR: job code {scanned_job_code} does not match main/linked job."
@@ -23932,15 +23943,7 @@ QWidget#ClientUIRoot {{
                 product_sku_for_pack = ""
                 pid = ""
                 scanned_job_code = self._extract_job_code_from_pack_qr(raw_s)
-                current_job_code = self._normalize_job_code(s.job_code)
-                allowed_pack_job_codes = set()
-                if current_job_code:
-                    allowed_pack_job_codes.add(current_job_code)
-                if s.linkage_enabled:
-                    for row in (s.linkage_jobs or []):
-                        linked_code_norm = self._normalize_job_code((row or {}).get("job_code"))
-                        if linked_code_norm:
-                            allowed_pack_job_codes.add(linked_code_norm)
+                allowed_pack_job_codes = self._production_pack_job_codes()
                 if isinstance(pack_hist, dict):
                     pid_raw = str(pack_hist.get("product_p") or pack_hist.get("product_id") or "").strip()
                     pid = pid_raw.lstrip("0") if pid_raw.isdigit() else pid_raw
@@ -23974,20 +23977,13 @@ QWidget#ClientUIRoot {{
                     "product_name": product_name_for_pack or None,
                 }
                 matched_part = self._find_job_part_for_scan_item(scan_item)
-                main_identity = self._job_product_identity_from_payload(s.job_payload or {})
-                main_output_item = {
-                    "product_id": main_identity.get("product_id"),
-                    "material_product_id": main_identity.get("product_id"),
-                    "sku": main_identity.get("product_sku"),
-                    "material_sku": main_identity.get("product_sku"),
-                    "product_name": main_identity.get("product_name"),
-                }
-                scan_product_keys = self._raw_material_match_keys(scan_item) | self._raw_material_name_keys(scan_item)
-                main_output_keys = self._raw_material_match_keys(main_output_item) | self._raw_material_name_keys(main_output_item)
-                is_main_output_pack = bool(scan_product_keys and scan_product_keys.intersection(main_output_keys))
+                is_production_output_pack = bool(
+                    self._pack_output_job_code_from_product(pid, product_sku_for_pack)
+                )
                 # Product-part labels also use PACK QR format. A listed part
-                # is used after job-id routing fails and before product fallback.
-                if matched_part is not None and not routed_job_code and not is_main_output_pack:
+                # wins even when its source job happens to resemble a linked
+                # route. Only a genuine main/packing output remains a PACK.
+                if matched_part is not None and not is_production_output_pack:
                     unique_key = ""
                     if isinstance(pack_hist, dict):
                         scan_idx = str(pack_hist.get("index") or "").strip()
