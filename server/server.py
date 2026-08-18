@@ -1468,6 +1468,52 @@ def _parse_int_or_none(value: Any) -> Optional[int]:
         return None
 
 
+_REJECT_DETAIL_CODES = {
+    "BM", "CS", "CO", "CR", "DI", "EM", "FL", "FM", "NO", "OC",
+    "SC", "SS", "SI", "SK", "SM", "ST", "VO", "WA", "WM", "WL",
+}
+_REJECT_DETAIL_LABEL_TO_CODE = {
+    "BURN MARK": "BM", "COLOR STREAK": "CS", "CONTAMINATION": "CO",
+    "CRACK/BRITTLE": "CR", "DISCOLORATION": "DI", "EJECTOR MARK": "EM",
+    "FLASHES": "FL", "FLOW MARK/ WRINKLE": "FM", "NO SHOT": "NO",
+    "OVER-CUT": "OC", "SCRATCH": "SC", "SHORT SHOT": "SS",
+    "SILICONE MARK": "SI", "SILVER STREAK": "SK", "SINK MARK": "SM",
+    "STUCK": "ST", "VOID": "VO", "WARP": "WA", "WATER MARK": "WM",
+    "WELD LINE": "WL",
+}
+
+
+def _canonical_reject_code(value: Any) -> str:
+    code = str(value or "").strip().upper()
+    if not code:
+        return ""
+    if code == "F08":
+        return "FM"
+    if code in _REJECT_DETAIL_LABEL_TO_CODE:
+        return _REJECT_DETAIL_LABEL_TO_CODE[code]
+    if code in _REJECT_DETAIL_CODES:
+        return code
+    prefix = code[:2]
+    return prefix if prefix in _REJECT_DETAIL_CODES else code
+
+
+def _canonical_reject_breakdown(value: Any) -> Dict[str, int]:
+    """Collapse replicated aliases (for example CO and CO03) without adding them."""
+    if not isinstance(value, dict):
+        return {}
+    normalized: Dict[str, int] = {}
+    for raw_code, raw_qty in value.items():
+        code = _canonical_reject_code(raw_code)
+        if not code:
+            continue
+        try:
+            qty = max(0, int(raw_qty or 0))
+        except Exception:
+            qty = 0
+        normalized[code] = max(normalized.get(code, 0), qty)
+    return normalized
+
+
 @dataclass
 class MachineSession:
     client_id: str
@@ -1558,7 +1604,7 @@ class MachineSession:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        d["reject_breakdown"] = d["reject_breakdown"] or {}
+        d["reject_breakdown"] = _canonical_reject_breakdown(d["reject_breakdown"])
         d["raw_material_scans"] = d["raw_material_scans"] or []
         d["raw_material_logs"] = d["raw_material_logs"] or []
         # Pack-history rows must come from an actual client QR snapshot.  Older
@@ -1863,7 +1909,7 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         good_total=int(raw.get("good_total", 0) or 0),
         butal_total=int(raw.get("butal_total", 0) or 0),
         reject_total=int(raw.get("reject_total", 0) or 0),
-        reject_breakdown=dict(raw.get("reject_breakdown") or {}),
+        reject_breakdown=_canonical_reject_breakdown(raw.get("reject_breakdown")),
         no_shot_total=int(raw.get("no_shot_total", 0) or 0),
         raw_sacks_count=int(raw.get("raw_sacks_count", 0) or 0),
         raw_material_scans=list(raw.get("raw_material_scans") or []),
@@ -14817,7 +14863,7 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
         pass
 
     if isinstance(snap.get("reject_breakdown"), dict):
-        sess.reject_breakdown = dict(snap.get("reject_breakdown") or {})
+        sess.reject_breakdown = _canonical_reject_breakdown(snap.get("reject_breakdown"))
     if isinstance(snap.get("raw_material_scans"), list):
         sess.raw_material_scans = list(snap.get("raw_material_scans") or [])
     if isinstance(snap.get("raw_material_logs"), list):
@@ -15413,7 +15459,7 @@ async def api_event(req: Request):
                 sess.reject_total = int(snap.get("reject_total", sess.reject_total) or 0)
                 sess.no_shot_total = int(snap.get("no_shot_total", sess.no_shot_total) or 0)
                 if isinstance(snap.get("reject_breakdown"), dict):
-                    sess.reject_breakdown = dict(snap.get("reject_breakdown") or {})
+                    sess.reject_breakdown = _canonical_reject_breakdown(snap.get("reject_breakdown"))
                 sess.raw_sacks_count = int(snap.get("raw_sacks_count", sess.raw_sacks_count) or 0)
                 if isinstance(snap.get("raw_material_scans"), list):
                     sess.raw_material_scans = list(snap.get("raw_material_scans") or [])
@@ -15584,12 +15630,14 @@ async def api_event(req: Request):
     elif ev_type == "REJECT":
         qty = int(ev.get("qty", 1) or 1)
         reason = str(ev.get("reason", "")).strip()
-        if reason.upper() == "NO":
+        bucket_code = _canonical_reject_code(reason)
+        if bucket_code == "NO":
             sess.no_shot_total += qty
         else:
             sess.reject_total += qty
-        if reason:
-            sess.reject_breakdown[reason] = sess.reject_breakdown.get(reason, 0) + qty
+        if bucket_code:
+            sess.reject_breakdown = _canonical_reject_breakdown(sess.reject_breakdown)
+            sess.reject_breakdown[bucket_code] = sess.reject_breakdown.get(bucket_code, 0) + qty
 
     if ev_type not in ("SESSION_SYNC", "HEARTBEAT", "FINISH_JOB", "FINISH_SHIFT"):
         if _apply_embedded_session_snapshot(sess, ev.get("session_snapshot"), machine_code):

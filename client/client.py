@@ -1370,6 +1370,39 @@ REJECT_DETAIL_ITEMS = [
 ]
 
 REJECT_DETAIL_CODES = {code for code, _label in REJECT_DETAIL_ITEMS}
+REJECT_DETAIL_LABEL_TO_CODE = {label.upper(): code for code, label in REJECT_DETAIL_ITEMS}
+
+
+def _canonical_reject_code(reason_code: Optional[str]) -> str:
+    """Return the stable reject bucket while retaining raw codes in audit logs."""
+    code = str(reason_code or "").strip().upper()
+    if not code:
+        return ""
+    if code == "F08":
+        return "FM"
+    if code in REJECT_DETAIL_LABEL_TO_CODE:
+        return REJECT_DETAIL_LABEL_TO_CODE[code]
+    if code in REJECT_DETAIL_CODES:
+        return code
+    prefix = code[:2]
+    return prefix if prefix in REJECT_DETAIL_CODES else code
+
+
+def _canonical_reject_breakdown(value: Any) -> Dict[str, int]:
+    """Collapse aliases such as CO and CO03 without double-counting replicas."""
+    if not isinstance(value, dict):
+        return {}
+    normalized: Dict[str, int] = {}
+    for raw_code, raw_qty in value.items():
+        code = _canonical_reject_code(raw_code)
+        if not code:
+            continue
+        try:
+            qty = max(0, int(raw_qty or 0))
+        except Exception:
+            qty = 0
+        normalized[code] = max(normalized.get(code, 0), qty)
+    return normalized
 
 PRODUCTION_DAILY_REPORT_ITEMS = [
     ("01", "Machine Issue/Breakdown/Repair"),
@@ -7917,38 +7950,12 @@ QWidget#ClientUIRoot {{
             self._set_background_blur(False)
 
     def _normalized_reject_counts(self, breakdown: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
-        counts_by_name: Dict[str, int] = {}
-        counts_by_code: Dict[str, int] = {}
         source = breakdown if isinstance(breakdown, dict) else (self.state.reject_breakdown or {})
-        for k, v in source.items():
-            key = str(k).strip().upper()
-            try:
-                qty = int(v or 0)
-            except Exception:
-                qty = 0
-            counts_by_name[key] = counts_by_name.get(key, 0) + qty
-            bucket_code = self._reject_detail_bucket_code(key)
-            if bucket_code in REJECT_DETAIL_CODES:
-                counts_by_code[bucket_code] = counts_by_code.get(bucket_code, 0) + qty
-        out: Dict[str, int] = {}
-        for code, label in REJECT_DETAIL_ITEMS:
-            by_name = counts_by_name.get(label.upper(), 0)
-            by_code = counts_by_code.get(code.upper(), 0)
-            out[code] = by_name if by_name else by_code
-        return out
+        counts = _canonical_reject_breakdown(source)
+        return {code: counts.get(code, 0) for code, _label in REJECT_DETAIL_ITEMS}
 
     def _reject_detail_bucket_code(self, reason_code: Optional[str]) -> str:
-        code = str(reason_code or "").strip().upper()
-        if not code:
-            return ""
-        if code == "F08":
-            return "FM"
-        if code in REJECT_DETAIL_CODES:
-            return code
-        prefix = code[:2]
-        if prefix in REJECT_DETAIL_CODES:
-            return prefix
-        return code
+        return _canonical_reject_code(reason_code)
 
     def _refresh_reject_summary_overlay(self):
         s = self.state
@@ -9834,13 +9841,8 @@ QWidget#ClientUIRoot {{
         self.lblButal.set_value(s.butal_total)
         self.lblReject.set_value(s.reject_total)
         self.lblTotalGood.set_value(s.good_total + s.butal_total)
-        carry_butal = int(self._current_job_last_shift_butal().get("qty") or 0)
-        if carry_butal > 0:
-            self.lastShiftButalNotice.setText(f"LAST SHIFT BUTAL {carry_butal} PCS")
-            self.lastShiftButalNotice.show()
-        else:
-            self.lastShiftButalNotice.setText("")
-            self.lastShiftButalNotice.hide()
+        self.lastShiftButalNotice.setText("")
+        self.lastShiftButalNotice.hide()
         show_pending_supervisor = bool(
             s.cycle_time_pending_supervisor
             and (
@@ -11594,8 +11596,8 @@ QWidget#ClientUIRoot {{
                 merged[key] = max(int(server_snap.get(key, 0) or 0), int(local_snap.get(key, 0) or 0))
             except Exception:
                 pass
-        server_rejects = server_snap.get("reject_breakdown") if isinstance(server_snap.get("reject_breakdown"), dict) else {}
-        local_rejects = local_snap.get("reject_breakdown") if isinstance(local_snap.get("reject_breakdown"), dict) else {}
+        server_rejects = _canonical_reject_breakdown(server_snap.get("reject_breakdown"))
+        local_rejects = _canonical_reject_breakdown(local_snap.get("reject_breakdown"))
         merged["reject_breakdown"] = {
             str(key): max(int(server_rejects.get(key, 0) or 0), int(local_rejects.get(key, 0) or 0))
             for key in set(server_rejects) | set(local_rejects)
@@ -11936,7 +11938,7 @@ QWidget#ClientUIRoot {{
         s.good_total = int(segment.get("good_total") or 0)
         s.butal_total = int(segment.get("butal_total") or 0)
         s.reject_total = int(segment.get("reject_total") or 0)
-        s.reject_breakdown = dict(segment.get("reject_breakdown") or {})
+        s.reject_breakdown = _canonical_reject_breakdown(segment.get("reject_breakdown"))
         s.no_shot_total = int(segment.get("no_shot_total") or 0)
         s.startup_reject_total = int(segment.get("startup_reject_total") or 0)
         s.raw_sacks_count = int(segment.get("raw_sacks_count") or 0)
@@ -12118,7 +12120,7 @@ QWidget#ClientUIRoot {{
         s.good_total = int(snap.get("good_total") or 0)
         s.butal_total = int(snap.get("butal_total") or 0)
         s.reject_total = int(snap.get("reject_total") or 0)
-        s.reject_breakdown = dict(snap.get("reject_breakdown") or {})
+        s.reject_breakdown = _canonical_reject_breakdown(snap.get("reject_breakdown"))
         s.no_shot_total = int(snap.get("no_shot_total") or 0)
         s.waiting_reject_reason = bool(snap.get("waiting_reject_reason"))
         s.reject_multiplier_input = str(snap.get("reject_multiplier_input") or "")
@@ -12290,7 +12292,9 @@ QWidget#ClientUIRoot {{
         s.operator_shift_baseline_startup_reject_total = int(snap.get("operator_shift_baseline_startup_reject_total") or 0)
         s.operator_shift_baseline_no_shot_total = int(snap.get("operator_shift_baseline_no_shot_total") or 0)
         s.operator_shift_baseline_raw_sacks_count = int(snap.get("operator_shift_baseline_raw_sacks_count") or 0)
-        s.operator_shift_baseline_reject_breakdown = dict(snap.get("operator_shift_baseline_reject_breakdown") or {})
+        s.operator_shift_baseline_reject_breakdown = _canonical_reject_breakdown(
+            snap.get("operator_shift_baseline_reject_breakdown")
+        )
         s.operator_shift_baseline_raw_material_logs_len = int(snap.get("operator_shift_baseline_raw_material_logs_len") or 0)
         s.operator_shift_baseline_product_pack_history_logs_len = int(snap.get("operator_shift_baseline_product_pack_history_logs_len") or 0)
         s.operator_shift_baseline_reject_review_logs_len = int(snap.get("operator_shift_baseline_reject_review_logs_len") or 0)
@@ -15078,7 +15082,7 @@ QWidget#ClientUIRoot {{
             dict(row) for row in (payload.get("part_availability_carryover_logs") or [])
             if isinstance(row, dict)
         ]
-        butal = dict((self.state.last_shift_butal_by_job or {}).get(self._normalize_job_code(job_code)) or {})
+        butal: Dict[str, Any] = {}
         record = {
             "key": key,
             "client_id": self._current_client_id(),
@@ -15146,16 +15150,6 @@ QWidget#ClientUIRoot {{
             return 0
         candidates.sort(key=lambda row: str(row.get("finished_at_utc") or row.get("ended_at_utc") or ""))
         latest = candidates[-1]
-        butal = latest.get("butal_carryover")
-        if isinstance(butal, dict) and int(butal.get("qty") or 0) > 0:
-            carry_rows = dict(s.last_shift_butal_by_job or {})
-            carry_rows[job_code] = dict(butal)
-            s.last_shift_butal_by_job = carry_rows
-            s.last_shift_butal_qty = int(butal.get("qty") or 0)
-            s.last_shift_butal_raw = str(butal.get("raw") or "")
-            s.last_shift_butal_saved_at = butal.get("saved_at") or latest.get("saved_at_utc")
-            s.last_shift_butal_job_code = job_code
-            s.last_shift_butal_job_name = latest.get("job_name") or s.job_name
         current_parts = [row for row in self._job_part_rows() if isinstance(row, dict)]
         allowed_part_keys: Set[str] = set()
         for part in current_parts:
@@ -17255,7 +17249,7 @@ QWidget#ClientUIRoot {{
         s.good_total = int(existing_segment.get("good_total") or 0)
         s.butal_total = int(existing_segment.get("butal_total") or 0)
         s.reject_total = int(existing_segment.get("reject_total") or 0)
-        s.reject_breakdown = dict(existing_segment.get("reject_breakdown") or {})
+        s.reject_breakdown = _canonical_reject_breakdown(existing_segment.get("reject_breakdown"))
         s.no_shot_total = int(existing_segment.get("no_shot_total") or 0)
         s.startup_reject_total = int(existing_segment.get("startup_reject_total") or 0)
         s.raw_sacks_count = int(existing_segment.get("raw_sacks_count") or 0)
@@ -20016,6 +20010,11 @@ QWidget#ClientUIRoot {{
         return True
 
     def _store_last_shift_butal_from_current_shift(self):
+        # Last-shift BUTAL carryover is intentionally disabled. Keep the
+        # compatibility fields readable for older snapshots, but never create
+        # a new balance or use one in production.
+        self._clear_last_shift_butal_carryover()
+        return
         s = self.state
         if isinstance(s.butal_by_job, dict) and s.butal_by_job:
             saved_at = datetime.now(timezone.utc).isoformat()
@@ -20096,6 +20095,8 @@ QWidget#ClientUIRoot {{
             return
 
     def _current_job_last_shift_butal(self, job_code: Optional[str] = None) -> Dict[str, Any]:
+        # Disabled for now: BUTAL starts clean for every active shift/job.
+        return {}
         s = self.state
         job_key = self._normalize_job_code(job_code or s.job_code)
         if not job_key:
@@ -20126,6 +20127,11 @@ QWidget#ClientUIRoot {{
             rows = dict(s.last_shift_butal_by_job or {})
             rows.pop(job_key, None)
             s.last_shift_butal_by_job = rows
+        if (
+            job_key
+            and self._normalize_job_code(s.last_shift_butal_job_code) != job_key
+        ):
+            return
         s.last_shift_butal_qty = 0
         s.last_shift_butal_raw = ""
         s.last_shift_butal_saved_at = None
@@ -20962,7 +20968,6 @@ QWidget#ClientUIRoot {{
         self._repair_initial_setup_state()
         if raw_s:
             self._append_app_log("SCAN", f"QR scanned: {raw_s}")
-
         reprint_trigger = parse_scan(raw_s)
         reprint_phase = str(getattr(self, "_reprint_qr_phase", "") or "").strip().upper()
         if reprint_phase:
