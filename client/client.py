@@ -103,6 +103,8 @@ JOB_DETAILS_CACHE_FILE = os.path.join(DATABASE_DIR, "job_details_cache.json")
 CLIENT_ACTIVE_MACHINE_SESSIONS_FILE = os.path.join(DATABASE_DIR, "client_active_machine_sessions.json")
 ACTIVE_MACHINE_SESSIONS_FILE = CLIENT_ACTIVE_MACHINE_SESSIONS_FILE
 SERVER_EVENT_QUEUE_FILE = os.path.join(DATABASE_DIR, "server_event_queue.json")
+SERVER_CONFIRMED_SESSIONS_FILE = os.path.join(DATABASE_DIR, "server_confirmed_sessions.json")
+SERVER_SYNC_PROTOCOL_VERSION = 2
 SCANNED_PACK_QR_KEYS_FILE = os.path.join(DATABASE_DIR, "scanned_pack_qr_keys.json")
 INVALID_SCAN_GIF = os.environ.get(
     "MACHINE_INVALID_SCAN_GIF",
@@ -617,6 +619,40 @@ def _delete_active_session_json(machine_code: Optional[str]) -> bool:
     return True
 
 
+def _load_confirmed_server_sessions_json() -> Dict[str, Any]:
+    return _read_active_sessions_json_file(SERVER_CONFIRMED_SESSIONS_FILE)
+
+
+def _upsert_confirmed_server_session_json(row: Dict[str, Any]) -> bool:
+    machine_code = str((row or {}).get("machine_code") or "").strip()
+    if not machine_code:
+        return False
+    rows = _load_confirmed_server_sessions_json()
+    payload = dict(row or {})
+    payload["machine_code"] = machine_code
+    previous = rows.get(machine_code) if isinstance(rows.get(machine_code), dict) else {}
+    previous_comparable = {
+        key: value for key, value in previous.items() if key != "_confirmed_at_utc"
+    }
+    if previous_comparable == payload:
+        return True
+    payload["_confirmed_at_utc"] = datetime.now(timezone.utc).isoformat()
+    rows[machine_code] = payload
+    try:
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        target = SERVER_CONFIRMED_SESSIONS_FILE
+        tmp = f"{target}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        _backup_active_sessions_file(target)
+        os.replace(tmp, target)
+        return True
+    except Exception:
+        return False
+
+
 def _load_server_event_queue_json() -> List[Dict[str, Any]]:
     try:
         if not os.path.exists(SERVER_EVENT_QUEUE_FILE):
@@ -669,6 +705,11 @@ def _server_event_queue_row_is_defective(row: Dict[str, Any]) -> bool:
 
 
 def _server_event_queue_row_is_stale(row: Dict[str, Any]) -> bool:
+    payload = row.get("payload") if isinstance(row, dict) else {}
+    if isinstance(payload, dict) and int(payload.get("sync_protocol_requested") or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
+        # Protocol 2 events are the durable mutation log. They may only leave
+        # the queue after the server acknowledges their unique event ID.
+        return False
     created_raw = str((row or {}).get("created_at_utc") or "").strip()
     if not created_raw:
         return False
@@ -707,6 +748,12 @@ def _trim_server_event_queue_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, 
         compact_row = dict(row)
         compact_row["payload"] = payload
 
+        if int(payload.get("sync_protocol_requested") or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
+            # Preserve protocol 2 in its exact original order. Server-side
+            # event-ID deduplication makes retries safe without coalescing.
+            clean.append(compact_row)
+            continue
+
         identity = (
             str(payload.get("client_id") or "").strip(),
             str(payload.get("machine_code") or "").strip(),
@@ -730,6 +777,12 @@ def _trim_server_event_queue_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, 
     # Keep only the newest recovery snapshot for each client/machine. Appending
     # it last ensures the server sees all queued deltas before final state repair.
     clean.extend(latest_session_sync.values())
+    if any(
+        int(((row.get("payload") or {}).get("sync_protocol_requested") or 0)) >= SERVER_SYNC_PROTOCOL_VERSION
+        for row in clean
+        if isinstance(row, dict) and isinstance(row.get("payload"), dict)
+    ):
+        return clean
     max_rows = max(50, int(SERVER_EVENT_QUEUE_DISK_MAX_ENTRIES or 5000))
     if len(clean) <= max_rows:
         return clean
@@ -3315,6 +3368,7 @@ class ClientUI(QWidget):
         self._server_event_queue_lock = threading.Lock()
         self._server_was_offline = False
         self._server_connection_ok = False
+        self._server_sync_protocol = 0
         self._server_identity_conflict = False
         self._server_last_success_at = 0.0
         self._server_recovery_snapshot_queued = False
@@ -9970,7 +10024,7 @@ QWidget#ClientUIRoot {{
         elif s.waiting_downtime_start_maintenance:
             self._set_banner_text("PDR waiting: scan Maintenance QR to start downtime")
         elif s.waiting_pdr_maintenance_reason:
-            self._set_banner_text("PDR validation: scan reason QR (01-15)")
+            self._set_banner_text("Downtime stopped: scan reason QR (01-15)")
         elif s.waiting_downtime_end_maintenance:
             self._set_banner_text("Downtime active: scan Maintenance QR when repair is done")
         elif s.waiting_maintenance_qr:
@@ -10236,7 +10290,7 @@ QWidget#ClientUIRoot {{
         if s.waiting_downtime_start_maintenance:
             action_text = "SCAN MAINTENANCE QR\nTO START DOWNTIME"
         elif s.waiting_pdr_maintenance_reason:
-            action_text = "SCAN VALID REASON\n01-15"
+            action_text = "DOWNTIME STOPPED\nSCAN REASON 01-15"
         elif s.waiting_downtime_end_maintenance:
             action_text = "SCAN MAINTENANCE QR WHEN\nREPAIR IS DONE"
         elif s.waiting_cycle_time_input:
@@ -11753,6 +11807,20 @@ QWidget#ClientUIRoot {{
             )
             return
         ack_event_type = str(server_snap.get("_ack_event_type") or "").strip().upper()
+        if bool(server_snap.get("_server_authoritative_replace")):
+            # Keep optimistic local scans visible while any mutation is still
+            # waiting. Once the ordered queue is empty, the returned server
+            # snapshot is the one official state for this active session.
+            if self._has_pending_server_mutations():
+                return
+            authoritative = {
+                key: value for key, value in server_snap.items()
+                if not str(key).startswith("_ack_") and key != "_server_authoritative_replace"
+            }
+            self._restore_state_from_snapshot(authoritative)
+            self._refresh_ui()
+            self._save_active_session_snapshot(force=True)
+            return
         if ack_event_type not in {"PACK_VOID", "PRODUCT_PART_VOID", "BUTAL_VOID", "REJECT_VOID"}:
             return
         merged = dict(local_snap)
@@ -13076,7 +13144,12 @@ QWidget#ClientUIRoot {{
 
     def _cancel_pending_pdr_start(self) -> bool:
         s = self.state
-        if s.downtime_active or s.downtime_started_at or s.waiting_downtime_end_maintenance:
+        if (
+            s.downtime_active
+            or s.downtime_started_at
+            or s.waiting_downtime_end_maintenance
+            or s.maintenance_downtime_seconds is not None
+        ):
             return False
         if not (s.waiting_production_report_reason or s.waiting_downtime_start_maintenance or s.waiting_pdr_maintenance_reason):
             return False
@@ -15680,6 +15753,12 @@ QWidget#ClientUIRoot {{
         label = "Raw material" if unit_kind == "kg" else "Component part"
         self.status.setText(f"{label} scanned: {material_name} (+{qty})")
         self._refresh_ui()
+        material_event_label = f"{label.upper()} SCANNED"
+        if part_sku:
+            material_event_label += f" | SKU {part_sku}"
+        elif material_name:
+            material_event_label += f" | {material_name}"
+        material_event_label += f" | QTY {qty}"
         self.push_event(
             {
                 "type": "RAW_MATERIAL",
@@ -15691,7 +15770,7 @@ QWidget#ClientUIRoot {{
                 "unique_key": unique_key or None,
                 "raw_job_code": raw_job_code or None,
             },
-            f"{label.upper()} {material_name} +{qty}",
+            material_event_label,
         )
         return True
 
@@ -21959,7 +22038,11 @@ QWidget#ClientUIRoot {{
                     "shared_part_storage": bool(shared_storage),
                     "raw_material_log": log_row,
                 },
-                f"RAW MATERIAL {material_name} +{qty}",
+                (
+                    f"RAW MATERIAL SCANNED | SKU {log_row.get('material_sku') or log_row.get('job_part_sku')} | QTY {qty}"
+                    if (log_row.get("material_sku") or log_row.get("job_part_sku"))
+                    else f"RAW MATERIAL SCANNED | {material_name} | QTY {qty}"
+                ),
             )
             return
 
@@ -21975,18 +22058,40 @@ QWidget#ClientUIRoot {{
             )
             return
 
-        # PDR waiting step: scan maintenance to actually start downtime timer.
+        # PDR waiting step: the first Maintenance scan ends response waiting
+        # and starts repair downtime immediately. The reason is intentionally
+        # collected only after Maintenance scans again to finish the repair.
         if s.waiting_downtime_start_maintenance:
             auth = self._authorized_person_from_scan(raw_s)
             if auth and str(auth.get("can_maintenance", "0")) == "1":
                 s.maintenance_name = str(auth.get("name") or raw_s)
+                if s.downtime_wait_started_at:
+                    s.downtime_wait_last_seconds = max(
+                        0, int(time.time() - s.downtime_wait_started_at)
+                    )
+                s.downtime_wait_started_at = None
                 s.waiting_downtime_start_maintenance = False
-                s.waiting_pdr_maintenance_reason = True
-                self.status.setText("Maintenance acknowledged. Scan valid PDR reason QR (01-15) to start downtime.")
-                self._set_production_overlay_mode("select")
+                s.waiting_pdr_maintenance_reason = False
+                s.downtime_reason_code = None
+                s.downtime_reason_text = None
+                s.downtime_started_at = time.time()
+                s.downtime_last_seconds = 0
+                s.maintenance_downtime_seconds = None
+                s.pdr_reason_segments = []
+                s.pdr_current_segment_start_seconds = 0
+                s.pdr_followup_reasons_remaining = 0
+                s.downtime_active = True
+                s.waiting_downtime_end_maintenance = True
+                self.status.setText(
+                    "Maintenance acknowledged. Downtime started; scan the Maintenance QR again when repair is done."
+                )
+                self._set_production_overlay_mode("active")
                 self._show_production_overlay()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
+                self.sync_session_snapshot_to_server(
+                    "SESSION SNAPSHOT SYNC (PDR DOWNTIME STARTED)"
+                )
                 return
             if auth:
                 self.status.setText(f"Waiting mode: scanned badge is {auth.get('role') or 'not Maintenance'}. Scan Maintenance QR.")
@@ -21994,12 +22099,45 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Waiting mode: Maintenance QR not found in profiles/cache. Check server/SQL profile role.")
             return
 
-        # PDR validation step: maintenance confirms the reason that starts downtime.
+        # After the second Maintenance scan stops downtime, record one reason
+        # for the completed repair interval and continue directly to cycle time.
         if s.waiting_pdr_maintenance_reason:
             code = self._extract_production_reason_code(raw_s)
             reason = self._production_reason_text(code) if code else None
             if not code or not reason:
                 self.status.setText("PDR validation: scan valid reason QR (01-15).")
+                return
+            if (
+                not s.downtime_active
+                and not s.downtime_started_at
+                and s.maintenance_downtime_seconds is not None
+            ):
+                duration = max(0, int(s.maintenance_downtime_seconds or 0))
+                s.waiting_pdr_maintenance_reason = False
+                s.downtime_reason_code = code
+                s.downtime_reason_text = reason
+                s.downtime_last_seconds = duration
+                s.pdr_reason_segments = [{
+                    "segment_index": 1,
+                    "reason_code": code,
+                    "reason": reason,
+                    "started_at_seconds": 0,
+                    "ended_at_seconds": duration,
+                    "duration_seconds": duration,
+                    "ended_by": "maintenance_qr",
+                    "closed_at_utc": datetime.now(timezone.utc).isoformat(),
+                }]
+                s.pdr_current_segment_start_seconds = duration
+                s.pdr_followup_reasons_remaining = 0
+                self._begin_downtime_resolution()
+                self.status.setText(
+                    f"PDR reason recorded: {code} - {reason}. Input the updated cycle time."
+                )
+                self._refresh_ui()
+                self._save_active_session_snapshot()
+                self.sync_session_snapshot_to_server(
+                    "SESSION SNAPSHOT SYNC (PDR REASON RECORDED)"
+                )
                 return
             if s.downtime_active or s.downtime_started_at or int(s.downtime_last_seconds or 0) > 0 or (s.pdr_reason_segments or []):
                 s.waiting_pdr_maintenance_reason = False
@@ -22033,32 +22171,36 @@ QWidget#ClientUIRoot {{
             self._save_active_session_snapshot()
             return
 
-        # Downtime running step: Maintenance finishes the repair by scanning
-        # their badge again; no separate PDR-done QR is required.
+        # Downtime running step: the second Maintenance scan stops the repair
+        # timer, then reason 01-15 is requested before cycle-time input.
         if s.waiting_downtime_end_maintenance and s.downtime_active and raw_l not in ("productiondailyreport~2", "pdr_done", "pdrdone"):
             auth = self._authorized_person_from_scan(raw_s)
             if auth and str(auth.get("can_maintenance", "0")) == "1":
                 s.maintenance_name = str(auth.get("name") or raw_s)
-                self._close_pdr_reason_segment("maintenance_qr")
                 s.downtime_last_seconds = self._pdr_elapsed_seconds()
                 s.maintenance_downtime_seconds = int(s.downtime_last_seconds or 0)
                 s.downtime_started_at = None
                 s.downtime_active = False
                 s.waiting_downtime_end_maintenance = False
                 s.waiting_maintenance_qr = False
+                s.waiting_pdr_maintenance_reason = True
                 # Keep the most recent weighing-app value active for incoming
                 # PACKs, but warn in red until a fresh post-PDR weight arrives.
                 s.external_average_weight_needs_refresh = bool(
                     s.external_average_weight_grams is not None
                     and float(s.external_average_weight_grams or 0) > 0
                 )
-                self._begin_downtime_resolution()
                 self.status.setText(
-                    "Maintenance completed PDR. Last weight remains active (new weight pending). "
-                    "Input the updated cycle time, then scan QC, Maintenance, or Supervisor badge."
+                    "Maintenance completed the repair and downtime stopped. "
+                    "Scan the applicable PDR reason QR (01-15)."
                 )
+                self._set_production_overlay_mode("select")
+                self._show_production_overlay()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
+                self.sync_session_snapshot_to_server(
+                    "SESSION SNAPSHOT SYNC (PDR DOWNTIME STOPPED)"
+                )
                 return
             self.status.setText("Downtime active: scan the Maintenance QR when repair is completed.")
             return
@@ -23906,9 +24048,9 @@ QWidget#ClientUIRoot {{
                     return
 
             if res.kind == "PRODUCTION_DAILY_REPORT_TRIGGER":
-                # Skip the old operator reason prompt. Start the response wait
-                # timer immediately; Maintenance then scans their badge and
-                # selects reason 01-15 before the actual downtime timer starts.
+                # Start response waiting immediately. The first Maintenance
+                # scan starts downtime; the second stops it, then reason 01-15
+                # and the updated cycle time are collected.
                 s.waiting_production_report_reason = False
                 s.waiting_reject_reason = False
                 s.pdr_operator_reason_code = None
@@ -23936,7 +24078,7 @@ QWidget#ClientUIRoot {{
                 s.supervisor_name = None
                 self._set_production_overlay_mode("active")
                 self._show_production_overlay()
-                self.status.setText("PDR waiting time started. Scan Maintenance QR to select downtime reason.")
+                self.status.setText("PDR waiting time started. Scan Maintenance QR to start downtime.")
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (PDR WAITING FOR MAINTENANCE)")
@@ -24407,9 +24549,28 @@ QWidget#ClientUIRoot {{
                         "pack_qty": main_pack_increment,
                         "qty": main_pack_qty,
                         "scanned_pack_qty": qty,
+                        "pack_scan": {
+                            "series_index": (pack_hist or {}).get("index") if isinstance(pack_hist, dict) else None,
+                            "series_total": (pack_hist or {}).get("total_labels") if isinstance(pack_hist, dict) else None,
+                            "product_id": pid or None,
+                            "product_sku": product_sku_for_pack or s.product_sku or None,
+                            "lot_number": (pack_hist or {}).get("lot_number") if isinstance(pack_hist, dict) else None,
+                        },
                         "linkage_output_allocation": pack_allocation,
                     },
-                    "PACK +1",
+                    " | ".join(
+                        part for part in (
+                            "PACK SCANNED",
+                            (
+                                f"{(pack_hist or {}).get('index')}"
+                                if isinstance(pack_hist, dict) and (pack_hist or {}).get("index")
+                                else ""
+                            ),
+                            f"{product_sku_for_pack or s.product_sku}" if (product_sku_for_pack or s.product_sku) else "",
+                            f"QTY {qty}",
+                        )
+                        if part
+                    ),
                     defer_snapshot=True,
                 )
                 return
@@ -24491,6 +24652,11 @@ QWidget#ClientUIRoot {{
         self.push_event({"type": "SESSION_SYNC", "session_snapshot": snapshot}, note)
 
     def _enqueue_reconnect_session_snapshot_sync(self, note: str = "SESSION SNAPSHOT SYNC (RECONNECT)"):
+        if int(getattr(self, "_server_sync_protocol", 0) or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
+            # Protocol 2 reconnects replay durable deltas and accept the
+            # canonical response. Uploading a client snapshot would let stale
+            # local downtime/counters overwrite the server.
+            return
         if bool(getattr(self, "_server_recovery_snapshot_queued", False)):
             return
         if not str(self.state.machine_code or "").strip():
@@ -24636,7 +24802,13 @@ QWidget#ClientUIRoot {{
 
     def _should_persist_server_event(self, item: Dict[str, Any]) -> bool:
         ev_type = self._server_event_type_from_item(item)
-        if ev_type in ("", "HEARTBEAT", "FINISH_SHIFT", "FINISH_JOB"):
+        payload = item.get("payload") if isinstance(item, dict) else {}
+        protocol_requested = int((payload or {}).get("sync_protocol_requested") or 0) if isinstance(payload, dict) else 0
+        if ev_type in ("", "HEARTBEAT"):
+            return False
+        if protocol_requested >= SERVER_SYNC_PROTOCOL_VERSION:
+            return True
+        if ev_type in ("FINISH_SHIFT", "FINISH_JOB"):
             return False
         if ev_type in ("REJECT_MODE", "PRODUCTION_DAILY_REPORT_MODE", "PRODUCTION_DAILY_REPORT", "REJECT_SUMMARY_VIEW", "BUTAL_COMPLETION_MODE"):
             return False
@@ -24648,13 +24820,26 @@ QWidget#ClientUIRoot {{
         event = payload.get("event") if isinstance(payload, dict) and isinstance(payload.get("event"), dict) else {}
         if str(event.get("type") or "").strip().upper() == "PACK":
             event.setdefault("pack_qty", 1)
-            payload["last_event"] = "PACK +1"
+            payload.setdefault("last_event", "PACK scanned")
+        payload.setdefault("sync_protocol_requested", SERVER_SYNC_PROTOCOL_VERSION)
+        row["payload"] = payload
         row.setdefault("id", f"{datetime.now(timezone.utc).isoformat()}-{uuid.uuid4().hex}")
         row["silent"] = bool(row.get("silent", silent))
         row.setdefault("created_at_utc", datetime.now(timezone.utc).isoformat())
         row.setdefault("attempts", 0)
         row.setdefault("last_error", "")
         return row
+
+    def _has_pending_server_mutations(self) -> bool:
+        with self._server_event_queue_lock:
+            if any(self._should_persist_server_event(row) for row in _load_server_event_queue_json()):
+                return True
+        try:
+            with self._event_queue.mutex:
+                queued = list(self._event_queue.queue)
+            return any(self._server_event_type_from_item(row) != "HEARTBEAT" for row in queued)
+        except Exception:
+            return True
 
     def _persist_server_event_item(self, item: Dict[str, Any]) -> None:
         if not self._should_persist_server_event(item):
@@ -24695,13 +24880,25 @@ QWidget#ClientUIRoot {{
             _save_server_event_queue_json(rows)
 
     def _load_persisted_server_events(self):
+        try:
+            with self._event_queue.mutex:
+                queued_ids = {
+                    str(row.get("id") or "")
+                    for row in self._event_queue.queue
+                    if isinstance(row, dict)
+                }
+        except Exception:
+            queued_ids = set()
         for row in _load_server_event_queue_json():
             item = self._normalize_server_event_item(row, silent=bool(row.get("silent")))
+            if str(item.get("id") or "") in queued_ids:
+                continue
             if not self._server_event_belongs_to_current_client(item):
                 self._remove_persisted_server_event(str(item.get("id") or ""))
                 continue
             try:
                 self._event_queue.put_nowait(item)
+                queued_ids.add(str(item.get("id") or ""))
             except queue.Full:
                 break
 
@@ -24721,19 +24918,28 @@ QWidget#ClientUIRoot {{
         return True
 
     def _event_dispatch_loop(self):
+        priority_retry_item: Optional[Dict[str, Any]] = None
         while not self._event_worker_stop.is_set():
-            try:
-                item = self._event_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
+            item_from_queue = False
+            if priority_retry_item is not None:
+                item = priority_retry_item
+                priority_retry_item = None
+            else:
+                try:
+                    item = self._event_queue.get(timeout=0.5)
+                    item_from_queue = True
+                except queue.Empty:
+                    continue
             item = self._normalize_server_event_item(item, silent=bool(item.get("silent")))
             if not self._server_event_belongs_to_current_client(item):
                 self._remove_persisted_server_event(str(item.get("id") or ""))
-                self._event_queue.task_done()
+                if item_from_queue:
+                    self._event_queue.task_done()
                 continue
             if _server_event_queue_row_is_stale(item):
                 self._remove_persisted_server_event(str(item.get("id") or ""))
-                self._event_queue.task_done()
+                if item_from_queue:
+                    self._event_queue.task_done()
                 continue
             item_payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
             item_session_id = str(item_payload.get("production_session_id") or "").strip()
@@ -24751,7 +24957,8 @@ QWidget#ClientUIRoot {{
             ):
                 self._remove_persisted_server_event(str(item.get("id") or ""))
                 self._append_app_log("SESSION FENCE", f"Discarded queued event for closed session {item_session_id}")
-                self._event_queue.task_done()
+                if item_from_queue:
+                    self._event_queue.task_done()
                 continue
             self._persist_server_event_item(item)
             event_type = self._server_event_type_from_item(item)
@@ -24794,22 +25001,29 @@ QWidget#ClientUIRoot {{
                         last_error = f"HTTP {status_code}: {str(resp.text or '')[:200]}"
                     else:
                         resp.raise_for_status()
+                    response_protocol = int(response_body.get("sync_protocol") or 0)
+                    if response_protocol >= SERVER_SYNC_PROTOCOL_VERSION and event_type != "HEARTBEAT":
+                        acknowledged_event_id = str(response_body.get("ack_event_id") or "").strip()
+                        if acknowledged_event_id != str(item.get("id") or "").strip():
+                            raise RuntimeError("Server response did not acknowledge this event ID")
+                    self._server_sync_protocol = response_protocol
                     request_reached_server = True
                 else:
-                    retry_item = event_type not in ("HEARTBEAT", "FINISH_SHIFT", "FINISH_JOB")
+                    retry_item = self._should_persist_server_event(item)
                     last_error = "server_url is empty"
             except Exception as e:
                 # Heartbeats are connectivity probes. Completed shifts/jobs
                 # remain safely owned by their local JSON stores and are only
                 # offered again after a later heartbeat proves connectivity.
-                retry_item = event_type not in ("HEARTBEAT", "FINISH_SHIFT", "FINISH_JOB")
+                retry_item = self._should_persist_server_event(item)
                 last_error = e
                 self._server_was_offline = True
                 self._server_connection_ok = False
                 if not bool(item.get("silent")):
                     self.scanner_status.emit(f"Server send failed: {e}")
             finally:
-                self._event_queue.task_done()
+                if item_from_queue:
+                    self._event_queue.task_done()
             if identity_conflict:
                 self._server_identity_conflict = True
                 self._server_was_offline = True
@@ -24833,7 +25047,12 @@ QWidget#ClientUIRoot {{
                         self.scanner_status.emit(f"Invalid server event removed: {event_type}")
                 if bool(getattr(self, "_server_was_offline", False)):
                     self._server_was_offline = False
-                    self._enqueue_reconnect_session_snapshot_sync()
+                    if int(getattr(self, "_server_sync_protocol", 0) or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
+                        self._server_recovery_snapshot_queued = False
+                    else:
+                        self._enqueue_reconnect_session_snapshot_sync()
+                        self._load_persisted_server_events()
+                if int(getattr(self, "_server_sync_protocol", 0) or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
                     self._load_persisted_server_events()
                 event_payload = item.get("payload") if isinstance(item, dict) else {}
                 event_body = event_payload.get("event") if isinstance(event_payload, dict) else {}
@@ -24843,7 +25062,13 @@ QWidget#ClientUIRoot {{
                     # acknowledged authoritative state through a queued signal
                     # so labels and local recovery storage update safely.
                     acknowledged_session = dict(acknowledged_session)
+                    _upsert_confirmed_server_session_json(acknowledged_session)
                     acknowledged_session["_ack_event_type"] = event_type
+                    if (
+                        int(getattr(self, "_server_sync_protocol", 0) or 0) >= SERVER_SYNC_PROTOCOL_VERSION
+                        and not self._has_pending_server_mutations()
+                    ):
+                        acknowledged_session["_server_authoritative_replace"] = True
                     self.server_session_received.emit(acknowledged_session)
                 if event_type == "HEARTBEAT":
                     self.sync_local_finish_shifts_to_server(force=False)
@@ -24865,13 +25090,18 @@ QWidget#ClientUIRoot {{
                     self._last_finish_shift_sync_signature = ""
             if retry_item and not self._event_worker_stop.is_set():
                 time.sleep(2.0)
-                try:
-                    self._event_queue.put(item, timeout=1.0)
-                except Exception:
-                    if self._should_persist_server_event(item):
-                        self._persist_server_event_item(item)
-                    if not bool(item.get("silent")):
-                        self.scanner_status.emit("Server retry queue is full. Event is saved and will retry.")
+                if int((item.get("payload") or {}).get("sync_protocol_requested") or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
+                    # Retry the failed mutation before later scans, preserving
+                    # the exact order in which the operator performed them.
+                    priority_retry_item = item
+                else:
+                    try:
+                        self._event_queue.put(item, timeout=1.0)
+                    except Exception:
+                        if self._should_persist_server_event(item):
+                            self._persist_server_event_item(item)
+                        if not bool(item.get("silent")):
+                            self.scanner_status.emit("Server retry queue is full. Event is saved and will retry.")
 
     def _enqueue_server_event(self, payload: Dict[str, Any], *, silent: bool) -> bool:
         item = self._normalize_server_event_item({"payload": payload, "silent": bool(silent)}, silent=silent)
@@ -24892,6 +25122,13 @@ QWidget#ClientUIRoot {{
                 self._event_queue.put_nowait(item)
                 return True
             except queue.Full:
+                if persistent:
+                    # It is already durable on disk. Do not evict an older
+                    # mutation; the dispatcher refills this item after earlier
+                    # event IDs have been acknowledged.
+                    return True
+                if self._server_event_type_from_item(item) == "HEARTBEAT":
+                    return False
                 if not self._make_room_for_server_event(item):
                     return False
                 continue
@@ -25024,6 +25261,7 @@ QWidget#ClientUIRoot {{
             "job_name": s.job_name,
             "operator_id": s.operator_id,
             "production_session_id": session_id,
+            "sync_protocol_requested": SERVER_SYNC_PROTOCOL_VERSION,
             "event": event_payload,
             "last_event": last_event,
         }

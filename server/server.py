@@ -1764,6 +1764,19 @@ def _canonical_reject_breakdown(value: Any) -> Dict[str, int]:
     return normalized
 
 
+TRANSPORT_ONLY_EVENT_TYPES = {"", "HEARTBEAT", "PING", "CLIENT_STATUS", "SESSION_SYNC"}
+
+
+def _clean_dashboard_last_event(value: Any) -> str:
+    text = str(value or "").strip()
+    upper = text.upper()
+    if upper in TRANSPORT_ONLY_EVENT_TYPES:
+        return ""
+    if upper.startswith("SESSION SNAPSHOT SYNC") or upper.startswith("SESSION SYNC"):
+        return ""
+    return text
+
+
 @dataclass
 class MachineSession:
     client_id: str
@@ -1836,6 +1849,9 @@ class MachineSession:
     machine_counter_overwrite_logs: List[Dict[str, Any]] = None
     maintenance_name: Optional[str] = None
     supervisor_name: Optional[str] = None
+    last_supervisor_check_at_utc: Optional[str] = None
+    last_supervisor_check_name: Optional[str] = None
+    last_supervisor_check_code: Optional[str] = None
     current_supervisor_review: Dict[str, Any] = None
     supervisor_review_logs: List[Dict[str, Any]] = None
     job_payload: Dict[str, Any] = None
@@ -1853,6 +1869,7 @@ class MachineSession:
     last_shift_butal_job_name: Optional[str] = None
     last_shift_butal_by_job: Dict[str, Dict[str, Any]] = None
     last_event: str = ""
+    last_event_at_utc: Optional[str] = None
     last_seen_utc: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1940,6 +1957,9 @@ def _reset_active_session_for_new_job_segment(sess: MachineSession, preserve_ope
     sess.machine_counter_overwrite_logs = []
     sess.maintenance_name = None
     sess.supervisor_name = None
+    sess.last_supervisor_check_at_utc = None
+    sess.last_supervisor_check_name = None
+    sess.last_supervisor_check_code = None
     sess.current_supervisor_review = {}
     sess.supervisor_review_logs = []
     sess.external_average_weight_grams = None
@@ -2239,6 +2259,9 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         ],
         maintenance_name=raw.get("maintenance_name"),
         supervisor_name=raw.get("supervisor_name"),
+        last_supervisor_check_at_utc=raw.get("last_supervisor_check_at_utc"),
+        last_supervisor_check_name=raw.get("last_supervisor_check_name"),
+        last_supervisor_check_code=raw.get("last_supervisor_check_code"),
         current_supervisor_review=dict(raw.get("current_supervisor_review") or {}),
         supervisor_review_logs=list(raw.get("supervisor_review_logs") or []),
         job_payload=dict(raw.get("job_payload") or {}),
@@ -2259,7 +2282,8 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         last_shift_butal_job_code=raw.get("last_shift_butal_job_code"),
         last_shift_butal_job_name=raw.get("last_shift_butal_job_name"),
         last_shift_butal_by_job=dict(raw.get("last_shift_butal_by_job") or {}),
-        last_event=str(raw.get("last_event") or "Recovered from active session snapshot").strip(),
+        last_event=_clean_dashboard_last_event(raw.get("last_event")),
+        last_event_at_utc=raw.get("last_event_at_utc"),
         last_seen_utc=last_seen_utc,
     )
 
@@ -5567,6 +5591,25 @@ def _dashboard_finished_summary(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _dashboard_finished_history() -> List[Dict[str, Any]]:
     now = utc_now()
+    limit = DASHBOARD_INITIAL_HISTORY_LIMIT
+    if limit:
+        recent: List[Dict[str, Any]] = []
+        # A dashboard refresh only needs the newest summary rows. Walking the
+        # complete (and potentially very large) history and returning every
+        # partial shift can block heartbeats while the websocket opens.
+        for row in reversed(FINISHED_JOBS):
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("record_type") or "").strip().upper() == "SHIFT_PARTIAL":
+                stamp = _parse_iso_utc(row.get("finished_at_utc") or row.get("ended_at_utc"))
+                if stamp is None or stamp < FINISHED_SHIFT_DISPLAY_CUTOFF_UTC or stamp > now:
+                    continue
+            recent.append(_dashboard_finished_summary(row))
+            if len(recent) >= limit:
+                break
+        recent.reverse()
+        return recent
+
     shifts: List[Dict[str, Any]] = []
     final_jobs: List[Dict[str, Any]] = []
     for row in FINISHED_JOBS:
@@ -5580,9 +5623,6 @@ def _dashboard_finished_history() -> List[Dict[str, Any]]:
             shifts.append(_dashboard_finished_summary(row))
         else:
             final_jobs.append(_dashboard_finished_summary(row))
-    limit = DASHBOARD_INITIAL_HISTORY_LIMIT
-    if limit:
-        final_jobs = final_jobs[-limit:]
     return shifts + final_jobs
 
 
@@ -13348,6 +13388,11 @@ DASHBOARD_HTML = """
       const supervisorRole = String(manual.set_by_role || "").trim();
       const reason = firstValue(manual.reason, manual.status_reason, "-");
       const remarks = firstValue(manual.remarks, manual.remark, manual.notes, "-");
+      const statusStartedAt = String(manual.started_at_utc || manual.updated_at_utc || "").trim();
+      const statusStartedMs = Date.parse(statusStartedAt);
+      const statusDuration = Number.isFinite(statusStartedMs)
+        ? fmtDowntimeSeconds(Math.max(0, Math.floor((Date.now() - statusStartedMs) / 1000)))
+        : "-";
       return `
         <div class="machine-status-flashcard">
           <div class="machine-status-flash-head">
@@ -13369,6 +13414,10 @@ DASHBOARD_HTML = """
             <div class="machine-status-flash-item">
               <div class="k">Remarks</div>
               <div class="v">${esc(remarks || "-")}</div>
+            </div>
+            <div class="machine-status-flash-item">
+              <div class="k">Status Duration</div>
+              <div class="v machine-status-live-duration" data-status-started="${esc(statusStartedAt)}">${esc(statusDuration)}</div>
             </div>
           </div>
         </div>
@@ -13405,6 +13454,9 @@ DASHBOARD_HTML = """
     const statusText = statusLabel || css.toUpperCase();
     const operatorText = displayNameForId(s.operator_id || "-");
     const clientText = displayNameForId(s.client_id || "-");
+    const supervisorCheckName = String(s.last_supervisor_check_name || "").trim();
+    const supervisorCheckAt = s.last_supervisor_check_at_utc ? fmtDateLocal(s.last_supervisor_check_at_utc) : "-";
+    const lastEventAt = s.last_event_at_utc ? fmtDateLocal(s.last_event_at_utc) : "-";
     const supervisorTooltip = [
       "Supervisor QR pending",
       "Scan Supervisor QR on the client to continue downtime resolution.",
@@ -13447,10 +13499,20 @@ DASHBOARD_HTML = """
       </div>
       <div class="machine-card-foot">
         <div>Last seen: ${esc(seenLabel)}</div>
-        <div>Last event: ${esc(s.last_event || "-")}</div>
+        <div>Last event: ${esc(s.last_event || "-")} · ${esc(lastEventAt)}</div>
+        <div>Supervisor check: ${esc(supervisorCheckName || "-")} · ${esc(supervisorCheckAt)}</div>
       </div>
     `;
   }
+
+  function updateMachineStatusDurations(){
+    document.querySelectorAll(".machine-status-live-duration[data-status-started]").forEach(el => {
+      const startedMs = Date.parse(String(el.dataset.statusStarted || ""));
+      if(!Number.isFinite(startedMs)) return;
+      el.textContent = fmtDowntimeSeconds(Math.max(0, Math.floor((Date.now() - startedMs) / 1000)));
+    });
+  }
+  window.setInterval(updateMachineStatusDurations, 1000);
 
   function upsertMachineCard(s, code, css, statusLabel){
     let card = machineCardEls.get(code);
@@ -15307,6 +15369,80 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
     return True
 
 
+SERVER_SYNC_PROTOCOL_VERSION = 2
+
+
+def _dashboard_event_description(
+    sess: MachineSession,
+    event_type: str,
+    event: Dict[str, Any],
+    fallback: str,
+) -> str:
+    """Build a concise operator-action label; never expose transport reconnects."""
+    ev_type = str(event_type or "").strip().upper()
+    ev = event if isinstance(event, dict) else {}
+    if ev_type == "PACK":
+        scan = ev.get("pack_scan") if isinstance(ev.get("pack_scan"), dict) else {}
+        if not scan:
+            scan = next(
+                (
+                    row for row in reversed(list(sess.product_pack_history_logs or []))
+                    if isinstance(row, dict) and not bool(row.get("voided"))
+                ),
+                {},
+            )
+        series = str(scan.get("series_index") or scan.get("index") or "").strip()
+        series_total = str(scan.get("series_total") or scan.get("total_labels") or "").strip()
+        sku = str(
+            scan.get("product_sku")
+            or scan.get("material_sku")
+            or scan.get("sku")
+            or sess.product_sku
+            or ""
+        ).strip()
+        qty = int(ev.get("scanned_pack_qty", ev.get("qty", 0)) or 0)
+        details = []
+        if series:
+            details.append(series)
+        if sku:
+            details.append(sku)
+        if qty:
+            details.append(f"Qty {qty}")
+        return "PACK scanned" + (" | " + " | ".join(details) if details else "")
+    if ev_type == "RAW_MATERIAL":
+        log = ev.get("raw_material_log") if isinstance(ev.get("raw_material_log"), dict) else {}
+        unit = str(ev.get("unit") or log.get("unit") or "").strip().lower()
+        label = "RAW MATERIAL" if unit == "kg" else "PRODUCT PART"
+        sku = str(log.get("material_sku") or log.get("job_part_sku") or log.get("sku") or "").strip()
+        name = str(ev.get("material") or log.get("material_name") or "").strip()
+        qty = int(ev.get("qty", 0) or 0)
+        details = [f"SKU {sku}" if sku else name]
+        if qty:
+            details.append(f"Qty {qty}")
+        return f"{label} scanned" + (" | " + " | ".join(x for x in details if x) if any(details) else "")
+    if ev_type in {"REJECT", "STARTUP_REJECT"}:
+        reason = str(ev.get("reason") or "").strip()
+        qty = int(ev.get("qty", 0) or 0)
+        return f"{ev_type.replace('_', ' ')} scanned" + (f" | {reason}" if reason else "") + (f" | Qty {qty}" if qty else "")
+    if ev_type == "BUTAL":
+        return f"BUTAL scanned | Qty {int(ev.get('qty', 0) or 0)}"
+    if ev_type == "SUPERVISOR_REVIEW":
+        review = ev.get("review") if isinstance(ev.get("review"), dict) else {}
+        actor = str(review.get("actor_name") or review.get("actor_code") or "Supervisor").strip()
+        return f"SUPERVISOR CHECK | {actor}"
+    return str(fallback or ev_type.replace("_", " ")).strip()
+
+
+@APP.get("/api/sync/capabilities")
+async def api_sync_capabilities():
+    return {
+        "ok": True,
+        "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
+        "server_authoritative": True,
+        "ordered_event_replay": True,
+    }
+
+
 @APP.post("/api/heartbeat")
 async def api_heartbeat(req: Request):
     """Lightweight client presence update; never mutates production counters."""
@@ -15340,6 +15476,8 @@ async def api_heartbeat(req: Request):
         "client_online": True,
         "machine_scanned": bool(machine_code),
         "elapsed_ms": round(elapsed_ms, 1),
+        "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
+        "server_authoritative": True,
         "session": session.to_dict() if session is not None else None,
     }
 
@@ -15393,6 +15531,9 @@ async def api_event(req: Request):
         return {
             "ok": True,
             "duplicate": True,
+            "ack_event_id": event_id,
+            "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
+            "server_authoritative": True,
             "session": duplicate_session.to_dict() if duplicate_session is not None else None,
         }
 
@@ -15527,6 +15668,9 @@ async def api_event(req: Request):
                 "ok": True,
                 "ignored": True,
                 "discarded": True,
+                "ack_event_id": event_id,
+                "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
+                "server_authoritative": True,
                 "reason": "production session is already closed",
                 "production_session_id": incoming_session_id,
                 "session": None,
@@ -15678,7 +15822,6 @@ async def api_event(req: Request):
         # HEARTBEAT events are normally not persisted. Save this repair before
         # broadcast_state() reloads the active-session snapshot from disk.
     sess.last_seen_utc = utc_now().isoformat()
-    sess.last_event = str(data.get("last_event", sess.last_event))
 
     # apply event counters if provided
     _append_server_app_log(
@@ -15744,6 +15887,9 @@ async def api_event(req: Request):
         sess.raw_material_scans = []
         sess.raw_material_logs = []
         sess.product_pack_history_logs = []
+        sess.last_supervisor_check_at_utc = None
+        sess.last_supervisor_check_name = None
+        sess.last_supervisor_check_code = None
         sess.last_event = f"OPERATOR CHANGE {new_operator}".strip()
     elif ev_type in ("RELIEF_START", "RELIEF_END"):
         break_row = ev.get("break_session")
@@ -16163,6 +16309,14 @@ async def api_event(req: Request):
                 sess.current_supervisor_review = {}
             sess.last_event = f"SUPERVISOR REVIEW {review.get('actor_name') or ''}".strip()
             sess.last_seen_utc = utc_now().isoformat()
+            sess.last_supervisor_check_at_utc = str(
+                review.get("last_updated_at_utc")
+                or review.get("opened_at_utc")
+                or data.get("event_created_at_utc")
+                or utc_now().isoformat()
+            )
+            sess.last_supervisor_check_name = str(review.get("actor_name") or "").strip() or None
+            sess.last_supervisor_check_code = str(review.get("actor_code") or "").strip() or None
     elif ev_type == "PACK":
         qty = int(ev.get("qty", 0) or 0)
         pack_qty = int(ev.get("pack_qty", 1) or 1)
@@ -16221,6 +16375,18 @@ async def api_event(req: Request):
                 },
             )
 
+    resulting_live_session = SESSIONS.get(machine_code)
+    if resulting_live_session is not None and ev_type not in TRANSPORT_ONLY_EVENT_TYPES:
+        resulting_live_session.last_event = _dashboard_event_description(
+            resulting_live_session,
+            ev_type,
+            ev,
+            str(data.get("last_event") or resulting_live_session.last_event or ""),
+        )
+        resulting_live_session.last_event_at_utc = str(
+            data.get("event_created_at_utc") or utc_now().isoformat()
+        )
+
     if ev_type not in ("HEARTBEAT", "FINISH_JOB"):
         _persist_active_sessions_state(machine_code)
 
@@ -16240,6 +16406,9 @@ async def api_event(req: Request):
     resulting_session = SESSIONS.get(machine_code)
     return {
         "ok": True,
+        "ack_event_id": event_id,
+        "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
+        "server_authoritative": True,
         "session": resulting_session.to_dict() if resulting_session is not None else None,
     }
 
@@ -16782,7 +16951,7 @@ async def api_planning_lookup(req: Request):
     if not job_identifier:
         return JSONResponse({"ok": False, "error": "job_identifier is required"}, status_code=400)
     try:
-        card = fetch_planning_job_from_bms(job_identifier)
+        card = await asyncio.to_thread(fetch_planning_job_from_bms, job_identifier)
         return {"ok": True, "item": card}
     except urllib_error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
@@ -16798,7 +16967,9 @@ async def api_jobs_lookup(req: Request):
     if not job_identifier:
         return JSONResponse({"ok": False, "error": "job_identifier is required"}, status_code=400)
     try:
-        payload = fetch_job_payload_from_bms(job_identifier)
+        # BMS is an internet dependency. Keep its DNS/login/request timeouts off
+        # the event loop so local heartbeats and dashboard refreshes stay live.
+        payload = await asyncio.to_thread(fetch_job_payload_from_bms, job_identifier)
         return {"ok": True, "found": True, "job_identifier": job_identifier, "payload": payload}
     except urllib_error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
