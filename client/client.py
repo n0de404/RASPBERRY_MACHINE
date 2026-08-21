@@ -17058,6 +17058,13 @@ QWidget#ClientUIRoot {{
                 # Live cycle time is per unit (sec/unit), weighted by scanned quantity.
                 s.live_cycle_avg_seconds = s.live_cycle_total_seconds / s.live_cycle_total_units
         s.live_cycle_last_scan_at = now_ts
+        # Keep the persisted/displayed current counter aligned with the app
+        # counter immediately after every accepted PACK (physical or virtual).
+        # The app total still derives from the shift-start counter, production
+        # output, cavities, and any approved overwrite baseline.
+        app_counter = self._current_machine_counter_app_total()
+        if app_counter is not None:
+            s.machine_counter_current = int(app_counter)
 
     def _http_error_snippet(self, resp: Any, max_len: int = 180) -> str:
         try:
@@ -21628,26 +21635,15 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
                     return
                 if reviewer_can_supervisor and s.cycle_time_current:
-                    same_supervisor_review_actor = (
-                        raw_s == (s.supervisor_review_actor_code or "")
-                        or self._clean_badge_scan_code(raw_s) == self._clean_badge_scan_code(s.supervisor_review_actor_code or "")
-                        or str(reviewer.get("code") or "").strip() == str(s.supervisor_review_actor_code or "").strip()
-                    )
-                    if s.supervisor_review_open and same_supervisor_review_actor and not s.waiting_cycle_time_confirm_popup:
-                        review = self._close_supervisor_review_snapshot(
+                    if s.supervisor_review_open and not s.waiting_cycle_time_confirm_popup:
+                        self._close_supervisor_review_snapshot(
                             s.supervisor_review_actor_code or reviewer.get("code") or raw_s,
                             s.supervisor_review_actor_name or reviewer.get("name") or raw_s,
                             s.supervisor_review_actor_role or reviewer.get("role") or "SUPERVISOR",
-                            action="SUMMARY_CONFIRMED",
-                            resolved=True,
+                            action="CYCLE_REVIEW_REOPENED",
+                            resolved=False,
                         )
                         self._hide_supervisor_review()
-                        self.status.setText("Supervisor review closed.")
-                        self._refresh_ui()
-                        self._save_active_session_snapshot()
-                        if review:
-                            self.push_event({"type": "SUPERVISOR_REVIEW", "review": review}, f"SUPERVISOR REVIEW {review.get('actor_name') or ''}".strip(), silent=True)
-                        return
                     # Every new Supervisor review captures a fresh cycle-time
                     # reading. The current value changes, while
                     # cycle_time_change_logs preserves each old -> new row.
