@@ -1820,6 +1820,7 @@ class MachineSession:
     product_pack_history_logs: List[Dict[str, Any]] = None
     butal_scan_logs: List[Dict[str, Any]] = None
     reject_review_logs: List[Dict[str, Any]] = None
+    client_app_logs: List[Dict[str, Any]] = None
     startup_reject_total: int = 0
     downtime_reason_code: Optional[str] = None
     downtime_reason_text: Optional[str] = None
@@ -1888,6 +1889,9 @@ class MachineSession:
         ]
         d["butal_scan_logs"] = d["butal_scan_logs"] or []
         d["reject_review_logs"] = d["reject_review_logs"] or []
+        d["client_app_logs"] = [
+            dict(row) for row in (d["client_app_logs"] or [])[-1000:] if isinstance(row, dict)
+        ]
         d["job_payload"] = d["job_payload"] or {}
         d["linkage_job_payload"] = d["linkage_job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
@@ -2219,6 +2223,15 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         ],
         butal_scan_logs=[dict(row) for row in (raw.get("butal_scan_logs") or []) if isinstance(row, dict)],
         reject_review_logs=[dict(row) for row in (raw.get("reject_review_logs") or []) if isinstance(row, dict)],
+        client_app_logs=[
+            dict(row)
+            for row in (
+                raw.get("client_app_logs")[-1000:]
+                if isinstance(raw.get("client_app_logs"), list)
+                else []
+            )
+            if isinstance(row, dict)
+        ],
         startup_reject_total=int(raw.get("startup_reject_total", 0) or 0),
         downtime_reason_code=raw.get("downtime_reason_code"),
         downtime_reason_text=raw.get("downtime_reason_text"),
@@ -5642,6 +5655,7 @@ def _state_payload(*, include_history: bool = False) -> Dict[str, Any]:
             "machine_counter_overwrite_logs",
             "supervisor_review_logs",
             "butal_scan_logs",
+            "client_app_logs",
         }
         for row in sessions:
             for field in heavy_session_fields:
@@ -5740,6 +5754,16 @@ DASHBOARD_HTML = """
     .main-tab-button:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(15,23,42,0.10); }
     .main-tab-button:active { transform: translateY(0) scale(0.985); }
     .main-tab-button.active { background: #1f8ef1; color: #fff; }
+    .machine-filter-wrap { position:relative; margin-left:auto; display:flex; align-items:center; }
+    .machine-filter-btn { width:38px; height:38px; display:inline-flex; align-items:center; justify-content:center; border:1px solid #cdd6e2; border-radius:50%; background:#fff; color:#475569; cursor:pointer; box-shadow:0 4px 12px rgba(15,23,42,.07); }
+    .machine-filter-btn:hover { color:#0f64bd; border-color:#93b8df; background:#f8fbff; }
+    .machine-filter-btn.active { color:#fff; border-color:#0f64bd; background:#0f64bd; }
+    .machine-filter-btn svg { width:18px; height:18px; display:block; }
+    .machine-filter-menu { position:absolute; z-index:80; top:calc(100% + 8px); right:0; width:230px; padding:10px; border:1px solid #cfd9e6; border-radius:10px; background:#fff; box-shadow:0 14px 32px rgba(15,23,42,.18); }
+    .machine-filter-menu[hidden] { display:none; }
+    .machine-filter-option { display:flex; align-items:center; gap:9px; padding:9px 10px; border-radius:8px; color:#0f172a; font-size:.84rem; font-weight:850; cursor:pointer; }
+    .machine-filter-option:hover { background:#f1f5f9; }
+    .machine-filter-option input { width:16px; height:16px; accent-color:#0f64bd; }
     .main-tab-content { display: none; padding: 0 clamp(10px, 1.6vw, 20px) clamp(12px, 1.6vw, 20px); min-width:0; }
     .main-tab-content.active { display: block; }
     .kpi-filter-row { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
@@ -5920,16 +5944,19 @@ DASHBOARD_HTML = """
     #machineGrid { grid-template-columns: repeat(auto-fill, minmax(320px, 360px)); justify-content:start; align-items:stretch; perspective:1200px; }
     #additionalMachineGrid { grid-template-columns: repeat(auto-fill, minmax(320px, 360px)); justify-content:start; align-items:stretch; perspective:1200px; }
     #additionalMachineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); gap:10px; min-height:0; padding:12px; border:1px solid #d8e2ef; border-top:4px solid #94a3b8; border-radius:10px; background:#fff; box-shadow:0 8px 20px rgba(15,23,42,.06); overflow:hidden; }
-    #additionalMachineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; background:#fbfffd; }
+    #additionalMachineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
+    #additionalMachineGrid .card.inactive { border-color:#d8e2ef; border-top-color:#94a3b8; background:#f8fafc; }
     #additionalMachineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; background:#fffafa; }
     #additionalMachineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; background:#fffdf8; }
-    #additionalMachineGrid .card.status-alert { border-color:#fdba74; border-top-color:#f97316; background:#fff7ed; }
+    #additionalMachineGrid .card.status-alert { border-color:#fdba74; border-top-color:#f97316; background:#fff7ed; animation:machineStatusAlertBlink 1.05s ease-in-out infinite; }
     #additionalMachineGrid .card .machine-card-title h3 { margin:0; color:#0f172a; font-size:1.16rem; }
     .additional-machines-section { margin-top:24px; padding-top:18px; border-top:2px solid #dbe4f0; }
     .additional-machines-title { margin:0 0 12px; color:#334155; font-size:1rem; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
     .card { min-width:0; background: #fff; border-radius: 12px; padding: clamp(10px, 1vw, 16px); border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform .12s ease, box-shadow .12s ease; }
+    .card[hidden] { display:none !important; }
     .card:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(0,0,0,0.12); }
     .card.active { border-color: #4CAF50; animation: cardPulseGreen 1.5s ease-in-out infinite; }
+    .card.inactive { border-color:#cbd5e1; background:#f8fafc; animation:none; }
     .card.disconnected { border-color: #f44336; }
     .card.maintenance { border-color: #FF9800; animation: cardPulseOrange 1.5s ease-in-out infinite; }
     .card h3 { margin: 0 0 10px; font-size: clamp(.9rem, .9vw, 1.05rem); border-bottom: 1px solid #eee; padding-bottom: 8px; overflow-wrap:anywhere; }
@@ -5937,6 +5964,7 @@ DASHBOARD_HTML = """
     #machineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); gap:10px; min-height:0; padding:12px; border:1px solid #d8e2ef; border-top:4px solid #94a3b8; border-radius:10px; background:#fff; box-shadow:0 8px 20px rgba(15,23,42,.06); overflow:hidden; transform-style:preserve-3d; backface-visibility:hidden; will-change:transform, box-shadow; }
     #machineGrid .card:hover { transform:translateY(-1px); box-shadow:0 14px 28px rgba(15,23,42,.10); }
     #machineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
+    #machineGrid .card.inactive { border-color:#d8e2ef; border-top-color:#94a3b8; animation:none; background:#f8fafc; }
     #machineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; animation:none; background:#fffafa; }
     #machineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; animation:none; background:#fffdf8; }
     #machineGrid .card.status-alert { border-color:#fdba74; border-top-color:#f97316; background:#fff7ed; animation:machineStatusAlertBlink 1.05s ease-in-out infinite; }
@@ -5947,17 +5975,19 @@ DASHBOARD_HTML = """
     .machine-status-badge { flex:0 0 auto; display:inline-flex; align-items:center; gap:7px; border-radius:6px; padding:6px 9px; font-size:.74rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; background:#f1f5f9; color:#475569; border:1px solid #e2e8f0; }
     .machine-status-badge::before { content:""; flex:0 0 auto; width:9px; height:9px; border-radius:999px; background:#94a3b8; box-shadow:0 0 0 3px rgba(148,163,184,.16); }
     .machine-status-badge.active { background:#dcfce7; color:#047857; border-color:#86efac; }
+    .machine-status-badge.inactive { background:#f1f5f9; color:#64748b; border-color:#cbd5e1; }
     .machine-status-badge.disconnected { background:#fef2f2; color:#b91c1c; border-color:#fecaca; }
     .machine-status-badge.maintenance { background:#ffedd5; color:#b45309; border-color:#fed7aa; }
     .machine-status-badge.active::before { background:#22c55e; animation:statusBeatGreen 1.25s ease-in-out infinite; }
+    .machine-status-badge.inactive::before { background:#94a3b8; animation:none; }
     .machine-status-badge.disconnected::before { background:#ef4444; animation:statusBeatRed 1.25s ease-in-out infinite; }
     .machine-status-badge.maintenance::before { background:#f59e0b; animation:statusBeatOrange 1.25s ease-in-out infinite; }
     .machine-job-block { padding:0 0 9px; border-bottom:1px solid #edf2f7; }
     .machine-job-name { color:#0f172a; font-size:1rem; line-height:1.3; font-weight:900; overflow-wrap:anywhere; }
     .machine-job-meta { margin-top:5px; display:grid; grid-template-columns:1fr 1fr; gap:4px 10px; color:#64748b; font-size:.86rem; line-height:1.3; }
     .machine-job-meta span { min-width:0; overflow-wrap:anywhere; }
-    #machineGrid .card.linkage-flip-out { animation:linkageCardFlipOut .24s cubic-bezier(.45,0,.7,.2) forwards; transform-origin:center center; pointer-events:none; }
-    #machineGrid .card.linkage-flip-in { animation:linkageCardFlipIn .34s cubic-bezier(.18,.82,.28,1) forwards; transform-origin:center center; pointer-events:none; }
+    #machineGrid .card.linkage-flip-out, #additionalMachineGrid .card.linkage-flip-out { animation:linkageCardFlipOut .24s cubic-bezier(.45,0,.7,.2) forwards; transform-origin:center center; pointer-events:none; }
+    #machineGrid .card.linkage-flip-in, #additionalMachineGrid .card.linkage-flip-in { animation:linkageCardFlipIn .34s cubic-bezier(.18,.82,.28,1) forwards; transform-origin:center center; pointer-events:none; }
     .machine-linkage-panel { display:grid; gap:7px; padding:9px 10px; border:1px solid #bfdbfe; border-radius:8px; background:#eff6ff; }
     .machine-linkage-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
     .machine-linkage-label { color:#1d4ed8; font-size:.68rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
@@ -5983,7 +6013,7 @@ DASHBOARD_HTML = """
     .machine-status-flash-item .k { color:#9a3412; font-size:.72rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
     .machine-status-flash-item .v { margin-top:5px; color:#0f172a; font-size:.95rem; line-height:1.25; font-weight:900; overflow-wrap:anywhere; }
     .machine-status-flash-item .sub { margin-top:4px; color:#7c2d12; font-size:.84rem; line-height:1.3; overflow-wrap:anywhere; }
-    #machineGrid .machine-linkage-flag { display:inline-flex; align-items:center; gap:8px; border:1px solid #bfdbfe; background:#eff6ff; color:#1d4ed8; border-radius:6px; padding:5px 6px 5px 8px; font-size:.64rem; font-weight:900; letter-spacing:.04em; width:max-content; max-width:100%; }
+    #machineGrid .machine-linkage-flag, #additionalMachineGrid .machine-linkage-flag { display:inline-flex; align-items:center; gap:8px; border:1px solid #bfdbfe; background:#eff6ff; color:#1d4ed8; border-radius:6px; padding:5px 6px 5px 8px; font-size:.64rem; font-weight:900; letter-spacing:.04em; width:max-content; max-width:100%; }
     .machine-notif-wrap { position:absolute; right:12px; bottom:12px; z-index:4; }
     .machine-notif-badge { width:30px; height:30px; border-radius:999px; border:1px solid #fdba74; background:#f59e0b; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:900; font-size:.78rem; box-shadow:0 0 0 3px rgba(245,158,11,.14), 0 8px 18px rgba(146,64,14,.20); cursor:help; }
     .panel { margin-top: 14px; background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
@@ -7137,6 +7167,17 @@ DASHBOARD_HTML = """
     <button class="main-tab-button" data-target="maintenanceTab">Maintenance</button>
     <button class="main-tab-button" data-target="userKpiTab">User KPIs</button>
     <button class="main-tab-button" data-target="pdrTab">PDR Reports</button>
+    <div class="machine-filter-wrap" id="machineFilterWrap">
+      <button class="machine-filter-btn" id="machineFilterBtn" type="button" aria-label="Filter machines" aria-expanded="false" title="Filter machines">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18l-7 8v5l-4 2v-7L3 5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+      </button>
+      <div class="machine-filter-menu" id="machineFilterMenu" hidden>
+        <label class="machine-filter-option">
+          <input id="hideInactiveMachinesFilter" type="checkbox" />
+          <span>Hide inactive machines</span>
+        </label>
+      </div>
+    </div>
   </div>
 
   <div id="machinesTab" class="main-tab-content active">
@@ -7818,6 +7859,10 @@ DASHBOARD_HTML = """
   const machineCountEl = document.getElementById("machine-count");
   const machineGrid = document.getElementById("machineGrid");
   const additionalMachineGrid = document.getElementById("additionalMachineGrid");
+  const machineFilterWrap = document.getElementById("machineFilterWrap");
+  const machineFilterBtn = document.getElementById("machineFilterBtn");
+  const machineFilterMenu = document.getElementById("machineFilterMenu");
+  const hideInactiveMachinesFilter = document.getElementById("hideInactiveMachinesFilter");
   const jobQueueSummary = document.getElementById("jobQueueSummary");
   const jobQueueTableWrap = document.getElementById("jobQueueTableWrap");
   const planningJobInput = document.getElementById("planningJobInput");
@@ -7976,6 +8021,13 @@ DASHBOARD_HTML = """
     "M00121", "M00122", "M00123", "M00124", "M00125", "M00126",
     "M00141", "M00142", "M00143", "M00144",
   ]);
+  function isFactory4Machine(code, session = null){
+    const machineCode = String(code || "").trim().toUpperCase();
+    if(ADDITIONAL_MACHINE_CODES.has(machineCode)) return true;
+    const displayName = String(session?.machine_name || MACHINE_NAME_MAP[machineCode] || "").trim().toUpperCase();
+    if(/^IMM\\s*4\\d{2}\\b/.test(displayName)) return true;
+    return /^M0*4\\d{2}$/.test(machineCode);
+  }
   const DEFAULT_MACHINE_CODES = Object.keys(MACHINE_NAME_MAP);
   let latestState = { sessions: [], active_ttl_seconds: 30 };
   let planningBoard = { lanes: { BACKLOG: [] }, updated_at_utc: "" };
@@ -8033,6 +8085,10 @@ DASHBOARD_HTML = """
   let settingsProfilesState = [];
   let machineStatusOverridesState = {};
   let visibleMachineCodesState = [];
+  let hideInactiveMachines = (() => {
+    try { return localStorage.getItem("hideInactiveMachines") === "1"; }
+    catch(_err) { return false; }
+  })();
   let activeMachineDetailCode = "";
   let userKpiRoleState = "operator";
   let userKpiLoading = false;
@@ -8055,14 +8111,26 @@ DASHBOARD_HTML = """
     );
   }
 
+  function hasOngoingMachineSession(session){
+    if(!session || typeof session !== "object") return false;
+    return !!(
+      String(session.production_session_id || "").trim() ||
+      String(session.job_code || session.job_name || "").trim() ||
+      String(session.operator_id || "").trim() ||
+      Number(session.pack_total || session.good_total || session.butal_total || session.reject_total || 0) > 0 ||
+      isMaintenanceSession(session)
+    );
+  }
+
   function statusClass(lastSeenUtc, activeTtlSeconds = 30, manualStatus = "", session = null){
     if(String(manualStatus || "").trim()) return "maintenance";
-    if(!lastSeenUtc) return "disconnected";
+    const ongoing = hasOngoingMachineSession(session);
+    if(!lastSeenUtc) return ongoing ? "disconnected" : "inactive";
     const seen = new Date(lastSeenUtc).getTime();
-    if(Number.isNaN(seen)) return "disconnected";
+    if(Number.isNaN(seen)) return ongoing ? "disconnected" : "inactive";
     const ageSec = (Date.now() - seen) / 1000;
     const connected = ageSec <= Number(activeTtlSeconds || 30);
-    if(!connected) return "disconnected";
+    if(!connected) return ongoing ? "disconnected" : "inactive";
     return isMaintenanceSession(session) ? "maintenance" : "active";
   }
 
@@ -8089,6 +8157,20 @@ DASHBOARD_HTML = """
     const mm = Math.floor((t % 3600) / 60);
     const ss = t % 60;
     return `${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+  }
+
+  function fmtStatusDuration(s){
+    const n = Number(s);
+    if(!Number.isFinite(n) || n < 0) return "-";
+    const totalMinutes = Math.floor(n / 60);
+    const days = Math.floor(totalMinutes / 1440);
+    const hours = Math.floor((totalMinutes % 1440) / 60);
+    const minutes = totalMinutes % 60;
+    const parts = [];
+    if(days > 0) parts.push(`${days} ${days === 1 ? "day" : "days"}`);
+    if(hours > 0 || days > 0) parts.push(`${hours} ${hours === 1 ? "hr" : "hrs"}`);
+    parts.push(`${minutes} ${minutes === 1 ? "min" : "mins"}`);
+    return parts.join(" ");
   }
 
   function machineCounterStartValue(session){
@@ -9111,6 +9193,48 @@ DASHBOARD_HTML = """
     return (machineStatusOverridesState && machineStatusOverridesState[c]) || null;
   }
 
+  function clientActivityLevel(row){
+    const source = String(row?.source || "APP").toUpperCase();
+    const message = String(row?.message || "").toLowerCase();
+    if(source.includes("ERROR") || /invalid|failed|error|already scanned|cannot|not found|rejected/.test(message)) return "ERROR";
+    if(source === "SCAN") return "SCAN";
+    if(source.includes("SERVER") || source.includes("RECOVERY")) return "SYSTEM";
+    return "ACTION";
+  }
+
+  function renderMachineClientActivity(items){
+    const rows = (Array.isArray(items) ? items : []).map((row, idx) => ({
+      index: idx + 1,
+      time: fmtDateLocal(row?.timestamp_utc || ""),
+      level: clientActivityLevel(row),
+      source: row?.source || "APP",
+      actor: row?.actor || "-",
+      message: row?.message || "-",
+    }));
+    return tableFromRows(rows, [
+      ["#", "index"],
+      ["Time", "time"],
+      ["Type", "level"],
+      ["Source", "source"],
+      ["Actor", "actor"],
+      ["Action / Error", "message"],
+    ], "No client activity has been received for this machine yet.", 400);
+  }
+
+  async function loadMachineClientActivity(machineCode){
+    const target = document.getElementById("machineClientActivityLog");
+    if(!target) return;
+    try{
+      const response = await fetch(`/api/machines/${encodeURIComponent(machineCode)}/activity?limit=400`, {cache:"no-store"});
+      const body = await response.json();
+      if(!response.ok || !body?.ok) throw new Error(body?.error || `HTTP ${response.status}`);
+      if(String(activeMachineDetailCode || "") !== String(machineCode || "")) return;
+      target.innerHTML = renderMachineClientActivity(body.items || []);
+    }catch(error){
+      target.innerHTML = `<div class="machine-detail-empty">Unable to load client activity: ${esc(error?.message || error)}</div>`;
+    }
+  }
+
   function openMachineDetail(session){
     if(!session) return;
     if(session._is_archived_detail){
@@ -9347,6 +9471,11 @@ DASHBOARD_HTML = """
         ` : ""}
       </div>
       <div class="machine-detail-section">
+        <h4>Client Activity Log</h4>
+        <div class="hint" style="margin-bottom:8px;">Newest first. Includes scans, accepted/rejected messages, errors, connection/queue events, and app actions reported by this client.</div>
+        <div id="machineClientActivityLog"><div class="machine-detail-empty">Loading client activity...</div></div>
+      </div>
+      <div class="machine-detail-section">
         <h4>Job Details</h4>
         <div class="machine-detail-grid">
           ${detailItem("Job Ref", job.ref_no || job.reference || job.id || "-")}
@@ -9365,6 +9494,7 @@ DASHBOARD_HTML = """
       </div>
     `;
     machineDetailOverlay.classList.add("active");
+    loadMachineClientActivity(activeMachineDetailCode);
   }
 
   function closeMachineDetail(){
@@ -13329,7 +13459,7 @@ DASHBOARD_HTML = """
     const activeTtlSeconds = Number((latestState && latestState.active_ttl_seconds) || 30);
     const manual = machineStatusOverrideFor(code);
     const manualStatus = String((manual && manual.status) || "").trim();
-    const css = statusClass(s.last_seen_utc, activeTtlSeconds, manualStatus, s) || "disconnected";
+    const css = statusClass(s.last_seen_utc, activeTtlSeconds, manualStatus, s) || "inactive";
     const statusLabel = manualStatus || css.toUpperCase();
     const hasStatusAlert = Boolean(manualStatus);
     const baseClassName = `card ${css}${hasStatusAlert ? " status-alert" : ""}`;
@@ -13391,7 +13521,7 @@ DASHBOARD_HTML = """
       const statusStartedAt = String(manual.started_at_utc || manual.updated_at_utc || "").trim();
       const statusStartedMs = Date.parse(statusStartedAt);
       const statusDuration = Number.isFinite(statusStartedMs)
-        ? fmtDowntimeSeconds(Math.max(0, Math.floor((Date.now() - statusStartedMs) / 1000)))
+        ? fmtStatusDuration(Math.max(0, Math.floor((Date.now() - statusStartedMs) / 1000)))
         : "-";
       return `
         <div class="machine-status-flashcard">
@@ -13509,7 +13639,7 @@ DASHBOARD_HTML = """
     document.querySelectorAll(".machine-status-live-duration[data-status-started]").forEach(el => {
       const startedMs = Date.parse(String(el.dataset.statusStarted || ""));
       if(!Number.isFinite(startedMs)) return;
-      el.textContent = fmtDowntimeSeconds(Math.max(0, Math.floor((Date.now() - startedMs) / 1000)));
+      el.textContent = fmtStatusDuration(Math.max(0, Math.floor((Date.now() - startedMs) / 1000)));
     });
   }
   window.setInterval(updateMachineStatusDurations, 1000);
@@ -13594,11 +13724,12 @@ DASHBOARD_HTML = """
       };
       const manual = machineStatusOverrideFor(code);
       const manualStatus = String((manual && manual.status) || "").trim();
-      const css = statusClass(s.last_seen_utc, activeTtlSeconds, manualStatus, s) || "disconnected";
+      const css = statusClass(s.last_seen_utc, activeTtlSeconds, manualStatus, s) || "inactive";
       const statusLabel = manualStatus || css.toUpperCase();
       s.machine_name = s.machine_name || MACHINE_NAME_MAP[code] || code;
       const card = upsertMachineCard(s, code, css, statusLabel);
-      const targetGrid = ADDITIONAL_MACHINE_CODES.has(code) ? additionalMachineGrid : machineGrid;
+      card.hidden = Boolean(hideInactiveMachines && css === "inactive");
+      const targetGrid = isFactory4Machine(code, s) ? additionalMachineGrid : machineGrid;
       if(card.parentNode !== targetGrid){
         targetGrid?.appendChild(card);
       }
@@ -13630,6 +13761,30 @@ DASHBOARD_HTML = """
       document.getElementById(target)?.classList.add("active");
       if(target === "userKpiTab") loadUserKpis();
     });
+  });
+  if(hideInactiveMachinesFilter) hideInactiveMachinesFilter.checked = hideInactiveMachines;
+  if(machineFilterBtn) machineFilterBtn.classList.toggle("active", hideInactiveMachines);
+  machineFilterBtn?.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const opening = Boolean(machineFilterMenu?.hidden);
+    if(machineFilterMenu) machineFilterMenu.hidden = !opening;
+    machineFilterBtn.setAttribute("aria-expanded", opening ? "true" : "false");
+  });
+  hideInactiveMachinesFilter?.addEventListener("change", () => {
+    hideInactiveMachines = Boolean(hideInactiveMachinesFilter.checked);
+    machineFilterBtn?.classList.toggle("active", hideInactiveMachines);
+    try { localStorage.setItem("hideInactiveMachines", hideInactiveMachines ? "1" : "0"); } catch(_err) {}
+    if(latestState) render(latestState);
+  });
+  document.addEventListener("click", (ev) => {
+    if(machineFilterWrap?.contains(ev.target)) return;
+    if(machineFilterMenu) machineFilterMenu.hidden = true;
+    machineFilterBtn?.setAttribute("aria-expanded", "false");
+  });
+  document.addEventListener("keydown", (ev) => {
+    if(ev.key !== "Escape") return;
+    if(machineFilterMenu) machineFilterMenu.hidden = true;
+    machineFilterBtn?.setAttribute("aria-expanded", "false");
   });
   document.querySelectorAll("[data-user-kpi-role]").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -15219,6 +15374,38 @@ async def api_machine_status_set(req: Request):
     }
 
 
+def _merge_client_app_logs(sess: MachineSession, incoming: Any) -> int:
+    rows = [dict(row) for row in (incoming or []) if isinstance(row, dict)]
+    if not rows:
+        return 0
+    merged = [dict(row) for row in (sess.client_app_logs or []) if isinstance(row, dict)]
+    seen = {
+        json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+        for row in merged
+    }
+    added = 0
+    for row in rows:
+        signature = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        merged.append(row)
+        added += 1
+    merged.sort(key=lambda row: str(row.get("timestamp_utc") or ""))
+    sess.client_app_logs = merged[-1000:]
+    return added
+
+
+def _session_protocol_payload(sess: Optional[MachineSession]) -> Optional[Dict[str, Any]]:
+    if sess is None:
+        return None
+    payload = sess.to_dict()
+    # Activity has its own on-demand endpoint; never echo the audit history on
+    # every heartbeat/event acknowledgement.
+    payload.pop("client_app_logs", None)
+    return payload
+
+
 def _session_snapshot_is_stale(sess: MachineSession, snap: Dict[str, Any]) -> bool:
     """Reject an older segment, but allow a continuing matching job.
 
@@ -15312,6 +15499,8 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
         sess.product_pack_history_logs = incoming_pack_logs
     if isinstance(snap.get("butal_scan_logs"), list):
         sess.butal_scan_logs = list(snap.get("butal_scan_logs") or [])
+    if isinstance(snap.get("client_app_logs"), list):
+        _merge_client_app_logs(sess, snap.get("client_app_logs"))
     if isinstance(snap.get("butal_by_job"), dict):
         sess.butal_by_job = {
             str(key): int(value or 0)
@@ -15443,6 +15632,26 @@ async def api_sync_capabilities():
     }
 
 
+@APP.get("/api/machines/{machine_code}/activity")
+async def api_machine_client_activity(machine_code: str, limit: int = 400):
+    code = str(machine_code or "").strip()
+    sess = SESSIONS.get(code)
+    if sess is None:
+        sess = next(
+            (row for key, row in SESSIONS.items() if str(key).strip().casefold() == code.casefold()),
+            None,
+        )
+    safe_limit = max(1, min(1000, int(limit or 400)))
+    rows = [dict(row) for row in ((sess.client_app_logs if sess else None) or []) if isinstance(row, dict)]
+    rows.sort(key=lambda row: str(row.get("timestamp_utc") or ""), reverse=True)
+    return {
+        "ok": True,
+        "machine_code": code,
+        "items": rows[:safe_limit],
+        "total": len(rows),
+    }
+
+
 @APP.post("/api/heartbeat")
 async def api_heartbeat(req: Request):
     """Lightweight client presence update; never mutates production counters."""
@@ -15462,14 +15671,27 @@ async def api_heartbeat(req: Request):
             {"ok": False, "error_code": "CLIENT_IDENTITY_CONFLICT", "error": f"Client ID {client_id} is already active"},
             status_code=409,
         )
-    _update_client_status(
+    client_status = _update_client_status(
         client_id,
         remote_host,
+        machine_code=machine_code,
+        machine_name=str(data.get("machine_name") or machine_code),
         event_type="HEARTBEAT",
         last_event="HEARTBEAT",
         machine_scanned=bool(machine_code),
     )
     session = SESSIONS.get(machine_code) if machine_code else None
+    activity_added = 0
+    if session is not None:
+        # Machine cards read the session timestamp, while the lightweight
+        # heartbeat previously refreshed only CLIENT_STATUSES. Keep both
+        # presence views aligned; the existing 3-second state tick broadcasts
+        # this in-memory timestamp without adding a full broadcast per client.
+        session.last_seen_utc = str(client_status.get("last_seen_utc") or utc_now().isoformat())
+        heartbeat_event = data.get("event") if isinstance(data.get("event"), dict) else {}
+        activity_added = _merge_client_app_logs(session, heartbeat_event.get("client_activity_logs"))
+        if activity_added:
+            _persist_active_sessions_state(machine_code)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     return {
         "ok": True,
@@ -15478,7 +15700,72 @@ async def api_heartbeat(req: Request):
         "elapsed_ms": round(elapsed_ms, 1),
         "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
         "server_authoritative": True,
-        "session": session.to_dict() if session is not None else None,
+        "client_activity_added": activity_added,
+        "session": _session_protocol_payload(session),
+    }
+
+
+@APP.post("/api/virtual-pack/reserve")
+async def api_virtual_pack_reserve(req: Request):
+    """Reserve a server-issued identity for one displayed virtual PACK QR."""
+    try:
+        data = await req.json()
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"Invalid JSON body: {exc}"}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({"ok": False, "error": "JSON body must be an object"}, status_code=400)
+
+    machine_code = str(data.get("machine_code") or "").strip()
+    job_code = str(data.get("job_code") or "").strip()
+    product_id = str(data.get("product_id") or "").strip()
+    if not machine_code or not job_code or not product_id:
+        return JSONResponse(
+            {"ok": False, "error": "machine_code, job_code, and product_id are required"},
+            status_code=400,
+        )
+    try:
+        requested_index = max(1, int(data.get("requested_index") or 1))
+    except (TypeError, ValueError):
+        requested_index = 1
+
+    normalized_job = job_code.lstrip("0") or "0"
+    normalized_product = product_id.lstrip("0") or "0"
+    max_used_index = 0
+    sess = SESSIONS.get(machine_code)
+    if sess is not None:
+        for row in sess.product_pack_history_logs or []:
+            if not isinstance(row, dict) or bool(row.get("voided")):
+                continue
+            row_job = str(row.get("po_number") or row.get("job_code") or "").strip()
+            row_product = str(row.get("product_p") or row.get("product_id") or "").strip()
+            if row_job and (row_job.lstrip("0") or "0") != normalized_job:
+                continue
+            if row_product and (row_product.lstrip("0") or "0") != normalized_product:
+                continue
+            try:
+                max_used_index = max(max_used_index, int(row.get("index") or 0))
+            except (TypeError, ValueError):
+                continue
+
+    reserved_index = max(requested_index, max_used_index + 1)
+    virtual_scan_id = uuid.uuid4().hex.upper()
+    _append_server_app_log(
+        "virtual_pack_reserved",
+        {
+            "client_id": str(data.get("client_id") or "").strip(),
+            "machine_code": machine_code,
+            "job_code": job_code,
+            "product_id": product_id,
+            "requested_index": requested_index,
+            "reserved_index": reserved_index,
+            "virtual_scan_id": virtual_scan_id,
+        },
+    )
+    return {
+        "ok": True,
+        "index": reserved_index,
+        "virtual_scan_id": virtual_scan_id,
+        "server_issued": True,
     }
 
 
@@ -15534,7 +15821,7 @@ async def api_event(req: Request):
             "ack_event_id": event_id,
             "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
             "server_authoritative": True,
-            "session": duplicate_session.to_dict() if duplicate_session is not None else None,
+            "session": _session_protocol_payload(duplicate_session),
         }
 
     client_id = str(data.get("client_id", "UNKNOWN")).strip() or "UNKNOWN"
@@ -15717,7 +16004,7 @@ async def api_event(req: Request):
                     "error": "Older job-start event cannot replace the current production session",
                     "incoming_production_session_id": incoming_session_id,
                     "current_production_session_id": current_session_id,
-                    "session": sess.to_dict(),
+                    "session": _session_protocol_payload(sess),
                 },
                 status_code=409,
             )
@@ -15745,7 +16032,7 @@ async def api_event(req: Request):
                 "error": "Event belongs to an older production session",
                 "incoming_production_session_id": incoming_session_id,
                 "current_production_session_id": current_session_id,
-                "session": sess.to_dict(),
+                "session": _session_protocol_payload(sess),
             },
             status_code=409,
         )
@@ -15761,7 +16048,7 @@ async def api_event(req: Request):
                 "error_code": "MISSING_PRODUCTION_SESSION",
                 "error": "production_session_id is required for this active session",
                 "current_production_session_id": current_session_id,
-                "session": sess.to_dict(),
+                "session": _session_protocol_payload(sess),
             },
             status_code=409,
         )
@@ -15822,6 +16109,8 @@ async def api_event(req: Request):
         # HEARTBEAT events are normally not persisted. Save this repair before
         # broadcast_state() reloads the active-session snapshot from disk.
     sess.last_seen_utc = utc_now().isoformat()
+
+    _merge_client_app_logs(sess, ev.get("client_activity_logs"))
 
     # apply event counters if provided
     _append_server_app_log(
@@ -16409,7 +16698,7 @@ async def api_event(req: Request):
         "ack_event_id": event_id,
         "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
         "server_authoritative": True,
-        "session": resulting_session.to_dict() if resulting_session is not None else None,
+        "session": _session_protocol_payload(resulting_session),
     }
 
 

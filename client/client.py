@@ -18645,6 +18645,7 @@ QWidget#ClientUIRoot {{
             return None
         p_digits, q_digits, i_digits, t_digits, lot_digits, po_digits = m.groups()
         product_code = p_digits.lstrip("0") or "0"
+        virtual_match = re.search(r"-V([A-Fa-f0-9]{16,64})\s*$", s)
         return {
             "product_name": f"Product {product_code}",
             "product_p": p_digits,
@@ -18653,6 +18654,7 @@ QWidget#ClientUIRoot {{
             "total_labels": str(int(t_digits)),
             "lot_number": lot_digits,  # preserve QR formatting
             "po_number": po_digits,    # preserve QR formatting
+            "virtual_scan_id": virtual_match.group(1).upper() if virtual_match else "",
         }
 
     def _next_printable_pack_payload(self) -> Optional[Dict[str, Any]]:
@@ -19092,7 +19094,44 @@ QWidget#ClientUIRoot {{
                 pass
         return max_idx + 1
 
-    def _build_generated_pack_qr_payload(self, lot_stamp: Optional[str] = None) -> Optional[str]:
+    def _reserve_virtual_pack_identity(self, requested_index: int) -> Dict[str, Any]:
+        fallback = {
+            "index": max(1, int(requested_index or 1)),
+            "virtual_scan_id": uuid.uuid4().hex.upper(),
+            "server_issued": False,
+        }
+        server_url = str((self.client_config or {}).get("server_url", SERVER_URL) or SERVER_URL).strip().rstrip("/")
+        if not server_url:
+            return fallback
+        try:
+            response = requests.post(
+                f"{server_url}/api/virtual-pack/reserve",
+                json={
+                    "client_id": self._current_client_id(),
+                    "machine_code": str(self.state.machine_code or "").strip(),
+                    "job_code": str(self.state.job_code or "").strip(),
+                    "product_id": self._generated_pack_product_id(),
+                    "production_session_id": str(self.state.production_session_id or "").strip(),
+                    "requested_index": fallback["index"],
+                },
+                timeout=2,
+            )
+            body = response.json() if response.content else {}
+            response.raise_for_status()
+            token = str(body.get("virtual_scan_id") or "").strip().upper()
+            reserved_index = max(1, int(body.get("index") or fallback["index"]))
+            if token:
+                return {"index": reserved_index, "virtual_scan_id": token, "server_issued": True}
+        except Exception as exc:
+            self._append_app_log("VIRTUAL PACK", f"Server reservation unavailable; using offline identity: {exc}")
+        return fallback
+
+    def _build_generated_pack_qr_payload(
+        self,
+        lot_stamp: Optional[str] = None,
+        index_value: Optional[int] = None,
+        virtual_scan_id: str = "",
+    ) -> Optional[str]:
         qty = self._generated_pack_qty_from_job_payload()
         if qty is None:
             return None
@@ -19101,8 +19140,8 @@ QWidget#ClientUIRoot {{
             return None
         lot = lot_stamp or datetime.now().strftime("%Y%m%d%H%M%S")
         total_qty = self._generated_pack_total_qty_from_job_payload()
-        idx = self._next_generated_pack_index()
-        return (
+        idx = max(1, int(index_value or self._next_generated_pack_index()))
+        payload = (
             "O00000000024"
             f"{self._zpad_digits(job_code, 11)}"
             "00000000000"
@@ -19113,6 +19152,8 @@ QWidget#ClientUIRoot {{
             f"T{self._zpad_digits(total_qty, 11)}"
             f"L{lot}-{self._zpad_digits(job_code, 12)}"
         )
+        token = re.sub(r"[^A-Fa-f0-9]+", "", str(virtual_scan_id or "")).upper()
+        return f"{payload}-V{token}" if token else payload
 
     def _qr_pixmap_for_payload(self, payload: str, size: int = 210) -> QPixmap:
         pm = QPixmap()
@@ -19178,7 +19219,13 @@ QWidget#ClientUIRoot {{
         context_key = f"{job_code}|{product_id}|{qty}|{next_index}|{total_qty}"
         if context_key != self._floating_pack_qr_context_key:
             lot_second = datetime.now().strftime("%Y%m%d%H%M%S")
-            payload = self._build_generated_pack_qr_payload(lot_second)
+            reservation = self._reserve_virtual_pack_identity(next_index)
+            reserved_index = max(1, int(reservation.get("index") or next_index))
+            payload = self._build_generated_pack_qr_payload(
+                lot_second,
+                index_value=reserved_index,
+                virtual_scan_id=str(reservation.get("virtual_scan_id") or ""),
+            )
             if not payload:
                 self._hide_floating_pack_qr_panel()
                 return
@@ -19192,7 +19239,7 @@ QWidget#ClientUIRoot {{
             if pm is None or pm.isNull():
                 self.floatingPackQrImage.setText("QR renderer missing")
             self.floatingPackQrTitle.setText(f"AUTO PACK QR  |  QTY {qty}")
-            self.floatingPackQrMeta.setText(f"INDEX {next_index}  |  TOTAL {total_qty}")
+            self.floatingPackQrMeta.setText(f"INDEX {reserved_index}  |  TOTAL {total_qty}")
         self._show_floating_pack_qr_panel()
 
     def _handle_pack_scan_floating_qr_state(self, raw_scan: str):
@@ -19287,6 +19334,9 @@ QWidget#ClientUIRoot {{
             parsed = self._extract_pack_history_fields(raw_scan)
             if isinstance(parsed, dict):
                 fields = parsed
+        virtual_scan_id = str(fields.get("virtual_scan_id") or "").strip().upper()
+        if virtual_scan_id:
+            return f"VIRTUAL|{virtual_scan_id}"
         idx = str(fields.get("index") or "").strip()
         pid = str(fields.get("product_p") or fields.get("product_id") or "").strip()
         po = self._normalize_job_code(fields.get("po_number"))
@@ -25229,6 +25279,13 @@ QWidget#ClientUIRoot {{
         if not s.machine_code:
             return
         event_payload = dict(event or {})
+        # Piggyback a small rolling audit batch on the existing event/heartbeat.
+        # The server deduplicates these rows, so no additional API requests are
+        # created for scan/status/UI/error logging.
+        event_payload.setdefault(
+            "client_activity_logs",
+            [dict(row) for row in list(getattr(self, "_app_logs", []) or [])[-80:] if isinstance(row, dict)],
+        )
         session_id = str(s.production_session_id or "").strip()
         if s.job_code and not session_id:
             session_id = self._legacy_production_session_id(
