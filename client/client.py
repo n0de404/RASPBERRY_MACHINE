@@ -11850,10 +11850,24 @@ QWidget#ClientUIRoot {{
             # snapshot is the one official state for this active session.
             if self._has_pending_server_mutations():
                 return
-            authoritative = {
+            server_authoritative = {
                 key: value for key, value in server_snap.items()
                 if not str(key).startswith("_ack_") and key != "_server_authoritative_replace"
             }
+            if (
+                local_snap.get("live_cycle_avg_seconds") is not None
+                and server_authoritative.get("live_cycle_avg_seconds") is None
+            ):
+                # An older/partial server cannot erase a valid locally measured
+                # PACK cycle merely by returning an empty optional field.
+                server_authoritative.pop("live_cycle_avg_seconds", None)
+            # The protocol response is authoritative for fields it carries,
+            # but MachineSession is intentionally smaller than ClientState.
+            # Merge it over the current client snapshot so omitted live/UI
+            # fields are not reset merely because the server has no column for
+            # them (live-cycle accumulators were the visible example).
+            authoritative = dict(local_snap)
+            authoritative.update(server_authoritative)
             self._restore_state_from_snapshot(authoritative)
             self._refresh_ui()
             self._save_active_session_snapshot(force=True)

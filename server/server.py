@@ -15560,6 +15560,12 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
     # the live client counter back after every accepted scan.
     if "cycle_time_current" in snap:
         sess.cycle_time_current = snap.get("cycle_time_current")
+    if "live_cycle_avg_seconds" in snap:
+        live_avg = snap.get("live_cycle_avg_seconds")
+        try:
+            sess.live_cycle_avg_seconds = float(live_avg) if live_avg is not None else None
+        except (TypeError, ValueError):
+            pass
     if "machine_counter_current" in snap:
         sess.machine_counter_current = _parse_int_or_none(snap.get("machine_counter_current"))
     if "machine_counter_shift_start" in snap:
