@@ -24333,6 +24333,8 @@ QWidget#ClientUIRoot {{
                 self._handle_pack_scan_floating_qr_state(raw_s)
                 product_name_for_pack = ""
                 product_sku_for_pack = ""
+                active_product_identity = self._job_product_identity_from_payload(s.job_payload)
+                active_product_sku = str(active_product_identity.get("product_sku") or "").strip()
                 pid = ""
                 scanned_job_code = self._extract_job_code_from_pack_qr(raw_s)
                 allowed_pack_job_codes = self._production_pack_job_codes()
@@ -24773,7 +24775,7 @@ QWidget#ClientUIRoot {{
                             "series_index": (pack_hist or {}).get("index") if isinstance(pack_hist, dict) else None,
                             "series_total": (pack_hist or {}).get("total_labels") if isinstance(pack_hist, dict) else None,
                             "product_id": pid or None,
-                            "product_sku": product_sku_for_pack or s.product_sku or None,
+                            "product_sku": product_sku_for_pack or active_product_sku or None,
                             "lot_number": (pack_hist or {}).get("lot_number") if isinstance(pack_hist, dict) else None,
                         },
                         "linkage_output_allocation": pack_allocation,
@@ -24786,7 +24788,9 @@ QWidget#ClientUIRoot {{
                                 if isinstance(pack_hist, dict) and (pack_hist or {}).get("index")
                                 else ""
                             ),
-                            f"{product_sku_for_pack or s.product_sku}" if (product_sku_for_pack or s.product_sku) else "",
+                            f"{product_sku_for_pack or active_product_sku}"
+                            if (product_sku_for_pack or active_product_sku)
+                            else "",
                             f"QTY {qty}",
                         )
                         if part
