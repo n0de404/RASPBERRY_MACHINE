@@ -17000,21 +17000,25 @@ QWidget#ClientUIRoot {{
         if current_label is None or next_label is None:
             return
         current = self._current_machine_counter_app_total()
-        next_counter = self._next_machine_counter_preview()
         current_text = f"Current Machine Counter: {current}" if current is not None else ""
-        next_text = f"Next Machine Counter: {next_counter}" if next_counter is not None else ""
         current_label.setText(current_text)
         current_label.setVisible(bool(current_text))
+        # Paint Current first. Next is intentionally derived only after the
+        # operator can see that newly calculated current value.
+        current_label.repaint()
+
+        next_counter = self._next_machine_counter_preview(current_counter=current)
+        next_text = f"Next Machine Counter: {next_counter}" if next_counter is not None else ""
         next_label.setText(next_text)
         next_label.setVisible(bool(next_text))
-        # A PACK handler still performs local persistence, animation, and
-        # queue work after this calculation. Paint now so neither value waits
-        # for control to return to the normal Qt refresh cycle.
-        current_label.repaint()
         next_label.repaint()
 
-    def _next_machine_counter_preview(self) -> Optional[int]:
-        current = self._current_machine_counter_app_total()
+    def _next_machine_counter_preview(self, current_counter: Optional[int] = None) -> Optional[int]:
+        current = (
+            int(current_counter)
+            if current_counter is not None
+            else self._current_machine_counter_app_total()
+        )
         pack_qty = self._latest_scanned_pack_qty()
         if pack_qty is None:
             pack_qty = self._generated_pack_qty_from_job_payload()
