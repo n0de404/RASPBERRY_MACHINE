@@ -95,7 +95,10 @@ async def _request_timing_middleware(request: Request, call_next):
         )
     return response
 
-ACTIVE_TTL_SECONDS = 15  # allow several 5s client heartbeat intervals before marking disconnected
+ACTIVE_TTL_SECONDS = max(
+    15,
+    int(float(os.environ.get("MACHINE_ACTIVE_TTL_SECONDS", "30") or 30)),
+)  # allow short local queue/network pauses without status flicker
 JOB_QUEUE_STALE_SECONDS = 24 * 60 * 60  # hide abandoned active-session snapshots after one day
 STATE_TICK_SECONDS = 3.0
 OPERATOR_BREAK_WINDOW_SECONDS = float(os.environ.get("MACHINE_OPERATOR_BREAK_WINDOW_SECONDS", "1800"))
@@ -2468,6 +2471,30 @@ CLIENT_STATUSES: Dict[str, Dict[str, Any]] = {}
 ACTIVE_SESSIONS_FILE_MTIME: Optional[float] = None
 
 
+def _preserve_fresher_session_presence(
+    loaded: MachineSession,
+    current: Optional[MachineSession],
+) -> MachineSession:
+    if current is None:
+        return loaded
+
+    loaded_client = str(getattr(loaded, "client_id", "") or "").strip()
+    current_client = str(getattr(current, "client_id", "") or "").strip()
+    if not loaded_client or loaded_client != current_client:
+        return loaded
+
+    loaded_session = str(getattr(loaded, "production_session_id", "") or "").strip()
+    current_session = str(getattr(current, "production_session_id", "") or "").strip()
+    if loaded_session and current_session and loaded_session != current_session:
+        return loaded
+
+    loaded_seen = str(getattr(loaded, "last_seen_utc", "") or "").strip()
+    current_seen = str(getattr(current, "last_seen_utc", "") or "").strip()
+    if current_seen and (not loaded_seen or current_seen > loaded_seen):
+        loaded.last_seen_utc = current_seen
+    return loaded
+
+
 def refresh_active_sessions_from_file() -> None:
     global ACTIVE_SESSIONS_FILE_MTIME
     try:
@@ -2481,7 +2508,7 @@ def refresh_active_sessions_from_file() -> None:
     for code, sess in load_active_sessions_seed().items():
         if not code:
             continue
-        SESSIONS[code] = sess
+        SESSIONS[code] = _preserve_fresher_session_presence(sess, SESSIONS.get(code))
 
 
 def _client_status_key(client_id: str, remote_host: str) -> str:
