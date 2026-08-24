@@ -17028,14 +17028,12 @@ QWidget#ClientUIRoot {{
                 pack_qty = int(allocation.get("main_qty") or pack_qty)
         if current is None or pack_qty is None or int(pack_qty or 0) <= 0:
             return None
-        s = self.state
-        current_good = max(
-            0,
-            int(s.good_total or 0) - int(s.operator_shift_baseline_good_total or 0),
-        )
-        current_cycles = self._machine_cycles_for_units(current_good)
-        next_cycles = self._machine_cycles_for_units(current_good + int(pack_qty))
-        return int(current) + max(0, next_cycles - current_cycles)
+        # Next is a forward preview from the already-updated Current value.
+        # Calculate the next PACK independently so a cavity remainder from the
+        # previous PACK cannot leave Next visually unchanged after Current
+        # advances (for example QTY 1 on a two-cavity job).
+        next_pack_cycles = self._machine_cycles_for_units(int(pack_qty))
+        return int(current) + max(1, next_pack_cycles)
 
     def _latest_scanned_pack_qty(self) -> Optional[int]:
         """Return the Q quantity encoded by the latest accepted PACK QR."""
