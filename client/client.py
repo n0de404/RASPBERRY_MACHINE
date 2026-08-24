@@ -13259,21 +13259,15 @@ QWidget#ClientUIRoot {{
         self._show_resolve_overlay()
 
     def _repair_initial_setup_state(self):
-        """Keep restored/partially completed initial setup on one valid step."""
+        """Derive the setup step from the confirmed cycle and counter values."""
         s = self.state
         if not (s.machine_code and s.job_code and s.operator_id):
             return
         cycle_valid = self._parse_cycle_seconds(s.cycle_time_current) is not None
         counter_valid = s.machine_counter_shift_start is not None
-        initial_flags = bool(
-            s.waiting_initial_cycle_time_input
-            or s.waiting_initial_cycle_qc_confirm
-            or s.waiting_initial_machine_counter_input
-        )
-        if not initial_flags:
-            return
-        # The initial QC flag is obsolete; initial cycle entry is confirmed by
-        # the confirm QR and then advances directly to machine counter.
+        # Server snapshots intentionally omit transient prompt flags. The two
+        # confirmed values are therefore the canonical setup progress:
+        # no cycle -> cycle prompt; cycle only -> counter prompt; both -> ready.
         s.waiting_initial_cycle_qc_confirm = False
         if not cycle_valid:
             s.waiting_initial_cycle_time_input = True
@@ -22020,6 +22014,9 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Machine counter saved. Production can continue.")
                 self._refresh_ui()
                 self._save_active_session_snapshot()
+                self.sync_session_snapshot_to_server(
+                    "SESSION SNAPSHOT SYNC (INITIAL MACHINE COUNTER CONFIRMED)"
+                )
                 self._resume_pending_pack_after_prerequisites()
                 return
             self.status.setText("Machine counter setup: scan numpad digits, backspace, confirm.")
@@ -22057,6 +22054,9 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Cycle time saved. Input machine counter next.")
                 self._refresh_ui()
                 self._save_active_session_snapshot()
+                self.sync_session_snapshot_to_server(
+                    "SESSION SNAPSHOT SYNC (INITIAL CYCLE TIME CONFIRMED)"
+                )
                 return
             self.status.setText("Cycle Time setup: scan num_0..num_9, backspace, confirm.")
             return
