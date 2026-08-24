@@ -13280,6 +13280,23 @@ QWidget#ClientUIRoot {{
         s.waiting_initial_cycle_time_input = False
         s.waiting_initial_machine_counter_input = not counter_valid
 
+    def _restore_visible_initial_prompt_state(self) -> None:
+        """Let a visible initial setup prompt keep ownership of numpad scans."""
+        overlay = getattr(self, "resolveOverlay", None)
+        title_label = getattr(self, "resolveTitle", None)
+        if overlay is None or title_label is None or not overlay.isVisible():
+            return
+        title = str(title_label.text() or "").strip().upper()
+        s = self.state
+        if "INITIAL CYCLE TIME" in title:
+            s.waiting_initial_cycle_time_input = True
+            s.waiting_initial_cycle_qc_confirm = False
+            s.waiting_initial_machine_counter_input = False
+        elif "INITIAL MACHINE COUNTER" in title:
+            s.waiting_initial_cycle_time_input = False
+            s.waiting_initial_cycle_qc_confirm = False
+            s.waiting_initial_machine_counter_input = True
+
     def _show_cycle_time_confirm_popup(self, reviewer: Dict[str, str]):
         s = self.state
         s.supervisor_review_open = True
@@ -19473,6 +19490,7 @@ QWidget#ClientUIRoot {{
         if not key:
             return True
         low = key.lower()
+        self._restore_visible_initial_prompt_state()
         s = self.state
         input_mode = bool(
             s.waiting_initial_cycle_time_input
@@ -21386,6 +21404,11 @@ QWidget#ClientUIRoot {{
         raw_s = str(raw).strip()
         raw_l = raw_s.lower()
         s = self.state
+        # Server/session reconciliation can omit transient input flags while
+        # the local setup overlay is still visibly asking for a value. Restore
+        # the prompt mode before repair/routing so numpad scans cannot fall
+        # through to the reject multiplier.
+        self._restore_visible_initial_prompt_state()
         self._repair_initial_setup_state()
         if raw_s:
             self._append_app_log("SCAN", f"QR scanned: {raw_s}")
