@@ -9220,6 +9220,7 @@ QWidget#ClientUIRoot {{
         else:
             self.state.waiting_shift_end_machine_counter_input = False
             self.state.machine_counter_input = ""
+            self.state.cycle_time_new_input = ""
         self._finish_shift_cancel_snapshot = None
         self.status.setText("Finish shift cancelled. Continue the current operator shift.")
         self._refresh_ui()
@@ -10000,7 +10001,7 @@ QWidget#ClientUIRoot {{
         elif s.waiting_initial_machine_counter_input:
             self._set_banner_text("Initial setup: Input machine counter")
         elif s.waiting_shift_end_machine_counter_input:
-            self._set_banner_text("Shift end: Input machine counter")
+            self._set_banner_text("Shift end: Input cycle time")
         elif s.waiting_cycle_time_confirm_popup:
             self._set_banner_text("Supervisor cycle review: scan confirm, then Supervisor QR")
         elif s.waiting_initial_cycle_qc_confirm:
@@ -12914,6 +12915,18 @@ QWidget#ClientUIRoot {{
         s.raw_material_unique_keys = set()
         s.product_pack_history_logs = []
         s.product_pack_history_keys = set()
+        # A finished shift must never reuse the previous session's displayed
+        # virtual QR or PACK cooldown state, even when the next job code is the
+        # same as the one that just ended.
+        self._floating_pack_qr_last_job_code = ""
+        self._floating_pack_qr_enabled_job_code = ""
+        self._floating_pack_qr_suppressed_job_code = ""
+        self._floating_pack_qr_payload = ""
+        self._floating_pack_qr_context_key = ""
+        self._floating_pack_qr_recent_payloads = []
+        self._floating_pack_qr_scan_pending_payload = ""
+        self._last_accepted_pack_scan_at = 0.0
+        self._last_accepted_pack_scan_cooldown_seconds = 0.0
         s.butal_scan_logs = []
         s.startup_reject_total = 0
         s.reject_review_logs = []
@@ -16825,15 +16838,17 @@ QWidget#ClientUIRoot {{
         no_shot_total: Any = 0,
         startup_reject_total: Any = 0,
     ) -> int:
-        produced_units = max(
+        # Cavities apply only to GOOD pieces. Every Butal, Reject, Startup
+        # Reject, and No Shot represents one additional machine cycle.
+        good_cycles = self._machine_cycles_for_units(max(0, int(good_total or 0)))
+        exception_cycles = max(
             0,
-            int(good_total or 0)
-            + int(butal_total or 0)
+            int(butal_total or 0)
             + int(reject_total or 0)
             + int(no_shot_total or 0)
             + int(startup_reject_total or 0),
         )
-        return self._machine_cycles_for_units(produced_units)
+        return good_cycles + exception_cycles
 
     def _current_job_cavity_count(self) -> int:
         payload = self.state.job_payload if isinstance(self.state.job_payload, dict) else {}
@@ -16872,6 +16887,11 @@ QWidget#ClientUIRoot {{
             return override_value + max(0, current_delta - override_baseline)
         return start_counter + current_delta
 
+    def _sync_machine_counter_current(self) -> None:
+        app_counter = self._current_machine_counter_app_total()
+        if app_counter is not None:
+            self.state.machine_counter_current = int(app_counter)
+
     def _next_machine_counter_preview(self) -> Optional[int]:
         current = self._current_machine_counter_app_total()
         pack_qty = self._latest_scanned_pack_qty()
@@ -16883,9 +16903,13 @@ QWidget#ClientUIRoot {{
                 pack_qty = int(allocation.get("main_qty") or pack_qty)
         if current is None or pack_qty is None or int(pack_qty or 0) <= 0:
             return None
-        current_units = self._current_operator_output_units()
-        current_cycles = self._machine_cycles_for_units(current_units)
-        next_cycles = self._machine_cycles_for_units(current_units + int(pack_qty))
+        s = self.state
+        current_good = max(
+            0,
+            int(s.good_total or 0) - int(s.operator_shift_baseline_good_total or 0),
+        )
+        current_cycles = self._machine_cycles_for_units(current_good)
+        next_cycles = self._machine_cycles_for_units(current_good + int(pack_qty))
         return int(current) + max(0, next_cycles - current_cycles)
 
     def _latest_scanned_pack_qty(self) -> Optional[int]:
@@ -16923,7 +16947,17 @@ QWidget#ClientUIRoot {{
         )
 
     def _current_operator_machine_output_delta(self) -> int:
-        return self._machine_cycles_for_units(self._current_operator_output_units())
+        s = self.state
+        return self._machine_output_total_from_counts(
+            good_total=max(0, int(s.good_total or 0) - int(s.operator_shift_baseline_good_total or 0)),
+            butal_total=max(0, int(s.butal_total or 0) - int(s.operator_shift_baseline_butal_total or 0)),
+            reject_total=max(0, int(s.reject_total or 0) - int(s.operator_shift_baseline_reject_total or 0)),
+            no_shot_total=max(0, int(s.no_shot_total or 0) - int(s.operator_shift_baseline_no_shot_total or 0)),
+            startup_reject_total=max(
+                0,
+                int(s.startup_reject_total or 0) - int(s.operator_shift_baseline_startup_reject_total or 0),
+            ),
+        )
 
     def _record_cycle_time_change(
         self,
@@ -17062,9 +17096,7 @@ QWidget#ClientUIRoot {{
         # counter immediately after every accepted PACK (physical or virtual).
         # The app total still derives from the shift-start counter, production
         # output, cavities, and any approved overwrite baseline.
-        app_counter = self._current_machine_counter_app_total()
-        if app_counter is not None:
-            s.machine_counter_current = int(app_counter)
+        self._sync_machine_counter_current()
 
     def _http_error_snippet(self, resp: Any, max_len: int = 180) -> str:
         try:
@@ -18168,6 +18200,18 @@ QWidget#ClientUIRoot {{
 
     def _compute_total_job_duration_seconds(self) -> int:
         s = self.state
+        # Job duration belongs to the production session, not to the sum of
+        # operator-shift rows. Using job_started_at prevents double counting,
+        # resets, and gaps when a shift is finalized or restored.
+        job_started_raw = str(s.job_started_at or "").strip()
+        if job_started_raw:
+            try:
+                job_started_dt = datetime.fromisoformat(job_started_raw.replace("Z", "+00:00"))
+                if job_started_dt.tzinfo is None:
+                    job_started_dt = job_started_dt.replace(tzinfo=timezone.utc)
+                return max(0, int((datetime.now(timezone.utc) - job_started_dt.astimezone(timezone.utc)).total_seconds()))
+            except Exception:
+                pass
         total_seconds = 0.0
         for row in (s.operator_shift_logs or []):
             if not isinstance(row, dict):
@@ -19343,7 +19387,16 @@ QWidget#ClientUIRoot {{
                 fields = parsed
         virtual_scan_id = str(fields.get("virtual_scan_id") or "").strip().upper()
         if virtual_scan_id:
-            return f"VIRTUAL|{virtual_scan_id}"
+            # Virtual labels are unique inside a production session. Scoping
+            # the key prevents a finished shift from making a fresh session's
+            # generated label look permanently used, while the in-session key
+            # still blocks an accidental double scan.
+            session_id = str(
+                row.get("production_session_id")
+                or self.state.production_session_id
+                or "LEGACY"
+            ).strip()
+            return f"VIRTUAL|{session_id}|{virtual_scan_id}"
         idx = str(fields.get("index") or "").strip()
         pid = str(fields.get("product_p") or fields.get("product_id") or "").strip()
         po = self._normalize_job_code(fields.get("po_number"))
@@ -19391,7 +19444,10 @@ QWidget#ClientUIRoot {{
         )
         # Repeated digits are intentional input (11, 1001, etc.). Transport
         # deduplication is appropriate for production labels, not numpad keys.
-        if input_mode and (re.fullmatch(r"num_[0-9]", low) or low in ("backspace", "confirm")):
+        if input_mode and (
+            self._numpad_digit_from_scan(low) is not None
+            or self._numpad_command_from_scan(low) in ("backspace", "confirm")
+        ):
             return False
         if (
             (low in ("finishjob", "finishjob~1", "jobfinish") and self._pending_final_review_payload)
@@ -19409,6 +19465,17 @@ QWidget#ClientUIRoot {{
         last_seen = self._recent_scan_seen.get(key)
         self._recent_scan_seen[key] = now
         return last_seen is not None and (now - last_seen) <= window
+
+    def _numpad_digit_from_scan(self, raw: Any) -> Optional[str]:
+        """Accept the supported numeric-key QR spellings as one digit."""
+        low = str(raw or "").strip().lower()
+        match = re.fullmatch(r"(?:(?:num|numpad)[_\- ]?)?([0-9])(?:~1)?", low)
+        return match.group(1) if match else None
+
+    def _numpad_command_from_scan(self, raw: Any) -> str:
+        low = str(raw or "").strip().lower()
+        match = re.fullmatch(r"(backspace|confirm)(?:~1)?", low)
+        return match.group(1) if match else ""
 
     def _pack_scan_cooldown_seconds_for_qty(self, qty: Any) -> float:
         # PACK lockout is a fixed operator-configured interval.  It must not
@@ -19516,7 +19583,7 @@ QWidget#ClientUIRoot {{
 
     def _format_resolve_cycle_input_text(self) -> str:
         typed = str(self.state.cycle_time_new_input or "")
-        if self.state.waiting_initial_cycle_time_input or (
+        if self.state.waiting_initial_cycle_time_input or self.state.waiting_shift_end_machine_counter_input or (
             self.state.waiting_cycle_time_confirm_popup and int(self.state.cycle_time_confirm_phase or 1) == 1
         ):
             cursor = "|" if self._supervisor_input_cursor_on else " "
@@ -19540,20 +19607,25 @@ QWidget#ClientUIRoot {{
         s.waiting_initial_machine_counter_input = current_mode == "initial"
         s.waiting_shift_end_machine_counter_input = current_mode == "shift_end"
         if current_mode == "shift_end":
+            self._sync_machine_counter_current()
+            s.machine_counter_shift_end = self._parse_int_value(s.machine_counter_current)
             app_total = self._current_machine_counter_app_total()
-            self.resolveTitle.setText("SHIFT END MACHINE COUNTER")
-            self.resolveHint.setText("Use numpad to input machine counter, then confirm")
-            self.resolveOldCycleTitle.setText("APP MACHINE COUNTER")
+            self.resolveTitle.setText("SHIFT END CYCLE TIME")
+            self.resolveHint.setText("Use numpad to input the ending cycle time, then confirm")
+            self.resolveOldCycleTitle.setText("CURRENT VALUES")
             self.resolveOldCycle.setText(
-                f"App Machine Counter: {app_total if app_total is not None else '-'}"
+                f"Cycle Time: {s.cycle_time_current or '-'}  |  "
+                f"Auto Counter: {app_total if app_total is not None else '-'}"
             )
+            self.resolveNewCycleTitle.setText("ENDING CYCLE TIME")
+            self.resolveNewCycle.setText(self._format_resolve_cycle_input_text())
         else:
             self.resolveTitle.setText("INITIAL MACHINE COUNTER")
             self.resolveHint.setText("Use numpad to input machine counter, then confirm")
             self.resolveOldCycleTitle.setText("CURRENT CYCLE TIME")
             self.resolveOldCycle.setText(f"Cycle Time: {s.cycle_time_current or '-'}")
-        self.resolveNewCycleTitle.setText("MACHINE COUNTER INPUT")
-        self.resolveNewCycle.setText(self._format_machine_counter_input_text())
+            self.resolveNewCycleTitle.setText("MACHINE COUNTER INPUT")
+            self.resolveNewCycle.setText(self._format_machine_counter_input_text())
         self._show_resolve_overlay()
 
     def _ensure_initial_setup_prompt_visible(self):
@@ -19723,9 +19795,9 @@ QWidget#ClientUIRoot {{
         if self.state.supervisor_review_open and hasattr(self, "rejectSummaryCycleInput"):
             self.rejectSummaryCycleInput.setText(self._format_supervisor_cycle_input_text())
         if hasattr(self, "resolveNewCycle") and self.resolveNewCycle is not None:
-            if self.state.waiting_initial_machine_counter_input or self.state.waiting_shift_end_machine_counter_input:
+            if self.state.waiting_initial_machine_counter_input:
                 self.resolveNewCycle.setText(self._format_machine_counter_input_text())
-            elif self.state.waiting_initial_cycle_time_input or (
+            elif self.state.waiting_initial_cycle_time_input or self.state.waiting_shift_end_machine_counter_input or (
                 self.state.waiting_cycle_time_confirm_popup and int(self.state.cycle_time_confirm_phase or 1) == 1
             ):
                 self.resolveNewCycle.setText(self._format_resolve_cycle_input_text())
@@ -20280,6 +20352,7 @@ QWidget#ClientUIRoot {{
         if not job_key:
             return False
         s.butal_total += qty
+        self._sync_machine_counter_current()
         rows = dict(s.butal_by_job or {})
         rows[job_key] = int(rows.get(job_key, 0) or 0) + qty
         s.butal_by_job = rows
@@ -20597,6 +20670,7 @@ QWidget#ClientUIRoot {{
             s.product_pack_history_logs.pop(row_index)
             s.pack_count = max(0, int(s.pack_count or 0) - 1)
             s.good_total = max(0, int(s.good_total or 0) - qty)
+            self._sync_machine_counter_current()
             self._append_adjustment_log(
                 "PACK",
                 "VOID",
@@ -20663,6 +20737,7 @@ QWidget#ClientUIRoot {{
             row["voided_at"] = datetime.now(timezone.utc).isoformat()
             void_qty = int(row.get("qty") or qty or 0)
             s.butal_total = max(0, int(s.butal_total or 0) - void_qty)
+            self._sync_machine_counter_current()
             assigned_key = self._normalize_job_code(row.get("assigned_job_code"))
             if assigned_key and isinstance(s.butal_by_job, dict):
                 rows = dict(s.butal_by_job or {})
@@ -20699,6 +20774,7 @@ QWidget#ClientUIRoot {{
                 row["voided_by"] = supervisor_name
             if entry_type == "STARTUP_REJECT_SCAN":
                 s.startup_reject_total = max(0, int(s.startup_reject_total or 0) - 1)
+                self._sync_machine_counter_current()
                 self._append_adjustment_log(
                     "STARTUP_REJECT",
                     "VOID",
@@ -20712,6 +20788,7 @@ QWidget#ClientUIRoot {{
                     s.no_shot_total = max(0, int(s.no_shot_total or 0) - 1)
                 else:
                     s.reject_total = max(0, int(s.reject_total or 0) - 1)
+                self._sync_machine_counter_current()
                 if bucket_code:
                     s.reject_breakdown[bucket_code] = max(0, int(s.reject_breakdown.get(bucket_code, 0)) - 1)
                 self._append_adjustment_log(
@@ -20915,8 +20992,10 @@ QWidget#ClientUIRoot {{
             return "Scan a valid Supervisor badge."
         if s.waiting_initial_cycle_time_input:
             return 'Scan num_0 to num_9 for cycle time, then scan "confirm".'
-        if s.waiting_initial_machine_counter_input or s.waiting_shift_end_machine_counter_input:
+        if s.waiting_initial_machine_counter_input:
             return 'Scan num_0 to num_9 for the machine counter, then scan "confirm".'
+        if s.waiting_shift_end_machine_counter_input:
+            return 'Scan num_0 to num_9 for the ending cycle time, then scan "confirm".'
         if s.waiting_cycle_time_confirm_popup:
             if int(s.cycle_time_confirm_phase or 0) == 2:
                 return "Scan the same Supervisor badge."
@@ -21778,15 +21857,17 @@ QWidget#ClientUIRoot {{
             self._hide_product_history_overlay()
 
         if s.waiting_machine_counter_overwrite_input:
-            if raw_l.startswith("num_") and raw_l[-1:].isdigit():
-                s.machine_counter_input += raw_l[-1]
+            counter_digit = self._numpad_digit_from_scan(raw_s)
+            counter_command = self._numpad_command_from_scan(raw_s)
+            if counter_digit is not None:
+                s.machine_counter_input += counter_digit
                 self.resolveNewCycle.setText(self._format_machine_counter_input_text())
                 return
-            if raw_l == "backspace":
+            if counter_command == "backspace":
                 s.machine_counter_input = s.machine_counter_input[:-1]
                 self.resolveNewCycle.setText(self._format_machine_counter_input_text())
                 return
-            if raw_l == "confirm":
+            if counter_command == "confirm":
                 self.status.setText("Confirm is not required. Scan the Supervisor badge to apply this counter.")
                 return
             self.status.setText("Machine counter overwrite: input digits, then scan Supervisor badge.")
@@ -21802,17 +21883,19 @@ QWidget#ClientUIRoot {{
             return
 
         if s.waiting_initial_machine_counter_input:
-            if raw_l.startswith("num_") and raw_l[-1:].isdigit():
-                s.machine_counter_input += raw_l[-1]
+            counter_digit = self._numpad_digit_from_scan(raw_s)
+            counter_command = self._numpad_command_from_scan(raw_s)
+            if counter_digit is not None:
+                s.machine_counter_input += counter_digit
                 self.resolveNewCycle.setText(self._format_machine_counter_input_text())
                 self._ensure_initial_setup_prompt_visible()
                 return
-            if raw_l == "backspace":
+            if counter_command == "backspace":
                 s.machine_counter_input = s.machine_counter_input[:-1]
                 self.resolveNewCycle.setText(self._format_machine_counter_input_text())
                 self._ensure_initial_setup_prompt_visible()
                 return
-            if raw_l == "confirm":
+            if counter_command == "confirm":
                 if not self._commit_machine_counter_input("initial"):
                     return
                 self._hide_resolve_overlay()
@@ -21828,17 +21911,25 @@ QWidget#ClientUIRoot {{
             if raw_l in ("operatorshift~1", "operator_shift~1", "shiftchange~1"):
                 self._cancel_pending_finish_shift()
                 return
-            if raw_l.startswith("num_") and raw_l[-1:].isdigit():
-                s.machine_counter_input += raw_l[-1]
-                self.resolveNewCycle.setText(self._format_machine_counter_input_text())
+            cycle_digit = self._numpad_digit_from_scan(raw_s)
+            cycle_command = self._numpad_command_from_scan(raw_s)
+            if cycle_digit is not None:
+                s.cycle_time_new_input += cycle_digit
+                self.resolveNewCycle.setText(self._format_resolve_cycle_input_text())
                 return
-            if raw_l == "backspace":
-                s.machine_counter_input = s.machine_counter_input[:-1]
-                self.resolveNewCycle.setText(self._format_machine_counter_input_text())
+            if cycle_command == "backspace":
+                s.cycle_time_new_input = s.cycle_time_new_input[:-1]
+                self.resolveNewCycle.setText(self._format_resolve_cycle_input_text())
                 return
-            if raw_l == "confirm":
-                if not self._commit_machine_counter_input("shift_end"):
+            if cycle_command == "confirm":
+                if self._parse_cycle_seconds(s.cycle_time_new_input) is None:
+                    self.status.setText("Ending cycle time must be greater than zero. Scan valid digits first.")
                     return
+                self._set_cycle_time_current(s.cycle_time_new_input, source="finish_shift")
+                self._sync_machine_counter_current()
+                s.machine_counter_shift_end = self._parse_int_value(s.machine_counter_current)
+                s.waiting_shift_end_machine_counter_input = False
+                s.cycle_time_new_input = ""
                 shift_payload = self._finalize_current_operator_shift("QR_SHIFT_HANDOFF", emit_event=False)
                 if shift_payload is None:
                     self.status.setText("Operator shift handoff failed: no active operator data.")
@@ -21865,7 +21956,7 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Finish shift review open. Scan Supervisor QR to approve, or Operator Shift QR to cancel.")
                 self._save_active_session_snapshot()
                 return
-            self.status.setText("Shift end machine counter: scan numpad digits, backspace, confirm.")
+            self.status.setText("Shift end cycle time: scan numpad digits, backspace, confirm.")
             return
 
         if s.waiting_initial_cycle_time_input:
@@ -22767,6 +22858,7 @@ QWidget#ClientUIRoot {{
                 self.status.setText("BUTAL completion: remaining BUTAL quantity is invalid.")
                 return
             s.butal_total += qty
+            self._sync_machine_counter_current()
             job_key = self._normalize_job_code(s.job_code)
             if job_key:
                 rows = dict(s.butal_by_job or {})
@@ -22838,6 +22930,7 @@ QWidget#ClientUIRoot {{
                 pack_hist.update(owner_context)
                 pack_hist["operator"] = owner_context["active_operator"]
                 pack_hist["operator_name"] = owner_context["active_operator_name"]
+                pack_hist["production_session_id"] = str(s.production_session_id or "")
                 pack_hist["status"] = "BUTAL_COMPLETED"
                 pack_hist["voided"] = False
                 pack_hist["scanned_at"] = datetime.now(timezone.utc).isoformat()
@@ -22867,6 +22960,7 @@ QWidget#ClientUIRoot {{
             s.pack_count += 1
             carried_qty = int(s.butal_completion_carried_qty or 0)
             new_qty = int(s.butal_completion_new_qty or 0)
+            self._mark_live_cycle_scan_event(units=max(1, carried_qty + new_qty))
             self.status.setText(f"BUTAL pack completed: Pack +1, Good +0, Butal +{new_qty}.")
             self.log_last(f"BUTAL PACK COMPLETE | Pack +1 | Good +0 | Butal +{new_qty}")
             self.lblPack.add_points(1)
@@ -22972,9 +23066,9 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay("Finish the active reject/downtime flow first.")
                 return
             self._finish_shift_cancel_snapshot = self._state_to_active_snapshot()
-            s.machine_counter_input = ""
+            s.cycle_time_new_input = ""
             self._show_machine_counter_prompt("shift_end")
-            self.status.setText("Input machine counter before finish preview.")
+            self.status.setText("Input ending cycle time before finish preview. Machine counter is automatic.")
             return
 
         if res.kind == "COLOR_CHANGE_TRIGGER":
@@ -23196,6 +23290,7 @@ QWidget#ClientUIRoot {{
                     s.no_shot_total += qty
                 else:
                     s.reject_total += qty
+                self._sync_machine_counter_current()
                 if bucket_code:
                     s.reject_breakdown[bucket_code] = s.reject_breakdown.get(bucket_code, 0) + qty
                 for _ in range(qty):
@@ -23222,6 +23317,7 @@ QWidget#ClientUIRoot {{
             if res.kind == "STARTUP_REJECT":
                 qty = self._reject_multiplier_value()
                 s.startup_reject_total += qty
+                self._sync_machine_counter_current()
                 for _ in range(qty):
                     s.reject_review_logs.append(
                         {
@@ -23251,6 +23347,7 @@ QWidget#ClientUIRoot {{
                 return
             qty = self._reject_multiplier_value()
             s.startup_reject_total += qty
+            self._sync_machine_counter_current()
             for _ in range(qty):
                 s.reject_review_logs.append(
                     {
@@ -23284,6 +23381,7 @@ QWidget#ClientUIRoot {{
             bucket_code = self._reject_detail_bucket_code(reason_code)
             qty = self._reject_multiplier_value()
             s.no_shot_total += qty
+            self._sync_machine_counter_current()
             if bucket_code:
                 s.reject_breakdown[bucket_code] = s.reject_breakdown.get(bucket_code, 0) + qty
             for _ in range(qty):
@@ -24344,6 +24442,7 @@ QWidget#ClientUIRoot {{
                     pack_hist.update(owner_context)
                     pack_hist["operator"] = owner_context["active_operator"]
                     pack_hist["operator_name"] = owner_context["active_operator_name"]
+                    pack_hist["production_session_id"] = str(s.production_session_id or "")
                     pack_hist["status"] = "ACTIVE"
                     pack_hist["voided"] = False
                     pack_hist["linkage_output_allocation"] = dict(pack_allocation)
@@ -24643,6 +24742,7 @@ QWidget#ClientUIRoot {{
                     self._save_active_session_snapshot()
                     return
                 s.butal_total += qty
+                self._sync_machine_counter_current()
                 job_key = self._normalize_job_code(s.job_code)
                 if job_key:
                     rows = dict(s.butal_by_job or {})
