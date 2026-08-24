@@ -17007,6 +17007,11 @@ QWidget#ClientUIRoot {{
         current_label.setVisible(bool(current_text))
         next_label.setText(next_text)
         next_label.setVisible(bool(next_text))
+        # A PACK handler still performs local persistence, animation, and
+        # queue work after this calculation. Paint now so neither value waits
+        # for control to return to the normal Qt refresh cycle.
+        current_label.repaint()
+        next_label.repaint()
 
     def _next_machine_counter_preview(self) -> Optional[int]:
         current = self._current_machine_counter_app_total()
