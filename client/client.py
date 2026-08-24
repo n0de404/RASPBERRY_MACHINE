@@ -12285,6 +12285,7 @@ QWidget#ClientUIRoot {{
         return
 
     def _restore_state_from_snapshot(self, snap: Dict[str, Any]):
+        visible_numeric_prompt = self._capture_visible_numeric_prompt_state()
         s = self.state
         s.machine_code = snap.get("machine_code")
         s.machine_name = _machine_display_name(snap.get("machine_code"), snap.get("machine_name"))
@@ -12396,6 +12397,7 @@ QWidget#ClientUIRoot {{
         s.waiting_initial_cycle_qc_confirm = bool(snap.get("waiting_initial_cycle_qc_confirm"))
         s.waiting_cycle_time_confirm_popup = bool(snap.get("waiting_cycle_time_confirm_popup"))
         s.cycle_time_confirm_phase = int(snap.get("cycle_time_confirm_phase") or 0)
+        self._restore_captured_visible_numeric_prompt_state(visible_numeric_prompt)
         s.supervisor_review_open = bool(snap.get("supervisor_review_open"))
         s.supervisor_review_actor_code = snap.get("supervisor_review_actor_code")
         s.supervisor_review_actor_name = snap.get("supervisor_review_actor_name")
@@ -13296,6 +13298,52 @@ QWidget#ClientUIRoot {{
             s.waiting_initial_cycle_time_input = False
             s.waiting_initial_cycle_qc_confirm = False
             s.waiting_initial_machine_counter_input = True
+
+    def _capture_visible_numeric_prompt_state(self) -> Optional[Dict[str, Any]]:
+        """Keep live numpad input when an older session snapshot is restored."""
+        overlay = getattr(self, "resolveOverlay", None)
+        title_label = getattr(self, "resolveTitle", None)
+        if overlay is None or title_label is None or not overlay.isVisible():
+            return None
+        title = str(title_label.text() or "").strip().upper()
+        if "CYCLE TIME" not in title and "MACHINE COUNTER" not in title:
+            return None
+        s = self.state
+        return {
+            "title": title,
+            "cycle_time_new_input": str(s.cycle_time_new_input or ""),
+            "machine_counter_input": str(s.machine_counter_input or ""),
+            "waiting_cycle_time_input": bool(s.waiting_cycle_time_input),
+            "waiting_initial_cycle_time_input": bool(s.waiting_initial_cycle_time_input),
+            "waiting_initial_machine_counter_input": bool(s.waiting_initial_machine_counter_input),
+            "waiting_machine_counter_overwrite_input": bool(s.waiting_machine_counter_overwrite_input),
+            "waiting_cycle_time_confirm_popup": bool(s.waiting_cycle_time_confirm_popup),
+            "cycle_time_confirm_phase": int(s.cycle_time_confirm_phase or 0),
+        }
+
+    def _restore_captured_visible_numeric_prompt_state(self, captured: Optional[Dict[str, Any]]) -> None:
+        """Reapply input owned by the prompt that is still visible to the operator."""
+        if not captured:
+            return
+        s = self.state
+        title = str(captured.get("title") or "")
+        if "MACHINE COUNTER" in title:
+            s.machine_counter_input = str(captured.get("machine_counter_input") or "")
+            if "INITIAL" in title:
+                s.waiting_initial_cycle_time_input = False
+                s.waiting_initial_machine_counter_input = True
+            elif "OVERWRITE" in title:
+                s.waiting_machine_counter_overwrite_input = True
+        else:
+            s.cycle_time_new_input = str(captured.get("cycle_time_new_input") or "")
+            if "INITIAL" in title:
+                s.waiting_initial_cycle_time_input = True
+                s.waiting_initial_machine_counter_input = False
+            elif "SUPERVISOR" in title:
+                s.waiting_cycle_time_confirm_popup = True
+                s.cycle_time_confirm_phase = int(captured.get("cycle_time_confirm_phase") or 1)
+            elif "DOWNTIME" in title:
+                s.waiting_cycle_time_input = True
 
     def _show_cycle_time_confirm_popup(self, reviewer: Dict[str, str]):
         s = self.state
@@ -21683,12 +21731,14 @@ QWidget#ClientUIRoot {{
                     self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_new_input}")
                     self._supervisor_input_cursor_on = True
                     self._refresh_reject_summary_overlay()
+                    self._save_active_session_snapshot()
                     return
                 if raw_l == "backspace":
                     s.cycle_time_new_input = s.cycle_time_new_input[:-1]
                     self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_new_input}")
                     self._supervisor_input_cursor_on = True
                     self._refresh_reject_summary_overlay()
+                    self._save_active_session_snapshot()
                     return
                 if raw_l == "confirm":
                     if not s.cycle_time_new_input:
@@ -21926,10 +21976,12 @@ QWidget#ClientUIRoot {{
             if counter_digit is not None:
                 s.machine_counter_input += counter_digit
                 self.resolveNewCycle.setText(self._format_machine_counter_input_text())
+                self._save_active_session_snapshot()
                 return
             if counter_command == "backspace":
                 s.machine_counter_input = s.machine_counter_input[:-1]
                 self.resolveNewCycle.setText(self._format_machine_counter_input_text())
+                self._save_active_session_snapshot()
                 return
             if counter_command == "confirm":
                 self.status.setText("Confirm is not required. Scan the Supervisor badge to apply this counter.")
@@ -21953,11 +22005,13 @@ QWidget#ClientUIRoot {{
                 s.machine_counter_input += counter_digit
                 self.resolveNewCycle.setText(self._format_machine_counter_input_text())
                 self._ensure_initial_setup_prompt_visible()
+                self._save_active_session_snapshot()
                 return
             if counter_command == "backspace":
                 s.machine_counter_input = s.machine_counter_input[:-1]
                 self.resolveNewCycle.setText(self._format_machine_counter_input_text())
                 self._ensure_initial_setup_prompt_visible()
+                self._save_active_session_snapshot()
                 return
             if counter_command == "confirm":
                 if not self._commit_machine_counter_input("initial"):
@@ -21983,11 +22037,13 @@ QWidget#ClientUIRoot {{
                 s.cycle_time_new_input += raw_l[-1]
                 self._update_cycle_input_display()
                 self._ensure_initial_setup_prompt_visible()
+                self._save_active_session_snapshot()
                 return
             if raw_l == "backspace":
                 s.cycle_time_new_input = s.cycle_time_new_input[:-1]
                 self._update_cycle_input_display()
                 self._ensure_initial_setup_prompt_visible()
+                self._save_active_session_snapshot()
                 return
             if raw_l == "confirm":
                 if self._parse_cycle_seconds(s.cycle_time_new_input) is None:
@@ -22367,11 +22423,13 @@ QWidget#ClientUIRoot {{
                 s.cycle_time_new_input += raw_l[-1]
                 self._update_cycle_input_display()
                 self._refresh_downtime_panel()
+                self._save_active_session_snapshot()
                 return
             if raw_l == "backspace":
                 s.cycle_time_new_input = s.cycle_time_new_input[:-1]
                 self._update_cycle_input_display()
                 self._refresh_downtime_panel()
+                self._save_active_session_snapshot()
                 return
             if raw_l == "confirm":
                 if not s.cycle_time_new_input:
