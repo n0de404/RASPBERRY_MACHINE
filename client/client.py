@@ -16991,6 +16991,22 @@ QWidget#ClientUIRoot {{
         app_counter = self._current_machine_counter_app_total()
         if app_counter is not None:
             self.state.machine_counter_current = int(app_counter)
+        self._refresh_machine_counter_header_labels()
+
+    def _refresh_machine_counter_header_labels(self) -> None:
+        """Render counter labels immediately; the clock timer remains a fallback."""
+        current_label = getattr(self, "headerMachineCounter", None)
+        next_label = getattr(self, "headerNextMachineCounter", None)
+        if current_label is None or next_label is None:
+            return
+        current = self._current_machine_counter_app_total()
+        next_counter = self._next_machine_counter_preview()
+        current_text = f"Current Machine Counter: {current}" if current is not None else ""
+        next_text = f"Next Machine Counter: {next_counter}" if next_counter is not None else ""
+        current_label.setText(current_text)
+        current_label.setVisible(bool(current_text))
+        next_label.setText(next_text)
+        next_label.setVisible(bool(next_text))
 
     def _next_machine_counter_preview(self) -> Optional[int]:
         current = self._current_machine_counter_app_total()
@@ -18337,18 +18353,7 @@ QWidget#ClientUIRoot {{
 
     def _update_header_datetime(self):
         now_local = datetime.now()
-        machine_counter_text = ""
-        next_machine_counter_text = ""
-        machine_counter_live = self._current_machine_counter_app_total()
-        if machine_counter_live is not None:
-            machine_counter_text = f"Current Machine Counter: {machine_counter_live}"
-        next_machine_counter = self._next_machine_counter_preview()
-        if next_machine_counter is not None:
-            next_machine_counter_text = f"Next Machine Counter: {next_machine_counter}"
-        self.headerMachineCounter.setText(machine_counter_text)
-        self.headerMachineCounter.setVisible(bool(machine_counter_text))
-        self.headerNextMachineCounter.setText(next_machine_counter_text)
-        self.headerNextMachineCounter.setVisible(bool(next_machine_counter_text))
+        self._refresh_machine_counter_header_labels()
         job_started_text = ""
         job_started_raw = str(self.state.job_started_at or "").strip()
         if job_started_raw:
