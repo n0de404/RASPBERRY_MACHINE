@@ -15554,6 +15554,29 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
             dict(row) for row in snap.get("pdr_downtime_logs") or []
             if isinstance(row, dict)
         ]
+    # Ordinary production events (PACK, rejects, etc.) carry the same client
+    # snapshot used by SESSION_SYNC. Keep its calculated machine counter too;
+    # otherwise the protocol response returns the old start value and rolls
+    # the live client counter back after every accepted scan.
+    if "cycle_time_current" in snap:
+        sess.cycle_time_current = snap.get("cycle_time_current")
+    if "machine_counter_current" in snap:
+        sess.machine_counter_current = _parse_int_or_none(snap.get("machine_counter_current"))
+    if "machine_counter_shift_start" in snap:
+        sess.machine_counter_shift_start = _parse_int_or_none(snap.get("machine_counter_shift_start"))
+    if "machine_counter_shift_end" in snap:
+        sess.machine_counter_shift_end = _parse_int_or_none(snap.get("machine_counter_shift_end"))
+    if "machine_counter_override_value" in snap:
+        sess.machine_counter_override_value = _parse_int_or_none(snap.get("machine_counter_override_value"))
+    if "machine_counter_override_app_delta_baseline" in snap:
+        sess.machine_counter_override_app_delta_baseline = _parse_int_or_none(
+            snap.get("machine_counter_override_app_delta_baseline")
+        )
+    if isinstance(snap.get("machine_counter_overwrite_logs"), list):
+        sess.machine_counter_overwrite_logs = [
+            dict(row) for row in snap.get("machine_counter_overwrite_logs") or []
+            if isinstance(row, dict)
+        ]
     _clear_completed_stale_pdr_wait(sess)
     return True
 
