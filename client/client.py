@@ -9226,6 +9226,42 @@ QWidget#ClientUIRoot {{
         self._refresh_ui()
         self._save_active_session_snapshot()
 
+    def _open_finish_shift_review(self) -> bool:
+        """Finalize current values and open Supervisor review immediately."""
+        s = self.state
+        self._hide_resolve_overlay()
+        s.waiting_shift_end_machine_counter_input = False
+        s.machine_counter_input = ""
+        s.cycle_time_new_input = ""
+        self._sync_machine_counter_current()
+        s.machine_counter_shift_end = self._parse_int_value(s.machine_counter_current)
+        shift_payload = self._finalize_current_operator_shift("QR_SHIFT_HANDOFF", emit_event=False)
+        if shift_payload is None:
+            self.status.setText("Operator shift handoff failed: no active operator data.")
+            self._show_invalid_overlay("No active operator shift to save.")
+            return False
+        review_payloads = self._pending_shift_review_payloads_for_current_operator()
+        if not review_payloads:
+            review_payloads = [shift_payload]
+        existing_review_keys = {
+            self._finish_shift_row_key(row)
+            for row in review_payloads
+            if isinstance(row, dict) and self._finish_shift_row_key(row)
+        }
+        for linked_row in self._build_linked_operator_shift_payloads(shift_payload):
+            linked_key = self._finish_shift_row_key(linked_row)
+            if linked_key and linked_key in existing_review_keys:
+                continue
+            review_payloads.append(linked_row)
+            if linked_key:
+                existing_review_keys.add(linked_key)
+        self._show_operator_shift_overlay(review_payloads[0], review_payloads[1:])
+        self.status.setText(
+            "Finish shift review open. Scan Supervisor QR to approve, or Operator Shift QR to cancel."
+        )
+        self._save_active_session_snapshot()
+        return True
+
     def _confirm_pending_final_job_review(self):
         if not self._pending_final_review_payload:
             return
@@ -12514,7 +12550,12 @@ QWidget#ClientUIRoot {{
         elif s.waiting_initial_machine_counter_input:
             self._show_machine_counter_prompt("initial")
         elif s.waiting_shift_end_machine_counter_input:
-            self._show_machine_counter_prompt("shift_end")
+            # Compatibility with snapshots created by the former shift-end
+            # input flow. Finish Shift now opens review directly.
+            s.waiting_shift_end_machine_counter_input = False
+            s.cycle_time_new_input = ""
+            s.machine_counter_input = ""
+            self._hide_resolve_overlay()
         elif s.waiting_cycle_time_confirm_popup:
             self.resolveTitle.setText("SUPERVISOR CYCLE TIME REVIEW")
             if int(s.cycle_time_confirm_phase or 0) == 2:
@@ -21911,52 +21952,7 @@ QWidget#ClientUIRoot {{
             if raw_l in ("operatorshift~1", "operator_shift~1", "shiftchange~1"):
                 self._cancel_pending_finish_shift()
                 return
-            cycle_digit = self._numpad_digit_from_scan(raw_s)
-            cycle_command = self._numpad_command_from_scan(raw_s)
-            if cycle_digit is not None:
-                s.cycle_time_new_input += cycle_digit
-                self.resolveNewCycle.setText(self._format_resolve_cycle_input_text())
-                return
-            if cycle_command == "backspace":
-                s.cycle_time_new_input = s.cycle_time_new_input[:-1]
-                self.resolveNewCycle.setText(self._format_resolve_cycle_input_text())
-                return
-            if cycle_command == "confirm":
-                if self._parse_cycle_seconds(s.cycle_time_new_input) is None:
-                    self.status.setText("Ending cycle time must be greater than zero. Scan valid digits first.")
-                    return
-                self._set_cycle_time_current(s.cycle_time_new_input, source="finish_shift")
-                self._sync_machine_counter_current()
-                s.machine_counter_shift_end = self._parse_int_value(s.machine_counter_current)
-                s.waiting_shift_end_machine_counter_input = False
-                s.cycle_time_new_input = ""
-                shift_payload = self._finalize_current_operator_shift("QR_SHIFT_HANDOFF", emit_event=False)
-                if shift_payload is None:
-                    self.status.setText("Operator shift handoff failed: no active operator data.")
-                    self._show_invalid_overlay("No active operator shift to save.")
-                    return
-                review_payloads = self._pending_shift_review_payloads_for_current_operator()
-                if not review_payloads:
-                    review_payloads = [shift_payload]
-                existing_review_keys = {
-                    self._finish_shift_row_key(row)
-                    for row in review_payloads
-                    if isinstance(row, dict) and self._finish_shift_row_key(row)
-                }
-                for linked_row in self._build_linked_operator_shift_payloads(shift_payload):
-                    linked_key = self._finish_shift_row_key(linked_row)
-                    if linked_key and linked_key in existing_review_keys:
-                        continue
-                    review_payloads.append(linked_row)
-                    if linked_key:
-                        existing_review_keys.add(linked_key)
-                linked_shift_payloads = review_payloads[1:]
-                shift_payload = review_payloads[0]
-                self._show_operator_shift_overlay(shift_payload, linked_shift_payloads)
-                self.status.setText("Finish shift review open. Scan Supervisor QR to approve, or Operator Shift QR to cancel.")
-                self._save_active_session_snapshot()
-                return
-            self.status.setText("Shift end cycle time: scan numpad digits, backspace, confirm.")
+            self._open_finish_shift_review()
             return
 
         if s.waiting_initial_cycle_time_input:
@@ -23066,9 +23062,7 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay("Finish the active reject/downtime flow first.")
                 return
             self._finish_shift_cancel_snapshot = self._state_to_active_snapshot()
-            s.cycle_time_new_input = ""
-            self._show_machine_counter_prompt("shift_end")
-            self.status.setText("Input ending cycle time before finish preview. Machine counter is automatic.")
+            self._open_finish_shift_review()
             return
 
         if res.kind == "COLOR_CHANGE_TRIGGER":
