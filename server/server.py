@@ -2431,16 +2431,25 @@ ACTIVE_SESSIONS_JSON_FLUSH_SECONDS = max(
 )
 
 
-def _persist_active_sessions_state(machine_code: Optional[str] = None) -> None:
+def _persist_active_sessions_state(machine_code: Optional[str] = None) -> bool:
     """Durably commit changed SQL state and defer the full JSON backup."""
     global ACTIVE_SESSIONS_JSON_DIRTY
     code = str(machine_code or "").strip()
+    sql_saved = True
     if code and code in SESSIONS:
-        _upsert_active_session_sql(SESSIONS[code].to_dict())
+        sql_saved = _upsert_active_session_sql(SESSIONS[code].to_dict())
     else:
         for sess in SESSIONS.values():
-            _upsert_active_session_sql(sess.to_dict())
+            sql_saved = _upsert_active_session_sql(sess.to_dict()) and sql_saved
     ACTIVE_SESSIONS_JSON_DIRTY = True
+    if sql_saved:
+        return True
+    # If SQL is temporarily unavailable, do not acknowledge a production event
+    # while SQL is configured as authoritative. File-only installations may use
+    # the atomic JSON fallback as their durable store.
+    json_saved = _flush_active_sessions_json_if_due(force=True)
+    sql_authoritative = bool(pymysql is not None and _load_sql_config().get("enabled"))
+    return bool(json_saved and not sql_authoritative)
 
 
 def _flush_active_sessions_json_if_due(force: bool = False) -> bool:
@@ -15703,6 +15712,44 @@ def _apply_reject_counter_event(
         sess.reject_breakdown[bucket_code] = sess.reject_breakdown.get(bucket_code, 0) + qty
 
 
+PACK_COUNTER_EVENT_TYPES = {"PACK", "LAST_SHIFT_BUTAL_PACK", "BUTAL_COMPLETION_PACK"}
+
+
+def _pack_counter_event_key(event: Any) -> str:
+    ev = event if isinstance(event, dict) else {}
+    pack_record = ev.get("pack_record") if isinstance(ev.get("pack_record"), dict) else {}
+    pack_scan = ev.get("pack_scan") if isinstance(ev.get("pack_scan"), dict) else {}
+    return str(ev.get("pack_key") or pack_record.get("pack_key") or pack_scan.get("pack_key") or "").strip()
+
+
+def _session_has_pack_counter_event(sess: MachineSession, pack_key: str) -> bool:
+    key = str(pack_key or "").strip()
+    if not key:
+        return False
+    return any(
+        isinstance(row, dict) and str(row.get("pack_key") or "").strip() == key
+        for row in (sess.product_pack_history_logs or [])
+    )
+
+
+def _append_pack_counter_event_record(
+    sess: MachineSession,
+    event: Dict[str, Any],
+    event_created_at_utc: Any,
+) -> None:
+    pack_key = _pack_counter_event_key(event)
+    if not pack_key or _session_has_pack_counter_event(sess, pack_key):
+        return
+    source = event.get("pack_record") if isinstance(event.get("pack_record"), dict) else event.get("pack_scan")
+    row = dict(source) if isinstance(source, dict) else {}
+    row["pack_key"] = pack_key
+    row.setdefault("production_session_id", sess.production_session_id)
+    row.setdefault("scanned_at", str(event_created_at_utc or utc_now().isoformat()))
+    row.setdefault("status", "ACTIVE")
+    row.setdefault("voided", False)
+    sess.product_pack_history_logs = list(sess.product_pack_history_logs or []) + [row]
+
+
 @APP.get("/api/sync/capabilities")
 async def api_sync_capabilities():
     return {
@@ -16204,6 +16251,23 @@ async def api_event(req: Request):
             "last_event": str(data.get("last_event", ""))[:120],
         },
     )
+    pack_event_key = _pack_counter_event_key(ev) if ev_type in PACK_COUNTER_EVENT_TYPES else ""
+    if pack_event_key and _session_has_pack_counter_event(sess, pack_event_key):
+        if not _persist_active_sessions_state(machine_code):
+            return JSONResponse(
+                {"ok": False, "error": "Could not durably save duplicate PACK acknowledgement; retry required"},
+                status_code=503,
+            )
+        _mark_event_id_processed(event_id)
+        return {
+            "ok": True,
+            "duplicate": True,
+            "duplicate_pack_key": pack_event_key,
+            "ack_event_id": event_id,
+            "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
+            "server_authoritative": True,
+            "session": _session_protocol_payload(sess),
+        }
     if ev_type == "OPERATOR_SET":
         raw_operator_qr = str(ev.get("operator_qr_payload") or "").strip()
         if raw_operator_qr:
@@ -16712,6 +16776,10 @@ async def api_event(req: Request):
             key = str(ev.get("carryover_job_code") or sess.job_code or "").strip()
             if key:
                 sess.last_shift_butal_by_job.pop(key, None)
+    elif ev_type == "BUTAL_COMPLETION_PACK":
+        sess.pack_total += int(ev.get("pack_qty", 1) or 1)
+        sess.good_total += int(ev.get("good_qty", 0) or 0)
+        sess.butal_total += int(ev.get("butal_qty", 0) or 0)
     elif ev_type == "BUTAL":
         qty = int(ev.get("qty", 0) or 0)
         sess.butal_total += qty
@@ -16722,6 +16790,9 @@ async def api_event(req: Request):
             sess.butal_by_job = rows
     elif ev_type in {"REJECT", "STARTUP_REJECT"}:
         _apply_reject_counter_event(sess, ev_type, ev)
+
+    if ev_type in PACK_COUNTER_EVENT_TYPES:
+        _append_pack_counter_event_record(sess, ev, data.get("event_created_at_utc"))
 
     if ev_type not in ("SESSION_SYNC", "HEARTBEAT", "FINISH_JOB", "FINISH_SHIFT"):
         if _apply_embedded_session_snapshot(sess, ev.get("session_snapshot"), machine_code):
@@ -16748,8 +16819,16 @@ async def api_event(req: Request):
             data.get("event_created_at_utc") or utc_now().isoformat()
         )
 
+    state_persisted = True
     if ev_type not in ("HEARTBEAT", "FINISH_JOB"):
-        _persist_active_sessions_state(machine_code)
+        state_persisted = _persist_active_sessions_state(machine_code)
+    if ev_type in PACK_COUNTER_EVENT_TYPES and not state_persisted:
+        # Do not acknowledge/remove the client's durable PACK outbox entry
+        # until its counter and pack identity have reached durable storage.
+        return JSONResponse(
+            {"ok": False, "error": "PACK state was not durably saved; retry required"},
+            status_code=503,
+        )
 
     if ev_type != "HEARTBEAT":
         await broadcast_state()

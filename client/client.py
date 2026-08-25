@@ -676,6 +676,33 @@ def _server_event_queue_type(row: Dict[str, Any]) -> str:
     return ""
 
 
+PACK_COUNTER_EVENT_TYPES = {"PACK", "LAST_SHIFT_BUTAL_PACK", "BUTAL_COMPLETION_PACK"}
+
+
+def _server_event_queue_pack_key(row: Dict[str, Any]) -> str:
+    payload = row.get("payload") if isinstance(row, dict) else {}
+    event = payload.get("event") if isinstance(payload, dict) else {}
+    if not isinstance(event, dict) or _server_event_queue_type(row) not in PACK_COUNTER_EVENT_TYPES:
+        return ""
+    pack_record = event.get("pack_record") if isinstance(event.get("pack_record"), dict) else {}
+    pack_scan = event.get("pack_scan") if isinstance(event.get("pack_scan"), dict) else {}
+    return str(event.get("pack_key") or pack_record.get("pack_key") or pack_scan.get("pack_key") or "").strip()
+
+
+def _server_event_queue_pack_record(row: Dict[str, Any]) -> Dict[str, Any]:
+    payload = row.get("payload") if isinstance(row, dict) else {}
+    event = payload.get("event") if isinstance(payload, dict) else {}
+    if not isinstance(event, dict):
+        return {}
+    source = event.get("pack_record") if isinstance(event.get("pack_record"), dict) else event.get("pack_scan")
+    record = dict(source) if isinstance(source, dict) else {}
+    pack_key = _server_event_queue_pack_key(row)
+    if pack_key:
+        record["pack_key"] = pack_key
+    record.setdefault("production_session_id", payload.get("production_session_id"))
+    return record
+
+
 def _server_event_queue_row_is_defective(row: Dict[str, Any]) -> bool:
     """Reject payloads that the server cannot safely apply or acknowledge."""
     if not isinstance(row, dict):
@@ -3365,6 +3392,11 @@ class ClientUI(QWidget):
         self._pending_pack_prereq_raw: str = ""
         scanned_pack_keys = _load_scanned_pack_qr_keys_json()
         self._used_pack_qr_keys: Set[str] = set(scanned_pack_keys.keys() if isinstance(scanned_pack_keys, dict) else [])
+        self._used_pack_qr_keys.update(
+            key
+            for key in (_server_event_queue_pack_key(row) for row in _load_server_event_queue_json())
+            if key
+        )
         self._server_event_queue_lock = threading.Lock()
         self._server_was_offline = False
         self._server_connection_ok = False
@@ -23011,6 +23043,7 @@ QWidget#ClientUIRoot {{
                 self.status.setText("BUTAL completion: scan PACK QR to complete pack.")
                 return
             pack_hist = self._extract_pack_history_fields(raw_s)
+            pack_key = ""
             if pack_hist is not None:
                 scanned_job_code = self._extract_job_code_from_pack_qr(raw_s)
                 if scanned_job_code is None:
@@ -23057,7 +23090,6 @@ QWidget#ClientUIRoot {{
                 s.product_pack_history_logs.append(pack_hist)
                 if pack_key:
                     s.product_pack_history_keys.add(pack_key)
-                    self._mark_pack_qr_used_permanently(pack_key, pack_hist)
                 self._advance_floating_pack_qr_after_virtual_scan(raw_s)
             s.pack_count += 1
             carried_qty = int(s.butal_completion_carried_qty or 0)
@@ -23068,16 +23100,21 @@ QWidget#ClientUIRoot {{
             self.lblPack.add_points(1)
             self._refresh_ui()
             self._pulse_card(self.cardStatPack)
-            self.push_event(
+            pack_event_saved = self.push_event(
                 {
                     "type": "BUTAL_COMPLETION_PACK",
                     "pack_qty": 1,
                     "good_qty": 0,
                     "butal_qty": new_qty,
                     "carried_qty": carried_qty,
+                    "pack_key": pack_key,
+                    "pack_record": dict(pack_hist or {}),
                 },
                 f"BUTAL COMPLETION PACK +1 BUTAL +{new_qty}",
+                defer_snapshot=True,
             )
+            if pack_key and pack_event_saved:
+                self._mark_pack_qr_used_permanently(pack_key, pack_hist or {})
             self._clear_butal_completion_mode()
             self._save_active_session_snapshot()
             return
@@ -24344,6 +24381,7 @@ QWidget#ClientUIRoot {{
             if res.kind == "PACK":
                 qty = int(res.qty or 0)
                 pack_hist = self._extract_pack_history_fields(raw_s)
+                pack_key = ""
                 offline_mode = not bool(getattr(self, "_server_connection_ok", False))
                 learned_qr_rule = self._offline_qr_rule(raw_s) if offline_mode else ""
                 # Older clients remembered num_0 as PACK. That rule is no
@@ -24644,7 +24682,6 @@ QWidget#ClientUIRoot {{
                         s.product_pack_history_logs.append(pack_hist)
                         if pack_key:
                             s.product_pack_history_keys.add(pack_key)
-                            self._mark_pack_qr_used_permanently(pack_key, pack_hist)
                         self._advance_floating_pack_qr_after_virtual_scan(raw_s)
                         s.pack_count += 1
                         s.good_total += main_new_good_qty
@@ -24661,7 +24698,7 @@ QWidget#ClientUIRoot {{
                         self._pulse_card(self.cardStatPack)
                         self._pulse_card(self.cardStatGood)
                         self._pulse_card(self.cardStatTotalGood)
-                        self.push_event(
+                        pack_event_saved = self.push_event(
                             {
                                 "type": "LAST_SHIFT_BUTAL_PACK",
                                 "pack_qty": 1,
@@ -24671,10 +24708,14 @@ QWidget#ClientUIRoot {{
                                 "butal_qty": 0,
                                 "carried_qty": carried_butal_qty,
                                 "carryover_job_code": scanned_job_code or s.job_code,
+                                "pack_key": pack_key,
+                                "pack_record": dict(pack_hist or {}),
                             },
                             f"LAST SHIFT BUTAL PACK +1 GOOD +{main_new_good_qty}",
                             defer_snapshot=True,
                         )
+                        if pack_key and pack_event_saved:
+                            self._mark_pack_qr_used_permanently(pack_key, pack_hist or {})
                         return
                     if not defer_raw_consumption:
                         self._stamp_pack_raw_consumption(
@@ -24688,7 +24729,6 @@ QWidget#ClientUIRoot {{
                     s.product_pack_history_logs.append(pack_hist)
                     if pack_key:
                         s.product_pack_history_keys.add(pack_key)
-                        self._mark_pack_qr_used_permanently(pack_key, pack_hist)
                 carryover = self._current_job_last_shift_butal(scanned_job_code or s.job_code)
                 carried_butal_qty = int(carryover.get("qty") or 0)
                 if carried_butal_qty > 0:
@@ -24732,7 +24772,7 @@ QWidget#ClientUIRoot {{
                     self._pulse_card(self.cardStatPack)
                     self._pulse_card(self.cardStatGood)
                     self._pulse_card(self.cardStatTotalGood)
-                    self.push_event(
+                    pack_event_saved = self.push_event(
                         {
                             "type": "LAST_SHIFT_BUTAL_PACK",
                             "pack_qty": 1,
@@ -24742,10 +24782,14 @@ QWidget#ClientUIRoot {{
                             "butal_qty": 0,
                             "carried_qty": carried_butal_qty,
                             "carryover_job_code": scanned_job_code or s.job_code,
+                            "pack_key": pack_key,
+                            "pack_record": dict(pack_hist or {}),
                         },
                         f"LAST SHIFT BUTAL PACK +1 GOOD +{main_new_good_qty}",
                         defer_snapshot=True,
                     )
+                    if pack_key and pack_event_saved:
+                        self._mark_pack_qr_used_permanently(pack_key, pack_hist or {})
                     return
                 self._mark_pack_scan_accepted(qty)
                 main_pack_increment = 1 if main_pack_qty > 0 else 0
@@ -24790,13 +24834,16 @@ QWidget#ClientUIRoot {{
                 self._pulse_card(self.cardStatPack)
                 self._pulse_card(self.cardStatGood)
                 self._pulse_card(self.cardStatTotalGood)
-                self.push_event(
+                pack_event_saved = self.push_event(
                     {
                         "type": "PACK",
                         "pack_qty": main_pack_increment,
                         "qty": main_pack_qty,
                         "scanned_pack_qty": qty,
+                        "pack_key": pack_key,
+                        "pack_record": dict(pack_hist or {}),
                         "pack_scan": {
+                            "pack_key": pack_key,
                             "series_index": (pack_hist or {}).get("index") if isinstance(pack_hist, dict) else None,
                             "series_total": (pack_hist or {}).get("total_labels") if isinstance(pack_hist, dict) else None,
                             "product_id": pid or None,
@@ -24822,6 +24869,8 @@ QWidget#ClientUIRoot {{
                     ),
                     defer_snapshot=True,
                 )
+                if pack_key and pack_event_saved:
+                    self._mark_pack_qr_used_permanently(pack_key, pack_hist or {})
                 return
 
             if res.kind == "BUTAL":
@@ -25091,18 +25140,19 @@ QWidget#ClientUIRoot {{
         except Exception:
             return True
 
-    def _persist_server_event_item(self, item: Dict[str, Any]) -> None:
+    def _persist_server_event_item(self, item: Dict[str, Any]) -> bool:
         if not self._should_persist_server_event(item):
-            return
+            return True
         row = self._normalize_server_event_item(item)
         event_id = str(row.get("id") or "").strip()
         if not event_id:
-            return
+            return False
         with self._server_event_queue_lock:
             rows = _load_server_event_queue_json()
-            if not any(str(existing.get("id") or "") == event_id for existing in rows):
-                rows.append(row)
-                _save_server_event_queue_json(rows)
+            if any(str(existing.get("id") or "") == event_id for existing in rows):
+                return True
+            rows.append(row)
+            return _save_server_event_queue_json(rows)
 
     def _remove_persisted_server_event(self, event_id: str) -> None:
         eid = str(event_id or "").strip()
@@ -25141,6 +25191,9 @@ QWidget#ClientUIRoot {{
             queued_ids = set()
         for row in _load_server_event_queue_json():
             item = self._normalize_server_event_item(row, silent=bool(row.get("silent")))
+            pending_pack_key = _server_event_queue_pack_key(item)
+            if pending_pack_key:
+                self._used_pack_qr_keys.add(pending_pack_key)
             if str(item.get("id") or "") in queued_ids:
                 continue
             if not self._server_event_belongs_to_current_client(item):
@@ -25210,7 +25263,17 @@ QWidget#ClientUIRoot {{
                 if item_from_queue:
                     self._event_queue.task_done()
                 continue
-            self._persist_server_event_item(item)
+            if not self._persist_server_event_item(item):
+                retry_item = self._should_persist_server_event(item)
+                last_error = "could not durably save event to the local outbox"
+                if not bool(item.get("silent")):
+                    self.scanner_status.emit("Local event queue write failed. Scan is pending and was not sent.")
+                if item_from_queue:
+                    self._event_queue.task_done()
+                if retry_item and not self._event_worker_stop.is_set():
+                    priority_retry_item = item
+                    time.sleep(0.5)
+                continue
             event_type = self._server_event_type_from_item(item)
             retry_item = False
             discard_item = False
@@ -25287,6 +25350,12 @@ QWidget#ClientUIRoot {{
                 self._server_connection_ok = True
                 self._server_last_success_at = time.time()
                 self._remove_persisted_server_event(str(item.get("id") or ""))
+                pending_pack_key = _server_event_queue_pack_key(item)
+                if pending_pack_key and not discard_item:
+                    self._mark_pack_qr_used_permanently(
+                        pending_pack_key,
+                        _server_event_queue_pack_record(item),
+                    )
                 if discard_item:
                     event_type = event_type or "UNKNOWN"
                     self._append_app_log(
@@ -25362,7 +25431,12 @@ QWidget#ClientUIRoot {{
                 self.scanner_status.emit(f"Invalid server event was not queued: {event_type}")
             return False
         persistent = self._should_persist_server_event(item)
-        self._persist_server_event_item(item)
+        if persistent and not self._persist_server_event_item(item):
+            event_type = self._server_event_type_from_item(item) or "UNKNOWN"
+            self._append_app_log("SERVER QUEUE", f"Could not durably save {event_type} before queueing")
+            if not silent:
+                self.scanner_status.emit(f"Could not save {event_type} to the local retry queue.")
+            return False
         if bool(getattr(self, "_server_identity_conflict", False)) and self._server_event_type_from_item(item) != "HEARTBEAT":
             # Preserve valid production data on disk, but only heartbeat probes
             # are allowed to test whether the identity conflict has cleared.
@@ -25474,10 +25548,10 @@ QWidget#ClientUIRoot {{
             elif op == "delete":
                 _delete_active_session_json(payload.get("machine_code"))
 
-    def push_event(self, event: Dict[str, Any], last_event: str, silent: bool = False, defer_snapshot: bool = False):
+    def push_event(self, event: Dict[str, Any], last_event: str, silent: bool = False, defer_snapshot: bool = False) -> bool:
         s = self.state
         if not s.machine_code:
-            return
+            return False
         event_payload = dict(event or {})
         # Piggyback a small rolling audit batch on the existing event/heartbeat.
         # The server deduplicates these rows, so no additional API requests are
@@ -25522,7 +25596,7 @@ QWidget#ClientUIRoot {{
             "event": event_payload,
             "last_event": last_event,
         }
-        self._enqueue_server_event(payload, silent=silent)
+        return self._enqueue_server_event(payload, silent=silent)
 
     def closeEvent(self, event):
         self._save_active_session_snapshot()
