@@ -15678,6 +15678,31 @@ def _dashboard_event_description(
     return str(fallback or ev_type.replace("_", " ")).strip()
 
 
+def _apply_reject_counter_event(
+    sess: MachineSession,
+    event_type: str,
+    event: Dict[str, Any],
+) -> None:
+    ev_type = str(event_type or "").strip().upper()
+    ev = event if isinstance(event, dict) else {}
+    qty = int(ev.get("qty", 1) or 1)
+    if ev_type == "STARTUP_REJECT":
+        sess.startup_reject_total += qty
+        return
+    if ev_type != "REJECT":
+        return
+
+    reason = str(ev.get("reason", "")).strip()
+    bucket_code = _canonical_reject_code(reason)
+    if bucket_code == "NO":
+        sess.no_shot_total += qty
+    else:
+        sess.reject_total += qty
+    if bucket_code:
+        sess.reject_breakdown = _canonical_reject_breakdown(sess.reject_breakdown)
+        sess.reject_breakdown[bucket_code] = sess.reject_breakdown.get(bucket_code, 0) + qty
+
+
 @APP.get("/api/sync/capabilities")
 async def api_sync_capabilities():
     return {
@@ -16695,17 +16720,8 @@ async def api_event(req: Request):
             rows = dict(sess.butal_by_job or {})
             rows[assigned_job_code] = int(rows.get(assigned_job_code, 0) or 0) + qty
             sess.butal_by_job = rows
-    elif ev_type == "REJECT":
-        qty = int(ev.get("qty", 1) or 1)
-        reason = str(ev.get("reason", "")).strip()
-        bucket_code = _canonical_reject_code(reason)
-        if bucket_code == "NO":
-            sess.no_shot_total += qty
-        else:
-            sess.reject_total += qty
-        if bucket_code:
-            sess.reject_breakdown = _canonical_reject_breakdown(sess.reject_breakdown)
-            sess.reject_breakdown[bucket_code] = sess.reject_breakdown.get(bucket_code, 0) + qty
+    elif ev_type in {"REJECT", "STARTUP_REJECT"}:
+        _apply_reject_counter_event(sess, ev_type, ev)
 
     if ev_type not in ("SESSION_SYNC", "HEARTBEAT", "FINISH_JOB", "FINISH_SHIFT"):
         if _apply_embedded_session_snapshot(sess, ev.get("session_snapshot"), machine_code):

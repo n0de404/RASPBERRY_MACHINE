@@ -10345,7 +10345,6 @@ QWidget#ClientUIRoot {{
             action_text = "MACHINE UNDER REPAIR /\nADJUSTMENT"
         self.productionActionBanner.setText(action_text)
         self._apply_production_action_banner_style()
-        self.rightStartupReject.setText(f"Start Up Reject: {s.startup_reject_total}")
         self.rightMaintenance.setText(f"Maintenance: {s.maintenance_name or '-'}")
         self.productionMaintenanceLine.setText(f"MAINTENANCE: {s.maintenance_name or '-'}")
         self.productionMaintenanceLine.setVisible(bool(self._overlay_mode == "active"))
