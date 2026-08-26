@@ -3447,6 +3447,7 @@ class ClientUI(QWidget):
         self._server_sync_protocol = 0
         self._server_identity_conflict = False
         self._server_last_success_at = 0.0
+        self._server_authoritative_reconcile_needed = True
         self._server_recovery_snapshot_queued = False
         self._pending_server_recovery: Optional[Dict[str, Any]] = None
         self._skip_server_recovery_machine = ""
@@ -11506,18 +11507,12 @@ QWidget#ClientUIRoot {{
             return
         self._active_session_snapshot_deferred_pending = False
         snapshot = self._state_to_active_snapshot()
-        try:
-            serialized = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        except Exception:
-            serialized = ""
-        if not force and serialized and serialized == self._last_active_session_snapshot_serialized:
-            return
-        # Disk I/O grows with the session histories and must not block the Qt
-        # scanner callback.  The persistence worker coalesces older snapshots
-        # while preserving the newest complete state.
-        self._enqueue_active_session_file_persist({"op": "upsert", "snapshot": snapshot})
-        if serialized:
-            self._last_active_session_snapshot_serialized = serialized
+        # Serialization is also proportional to the complete scan history. Do
+        # both duplicate detection and disk I/O on the persistence worker so
+        # the Qt scanner callback only captures the newest immutable snapshot.
+        self._enqueue_active_session_file_persist(
+            {"op": "upsert", "snapshot": snapshot, "force": bool(force)}
+        )
         self._trigger_active_session_sql_sync(force=False)
 
     def _schedule_active_session_snapshot_save(self, delay_ms: int = 250):
@@ -25396,6 +25391,7 @@ QWidget#ClientUIRoot {{
                 last_error = e
                 self._server_was_offline = True
                 self._server_connection_ok = False
+                self._server_authoritative_reconcile_needed = True
                 if not bool(item.get("silent")):
                     self.scanner_status.emit(f"Server send failed: {e}")
             finally:
@@ -25440,19 +25436,39 @@ QWidget#ClientUIRoot {{
                 event_payload = item.get("payload") if isinstance(item, dict) else {}
                 event_body = event_payload.get("event") if isinstance(event_payload, dict) else {}
                 acknowledged_session = response_body.get("session") if isinstance(response_body, dict) else None
-                if not discard_item and isinstance(acknowledged_session, dict):
-                    # Network dispatch runs off the Qt thread. Reconcile the
-                    # acknowledged authoritative state through a queued signal
-                    # so labels and local recovery storage update safely.
+                void_event_types = {"PACK_VOID", "PRODUCT_PART_VOID", "BUTAL_VOID", "REJECT_VOID"}
+                heartbeat_reconcile = bool(
+                    event_type == "HEARTBEAT"
+                    and getattr(self, "_server_authoritative_reconcile_needed", True)
+                )
+                reconcile_event_types = {"SESSION_SYNC"} | void_event_types
+                if (
+                    not discard_item
+                    and isinstance(acknowledged_session, dict)
+                    and (event_type in reconcile_event_types or heartbeat_reconcile)
+                ):
+                    # Ordinary production deltas already update the UI
+                    # optimistically and are protected by their durable event
+                    # IDs. Reapplying a multi-megabyte server snapshot after
+                    # every PACK/REJECT forces a second full state restore and
+                    # repaint on the Raspberry Pi. Heartbeat/recovery remains
+                    # the authoritative reconciliation point; void events keep
+                    # their targeted downward correction below.
                     acknowledged_session = dict(acknowledged_session)
-                    _upsert_confirmed_server_session_json(acknowledged_session)
+                    if event_type == "SESSION_SYNC" or heartbeat_reconcile:
+                        _upsert_confirmed_server_session_json(acknowledged_session)
                     acknowledged_session["_ack_event_type"] = event_type
+                    authoritative_replace_queued = False
                     if (
-                        int(getattr(self, "_server_sync_protocol", 0) or 0) >= SERVER_SYNC_PROTOCOL_VERSION
+                        (event_type == "SESSION_SYNC" or heartbeat_reconcile)
+                        and int(getattr(self, "_server_sync_protocol", 0) or 0) >= SERVER_SYNC_PROTOCOL_VERSION
                         and not self._has_pending_server_mutations()
                     ):
                         acknowledged_session["_server_authoritative_replace"] = True
+                        authoritative_replace_queued = True
                     self.server_session_received.emit(acknowledged_session)
+                    if authoritative_replace_queued:
+                        self._server_authoritative_reconcile_needed = False
                 if event_type == "HEARTBEAT":
                     self.sync_local_finish_shifts_to_server(force=False)
                     self.sync_local_finished_jobs_to_server()
@@ -25567,7 +25583,31 @@ QWidget#ClientUIRoot {{
                 if op == "upsert":
                     snapshot = item.get("snapshot")
                     if isinstance(snapshot, dict):
-                        _upsert_active_session_json(snapshot)
+                        # saved_at_utc changes on every autosave and is not a
+                        # production-state change. Excluding it prevents an
+                        # unchanged multi-megabyte session from being rewritten
+                        # every three seconds.
+                        comparable = dict(snapshot)
+                        comparable.pop("saved_at_utc", None)
+                        try:
+                            serialized = json.dumps(
+                                comparable,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                                default=str,
+                            )
+                        except Exception:
+                            serialized = ""
+                        force = bool(item.get("force"))
+                        if (
+                            not force
+                            and serialized
+                            and serialized == self._last_active_session_snapshot_serialized
+                        ):
+                            continue
+                        if _upsert_active_session_json(snapshot) and serialized:
+                            self._last_active_session_snapshot_serialized = serialized
                 elif op == "delete":
                     _delete_active_session_json(item.get("machine_code"))
             except Exception:
@@ -25638,13 +25678,12 @@ QWidget#ClientUIRoot {{
                 finished_row.setdefault("production_session_id", session_id)
                 event_payload["finished_job"] = finished_row
         if defer_snapshot:
-            snapshot = self._state_to_active_snapshot()
-            if (
-                self._snapshot_is_recoverable(snapshot)
-                and "session_snapshot" not in event_payload
-            ):
-                event_payload["session_snapshot"] = snapshot
-            self._schedule_active_session_snapshot_save()
+            # Protocol 2 production events are compact durable deltas. Building
+            # and attaching the entire session here defeats deferral, blocks the
+            # Qt scanner callback while histories are copied, and sends several
+            # megabytes for a one-pack change. Persist the newest full recovery
+            # snapshot shortly afterward on the existing coalescing worker.
+            self._schedule_active_session_snapshot_save(delay_ms=500)
         else:
             self._save_active_session_snapshot()
 
