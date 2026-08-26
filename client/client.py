@@ -149,7 +149,7 @@ SERVER_EVENT_QUEUE_MAX_AGE_SECONDS = max(
 JOB_API_PENDING_RETRY_INTERVAL_MS = int(os.environ.get("MACHINE_JOB_API_PENDING_RETRY_INTERVAL_MS", "3000"))
 JOB_API_PENDING_MAX_RETRIES = int(os.environ.get("MACHINE_JOB_API_PENDING_MAX_RETRIES", "0"))
 SCANNER_MIN_TIMEOUT_SECONDS = float(os.environ.get("MACHINE_SCANNER_MIN_TIMEOUT", "0.2"))
-UI_REFRESH_DEBOUNCE_MS = int(os.environ.get("MACHINE_UI_REFRESH_DEBOUNCE_MS", "60"))
+UI_REFRESH_DEBOUNCE_MS = int(os.environ.get("MACHINE_UI_REFRESH_DEBOUNCE_MS", "180"))
 SCAN_DEDUP_WINDOW_MS = int(os.environ.get("MACHINE_SCAN_DEDUP_WINDOW_MS", "900"))
 PACK_SCAN_INTERVAL_SECONDS = float(os.environ.get("MACHINE_PACK_SCAN_INTERVAL_SECONDS", "10"))
 OPERATOR_BREAK_WINDOW_SECONDS = float(os.environ.get("MACHINE_OPERATOR_BREAK_WINDOW_SECONDS", "1800"))
@@ -1835,6 +1835,9 @@ class CounterCard(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.setInterval(16)
+        self._coalesced_repaint_timer = QTimer(self)
+        self._coalesced_repaint_timer.setSingleShot(True)
+        self._coalesced_repaint_timer.timeout.connect(self.update)
 
         self.num_anim = QVariantAnimation(self)
         self.num_anim.setDuration(500)
@@ -1898,7 +1901,10 @@ class CounterCard(QWidget):
 
         if not self._animations_enabled:
             self._display_value = float(self._value)
-            self.update()
+            # A burst of scans should repaint the latest total once rather
+            # than render every intermediate number on the Raspberry Pi.
+            if not self._coalesced_repaint_timer.isActive():
+                self._coalesced_repaint_timer.start(max(20, UI_REFRESH_DEBOUNCE_MS))
             return
 
         self.num_anim.stop()
@@ -1926,9 +1932,15 @@ class CounterCard(QWidget):
         self._sync_tick_timer()
 
     def set_value(self, value: int):
-        self._value = max(0, int(value))
-        self._display_value = float(self._value)
-        self.update()
+        next_value = max(0, int(value))
+        if self._value == next_value and self._display_value == float(next_value):
+            return
+        self._value = next_value
+        self._display_value = float(next_value)
+        if self._animations_enabled:
+            self.update()
+        elif not self._coalesced_repaint_timer.isActive():
+            self._coalesced_repaint_timer.start(max(20, UI_REFRESH_DEBOUNCE_MS))
 
     def _num_update(self, value):
         self._display_value = float(value)
@@ -4758,7 +4770,7 @@ QWidget#ClientUIRoot {{
 
         self.setLayout(root)
 
-        # Center overlay for invalid scans (GIF)
+        # Center overlay for invalid scans (static icon keeps scan feedback light).
         self.invalidOverlay = QFrame(self)
         self.invalidOverlay.setObjectName("InvalidOverlay")
         self.invalidOverlay.setStyleSheet(
@@ -4795,11 +4807,7 @@ QWidget#ClientUIRoot {{
         self.invalidTextBand.setLayout(QVBoxLayout())
         self.invalidTextBand.layout().setContentsMargins(8, 6, 8, 6)
         self.invalidTextBand.layout().setSpacing(4)
-        gif_shadow = QGraphicsDropShadowEffect(self)
-        gif_shadow.setBlurRadius(10)
-        gif_shadow.setOffset(0, 0)
-        gif_shadow.setColor(Qt.GlobalColor.black)
-        self.invalidGifLabel.setGraphicsEffect(gif_shadow)
+        self.invalidGifLabel.setGraphicsEffect(None)
         self.invalidTextLabel.setGraphicsEffect(None)
         self.invalidReasonLabel.setGraphicsEffect(None)
         self.invalidOverlay.layout().addWidget(self.invalidGifLabel, 0, Qt.AlignmentFlag.AlignCenter)
@@ -6883,23 +6891,20 @@ QWidget#ClientUIRoot {{
             self.rightTopSpacer.setFixedHeight(0)
 
     def _setup_invalid_overlay_media(self):
-        if not getattr(self, "enable_gif_animations", True):
-            self.invalidGifLabel.clear()
-            self.invalidGifLabel.hide()
-            self._invalid_movie = None
-            return
-        gif_path = INVALID_SCAN_GIF
-        if gif_path and os.path.exists(gif_path):
-            movie = QMovie(gif_path)
-            if movie.isValid():
-                movie.jumpToFrame(0)
-                movie.setScaledSize(self._fit_movie_size(self.invalidOverlay.size(), movie))
-                movie.setSpeed(180)
-                self.invalidGifLabel.setMovie(movie)
-                self._invalid_movie = movie
-                return
-        # fallback is text-only overlay when gif is missing/invalid
+        # A static cross is substantially cheaper than decoding and scaling a
+        # GIF while the scanner is already handling an invalid input.
+        if self._invalid_movie is not None:
+            self._invalid_movie.stop()
         self._invalid_movie = None
+        self.invalidGifLabel.clear()
+        self.invalidGifLabel.setText("✕")
+        self.invalidGifLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.invalidGifLabel.setMinimumSize(180, 120)
+        self.invalidGifLabel.setStyleSheet(
+            "background: transparent; border: none; color: #ffffff;"
+            "font-size: 104px; font-weight: 900;"
+        )
+        self.invalidGifLabel.setGraphicsEffect(None)
 
     def _fit_movie_size(self, container: QSize, movie: Optional[QMovie] = None) -> QSize:
         m = movie or self._invalid_movie
@@ -6987,13 +6992,10 @@ QWidget#ClientUIRoot {{
             "background: transparent; border: none; color: #fde68a; font-size: 15px; font-weight: 700;"
         )
         self._position_invalid_overlay()
-        if self.enable_gif_animations and self._invalid_movie is not None:
+        if self._invalid_movie is not None:
             self._invalid_movie.stop()
-            self._invalid_movie.setScaledSize(self._fit_movie_size(self.invalidOverlay.size()))
-            self._invalid_movie.start()
-            self.invalidGifLabel.show()
-        else:
-            self.invalidGifLabel.hide()
+        self.invalidGifLabel.setText("✕")
+        self.invalidGifLabel.show()
         self.invalidTextLabel.setText("INVALID SCAN")
         self.invalidTextLabel.setStyleSheet(
             "background: transparent; border: none; color: #ffffff; font-size: 28px; font-weight: 900;"
@@ -13772,11 +13774,12 @@ QWidget#ClientUIRoot {{
             else:
                 self.productionFixAnim.timer.stop()
                 self.productionFixAnim.hide()
-        if self.enable_gif_animations and self._invalid_movie is None:
-            self._setup_invalid_overlay_media()
-        if self._invalid_movie is not None and not self.enable_gif_animations:
+        if self._invalid_movie is not None:
             self._invalid_movie.stop()
-        self.invalidGifLabel.setVisible(bool(self.enable_gif_animations and self.invalidOverlay.isVisible() and self._invalid_movie is not None))
+        self._setup_invalid_overlay_media()
+        self.invalidGifLabel.setVisible(
+            bool(self.invalidOverlay.isVisible() and not getattr(self, "_info_overlay_compact", False))
+        )
         if not self.enable_heavy_animations:
             self.invalidGifLabel.setGraphicsEffect(None)
             for attr_name in (
