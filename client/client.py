@@ -703,6 +703,36 @@ def _server_event_queue_pack_record(row: Dict[str, Any]) -> Dict[str, Any]:
     return record
 
 
+def _server_finished_job_identity(row: Dict[str, Any]) -> str:
+    """Return the stable identity shared by retries of one finished job."""
+    if not isinstance(row, dict):
+        return ""
+    parts = [
+        str(row.get("finished_at_utc") or row.get("ended_at_utc") or "").strip(),
+        str(row.get("machine_code") or "").strip(),
+        str(row.get("job_code") or "").strip(),
+        str(row.get("operator_id") or "").strip(),
+        str(row.get("pack_count") or "").strip(),
+        str(row.get("good_total") or "").strip(),
+        str(row.get("butal_total") or "").strip(),
+        str(row.get("reject_total") or "").strip(),
+    ]
+    # A missing completion timestamp is not safe to coalesce: two otherwise
+    # identical jobs could have been completed at different times.
+    if not parts[0] or not parts[1] or not parts[2]:
+        return ""
+    return "|".join(parts)
+
+
+def _server_event_queue_finished_job_key(row: Dict[str, Any]) -> str:
+    if _server_event_queue_type(row) != "FINISH_JOB":
+        return ""
+    payload = row.get("payload") if isinstance(row, dict) else {}
+    event = payload.get("event") if isinstance(payload, dict) else {}
+    finished = event.get("finished_job") if isinstance(event, dict) else {}
+    return _server_finished_job_identity(finished)
+
+
 def _server_event_queue_row_is_defective(row: Dict[str, Any]) -> bool:
     """Reject payloads that the server cannot safely apply or acknowledge."""
     if not isinstance(row, dict):
@@ -757,6 +787,7 @@ def _trim_server_event_queue_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, 
     clean: List[Dict[str, Any]] = []
     latest_session_sync: Dict[tuple, Dict[str, Any]] = {}
     finish_shift_indexes: Dict[tuple, int] = {}
+    pending_finished_jobs: Set[str] = set()
     for row in rows or []:
         if _server_event_queue_row_is_defective(row):
             continue
@@ -775,9 +806,22 @@ def _trim_server_event_queue_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, 
         compact_row = dict(row)
         compact_row["payload"] = payload
 
+        # A finished job may be offered again by a later heartbeat while its
+        # first copy is still waiting for acknowledgement. Keep the oldest
+        # durable event ID and discard only semantically identical retries.
+        # This is safe for protocol 2 because the retained event is still
+        # replayed until the server acknowledges that exact ID.
+        if event_type == "FINISH_JOB":
+            finished_job_key = _server_event_queue_finished_job_key(compact_row)
+            if finished_job_key:
+                if finished_job_key in pending_finished_jobs:
+                    continue
+                pending_finished_jobs.add(finished_job_key)
+
         if int(payload.get("sync_protocol_requested") or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
-            # Preserve protocol 2 in its exact original order. Server-side
-            # event-ID deduplication makes retries safe without coalescing.
+            # Preserve protocol 2 in its exact original order after the safe
+            # FINISH_JOB equivalence check above. Server-side event-ID
+            # deduplication makes all remaining retries safe.
             clean.append(compact_row)
             continue
 
@@ -16500,16 +16544,7 @@ QWidget#ClientUIRoot {{
         ])
 
     def _server_finished_job_key(self, row: Dict[str, Any]) -> str:
-        return "|".join([
-            str(row.get("finished_at_utc", "")),
-            str(row.get("machine_code", "")),
-            str(row.get("job_code", "")),
-            str(row.get("operator_id", "")),
-            str(row.get("pack_count", "")),
-            str(row.get("good_total", "")),
-            str(row.get("butal_total", "")),
-            str(row.get("reject_total", "")),
-        ])
+        return _server_finished_job_identity(row)
 
     def _approve_local_finished_shift(self, shift_payload: Dict[str, Any], reviewer: Dict[str, Any], remarks: str) -> bool:
         key = self._finish_shift_row_key(shift_payload)
@@ -25038,9 +25073,37 @@ QWidget#ClientUIRoot {{
         """Offer locally owned finished jobs only after a heartbeat succeeds."""
         if not bool(getattr(self, "_server_connection_ok", False)):
             return
+        # A heartbeat is only a connectivity signal; it must not create another
+        # copy of a finished job that is already waiting in the durable outbox
+        # or the in-memory dispatcher queue.
+        with self._server_event_queue_lock:
+            pending_keys = {
+                key
+                for key in (
+                    _server_event_queue_finished_job_key(item)
+                    for item in _load_server_event_queue_json()
+                )
+                if key
+            }
+        try:
+            with self._event_queue.mutex:
+                queued_items = list(self._event_queue.queue)
+            pending_keys.update(
+                key
+                for key in (
+                    _server_event_queue_finished_job_key(item)
+                    for item in queued_items
+                )
+                if key
+            )
+        except Exception:
+            pass
         client_id = self._current_client_id()
         for row in _load_finished_jobs_json():
             if not isinstance(row, dict) or not self._belongs_to_current_client(row):
+                continue
+            finished_job_key = self._server_finished_job_key(row)
+            if finished_job_key and finished_job_key in pending_keys:
                 continue
             machine_code = str(row.get("machine_code") or "").strip()
             if not machine_code:
@@ -25060,7 +25123,8 @@ QWidget#ClientUIRoot {{
                 },
                 "last_event": f"FINISH JOB SYNC {row.get('job_name') or row.get('job_code') or ''}".strip(),
             }
-            self._enqueue_server_event(payload, silent=True)
+            if self._enqueue_server_event(payload, silent=True) and finished_job_key:
+                pending_keys.add(finished_job_key)
 
     def _remove_acknowledged_local_finish_shift(self, finished_row: Dict[str, Any]) -> None:
         key = self._finish_shift_row_key(finished_row)
