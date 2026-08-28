@@ -56,6 +56,7 @@ async def _app_lifespan(app: FastAPI):
 
 APP = FastAPI(title="Machine Dashboard Server", lifespan=_app_lifespan)
 APP.mount("/Images", StaticFiles(directory=str(Path(__file__).resolve().parent / "Images")), name="images")
+APP.mount("/PERSON", StaticFiles(directory=str(Path(__file__).resolve().parent / "PERSON")), name="person")
 MACHINE_EVENT_LOCKS: Dict[str, asyncio.Lock] = {}
 
 
@@ -5675,9 +5676,217 @@ def _dashboard_finished_history() -> List[Dict[str, Any]]:
     return shifts + final_jobs
 
 
+def _material_usage_identity(*values: Any) -> str:
+    for value in values:
+        text = re.sub(r"[^A-Z0-9]+", "", str(value or "").strip().upper())
+        if text:
+            return text
+    return ""
+
+
+def _finished_shift_material_usage(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return pack-stamped material usage, repairing zero-weight and missing pack rows."""
+    item = row if isinstance(row, dict) else {}
+    pack_logs = [
+        pack for pack in (item.get("product_pack_history_logs") or [])
+        if isinstance(pack, dict) and not bool(pack.get("voided"))
+    ]
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for pack in pack_logs:
+        entries = pack.get("raw_part_consumption")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            product_id = str(entry.get("part_product_id") or entry.get("product_id") or "").strip()
+            sku = str(entry.get("part_sku") or entry.get("sku") or entry.get("part_code") or entry.get("product_code") or "").strip()
+            name = str(entry.get("part_name") or entry.get("material_name") or entry.get("product_name") or sku or product_id or "Material").strip()
+            key = _material_usage_identity(product_id, sku, name)
+            if not key:
+                continue
+            group = grouped.setdefault(key, {
+                "material_product_id": product_id,
+                "material_sku": sku,
+                "material_name": name,
+                "entries": [],
+            })
+            per_unit = max(0.0, _parse_number_like(
+                entry.get("part_qty_per_unit_kg")
+                if entry.get("part_qty_per_unit_kg") not in (None, "")
+                else entry.get("part_qty_per_unit")
+            ))
+            produced = max(0.0, _parse_number_like(entry.get("produced_units")))
+            used = max(0.0, _parse_number_like(
+                entry.get("used_qty_kg")
+                if entry.get("used_qty_kg") not in (None, "")
+                else entry.get("used_qty")
+            ))
+            group["entries"].append({"per_unit": per_unit, "produced": produced, "used": used})
+
+    shift_weight = max(0.0, _parse_number_like(item.get("external_average_weight_grams")) / 1000.0)
+    target_units = max(0.0, _parse_number_like(item.get("good_total") or item.get("total_good") or item.get("partial_qty")))
+    output: List[Dict[str, Any]] = []
+    for group in grouped.values():
+        entries = list(group.pop("entries", []))
+        positive_rates = [float(entry["per_unit"]) for entry in entries if float(entry.get("per_unit") or 0) > 0]
+        first_rate = positive_rates[0] if positive_rates else shift_weight
+        last_rate = positive_rates[-1] if positive_rates else first_rate
+        used_qty = 0.0
+        recorded_units = 0.0
+        for entry in entries:
+            produced = max(0.0, float(entry.get("produced") or 0))
+            rate = max(0.0, float(entry.get("per_unit") or 0)) or first_rate
+            used = max(0.0, float(entry.get("used") or 0))
+            recorded_units += produced
+            used_qty += used if used > 0 else produced * rate
+        missing_units = max(0.0, target_units - recorded_units)
+        if missing_units > 0 and last_rate > 0:
+            used_qty += missing_units * last_rate
+        output.append({
+            **group,
+            "used_qty": used_qty,
+            "recorded_units": recorded_units,
+            "reconciled_units": target_units,
+            "missing_units": missing_units,
+            "first_rate": first_rate,
+            "last_rate": last_rate,
+        })
+    return output
+
+
+def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, Any]:
+    """Return compact, deduplicated material totals from earlier partials."""
+    machine_code = str(session.get("machine_code") or "").strip().upper()
+    job_code = str(session.get("job_code") or session.get("job_name") or "").strip().upper()
+    if not machine_code or not job_code:
+        return {"partial_count": 0, "scan_count": 0, "consumed_units": 0, "rows": []}
+
+    matching_rows: List[Dict[str, Any]] = []
+    latest_completed_at = ""
+    for row in FINISHED_JOBS:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("machine_code") or "").strip().upper() != machine_code:
+            continue
+        row_job_code = str(row.get("job_code") or row.get("job_name") or "").strip().upper()
+        if row_job_code != job_code:
+            continue
+        record_type = str(row.get("record_type") or "").strip().upper()
+        row_time = str(row.get("finished_at_utc") or row.get("ended_at_utc") or "").strip()
+        if record_type == "SHIFT_PARTIAL":
+            matching_rows.append(row)
+        elif row_time and row_time > latest_completed_at:
+            latest_completed_at = row_time
+
+    if latest_completed_at:
+        matching_rows = [
+            row for row in matching_rows
+            if str(row.get("finished_at_utc") or row.get("ended_at_utc") or "").strip() > latest_completed_at
+        ]
+
+    unique_partials: List[Dict[str, Any]] = []
+    seen_partials: set = set()
+    for row in sorted(matching_rows, key=lambda x: str(x.get("finished_at_utc") or x.get("ended_at_utc") or "")):
+        partial_key = "|".join([
+            str(row.get("shift_index") or ""),
+            str(row.get("started_at_utc") or ""),
+            str(row.get("ended_at_utc") or row.get("finished_at_utc") or ""),
+            str(row.get("operator_id") or ""),
+        ])
+        if partial_key in seen_partials:
+            continue
+        seen_partials.add(partial_key)
+        unique_partials.append(row)
+
+    consumed_units = 0.0
+    material_groups: Dict[str, Dict[str, Any]] = {}
+    seen_scans: set = set()
+    scan_count = 0
+    for partial in unique_partials:
+        output_total = sum(
+            max(0.0, _parse_number_like(partial.get(field)))
+            for field in ("good_total", "butal_total", "reject_total", "startup_reject_total", "no_shot_total")
+        )
+        if output_total <= 0:
+            output_total = max(0.0, _parse_number_like(partial.get("total_good") or partial.get("partial_qty")))
+        consumed_units += output_total
+
+        logs = partial.get("raw_material_logs") or []
+        if not isinstance(logs, list):
+            continue
+        for raw in logs:
+            if not isinstance(raw, dict):
+                continue
+            source = str(raw.get("source") or "").strip().upper()
+            if "CARRYOVER" in source:
+                continue
+            raw_scan = str(raw.get("raw_scan") or raw.get("qr_payload") or raw.get("payload") or raw.get("scan_value") or "").strip()
+            unique_key = str(raw.get("unique_key") or raw_scan or "").strip()
+            if not unique_key:
+                unique_key = "|".join([
+                    str(raw.get("material_product_id") or raw.get("product_id") or ""),
+                    str(raw.get("material_sku") or raw.get("sku") or ""),
+                    str(raw.get("lot_number") or raw.get("lot") or ""),
+                    str(raw.get("index") or ""),
+                    str(raw.get("scanned_at") or raw.get("timestamp_utc") or ""),
+                    str(raw.get("qty") or raw.get("quantity") or ""),
+                ])
+            if unique_key in seen_scans:
+                continue
+            seen_scans.add(unique_key)
+            qty = max(0.0, _parse_number_like(raw.get("qty") or raw.get("quantity")))
+            product_id = str(raw.get("material_product_id") or raw.get("product_id") or "").strip()
+            sku = str(raw.get("material_sku") or raw.get("sku") or raw.get("material_code") or "").strip()
+            name = str(raw.get("material_name") or raw.get("material") or raw.get("product_name") or sku or product_id or "Raw Material").strip()
+            group_key = (product_id or sku or name).strip().upper()
+            group = material_groups.setdefault(group_key, {
+                "material": name,
+                "material_name": name,
+                "material_product_id": product_id,
+                "material_sku": sku,
+                "code": sku or product_id,
+                "qty": 0.0,
+                "scan_count": 0,
+                "source": "SERVER_PARTIAL_TOTAL",
+            })
+            group["qty"] = float(group.get("qty") or 0) + qty
+            group["scan_count"] = int(group.get("scan_count") or 0) + 1
+            scan_count += 1
+
+        for usage in _finished_shift_material_usage(partial):
+            usage_keys = {
+                _material_usage_identity(usage.get("material_product_id")),
+                _material_usage_identity(usage.get("material_sku")),
+                _material_usage_identity(usage.get("material_name")),
+            }
+            usage_keys.discard("")
+            match = next((
+                material for material in material_groups.values()
+                if usage_keys.intersection({
+                    _material_usage_identity(material.get("material_product_id")),
+                    _material_usage_identity(material.get("material_sku")),
+                    _material_usage_identity(material.get("material_name")),
+                })
+            ), None)
+            if match is None:
+                continue
+            match["used_qty"] = float(match.get("used_qty") or 0) + max(0.0, _parse_number_like(usage.get("used_qty")))
+            match["reconciled_missing_units"] = float(match.get("reconciled_missing_units") or 0) + max(0.0, _parse_number_like(usage.get("missing_units")))
+
+    return {
+        "partial_count": len(unique_partials),
+        "scan_count": scan_count,
+        "consumed_units": consumed_units,
+        "rows": list(material_groups.values()),
+    }
+
+
 def _state_payload(*, include_history: bool = False) -> Dict[str, Any]:
     refresh_active_sessions_from_file()
     sessions = [s.to_dict() for s in SESSIONS.values()]
+    for row in sessions:
+        row["prior_partial_raw_material_totals"] = _same_job_partial_raw_material_totals(row)
     if not include_history:
         heavy_session_fields = {
             "product_pack_history_logs",
@@ -5977,15 +6186,14 @@ DASHBOARD_HTML = """
     .sub-tab-content { display:none; }
     .sub-tab-content.active { display:block; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(clamp(150px, 11vw, 190px), 1fr)); gap: clamp(10px, 1.2vw, 18px); }
-    #machineGrid { grid-template-columns: repeat(auto-fill, minmax(320px, 360px)); justify-content:start; align-items:stretch; perspective:1200px; }
-    #additionalMachineGrid { grid-template-columns: repeat(auto-fill, minmax(320px, 360px)); justify-content:start; align-items:stretch; perspective:1200px; }
-    #additionalMachineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); gap:10px; min-height:0; padding:12px; border:1px solid #d8e2ef; border-top:4px solid #94a3b8; border-radius:10px; background:#fff; box-shadow:0 8px 20px rgba(15,23,42,.06); overflow:hidden; }
+    #machineGrid, #additionalMachineGrid { grid-template-columns:repeat(6, minmax(0, 1fr)); justify-content:stretch; align-items:stretch; gap:10px; perspective:1200px; }
+    #additionalMachineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); align-content:start; gap:8px; min-height:176px; padding:13px 14px; border:1px solid #e2e8f0; border-radius:11px; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); box-shadow:0 4px 14px rgba(15,23,42,.07); overflow:hidden; }
     #additionalMachineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
     #additionalMachineGrid .card.inactive { border-color:#d8e2ef; border-top-color:#94a3b8; background:#f8fafc; }
     #additionalMachineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; background:#fffafa; }
     #additionalMachineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; background:#fffdf8; }
-    #additionalMachineGrid .card.status-alert { border-color:#fdba74; border-top-color:#f97316; background:#fff7ed; animation:machineStatusAlertBlink 1.05s ease-in-out infinite; }
-    #additionalMachineGrid .card .machine-card-title h3 { margin:0; color:#0f172a; font-size:1.16rem; }
+    #additionalMachineGrid .card.status-alert { border-color:#fed7aa; background:#fffdf8; animation:none; }
+    #additionalMachineGrid .card .machine-card-title h3 { margin:0; color:#1e293b; font-size:.90rem; }
     .additional-machines-section { margin-top:24px; padding-top:18px; border-top:2px solid #dbe4f0; }
     .additional-machines-title { margin:0 0 12px; color:#334155; font-size:1rem; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
     .card { min-width:0; background: #fff; border-radius: 12px; padding: clamp(10px, 1vw, 16px); border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform .12s ease, box-shadow .12s ease; }
@@ -5997,27 +6205,84 @@ DASHBOARD_HTML = """
     .card.maintenance { border-color: #FF9800; animation: cardPulseOrange 1.5s ease-in-out infinite; }
     .card h3 { margin: 0 0 10px; font-size: clamp(.9rem, .9vw, 1.05rem); border-bottom: 1px solid #eee; padding-bottom: 8px; overflow-wrap:anywhere; }
     .card p { margin: 6px 0; font-size: 0.9rem; overflow-wrap:break-word; word-break:normal; }
-    #machineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); gap:10px; min-height:0; padding:12px; border:1px solid #d8e2ef; border-top:4px solid #94a3b8; border-radius:10px; background:#fff; box-shadow:0 8px 20px rgba(15,23,42,.06); overflow:hidden; transform-style:preserve-3d; backface-visibility:hidden; will-change:transform, box-shadow; }
-    #machineGrid .card:hover { transform:translateY(-1px); box-shadow:0 14px 28px rgba(15,23,42,.10); }
+    #machineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); align-content:start; gap:8px; min-height:176px; padding:13px 14px; border:1px solid #e2e8f0; border-radius:11px; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); box-shadow:0 4px 14px rgba(15,23,42,.07); overflow:hidden; transform-style:preserve-3d; backface-visibility:hidden; will-change:transform, box-shadow; }
+    #machineGrid .card:hover, #additionalMachineGrid .card:hover { transform:translateY(-1px); box-shadow:0 8px 20px rgba(15,23,42,.10); }
     #machineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
     #machineGrid .card.inactive { border-color:#d8e2ef; border-top-color:#94a3b8; animation:none; background:#f8fafc; }
     #machineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; animation:none; background:#fffafa; }
     #machineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; animation:none; background:#fffdf8; }
-    #machineGrid .card.status-alert { border-color:#fdba74; border-top-color:#f97316; background:#fff7ed; animation:machineStatusAlertBlink 1.05s ease-in-out infinite; }
-    .machine-card-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; align-items:center; }
+    #machineGrid .card.status-alert { border-color:#fed7aa; background:#fffdf8; animation:none; }
+    .machine-card-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px; align-items:center; }
     .machine-card-title { min-width:0; display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
-    #machineGrid .card .machine-card-title h3 { margin:0; padding:0; border:0; color:#0f172a; font-size:1.16rem; line-height:1.15; }
+    #machineGrid .card .machine-card-title h3 { margin:0; padding:0; border:0; color:#1e293b; font-size:.90rem; line-height:1.15; letter-spacing:.01em; }
     .machine-card-code { display:none; }
-    .machine-status-badge { flex:0 0 auto; display:inline-flex; align-items:center; gap:7px; border-radius:6px; padding:6px 9px; font-size:.74rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; background:#f1f5f9; color:#475569; border:1px solid #e2e8f0; }
-    .machine-status-badge::before { content:""; flex:0 0 auto; width:9px; height:9px; border-radius:999px; background:#94a3b8; box-shadow:0 0 0 3px rgba(148,163,184,.16); }
+    .machine-status-badge { flex:0 0 auto; display:inline-flex; align-items:center; gap:5px; border-radius:6px; padding:5px 7px; font-size:.56rem; line-height:1; font-weight:950; letter-spacing:.04em; text-transform:uppercase; background:#f1f5f9; color:#475569; border:1px solid #e2e8f0; box-shadow:0 3px 10px rgba(15,23,42,.06); }
+    .machine-status-badge::before { content:""; flex:0 0 auto; width:6px; height:6px; border-radius:999px; background:#94a3b8; box-shadow:none; }
     .machine-status-badge.active { background:#dcfce7; color:#047857; border-color:#86efac; }
     .machine-status-badge.inactive { background:#f1f5f9; color:#64748b; border-color:#cbd5e1; }
     .machine-status-badge.disconnected { background:#fef2f2; color:#b91c1c; border-color:#fecaca; }
     .machine-status-badge.maintenance { background:#ffedd5; color:#b45309; border-color:#fed7aa; }
-    .machine-status-badge.active::before { background:#22c55e; animation:statusBeatGreen 1.25s ease-in-out infinite; }
+    .machine-status-badge.active::before { background:#22c55e; animation:none; }
     .machine-status-badge.inactive::before { background:#94a3b8; animation:none; }
-    .machine-status-badge.disconnected::before { background:#ef4444; animation:statusBeatRed 1.25s ease-in-out infinite; }
-    .machine-status-badge.maintenance::before { background:#f59e0b; animation:statusBeatOrange 1.25s ease-in-out infinite; }
+    .machine-status-badge.disconnected::before { background:#ef4444; animation:none; }
+    .machine-status-badge.maintenance::before { background:#f59e0b; animation:none; }
+    .machine-compact-meta { min-width:0; display:grid; gap:3px; }
+    .machine-compact-row { min-width:0; display:grid; gap:1px; }
+    .machine-compact-row .k { color:#94a3b8; font-size:.55rem; line-height:1; font-weight:850; }
+    .machine-compact-row .v { min-width:0; color:#334155; font-size:.67rem; line-height:1.2; font-weight:850; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .machine-last-action { min-height:28px; padding-top:5px; border-top:1px solid #eef2f7; color:#64748b; font-size:.61rem; line-height:1.3; font-weight:750; overflow:hidden; overflow-wrap:anywhere; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
+    .machine-compact-bottom { align-self:end; margin-top:auto; padding-top:5px; border-top:1px solid #eef2f7; }
+    .machine-progress-row { display:grid; gap:5px; color:#16a34a; font-size:.56rem; font-weight:950; }
+    .machine-progress-summary { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    .machine-progress-count { min-width:0; overflow:hidden; color:#64748b; font-size:.61rem; line-height:1; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-progress-row strong { flex:0 0 auto; font-size:.76rem; line-height:1; text-align:right; }
+    .machine-progress-track { height:6px; overflow:hidden; border-radius:999px; background:#e9eef5; }
+    .machine-progress-fill { display:block; width:0; height:100%; border-radius:inherit; background:linear-gradient(90deg,#22c55e,#16a34a); transition:width .25s ease; }
+    .machine-progress-row.disconnected { color:#ef4444; }
+    .machine-progress-row.disconnected .machine-progress-fill { background:#ef4444; }
+    .machine-progress-row.inactive { color:#64748b; }
+    .machine-progress-row.inactive .machine-progress-fill { background:#94a3b8; }
+    .machine-offline-note { display:flex; align-items:center; justify-content:center; gap:6px; min-height:25px; border:1px solid #fecaca; border-radius:7px; background:#fef2f2; color:#b91c1c; font-size:.62rem; line-height:1; font-weight:950; text-transform:uppercase; letter-spacing:.03em; }
+    .machine-offline-note .offline-icon { font-size:.82rem; }
+    .machine-compact-duration { display:flex; align-items:center; gap:8px; min-height:32px; padding:7px 9px; border:1px solid #ffedd5; border-radius:7px; background:#fffdfa; color:#f97316; font-size:.72rem; line-height:1.1; font-weight:950; }
+    .machine-compact-duration .clock { font-size:.92rem; }
+    .machine-no-schedule-overlay { position:absolute; inset:0; z-index:7; overflow:hidden; border-radius:inherit; background:#fff; pointer-events:auto; isolation:isolate; }
+    .machine-no-schedule-caption { position:absolute; z-index:2; left:10px; right:10px; top:9px; display:flex; align-items:center; justify-content:space-between; gap:8px; color:#334155; }
+    .machine-no-schedule-caption strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.74rem; font-weight:950; }
+    .machine-no-schedule-caption span { flex:0 0 auto; border:1px solid #fed7aa; border-radius:6px; padding:4px 6px; background:#fff7ed; color:#c2410c; font-size:.50rem; line-height:1; font-weight:950; letter-spacing:.035em; }
+    .machine-no-schedule-stage { position:absolute; left:50%; bottom:-5px; width:114px; height:171px; margin-left:-57px; transform-origin:50% 100%; transition:transform .08s linear; will-change:transform; }
+    .machine-no-schedule-image { display:block; width:100%; height:100%; object-fit:contain; background:#fff; filter:brightness(1.035) contrast(1.025); mix-blend-mode:multiply; user-select:none; -webkit-user-drag:none; }
+    .machine-no-schedule-symbol { position:absolute; z-index:3; right:-5px; top:4px; display:none; min-width:30px; text-align:center; font-size:1.45rem; line-height:1; font-weight:950; text-shadow:0 2px 4px rgba(255,255,255,.95); }
+    .machine-no-schedule-overlay.waiting .machine-no-schedule-symbol.question { display:block; color:#f59e0b; animation:machineNoScheduleQuestion .8s ease-in-out infinite; }
+    .machine-no-schedule-overlay.sleeping .machine-no-schedule-symbol.sleep { display:block; color:#2563eb; font-size:1.05rem; letter-spacing:.12em; animation:machineNoScheduleSleep 1.2s ease-in-out infinite; }
+    .machine-no-schedule-overlay.finishing { opacity:0; transition:opacity .45s ease; }
+    .machine-no-schedule-overlay.hover-fading, .machine-pack-overlay.hover-fading { opacity:0; transition:opacity .35s ease; }
+    .machine-no-schedule-overlay.snoring .machine-no-schedule-image { transform-origin:50% 72%; animation:machineNoScheduleBreathe 1.45s ease-in-out infinite; }
+    @keyframes machineNoScheduleQuestion { 0%,100% { transform:translateY(0) rotate(-5deg); } 50% { transform:translateY(-4px) rotate(5deg); } }
+    @keyframes machineNoScheduleSleep { 0%,100% { transform:translate(0,2px) scale(.92) scaleX(1.18); opacity:.62; } 50% { transform:translate(4px,-5px) scale(1.08) scaleX(1.30); opacity:1; } }
+    @keyframes machineNoScheduleBreathe { 0%,100% { transform:scaleX(1) scaleY(1); } 50% { transform:scaleX(1.018) scaleY(.985) translateY(1px); } }
+    .machine-pack-overlay { position:absolute; inset:0; z-index:8; display:grid; place-items:center; overflow:hidden; border-radius:inherit; background:linear-gradient(145deg,#ffffff 0%,#f8fafc 100%); cursor:default; isolation:isolate; }
+    .machine-pack-stage { position:relative; width:calc(100% - 14px); aspect-ratio:2321 / 715; transform-origin:center; }
+    .machine-pack-image { display:block; width:100%; height:100%; object-fit:contain; user-select:none; -webkit-user-drag:none; }
+    .machine-pack-signal { position:absolute; left:6%; top:-3%; width:5px; height:10px; transform:translateX(-50%); border:1px solid rgba(51,65,85,.70); border-radius:1px; background:rgba(203,213,225,.72); box-shadow:0 0 0 1px rgba(255,255,255,.45); }
+    .machine-pack-signal::after { content:""; position:absolute; left:2px; top:100%; width:1px; height:9px; background:#475569; }
+    .machine-pack-signal span { position:absolute; left:0; width:3px; height:3px; border-radius:1px; }
+    .machine-pack-signal .red { top:1px; background:#a83232; }
+    .machine-pack-signal .green { bottom:1px; background:#22c55e; animation:machinePackLight .52s steps(1,end) infinite; }
+    .machine-pack-smoke { position:absolute; left:41%; top:48%; width:1px; height:1px; opacity:0; pointer-events:none; }
+    .machine-pack-overlay.pressing .machine-pack-smoke { opacity:1; }
+    .machine-pack-smoke i { --smoke-size:12px; --smoke-y:-12px; --smoke-delay:0ms; position:absolute; left:0; top:0; width:var(--smoke-size); height:calc(var(--smoke-size) * .72); margin:calc(var(--smoke-size) * -.5); border-radius:50%; opacity:0; filter:blur(1.4px); background:radial-gradient(ellipse at center,rgba(255,255,255,.92) 0%,rgba(226,232,240,.68) 45%,rgba(203,213,225,0) 100%); animation:machinePackSmokeRight .9s ease-out var(--smoke-delay) infinite; }
+    .machine-pack-smoke.left i { animation-name:machinePackSmokeLeft; }
+    .machine-pack-overlay.pressing .machine-pack-stage { animation:machinePackShake .08s linear infinite; }
+    @keyframes machinePackLight { 0%,48% { opacity:1; box-shadow:0 0 5px 3px rgba(34,197,94,.76); } 49%,100% { opacity:.24; box-shadow:none; } }
+    @keyframes machinePackShake { 0% { transform:translate(0,0); } 25% { transform:translate(1px,-1px); } 50% { transform:translate(-1px,0); } 75% { transform:translate(1px,1px); } 100% { transform:translate(0,0); } }
+    @keyframes machinePackSmokeRight { 0% { opacity:0; transform:translate(0,0) scale(.55); } 16% { opacity:.88; } 100% { opacity:0; transform:translate(78px,var(--smoke-y)) scale(2.25); } }
+    @keyframes machinePackSmokeLeft { 0% { opacity:0; transform:translate(0,0) scale(.55); } 16% { opacity:.88; } 100% { opacity:0; transform:translate(-78px,var(--smoke-y)) scale(2.25); } }
+    @media (prefers-reduced-motion: reduce) {
+      .machine-pack-overlay.pressing .machine-pack-stage, .machine-pack-signal .green, .machine-pack-smoke i { animation-duration:.01ms; animation-iteration-count:1; }
+      .machine-no-schedule-symbol { animation:none !important; }
+      .machine-no-schedule-overlay.snoring .machine-no-schedule-image { animation:none; }
+    }
     .machine-job-block { padding:0 0 9px; border-bottom:1px solid #edf2f7; }
     .machine-job-name { color:#0f172a; font-size:1rem; line-height:1.3; font-weight:900; overflow-wrap:anywhere; }
     .machine-job-meta { margin-top:5px; display:grid; grid-template-columns:1fr 1fr; gap:4px 10px; color:#64748b; font-size:.86rem; line-height:1.3; }
@@ -6793,6 +7058,33 @@ DASHBOARD_HTML = """
       color: #334155; cursor: pointer; font-size: 18px; font-weight: 700;
     }
     .icon-btn:hover { background:#fff; box-shadow:0 6px 14px rgba(15,23,42,.08); }
+    .machine-history-overlay { z-index:1100; }
+    .machine-history-card { width:min(1080px, calc(100vw - 28px)); height:min(82vh, 820px); max-height:calc(100vh - 28px); border-radius:20px; background:#f8fafc; }
+    .machine-history-card .overlay-head { min-height:58px; padding:10px 16px; background:#fff; border-bottom:1px solid #e2e8f0; }
+    .machine-history-tools { display:flex; align-items:center; gap:12px; padding:12px 16px; background:#f8fafc; border-bottom:1px solid #e2e8f0; }
+    .machine-history-search { flex:1; min-width:0; height:42px; padding:0 14px; border:1px solid #cbd5e1; border-radius:11px; background:#fff; color:#0f172a; font:inherit; outline:none; }
+    .machine-history-search:focus { border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,.12); }
+    .shift-history-filter { flex:0 0 auto; min-width:145px; height:42px; padding:0 34px 0 12px; border:1px solid #cbd5e1; border-radius:11px; background:#fff; color:#0f172a; font:inherit; font-size:.82rem; font-weight:750; outline:none; }
+    .shift-history-filter:focus { border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,.12); }
+    .machine-history-count { flex:0 0 auto; color:#64748b; font-size:.78rem; font-weight:800; }
+    .machine-history-body { min-height:0; flex:1; overflow:auto; padding:0 16px 16px; background:#f8fafc; }
+    .machine-history-table-wrap { min-width:0; overflow-x:hidden; border:1px solid #dbe4f0; border-radius:12px; background:#fff; }
+    .machine-history-table { width:100%; table-layout:fixed; border-collapse:collapse; }
+    .machine-history-table th { position:sticky; top:0; z-index:2; padding:10px 8px; border-bottom:1px solid #cbd5e1; background:#eef4fb; color:#64748b; font-size:.68rem; letter-spacing:.035em; text-align:left; text-transform:uppercase; }
+    .machine-history-table td { padding:10px 8px; border-bottom:1px solid #e2e8f0; color:#1e293b; font-size:.78rem; line-height:1.35; font-weight:700; vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
+    .machine-history-table tr:last-child td { border-bottom:0; }
+    .machine-history-series { width:38px; padding-left:4px !important; padding-right:4px !important; text-align:center !important; }
+    .machine-history-time { width:126px; }
+    .machine-history-type { width:76px; }
+    .machine-history-source { width:88px; }
+    .machine-history-actor { width:170px; }
+    .machine-history-message { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3; overflow:hidden; }
+    .machine-history-empty { display:grid; place-items:center; min-height:180px; padding:24px; color:#64748b; text-align:center; }
+    @media (max-width:760px) {
+      .machine-history-tools { flex-wrap:wrap; }
+      .machine-history-search { flex:1 1 100%; }
+      .shift-history-filter { flex:1 1 145px; min-width:0; }
+    }
     .machine-detail-status-panel { background:#f8fbff; border:1px solid #d9e6f6; border-radius:12px; padding:10px; display:grid; gap:8px; }
     .machine-detail-status-panel .row { display:grid; grid-template-columns: 160px 1fr auto; gap:8px; align-items:center; }
     .machine-detail-status-panel label { font-weight:700; color:#475569; font-size:.86rem; }
@@ -6805,14 +7097,199 @@ DASHBOARD_HTML = """
     .machine-status-save-bar { height:100%; width:0%; background: linear-gradient(90deg, #f97316, #22c55e); transition: width .10s linear; }
     .machine-status-save-check { width:22px; height:22px; border-radius:999px; border:2px solid #16a34a; color:#16a34a; display:flex; align-items:center; justify-content:center; font-weight:900; opacity:.15; transform:scale(.92); transition: all .16s ease; background:#fff; }
     .machine-status-save-check.done { opacity:1; transform:scale(1); background:#ecfdf5; }
-    .machine-detail-card { width: min(980px, 100%); max-height: min(88vh, 860px); display: flex; flex-direction: column; }
-    .machine-detail-body { padding: 14px; overflow: auto; display: grid; gap: 12px; }
+    .machine-detail-card { width:min(1180px, calc(100vw - 28px)); max-width:calc(100vw - 28px); max-height:min(92vh, 940px); display:flex; flex-direction:column; border-radius:20px; background:#f8fafc; }
+    .machine-detail-card .overlay-head { min-height:58px; padding:10px 16px; border-bottom:1px solid #e7edf5; background:rgba(255,255,255,.96); }
+    .machine-detail-head-title { display:flex; align-items:center; gap:10px; }
+    .machine-detail-menu-icon { display:grid; place-items:center; width:34px; height:34px; border:1px solid #e2e8f0; border-radius:999px; background:#fff; color:#1d4ed8; box-shadow:0 5px 14px rgba(15,23,42,.08); font-size:.9rem; }
+    .machine-detail-body { padding:16px; overflow-y:auto; overflow-x:hidden; display:grid; grid-template-columns:minmax(0,1fr); grid-auto-rows:max-content; align-content:start; gap:12px; min-width:0; background:linear-gradient(145deg,#fbfdff,#f7f9fd); }
+    .machine-detail-body > * { width: 100%; max-width: 100%; min-width: 0; }
+    .machine-detail-layout { min-width:0; display:grid; grid-template-columns:270px minmax(0,1fr); gap:18px; align-items:start; }
+    .machine-detail-sidebar { min-width:0; position:sticky; top:0; display:grid; gap:13px; padding:16px; border:1px solid #e7edf5; border-radius:16px; background:rgba(255,255,255,.98); box-shadow:0 10px 28px rgba(30,64,175,.07); }
+    .machine-detail-side-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+    .machine-detail-eyebrow { color:#1e3a8a; font-size:.62rem; line-height:1; font-weight:950; letter-spacing:.06em; text-transform:uppercase; }
+    .machine-detail-status-chip { display:inline-flex; align-items:center; gap:5px; padding:6px 9px; border:1px solid #dbe4f0; border-radius:999px; background:#f8fafc; color:#64748b; font-size:.58rem; font-weight:950; text-transform:uppercase; box-shadow:0 5px 14px rgba(15,23,42,.06); }
+    .machine-detail-status-chip::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; }
+    .machine-detail-status-chip.active { border-color:#bbf7d0; background:#ecfdf5; color:#10b981; }
+    .machine-detail-status-chip.disconnected { border-color:#fecaca; background:#fef2f2; color:#ef4444; }
+    .machine-detail-status-chip.inactive { border-color:#cbd5e1; background:#f1f5f9; color:#64748b; }
+    .machine-detail-status-chip.manual { border-color:#fed7aa; background:#fff7ed; color:#f97316; }
+    .machine-detail-machine-identity { display:grid; grid-template-columns:82px minmax(0,1fr); gap:12px; align-items:center; padding:4px 0 2px; }
+    .machine-detail-machine-image { display:grid; place-items:center; min-width:0; min-height:68px; }
+    .machine-detail-machine-image img { display:block; width:100%; height:auto; object-fit:contain; }
+    .machine-detail-machine-name { min-width:0; color:#0f2a68; font-size:1.25rem; line-height:1.1; font-weight:950; overflow-wrap:anywhere; }
+    .machine-detail-machine-code { margin-top:6px; color:#64748b; font-size:.72rem; font-weight:800; overflow-wrap:anywhere; }
+    .machine-detail-side-metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; }
+    .machine-detail-side-metric { min-width:0; min-height:66px; display:grid; align-content:space-between; gap:6px; padding:11px; border:1px solid #edf1f7; border-radius:12px; background:#fff; box-shadow:0 7px 18px rgba(30,64,175,.06); }
+    .machine-detail-side-metric .k { color:#64748b; font-size:.59rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
+    .machine-detail-side-metric .v { color:#172554; font-size:1.14rem; line-height:1; font-weight:950; }
+    .machine-detail-side-metric.good .k,.machine-detail-side-metric.good .v { color:#10b981; }
+    .machine-detail-side-metric.butal .k,.machine-detail-side-metric.butal .v { color:#0ea5e9; }
+    .machine-detail-side-metric.reject .k,.machine-detail-side-metric.reject .v { color:#ef4444; }
+    .machine-detail-side-metric.total .k,.machine-detail-side-metric.total .v { color:#7c3aed; }
+    .machine-detail-good-metric { position:relative; outline:none; cursor:help; }
+    .machine-detail-good-bubble { position:fixed; left:12px; top:12px; z-index:1400; display:none; width:190px; max-width:calc(100vw - 24px); gap:7px; padding:12px; border:1px solid #bbf7d0; border-radius:13px; background:#fff; color:#334155; box-shadow:0 14px 34px rgba(15,23,42,.18); }
+    .machine-detail-good-bubble-title { color:#047857; font-size:.66rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; }
+    .machine-detail-good-bubble-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding-top:7px; border-top:1px solid #d1fae5; font-size:.68rem; line-height:1.25; font-weight:850; }
+    .machine-detail-good-bubble-row strong { flex:0 0 auto; color:#047857; }
+    .machine-detail-good-metric:hover .machine-detail-good-bubble,
+    .machine-detail-good-metric:focus .machine-detail-good-bubble,
+    .machine-detail-good-metric:focus-within .machine-detail-good-bubble { display:grid; }
+    .machine-detail-reject-metric { position:relative; outline:none; cursor:help; }
+    .machine-detail-reject-bubble { position:fixed; left:12px; top:50%; z-index:1200; width:190px; max-width:calc(100vw - 24px); display:none; gap:7px; padding:12px; border:1px solid #fecaca; border-radius:13px; background:#fff; color:#334155; box-shadow:0 14px 34px rgba(15,23,42,.18); transform:translateY(-50%); }
+    .machine-detail-reject-bubble::after { content:""; position:absolute; left:100%; top:50%; border:7px solid transparent; border-left-color:#fecaca; transform:translateY(-50%); }
+    .machine-detail-reject-bubble.right-side::after { left:auto; right:100%; border-left-color:transparent; border-right-color:#fecaca; }
+    .machine-detail-reject-metric:hover .machine-detail-reject-bubble,.machine-detail-reject-metric:focus .machine-detail-reject-bubble,.machine-detail-reject-metric:focus-within .machine-detail-reject-bubble { display:grid; }
+    .machine-detail-reject-bubble-title { color:#991b1b; font-size:.66rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; }
+    .machine-detail-reject-bubble-row { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding-top:6px; border-top:1px solid #fee2e2; font-size:.64rem; line-height:1.25; font-weight:850; }
+    .machine-detail-reject-bubble-row span:first-child { min-width:0; overflow-wrap:anywhere; }
+    .machine-detail-reject-bubble-row strong { flex:0 0 auto; color:#b91c1c; }
+    .machine-detail-side-list { display:grid; }
+    .machine-detail-side-row { min-width:0; display:grid; grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr); gap:8px; padding:9px 0; border-top:1px solid #edf1f7; }
+    .machine-detail-side-row .k { color:#7890bd; font-size:.59rem; font-weight:900; text-transform:uppercase; }
+    .machine-detail-side-row .v { color:#17306d; font-size:.66rem; font-weight:900; text-align:right; overflow-wrap:anywhere; }
+    .machine-detail-side-callout { display:grid; gap:4px; padding:11px 12px; border-radius:11px; background:linear-gradient(135deg,#f8faff,#fff); box-shadow:0 6px 16px rgba(30,64,175,.05); }
+    .machine-detail-side-callout .k { color:#7890bd; font-size:.58rem; font-weight:900; text-transform:uppercase; }
+    .machine-detail-side-callout .v { color:#172554; font-size:.68rem; font-weight:900; overflow-wrap:anywhere; }
+    .machine-detail-main { min-width:0; display:grid; gap:12px; }
+    .machine-detail-main-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; padding:4px 10px 2px; }
+    .machine-detail-main-title { margin:0; color:#102a67; font-size:1.42rem; line-height:1.1; font-weight:950; }
+    .machine-detail-chip-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:11px; }
+    .machine-detail-chip { display:inline-flex; align-items:center; gap:6px; max-width:100%; padding:7px 11px; border:1px solid #e6ebf4; border-radius:999px; background:#fff; color:#2563eb; font-size:.61rem; line-height:1; font-weight:950; text-transform:uppercase; box-shadow:0 6px 16px rgba(30,64,175,.06); }
+    .machine-detail-chip.active { border-color:#d1fae5; background:#ecfdf5; color:#10b981; }
+    .machine-detail-chip.disconnected { border-color:#fecaca; background:#fef2f2; color:#ef4444; }
+    .machine-detail-chip.inactive { border-color:#cbd5e1; background:#f1f5f9; color:#64748b; }
+    .machine-detail-chip.manual { border-color:#fed7aa; background:#fff7ed; color:#f97316; }
+    .machine-detail-chip.purple { border-color:#ede9fe; background:#f5f3ff; color:#7c3aed; }
+    .machine-detail-info-panel { min-width:0; overflow:hidden; border:1px solid #e8edf5; border-radius:16px; background:rgba(255,255,255,.98); box-shadow:0 9px 24px rgba(30,64,175,.06); }
+    .machine-detail-info-title { padding:15px 18px 12px; color:#17306d; font-size:.68rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; border-bottom:1px solid #edf1f7; }
+    .machine-detail-info-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); }
+    .product-weight-info-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
+    .downtime-summary-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
+    .product-weight-info-grid .machine-detail-info-item:nth-child(3n) { border-right:1px solid #edf1f7; }
+    .downtime-summary-grid .machine-detail-info-item:nth-child(3n) { border-right:1px solid #edf1f7; }
+    .product-weight-info-grid .machine-detail-info-item:nth-child(4n) { border-right:0; }
+    .downtime-summary-grid .machine-detail-info-item:nth-child(4n) { border-right:0; }
+    .product-weight-info-grid .machine-detail-info-item { border-bottom:0; }
+    .downtime-summary-grid .machine-detail-info-item { border-bottom:0; }
+    .machine-detail-info-item { min-width:0; min-height:70px; padding:13px 18px; border-right:1px solid #edf1f7; border-bottom:1px solid #edf1f7; }
+    .machine-detail-info-item:nth-child(3n) { border-right:0; }
+    .machine-detail-info-item:nth-last-child(-n+3) { border-bottom:0; }
+    .machine-detail-info-item .k { color:#7890bd; font-size:.58rem; font-weight:900; letter-spacing:.035em; text-transform:uppercase; }
+    .machine-detail-info-item .v { margin-top:8px; color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; overflow-wrap:anywhere; }
+    .machine-detail-records-title { margin-top:4px; padding:3px 2px; color:#17306d; font-size:.75rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
     .machine-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-    .machine-detail-item { background: #f8fbff; border: 1px solid #d9e6f6; border-radius: 10px; padding: 9px 10px; }
+    .machine-detail-item { min-width: 0; background: #f8fbff; border: 1px solid #d9e6f6; border-radius: 10px; padding: 9px 10px; }
     .machine-detail-item .k { font-size: .76rem; color: #64748b; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .03em; }
     .machine-detail-item .v { font-size: .92rem; font-weight: 600; color: #0f172a; overflow-wrap: anywhere; }
-    .machine-detail-section { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px; }
+    .machine-detail-section { min-width: 0; max-width: 100%; background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px; }
     .machine-detail-section h4 { margin: 0 0 10px; color: #0f172a; font-size: .98rem; }
+    #machineDetailOverlay .review-kv-table { width: 100%; max-width: 100%; table-layout: fixed; }
+    #machineDetailOverlay .review-kv-table th,
+    #machineDetailOverlay .review-kv-table td { min-width: 0; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+    .job-parts-panel { overflow:visible; }
+    .job-parts-panel .machine-detail-info-title { border-radius:16px 16px 0 0; background:rgba(255,255,255,.98); }
+    .job-parts-panel-body { min-width:0; padding:10px 12px 12px; border-radius:0 0 16px 16px; background:rgba(255,255,255,.98); }
+    .job-parts-table { min-width:0; overflow:visible; }
+    .job-parts-table > .review-data-table { width:100%; table-layout:fixed; }
+    .job-parts-table > .review-data-table > thead > tr > th,
+    .job-parts-table > .review-data-table > tbody > tr > td { padding-left:8px; padding-right:8px; }
+    .job-parts-table > .review-data-table > thead > tr > th { color:#7890bd; font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
+    .job-parts-table > .review-data-table > tbody > tr > td { color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; font-family:inherit; }
+    .job-parts-table > .review-data-table > thead > tr > th:nth-child(1),
+    .job-parts-table > .review-data-table > tbody > tr > td:nth-child(1) { width:34px; padding-left:3px; padding-right:3px; text-align:center; }
+    .job-parts-table > .review-data-table > thead > tr > th:nth-child(2),
+    .job-parts-table > .review-data-table > tbody > tr > td:nth-child(2) { width:22%; }
+    .job-parts-table > .review-data-table > thead > tr > th:nth-child(3),
+    .job-parts-table > .review-data-table > tbody > tr > td:nth-child(3) { width:20%; }
+    .job-part-sku { position:relative; display:inline-flex; align-items:center; gap:5px; max-width:100%; padding:0; border:0; background:transparent; color:#1d4ed8; font:inherit; text-align:left; cursor:pointer; outline:none; overflow-wrap:anywhere; }
+    .job-part-sku-caret { flex:0 0 auto; font-size:.58rem; transition:transform .22s ease; }
+    .job-part-sku[aria-expanded="true"] .job-part-sku-caret { transform:rotate(90deg); }
+    .job-part-sku-tooltip { position:absolute; left:0; bottom:calc(100% + 8px); z-index:1250; display:none; width:max-content; max-width:min(300px, 70vw); padding:8px 10px; border:1px solid #bfdbfe; border-radius:9px; background:#0f2a68; color:#fff; font-size:.72rem; line-height:1.35; font-weight:800; box-shadow:0 10px 24px rgba(15,23,42,.20); overflow-wrap:anywhere; }
+    .job-part-sku-tooltip::after { content:""; position:absolute; top:100%; left:14px; border:6px solid transparent; border-top-color:#0f2a68; }
+    .job-part-sku:hover .job-part-sku-tooltip,
+    .job-part-sku:focus .job-part-sku-tooltip { display:block; }
+    .job-part-sku.tooltip-dismissed .job-part-sku-tooltip { display:none !important; }
+    .job-part-scan-cell { width:auto !important; padding:0 !important; border-bottom:0 !important; text-align:left !important; }
+    .job-part-scan-drawer { max-height:0; overflow:hidden; opacity:0; padding:0 12px; border-left:3px solid transparent; background:#f8fbff; transition:max-height .28s ease, opacity .2s ease, padding .28s ease, border-color .2s ease; }
+    .job-part-scan-drawer.open { max-height:720px; overflow:auto; opacity:1; padding:12px; border-left-color:#3b82f6; border-bottom:1px solid #dbe4f0; }
+    .job-part-scan-title { margin-bottom:9px; color:#17306d; font-size:.64rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; }
+    .job-part-scan-drawer .review-data-table { table-layout:fixed; background:#fff; border:1px solid #dbe4f0; border-radius:10px; }
+    .job-part-scan-drawer .review-data-table th { color:#7890bd; font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
+    .job-part-scan-drawer .review-data-table td { color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; font-family:inherit; }
+    .job-part-scan-drawer .review-data-table th:first-child,
+    .job-part-scan-drawer .review-data-table td:first-child { width:34px; text-align:center; }
+    .job-part-scan-drawer .review-data-table th:nth-child(4),
+    .job-part-scan-drawer .review-data-table td:nth-child(4) { width:54px; text-align:center; }
+    .material-qr-link { position:relative; display:inline; max-width:100%; padding:0; border:0; border-radius:0; background:transparent; color:#1d4ed8; font:inherit; font-weight:900; text-align:left; white-space:normal; cursor:pointer; overflow-wrap:anywhere; }
+    .material-qr-link:hover { border:0; background:transparent; color:#1e40af; text-decoration:underline; box-shadow:none; }
+    .material-qr-name-tooltip { position:absolute; left:0; bottom:calc(100% + 8px); z-index:1260; display:none; width:max-content; max-width:min(300px,70vw); padding:8px 10px; border:1px solid #bfdbfe; border-radius:9px; background:#0f2a68; color:#fff; font-size:.72rem; line-height:1.35; font-weight:800; text-decoration:none; box-shadow:0 10px 24px rgba(15,23,42,.20); overflow-wrap:anywhere; }
+    .material-qr-name-tooltip::after { content:""; position:absolute; top:100%; left:14px; border:6px solid transparent; border-top-color:#0f2a68; }
+    .material-qr-link:hover .material-qr-name-tooltip,
+    .material-qr-link:focus .material-qr-name-tooltip { display:block; }
+    .product-pack-panel { overflow:visible; }
+    .product-pack-panel-body { min-width:0; padding:10px 12px 12px; }
+    .machine-detail-record-panel-body { min-width:0; padding:10px 12px 12px; }
+    .machine-detail-record-panel-body .review-data-table { width:100%; table-layout:fixed; }
+    .machine-detail-record-panel-body .review-data-table th { color:#7890bd; font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
+    .machine-detail-record-panel-body .review-data-table td { color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; font-family:inherit; }
+    .machine-detail-record-panel-body .review-data-table th:first-child,
+    .machine-detail-record-panel-body .review-data-table td:first-child { width:34px; padding-left:3px; padding-right:3px; text-align:center; }
+    .machine-detail-record-panel-body .machine-detail-empty { padding:3px 0; color:#64748b; font-size:.72rem; line-height:1.35; font-weight:800; }
+    .machine-detail-downtime-history { border-top:1px solid #edf1f7; }
+    .product-pack-table { min-width:0; overflow:hidden; }
+    .product-pack-table > .review-data-table { width:100%; table-layout:fixed; }
+    .product-pack-table > .review-data-table > thead > tr > th { color:#7890bd; font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
+    .product-pack-table > .review-data-table > tbody > tr > td { color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; font-family:inherit; }
+    .product-pack-table > .review-data-table > thead > tr > th:first-child,
+    .product-pack-table > .review-data-table > tbody > tr > td:first-child { width:34px; padding-left:3px; padding-right:3px; text-align:center; }
+    .product-pack-table > .review-data-table > thead > tr > th:nth-child(2),
+    .product-pack-table > .review-data-table > tbody > tr > td:nth-child(2) { width:25%; }
+    .product-pack-table > .review-data-table > thead > tr > th:nth-child(3),
+    .product-pack-table > .review-data-table > tbody > tr > td:nth-child(3) { width:82px; text-align:center; }
+    .product-pack-table > .review-data-table > thead > tr > th:nth-child(4),
+    .product-pack-table > .review-data-table > tbody > tr > td:nth-child(4) { width:18%; }
+    .product-pack-table > .review-data-table > thead > tr > th:nth-child(5),
+    .product-pack-table > .review-data-table > tbody > tr > td:nth-child(5) { width:82px; text-align:center; }
+    .product-pack-table > .review-data-table > thead > tr > th:nth-child(6),
+    .product-pack-table > .review-data-table > tbody > tr > td:nth-child(6) { width:148px; }
+    .product-pack-latest { display:grid; gap:2px; color:#172554; }
+    .product-pack-latest strong { color:#1d4ed8; font-size:.68rem; font-weight:950; }
+    .product-pack-latest small { color:#64748b; font-size:.62rem; line-height:1.25; font-weight:800; }
+    .pack-item-link { position:relative; display:inline-flex; align-items:center; gap:5px; max-width:100%; padding:0; border:0; border-radius:0; background:transparent; color:#1d4ed8; font:inherit; font-weight:900; text-align:left; white-space:normal; cursor:pointer; overflow-wrap:anywhere; }
+    .pack-item-link:hover { border:0; background:transparent; color:#1e40af; text-decoration:underline; box-shadow:none; }
+    .pack-item-caret { flex:0 0 auto; font-size:.58rem; transition:transform .22s ease; }
+    .pack-item-link[aria-expanded="true"] .pack-item-caret { transform:rotate(90deg); }
+    .pack-item-name-tooltip { position:fixed; left:12px; top:12px; z-index:1400; display:none; width:max-content; max-width:min(300px,70vw); padding:8px 10px; border:1px solid #bfdbfe; border-radius:9px; background:#0f2a68; color:#fff; font-size:.72rem; line-height:1.35; font-weight:800; text-decoration:none; box-shadow:0 10px 24px rgba(15,23,42,.20); overflow-wrap:anywhere; pointer-events:none; }
+    .pack-item-link:hover .pack-item-name-tooltip,
+    .pack-item-link:focus .pack-item-name-tooltip { display:block; }
+    .pack-item-link.tooltip-dismissed .pack-item-name-tooltip { display:none !important; }
+    .product-pack-scan-cell { width:auto !important; padding:0 !important; border-bottom:0 !important; text-align:left !important; }
+    .product-pack-scan-drawer { max-height:0; overflow:hidden; opacity:0; padding:0 12px; border-left:3px solid transparent; background:#f8fbff; transition:max-height .28s ease, opacity .2s ease, padding .28s ease, border-color .2s ease; }
+    .product-pack-scan-drawer.open { max-height:720px; overflow:auto; opacity:1; padding:12px; border-left-color:#3b82f6; border-bottom:1px solid #dbe4f0; }
+    .product-pack-scan-title { margin-bottom:9px; color:#17306d; font-size:.64rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; }
+    .product-pack-scan-drawer .review-data-table { table-layout:fixed; background:#fff; border:1px solid #dbe4f0; border-radius:10px; }
+    .product-pack-scan-drawer .review-data-table th { color:#7890bd; font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
+    .product-pack-scan-drawer .review-data-table td { color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; font-family:inherit; }
+    .product-pack-scan-drawer .review-data-table th:first-child,
+    .product-pack-scan-drawer .review-data-table td:first-child { width:34px; text-align:center; }
+    .product-pack-scan-drawer .review-data-table th:nth-child(2),
+    .product-pack-scan-drawer .review-data-table td:nth-child(2) { width:25%; }
+    .product-pack-scan-drawer .review-data-table th:nth-child(3),
+    .product-pack-scan-drawer .review-data-table td:nth-child(3),
+    .product-pack-scan-drawer .review-data-table th:nth-child(4),
+    .product-pack-scan-drawer .review-data-table td:nth-child(4),
+    .product-pack-scan-drawer .review-data-table th:nth-child(6),
+    .product-pack-scan-drawer .review-data-table td:nth-child(6) { width:62px; text-align:center; }
+    .product-pack-scan-drawer .review-data-table th:nth-child(5),
+    .product-pack-scan-drawer .review-data-table td:nth-child(5) { width:16%; }
+    .product-pack-scan-drawer .review-data-table th:nth-child(7),
+    .product-pack-scan-drawer .review-data-table td:nth-child(7) { width:138px; }
+    .pack-scan-qr-link { position:relative; display:inline; padding:0; border:0; border-radius:0; background:transparent; color:#1d4ed8; font:inherit; font-weight:900; cursor:pointer; }
+    .pack-scan-qr-link:hover { border:0; background:transparent; color:#1e40af; text-decoration:underline; box-shadow:none; }
+    .pack-scan-qr-link:hover .pack-item-name-tooltip,
+    .pack-scan-qr-link:focus .pack-item-name-tooltip { display:block; }
+    .product-pack-missing-value { color:#b45309; font-weight:950; overflow-wrap:anywhere; }
+    .product-pack-missing-value.none { color:#16a34a; }
     .shift-job-tabs { background:#fff; border:1px solid #dbe4f0; border-radius:12px; overflow:hidden; }
     .shift-job-tabs-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:11px 12px; border-bottom:1px solid #e5edf5; background:#f8fafc; }
     .shift-job-tabs-title { font-size:.92rem; font-weight:900; color:#0f172a; }
@@ -6871,22 +7348,47 @@ DASHBOARD_HTML = """
     .detail-progress-fill { height:100%; border-radius:999px; background:#2563eb; }
     .detail-progress-fill.warn { background:#f59e0b; }
     .detail-progress-fill.bad { background:#ef4444; }
-    .raw-insight-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:10px; }
-    .raw-insight-card { border:1px solid #dbe4f0; border-radius:12px; background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%); padding:10px 11px; min-width:0; }
-    .raw-insight-card .k { font-size:.7rem; font-weight:900; color:#64748b; text-transform:uppercase; letter-spacing:.04em; }
-    .raw-insight-card .v { margin-top:4px; font-size:1.05rem; font-weight:900; color:#0f172a; overflow-wrap:anywhere; }
+    .raw-material-stat-panel-body { min-width:0; padding:12px; }
+    .raw-stat-note { margin:0 0 10px; color:#64748b; font-size:.68rem; font-weight:750; line-height:1.4; }
+    .raw-stat-table { min-width:0; overflow:hidden; border:1px solid #dbe4f0; border-radius:12px; background:#fff; }
+    .raw-stat-table .review-data-table { width:100%; table-layout:fixed; }
+    .raw-stat-table .review-data-table th { color:#7890bd; font-size:.56rem; line-height:1.25; font-weight:900; }
+    .raw-stat-table .review-data-table td { color:#172554; font-size:.68rem; line-height:1.35; font-weight:850; vertical-align:middle; }
+    .raw-stat-table .review-data-table th:first-child,
+    .raw-stat-table .review-data-table td:first-child { width:32px; text-align:center; }
+    .raw-stat-table .review-data-table th:nth-child(2),
+    .raw-stat-table .review-data-table td:nth-child(2) { width:25%; }
+    .raw-stat-material { color:#172554; font-weight:900; overflow-wrap:anywhere; }
+    .raw-stat-sku { margin-top:3px; color:#2563eb; font-size:.62rem; font-weight:900; overflow-wrap:anywhere; }
+    .raw-insight-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; margin-bottom:12px; }
+    .raw-insight-card { position:relative; overflow:hidden; border:1px solid #dbe4f0; border-radius:13px; background:linear-gradient(145deg,#ffffff 0%,#f6f9ff 100%); padding:12px 13px; min-width:0; box-shadow:0 6px 16px rgba(30,64,175,.05); }
+    .raw-insight-card::before { content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:#60a5fa; }
+    .raw-insight-card .k { font-size:.58rem; font-weight:950; color:#7890bd; text-transform:uppercase; letter-spacing:.04em; }
+    .raw-insight-card .v { margin-top:7px; font-size:1.16rem; line-height:1; font-weight:950; color:#172554; overflow-wrap:anywhere; }
+    .raw-insight-card .u { margin-top:6px; color:#64748b; font-size:.61rem; line-height:1.2; font-weight:800; }
     .raw-insight-card.warn { border-color:#fed7aa; background:#fff7ed; }
     .raw-insight-card.good { border-color:#bbf7d0; background:#f0fdf4; }
     .raw-insight-card.bad { border-color:#fecaca; background:#fef2f2; }
+    .raw-insight-card.good::before { background:#22c55e; }
+    .raw-insight-card.warn::before { background:#f59e0b; }
+    .raw-insight-card.bad::before { background:#ef4444; }
+    .raw-coverage-panel { overflow:hidden; border:1px solid #dbe4f0; border-radius:13px; background:#f8fbff; }
+    .raw-coverage-title { padding:10px 12px; border-bottom:1px solid #dbe4f0; color:#17306d; font-size:.62rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
+    .raw-coverage-body { padding:10px 12px; }
     .raw-match-list { display:grid; gap:8px; }
-    .raw-match-item { border:1px solid #dbe4f0; border-radius:12px; background:#fff; padding:10px 11px; }
+    .raw-match-item { border:1px solid #dbe4f0; border-radius:12px; background:#fff; padding:11px 12px; box-shadow:0 4px 12px rgba(30,64,175,.04); }
     .raw-match-top { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
-    .raw-match-name { font-weight:900; color:#0f172a; overflow-wrap:anywhere; }
+    .raw-match-name { font-size:.76rem; font-weight:950; color:#172554; overflow-wrap:anywhere; }
     .raw-match-status { border-radius:999px; padding:4px 8px; font-size:.7rem; font-weight:900; text-transform:uppercase; white-space:nowrap; background:#e2e8f0; color:#334155; }
     .raw-match-status.good { background:#dcfce7; color:#166534; }
     .raw-match-status.warn { background:#ffedd5; color:#9a3412; }
     .raw-match-status.bad { background:#fee2e2; color:#991b1b; }
-    .raw-match-meta { margin-top:7px; display:flex; flex-wrap:wrap; gap:7px; font-size:.76rem; font-weight:800; color:#475569; }
+    .raw-match-meta { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; font-size:.65rem; font-weight:850; color:#475569; }
+    .raw-match-meta span { padding:4px 7px; border-radius:999px; background:#f1f5f9; }
+    .raw-match-progress { height:7px; margin-top:9px; overflow:hidden; border-radius:999px; background:#e2e8f0; }
+    .raw-match-progress-fill { height:100%; border-radius:999px; background:linear-gradient(90deg,#3b82f6,#22c55e); }
+    .raw-match-progress-fill.warn { background:linear-gradient(90deg,#f59e0b,#fb923c); }
+    .raw-match-progress-fill.bad { background:#ef4444; }
     body[data-theme="Soft Gray"] { background: #eef1f4; color: #243041; }
     body[data-theme="Soft Gray"] .diag-item,
     body[data-theme="Soft Gray"] .card,
@@ -7067,7 +7569,7 @@ DASHBOARD_HTML = """
     }
     @media (max-width: 1200px) {
       .diagnostics { grid-template-columns: repeat(4, 48px) repeat(2, minmax(150px, 1fr)); }
-      #machineGrid { grid-template-columns:repeat(auto-fill, minmax(260px, 320px)); }
+      #machineGrid, #additionalMachineGrid { grid-template-columns:repeat(4, minmax(0, 1fr)); }
       .maintenance-summary { grid-template-columns:repeat(2, minmax(0, 1fr)); }
       #maintenanceTab .maintenance-person { grid-template-columns:64px minmax(0,1fr); }
       #maintenanceTab .maintenance-stats { grid-column:1 / -1; border-left:none; border-top:1px solid #e5ecf4; }
@@ -7078,6 +7580,14 @@ DASHBOARD_HTML = """
     }
     @media (max-width: 900px) {
       .diagnostics { grid-template-columns: repeat(4, 48px) minmax(0, 1fr); }
+      #machineGrid, #additionalMachineGrid { grid-template-columns:repeat(3, minmax(0, 1fr)); }
+      .machine-detail-layout { grid-template-columns:1fr; }
+      .machine-detail-sidebar { position:static; }
+      .machine-detail-info-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .machine-detail-info-item:nth-child(3n) { border-right:1px solid #edf1f7; }
+      .machine-detail-info-item:nth-child(2n) { border-right:0; }
+      .machine-detail-info-item:nth-last-child(-n+3) { border-bottom:1px solid #edf1f7; }
+      .machine-detail-info-item:nth-last-child(-n+2) { border-bottom:0; }
       .main-tab-button { flex:1 1 140px; }
       .planning-head { display:grid; grid-template-columns:1fr; }
       .planning-ops-summary { grid-template-columns:repeat(2, minmax(0,1fr)); }
@@ -7128,6 +7638,10 @@ DASHBOARD_HTML = """
       .user-kpi-detail-body { padding:10px; }
       .user-kpi-job-grid { grid-template-columns:1fr 1fr; }
       .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
+      .machine-detail-main-head { padding:2px; }
+      .machine-detail-info-grid { grid-template-columns:1fr; }
+      .machine-detail-info-item,.machine-detail-info-item:nth-child(2n),.machine-detail-info-item:nth-child(3n) { border-right:0; border-bottom:1px solid #edf1f7; }
+      .machine-detail-info-item:last-child { border-bottom:0; }
       #machineGrid { grid-template-columns:repeat(2, minmax(0, 1fr)); }
       #additionalMachineGrid { grid-template-columns:repeat(2, minmax(0, 1fr)); }
       .card p { font-size:.78rem; }
@@ -7438,7 +7952,10 @@ DASHBOARD_HTML = """
     <div class="overlay-card">
       <div class="overlay-head">
         <div id="approvePrintOverlayTitle" class="overlay-title">Approve and Print QR</div>
-        <button id="overlayCloseBtn" class="overlay-close" type="button">Close</button>
+        <div class="overlay-head-actions">
+          <button id="overlayShiftHistoryBtn" class="icon-btn" type="button" title="Shift action history" aria-label="Shift action history" style="display:none;">&#128337;</button>
+          <button id="overlayCloseBtn" class="overlay-close" type="button">Close</button>
+        </div>
       </div>
       <div class="overlay-body">
         <div id="overlayReviewStep">
@@ -7569,13 +8086,46 @@ DASHBOARD_HTML = """
     </div>
   </div>
 
+  <div id="shiftActionHistoryOverlay" class="overlay-backdrop machine-history-overlay">
+    <div class="overlay-card machine-history-card">
+      <div class="overlay-head">
+        <div class="machine-detail-head-title">
+          <span class="machine-detail-menu-icon" aria-hidden="true">&#128337;</span>
+          <div id="shiftActionHistoryTitle" class="overlay-title">Shift Action History</div>
+        </div>
+        <button id="shiftActionHistoryCloseBtn" class="icon-btn" type="button" title="Close history" aria-label="Close history">&times;</button>
+      </div>
+      <div class="machine-history-tools">
+        <input id="shiftActionHistorySearch" class="machine-history-search" type="search" autocomplete="off" placeholder="Search time, type, source, actor, action, error, or scanned value..." aria-label="Search shift action history" />
+        <select id="shiftActionHistoryType" class="shift-history-filter" aria-label="Filter by action type">
+          <option value="">All types</option>
+          <option value="SCAN">Scans</option>
+          <option value="ACTION">Actions</option>
+          <option value="ERROR">Errors</option>
+          <option value="SYSTEM">System</option>
+        </select>
+        <select id="shiftActionHistorySource" class="shift-history-filter" aria-label="Filter by source">
+          <option value="">All sources</option>
+        </select>
+        <span id="shiftActionHistoryCount" class="machine-history-count">0 records</span>
+      </div>
+      <div id="shiftActionHistoryBody" class="machine-history-body">
+        <div class="machine-history-empty">Open a finished shift to view its actions.</div>
+      </div>
+    </div>
+  </div>
+
   <div id="machineDetailOverlay" class="overlay-backdrop">
     <div class="overlay-card machine-detail-card">
       <div class="overlay-head">
-        <div class="overlay-title" id="machineDetailTitle">Machine Details</div>
+        <div class="machine-detail-head-title">
+          <span class="machine-detail-menu-icon" aria-hidden="true">&#9776;</span>
+          <div class="overlay-title" id="machineDetailTitle">Machine Details</div>
+        </div>
         <div class="overlay-head-actions">
+          <button id="machineDetailHistoryBtn" class="icon-btn" type="button" title="Machine history" aria-label="Machine history">&#128337;</button>
           <button id="machineDetailSettingsBtn" class="icon-btn" type="button" title="Machine status settings" aria-label="Machine status settings">&#9881;</button>
-          <button id="machineDetailCloseBtn" class="overlay-close" type="button">Close</button>
+          <button id="machineDetailCloseBtn" class="icon-btn" type="button" title="Close" aria-label="Close">&times;</button>
         </div>
       </div>
       <div id="machineDetailStatusPanel" class="machine-detail-status-panel" style="display:none; margin: 12px 14px 0;">
@@ -7609,6 +8159,25 @@ DASHBOARD_HTML = """
         <div class="hint">Override affects the machine flashcard status label and pulse color (orange) on the dashboard.</div>
       </div>
       <div class="machine-detail-body" id="machineDetailBody"></div>
+    </div>
+  </div>
+
+  <div id="machineHistoryOverlay" class="overlay-backdrop machine-history-overlay">
+    <div class="overlay-card machine-history-card">
+      <div class="overlay-head">
+        <div class="machine-detail-head-title">
+          <span class="machine-detail-menu-icon" aria-hidden="true">&#128337;</span>
+          <div class="overlay-title" id="machineHistoryTitle">Machine History</div>
+        </div>
+        <button id="machineHistoryCloseBtn" class="icon-btn" type="button" title="Close history" aria-label="Close history">&times;</button>
+      </div>
+      <div class="machine-history-tools">
+        <input id="machineHistorySearch" class="machine-history-search" type="search" autocomplete="off" placeholder="Search time, type, source, actor, action, error, or scanned value..." aria-label="Search machine history" />
+        <span id="machineHistoryCount" class="machine-history-count">0 records</span>
+      </div>
+      <div id="machineHistoryBody" class="machine-history-body">
+        <div class="machine-history-empty">Select History to load this machine's activity.</div>
+      </div>
     </div>
   </div>
 
@@ -7938,7 +8507,16 @@ DASHBOARD_HTML = """
   const userKpiDetailPerson = document.getElementById("userKpiDetailPerson");
   const userKpiDetailBody = document.getElementById("userKpiDetailBody");
   const approvePrintOverlay = document.getElementById("approvePrintOverlay");
+  const overlayShiftHistoryBtn = document.getElementById("overlayShiftHistoryBtn");
   const overlayCloseBtn = document.getElementById("overlayCloseBtn");
+  const shiftActionHistoryOverlay = document.getElementById("shiftActionHistoryOverlay");
+  const shiftActionHistoryTitle = document.getElementById("shiftActionHistoryTitle");
+  const shiftActionHistoryCloseBtn = document.getElementById("shiftActionHistoryCloseBtn");
+  const shiftActionHistorySearch = document.getElementById("shiftActionHistorySearch");
+  const shiftActionHistoryType = document.getElementById("shiftActionHistoryType");
+  const shiftActionHistorySource = document.getElementById("shiftActionHistorySource");
+  const shiftActionHistoryCount = document.getElementById("shiftActionHistoryCount");
+  const shiftActionHistoryBody = document.getElementById("shiftActionHistoryBody");
   const overlayCancelBtn = document.getElementById("overlayCancelBtn");
   const overlayGenerateBtn = document.getElementById("overlayGenerateBtn");
   const overlayRequestBtn = document.getElementById("overlayRequestBtn");
@@ -7995,6 +8573,7 @@ DASHBOARD_HTML = """
   const overlayLotNumber = document.getElementById("overlayLotNumber");
   const overlayPoNumberRow = overlayPoNumber ? overlayPoNumber.closest(".overlay-row") : null;
   const machineDetailOverlay = document.getElementById("machineDetailOverlay");
+  const machineDetailHistoryBtn = document.getElementById("machineDetailHistoryBtn");
   const machineDetailSettingsBtn = document.getElementById("machineDetailSettingsBtn");
   const machineDetailCloseBtn = document.getElementById("machineDetailCloseBtn");
   const machineDetailTitle = document.getElementById("machineDetailTitle");
@@ -8008,6 +8587,12 @@ DASHBOARD_HTML = """
   const machineStatusSaveBar = document.getElementById("machineStatusSaveBar");
   const machineStatusSaveCheck = document.getElementById("machineStatusSaveCheck");
   const machineDetailBody = document.getElementById("machineDetailBody");
+  const machineHistoryOverlay = document.getElementById("machineHistoryOverlay");
+  const machineHistoryTitle = document.getElementById("machineHistoryTitle");
+  const machineHistoryCloseBtn = document.getElementById("machineHistoryCloseBtn");
+  const machineHistorySearch = document.getElementById("machineHistorySearch");
+  const machineHistoryCount = document.getElementById("machineHistoryCount");
+  const machineHistoryBody = document.getElementById("machineHistoryBody");
   const qrScanCaptureOverlay = document.getElementById("qrScanCaptureOverlay");
   const qrScanCaptureInput = document.getElementById("qrScanCaptureInput");
   const qrScanCaptureCancelBtn = document.getElementById("qrScanCaptureCancelBtn");
@@ -8079,8 +8664,51 @@ DASHBOARD_HTML = """
   const machineCardEls = new Map();
   const machineLinkageDisplayIndex = new Map();
   const machineLinkageFlipTimers = new Map();
+  const machinePackAnimations = new Map();
+  const machinePackQtyBySession = new Map();
+  const machineNoScheduleAnimations = new Map();
+  const REJECT_DETAIL_NAMES = Object.freeze({
+    BM:"BURN MARK", CS:"COLOR STREAK", CO:"CONTAMINATION", CR:"CRACK / BRITTLE",
+    DI:"DISCOLORATION", EM:"EJECTOR MARK", FL:"FLASHES", FM:"FLOW MARK / WRINKLE",
+    NO:"NO SHOT", OC:"OVER-CUT", SC:"SCRATCH", SS:"SHORT SHOT", SI:"SILICONE MARK",
+    SK:"SILVER STREAK", SM:"SINK MARK", ST:"STUCK", VO:"VOID", WA:"WARP",
+    WM:"WATER MARK", WL:"WELD LINE",
+  });
+  const MACHINE_PACK_FRAME_DELAY_MS = 180;
+  const MACHINE_PACK_PRESS_DURATION_MS = 2000;
+  const MACHINE_PACK_TOTAL_DURATION_MS = 4000;
+  const MACHINE_NO_SCHEDULE_WALK_FRAME_MS = 140;
+  const MACHINE_NO_SCHEDULE_WAIT_FRAME_MS = 280;
+  const MACHINE_NO_SCHEDULE_SLEEP_FRAME_MS = 230;
+  const MACHINE_NO_SCHEDULE_SLEEP_HOLD_MS = 2200;
+  const MACHINE_NO_SCHEDULE_FADE_MS = 450;
+  const MACHINE_NO_SCHEDULE_REPEAT_MS = 5 * 60 * 1000;
+  const MACHINE_PACK_FRAME_URLS = Object.freeze(
+    Array.from({ length: 6 }, (_, index) => `/Images/FRAME%20${index + 1}.png`)
+  );
+  const MACHINE_NO_SCHEDULE_WALK_URLS = Object.freeze(
+    Array.from({ length: 9 }, (_, index) => `/PERSON/walk${index + 1}.png`)
+  );
+  const MACHINE_NO_SCHEDULE_WAIT_URLS = Object.freeze(
+    Array.from({ length: 5 }, (_, index) => `/PERSON/wait${index + 1}.png`)
+  );
+  const MACHINE_NO_SCHEDULE_SLEEP_URLS = Object.freeze(
+    Array.from({ length: 11 }, (_, index) => `/PERSON/sleep${index + 1}.png`)
+  );
+  MACHINE_PACK_FRAME_URLS.forEach(src => {
+    const image = new Image();
+    image.decoding = "async";
+    image.src = src;
+  });
+  [...MACHINE_NO_SCHEDULE_WALK_URLS, ...MACHINE_NO_SCHEDULE_WAIT_URLS, ...MACHINE_NO_SCHEDULE_SLEEP_URLS].forEach(src => {
+    const image = new Image();
+    image.decoding = "async";
+    image.src = src;
+  });
   let finishedJobsState = [];
   let finishedShiftState = [];
+  let completeFinishedHistoryState = null;
+  let completeFinishedHistoryLoading = false;
   let finishedShiftViewMode = (() => {
     try {
       return localStorage.getItem("finishedShiftViewMode") === "list" ? "list" : "grid";
@@ -8126,11 +8754,15 @@ DASHBOARD_HTML = """
     catch(_err) { return false; }
   })();
   let activeMachineDetailCode = "";
+  let machineHistoryItems = [];
+  let machineHistoryMachineCode = "";
+  let shiftActionHistoryItems = [];
   let userKpiRoleState = "operator";
   let userKpiLoading = false;
   let userKpiItemsState = [];
 
   function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;"); }
+  function escAttr(s){ return esc(s).replaceAll('"', "&quot;"); }
   function escJson(v){
     try { return esc(JSON.stringify(v ?? {}, null, 2)); } catch { return esc(String(v ?? "")); }
   }
@@ -8446,19 +9078,6 @@ DASHBOARD_HTML = """
             { label: "Qty", value: x => x.qty },
           ], "No reject details recorded.", 8)}</div>
         </div>
-        <div class="review-group-card">
-          <div class="review-group-head">Raw Materials</div>
-          <div class="review-group-body">${tableFromRows(rawRows, [
-            { label: "#", value: x => x.index },
-            { label: "Material", value: x => x.material },
-            { label: "Qty", value: x => x.qty },
-            { label: "Lot", value: x => x.lot },
-          ], "No raw materials scanned for this job.", 8)}</div>
-        </div>
-        <div class="review-group-card wide">
-          <div class="review-group-head">Raw Material Scanned QR History</div>
-          <div class="review-group-body">${rawMaterialQrHistoryHtml(rawRows)}</div>
-        </div>
         <div class="review-group-card wide">
           <div class="review-group-head">Pack History</div>
           <div class="review-group-body">${tableFromRows(packRows, [
@@ -8562,6 +9181,90 @@ DASHBOARD_HTML = """
 
   function detailItem(label, value){
     return `<div class="machine-detail-item"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
+  }
+
+  function machineDetailInfoItem(label, value){
+    return `<div class="machine-detail-info-item"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
+  }
+
+  function machineDetailSideRow(label, value){
+    return `<div class="machine-detail-side-row"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
+  }
+
+  function machineRejectDisplayName(value){
+    const raw = String(value || "").trim();
+    const upper = raw.toUpperCase();
+    const code = upper === "F08" ? "FM" : (REJECT_DETAIL_NAMES[upper] ? upper : upper.slice(0, 2));
+    const fullName = REJECT_DETAIL_NAMES[code];
+    return fullName ? `${fullName} (${code})` : (raw || "Reject");
+  }
+
+  function positionMachineRejectBubble(metric){
+    const bubble = metric?.querySelector?.(".machine-detail-reject-bubble");
+    if(!bubble) return;
+    const rect = metric.getBoundingClientRect();
+    const bubbleWidth = 190;
+    const gap = 12;
+    let left = rect.left - bubbleWidth - gap;
+    bubble.classList.remove("right-side");
+    if(left < 12){
+      left = Math.min(window.innerWidth - bubbleWidth - 12, rect.right + gap);
+      bubble.classList.add("right-side");
+    }
+    bubble.style.left = `${Math.max(12, left)}px`;
+    bubble.style.top = `${Math.max(70, Math.min(window.innerHeight - 70, rect.top + (rect.height / 2)))}px`;
+  }
+
+  function positionMachineGoodBubble(metric){
+    const bubble = metric?.querySelector?.(".machine-detail-good-bubble");
+    if(!bubble) return;
+    const rect = metric.getBoundingClientRect();
+    const width = 190;
+    const height = Math.max(90, bubble.offsetHeight || 110);
+    const gap = 12;
+    let left = rect.left - width - gap;
+    if(left < 12) left = Math.min(window.innerWidth - width - 12, rect.right + gap);
+    const top = Math.max(12, Math.min(window.innerHeight - height - 12, rect.top + (rect.height / 2) - (height / 2)));
+    bubble.style.left = `${Math.max(12, left)}px`;
+    bubble.style.top = `${top}px`;
+  }
+
+  function positionPackItemTooltip(button){
+    const tooltip = button?.querySelector?.(".pack-item-name-tooltip");
+    if(!tooltip) return;
+    window.requestAnimationFrame(() => {
+      const rect = button.getBoundingClientRect();
+      const width = Math.max(120, tooltip.offsetWidth || 220);
+      const height = Math.max(32, tooltip.offsetHeight || 40);
+      const left = Math.max(12, Math.min(window.innerWidth - width - 12, rect.left));
+      let top = rect.top - height - 8;
+      if(top < 12) top = Math.min(window.innerHeight - height - 12, rect.bottom + 8);
+      tooltip.style.left = `${left}px`;
+      tooltip.style.top = `${Math.max(12, top)}px`;
+    });
+  }
+
+  function fmtDateOnly(iso){
+    if(!iso) return "-";
+    const d = new Date(iso);
+    if(Number.isNaN(d.getTime())) return String(iso);
+    return d.toLocaleDateString("en-US", {
+      month: "2-digit",
+      day: "2-digit",
+      year: "numeric",
+    });
+  }
+
+  function fmtTimeOnly(iso){
+    if(!iso) return "-";
+    const d = new Date(iso);
+    if(Number.isNaN(d.getTime())) return String(iso);
+    return d.toLocaleTimeString("en-US", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
   }
 
   function archiveMetric(label, value, tone = ""){
@@ -8673,7 +9376,7 @@ DASHBOARD_HTML = """
         qty: scanQty || "-",
         lot: firstValue(logObj.lot_number, logObj.lot, scanObj.lot_number, scanObj.lot) || "-",
         time: scanTime || "",
-        code: firstValue(logObj.material_code, logObj.product_id, logObj.sku, scanObj.material_code, scanObj.product_id, scanObj.sku, ""),
+        code: firstValue(logObj.material_sku, logObj.material_code, logObj.product_id, logObj.sku, scanObj.material_sku, scanObj.material_code, scanObj.product_id, scanObj.sku, parsedScan.product_id, ""),
         raw_scan: String(scanPayload || ""),
         is_scanned: hasScanRecord,
         scan_qty: firstValue(parsedScan.qty, scanQty, "-"),
@@ -8697,6 +9400,9 @@ DASHBOARD_HTML = """
         qty: firstValue(x.good_qty, x.qty_q, x.qty, x.completed_pack_qty, "-"),
         pack_qty: firstValue(x.completed_pack_qty, x.pack_qty, x.qty, "-"),
         product: firstValue(x.product_p, x.product_id, "-"),
+        item_sku: firstValue(x.product_sku, x.sku, x.item_sku, ""),
+        item_name: firstValue(x.product_name, x.item_name, x.name, ""),
+        item_description: firstValue(x.product_description, x.description, x.item_description, ""),
         series: firstValue(x.series, x.index, x.label_index, "-"),
         total_labels: firstValue(x.total_labels, x.total, "-"),
         lot: firstValue(x.lot_number, x.lot, "-"),
@@ -8779,54 +9485,127 @@ DASHBOARD_HTML = """
     const rows = productPackHistoryRows(session);
     const missingRows = productPackMissingSeriesRows(session);
     const visible = rows.slice().reverse();
-    const missingTable = tableFromRows(missingRows, [
-      { label: "Item", value: x => x.product },
-      { label: "PO", value: x => x.po },
-      { label: "Lots", value: x => x.lot },
-      { label: "Expected Series", value: x => x.expected },
-      { label: "Scanned", value: x => x.scanned },
-      { label: "Scanned Series", value: x => x.scanned_series },
-      { label: "Missing Series", value: x => x.missing_series },
-    ], "No pack QR scans recorded.", 7);
-    const table = tableFromRows(visible, [
-      { label: "#", value: x => x.index },
-      { label: "Source", value: x => x.source },
-      { label: "Good Qty", value: x => x.qty },
-      { label: "Pack Qty", value: x => x.pack_qty },
-      { label: "Series", value: x => x.series },
-      { label: "Total", value: x => x.total_labels },
-      { label: "Lot", value: x => x.lot },
-      { label: "PO", value: x => x.po },
-      { label: "Operator", value: x => x.operator },
-      { label: "Scanned At", value: x => fmtDateLocal(x.time || "") || "-" },
-      { label: "QR", html: x => qrViewButton(qrPackDetails(x)) },
-    ], "No pack QR scans recorded.", Math.max(1, rows.length));
-    const scannedTable = rows.length
-      ? `<div class="scanned-pack-scroll">${table}</div>`
-      : table;
-    const scannedQrRows = rows.map(x => {
-      const raw = String(x.raw_scan || "").trim();
-      if(raw) return `${x.index}. ${raw}`;
-      return `${x.index}. Series ${x.series || "-"} / Lot ${x.lot || "-"} / PO ${x.po || "-"} / Qty ${x.qty || "-"}`;
+    const normalizeProductId = value => {
+      const text = String(value || "").trim();
+      return text.replace(/^0+/, "") || text;
+    };
+    const jobCandidates = [session, ...(Array.isArray(session?.linkage_jobs) ? session.linkage_jobs : [])];
+    if(session?.linkage_job_payload && typeof session.linkage_job_payload === "object"){
+      jobCandidates.push({job_payload: session.linkage_job_payload});
+    }
+    const packItemMeta = row => {
+      const productId = normalizeProductId(row?.product);
+      const matchedJob = jobCandidates.find(candidate => {
+        const job = extractJobRecord(candidate) || {};
+        const details = extractJobDetailsRecord(candidate) || {};
+        return [candidate?.product_id, job.product_id, details.product_id]
+          .map(normalizeProductId)
+          .some(id => id && id === productId);
+      }) || (new Set(rows.map(item => normalizeProductId(item.product))).size === 1 ? session : null);
+      const matchedRecord = matchedJob ? (extractJobRecord(matchedJob) || {}) : {};
+      const matchedDetails = matchedJob ? (extractJobDetailsRecord(matchedJob) || {}) : {};
+      const catalogItem = Array.isArray(productItems) ? productItems.find(product => {
+        const id = normalizeProductId(product?.id || product?.product_id);
+        return id && id === productId;
+      }) : null;
+      return {
+        sku: firstValue(row?.item_sku, matchedJob ? jobSku(matchedJob) : "", catalogItem?.sku, catalogItem?.product_sku, row?.product, "-"),
+        name: firstValue(
+          row?.item_name, matchedJob?.product_name, matchedDetails.product_name,
+          matchedRecord.product_name, catalogItem?.name, catalogItem?.product_name,
+          `Product ${row?.product || "-"}`
+        ),
+        description: firstValue(
+          row?.item_description,
+          matchedJob?.product_description, matchedJob?.description,
+          matchedDetails.product_description, matchedDetails.description,
+          matchedRecord.product_description, matchedRecord.description,
+          catalogItem?.description, catalogItem?.product_description,
+          row?.item_name, matchedJob?.product_name, matchedDetails.product_name,
+          matchedRecord.product_name, catalogItem?.name, catalogItem?.product_name,
+          "Description unavailable"
+        ),
+      };
+    };
+    const combinedRows = visible.map(row => {
+      const itemMeta = packItemMeta(row);
+      return {
+        ...row,
+        item_sku: itemMeta.sku,
+        item_name: itemMeta.name,
+        item_description: itemMeta.description,
+      };
     });
-    const rawDetails = scannedQrRows.length ? `
-      <details class="archive-raw-details">
-        <summary>Show all scanned QR</summary>
-        <div class="machine-detail-code" style="margin-top:8px;">${esc(scannedQrRows.join("\\n"))}</div>
-      </details>
-    ` : "";
+    if(!combinedRows.length) return '<div class="machine-detail-empty">No pack QR scans recorded.</div>';
+    const missingByGroup = new Map(missingRows.map(row => [
+      [row.product || "-", row.po || "-", row.expected || "-"].join("|"),
+      row.missing_series || "None",
+    ]));
+    const grouped = new Map();
+    combinedRows.forEach(row => {
+      const key = [row.product || "-", row.po || "-", row.total_labels || "-"].join("|");
+      if(!grouped.has(key)){
+        grouped.set(key, {
+          key,
+          product: row.product,
+          item_sku: row.item_sku,
+          item_name: row.item_name,
+          item_description: row.item_description,
+          qty: row.qty,
+          po: row.po,
+          total: row.total_labels,
+          missing_series: missingByGroup.get(key) || "None",
+          scans: [],
+        });
+      }
+      grouped.get(key).scans.push(row);
+    });
+    const bodyRows = Array.from(grouped.values()).map((group, groupIndex) => {
+      const drawerId = `productPackScans-${groupIndex + 1}`;
+      const scanRows = group.scans.map((scan, scanIndex) => {
+        const encoded = encodeURIComponent(JSON.stringify(qrPackDetails(scan)));
+        return `
+          <tr>
+            <td>${esc(scanIndex + 1)}</td>
+            <td><button type="button" class="qr-view-btn pack-scan-qr-link" data-qr-view="${escAttr(encoded)}" aria-label="${escAttr(`${scan.item_sku}: ${scan.item_name}`)}">${esc(scan.item_sku || scan.product || "-")}<span class="pack-item-name-tooltip" role="tooltip">${esc(scan.item_name || `Product ${scan.product || "-"}`)}</span></button></td>
+            <td>${esc(compactValue(scan.qty))}</td>
+            <td>${esc(compactValue(scan.series))}</td>
+            <td>${esc(compactValue(scan.po))}</td>
+            <td>${esc(compactValue(scan.total_labels))}</td>
+            <td>${esc(fmtDateLocal(scan.time || "") || "-")}</td>
+          </tr>`;
+      }).join("");
+      const missingNone = String(group.missing_series || "None").toLowerCase() === "none";
+      const latestScan = group.scans[0] || {};
+      return `
+        <tr>
+          <td>${esc(groupIndex + 1)}</td>
+          <td><button type="button" class="pack-item-link pack-item-drawer-button" data-pack-drawer="${escAttr(drawerId)}" aria-expanded="false" aria-controls="${escAttr(drawerId)}" aria-label="${escAttr(`${group.item_sku}: ${group.item_description}`)}"><span class="pack-item-caret" aria-hidden="true">&#9654;</span><span>${esc(group.item_sku)}</span><span class="pack-item-name-tooltip" role="tooltip">${esc(group.item_description)}</span></button></td>
+          <td>${esc(compactValue(group.qty))}</td>
+          <td>${esc(compactValue(group.po))}</td>
+          <td>${esc(compactValue(group.total))}</td>
+          <td><span class="product-pack-latest"><strong>Series ${esc(latestScan.series || latestScan.index || "-")}</strong><small>${esc(fmtDateLocal(latestScan.time || "") || "-")}</small></span></td>
+          <td><span class="product-pack-missing-value${missingNone ? " none" : ""}">${esc(group.missing_series)}</span></td>
+        </tr>
+        <tr class="product-pack-scan-row">
+          <td class="product-pack-scan-cell" colspan="7">
+            <div id="${escAttr(drawerId)}" class="product-pack-scan-drawer">
+              <div class="product-pack-scan-title">Scanned Pack QR for ${esc(group.item_sku)} &mdash; ${esc(group.scans.length)} scan${group.scans.length === 1 ? "" : "s"}</div>
+              <table class="review-kv-table review-data-table">
+                <thead><tr><th>#</th><th>Item</th><th>Qty</th><th>Series</th><th>PO</th><th>Total</th><th>Scanned At</th></tr></thead>
+                <tbody>${scanRows}</tbody>
+              </table>
+            </div>
+          </td>
+        </tr>`;
+    }).join("");
     return `
-      <div class="review-group-list">
-        <div class="review-group-card wide">
-          <div class="review-group-head">Missing Series</div>
-          <div class="review-group-body">${missingTable}</div>
-        </div>
-        <div class="review-group-card wide">
-          <div class="review-group-head">Scanned Pack QR</div>
-          <div class="review-group-body">${scannedTable}${rawDetails}</div>
-        </div>
-      </div>
-    `;
+      <div class="product-pack-table">
+        <table class="review-kv-table review-data-table">
+          <thead><tr><th>#</th><th>Item</th><th>Qty</th><th>PO</th><th>Total</th><th>Latest Scan</th><th>Missing Series</th></tr></thead>
+          <tbody>${bodyRows}</tbody>
+        </table>
+      </div>`;
   }
 
   function rawPartRows(row){
@@ -8847,6 +9626,36 @@ DASHBOARD_HTML = """
       if(clean.length) return clean;
     }
     return [];
+  }
+
+  function allJobPartRows(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const sources = [item];
+    const linkedRows = Array.isArray(item.linkage_jobs) ? item.linkage_jobs : [];
+    linkedRows.forEach(linked => {
+      if(!linked || typeof linked !== "object") return;
+      let linkedSource = linked;
+      const linkedCode = firstValue(linked.job_code, linked.job_name, "");
+      const hasPayload = linked.job_payload && typeof linked.job_payload === "object" && Object.keys(linked.job_payload).length;
+      if(!hasPayload && String(linkedCode) === String(item.linkage_job_code || "") && item.linkage_job_payload && typeof item.linkage_job_payload === "object"){
+        linkedSource = {...linked, job_payload:item.linkage_job_payload};
+      }
+      sources.push(linkedSource);
+    });
+    const parts = [];
+    const seen = new Set();
+    sources.forEach(source => {
+      rawPartRows(source).forEach(part => {
+        if(!part || typeof part !== "object") return;
+        const productId = firstValue(part.part_product_id, part.product_id, part.id, "-");
+        const sku = firstValue(part.sku, part.part_sku, part.product_sku, part.part_code, part.product_code, part.code, "-");
+        const key = `${materialKeyText(productId)}|${materialKeyText(sku)}`;
+        if(seen.has(key)) return;
+        seen.add(key);
+        parts.push(part);
+      });
+    });
+    return parts;
   }
 
   function jobPartsNeededHtml(row){
@@ -8887,26 +9696,61 @@ DASHBOARD_HTML = """
           requested: firstValue(part.request_part_qty, part.required_qty, part.qty, part.quantity, "-"),
           approved: firstValue(part.approve_part_qty, part.approved_qty, "-"),
           completed: firstValue(part.complete_part_qty, part.completed_qty, "-"),
+          source_part: part,
         });
       });
     });
     partRows.forEach((part, idx) => { part.index = idx + 1; });
-    return tableFromRows(partRows, [
-      { label: "#", value: x => x.index },
-      { label: "Required By", value: x => x.required_by },
-      { label: "Product ID", value: x => x.product_id },
-      { label: "SKU", value: x => x.sku },
-      { label: "Part Needed", value: x => x.name },
-      { label: "Qty / Unit", value: x => x.per_unit },
-      { label: "Requested", value: x => x.requested },
-      { label: "Approved", value: x => x.approved },
-      { label: "Completed", value: x => x.completed },
-    ], "No required-parts list was returned by the Job API.", Math.max(1, partRows.length));
+    if(!partRows.length) return '<div class="machine-detail-empty">No required-parts list was returned by the Job API.</div>';
+    const materialRows = archivedMaterialRows(item);
+    const bodyRows = partRows.map(part => {
+      const sourcePart = {...(part.source_part || {}), product_id: part.product_id, sku: part.sku, name: part.name};
+      const scans = rawLogsForPart(materialRows, sourcePart, partRows.length)
+        .filter(row => row?.is_scanned === true)
+        .map(row => ({...row, display_sku: part.sku, display_name: part.name}));
+      const drawerId = `jobPartScans-${part.index}`;
+      return `
+        <tr>
+          <td>${esc(part.index)}</td>
+          <td>${esc(part.required_by)}</td>
+          <td>
+            <button class="job-part-sku job-part-sku-button" type="button" data-parts-drawer="${escAttr(drawerId)}" aria-expanded="false" aria-controls="${escAttr(drawerId)}">
+              <span class="job-part-sku-caret" aria-hidden="true">&#9654;</span><span>${esc(part.sku)}</span>
+              <span class="job-part-sku-tooltip" role="tooltip">${esc(part.name || "Name unavailable")}</span>
+            </button>
+          </td>
+          <td>${esc(compactValue(part.per_unit))}</td>
+          <td>${esc(compactValue(part.requested))}</td>
+          <td>${esc(compactValue(part.approved))}</td>
+          <td>${esc(compactValue(part.completed))}</td>
+        </tr>
+        <tr class="job-part-scan-row">
+          <td class="job-part-scan-cell" colspan="7">
+            <div id="${escAttr(drawerId)}" class="job-part-scan-drawer">
+              <div class="job-part-scan-title">Scanned Items for ${esc(part.sku)} &mdash; ${esc(part.name || "Name unavailable")}</div>
+              ${rawMaterialQrHistoryHtml(scans)}
+            </div>
+          </td>
+        </tr>`;
+    }).join("");
+    return `
+      <div class="job-parts-table">
+        <table class="review-kv-table review-data-table">
+          <thead><tr><th>#</th><th>Required By</th><th>SKU</th><th>Qty / Unit</th><th>Requested</th><th>Approved</th><th>Completed</th></tr></thead>
+          <tbody>${bodyRows}</tbody>
+        </table>
+      </div>`;
   }
 
   function isRawMaterialPart(part){
     const p = (part && typeof part === "object") ? part : {};
     const sku = String(p.sku || p.part_sku || p.product_sku || p.material_sku || p.part_code || p.product_code || p.code || "").trim().toUpperCase();
+    return sku.startsWith("Z-RM");
+  }
+
+  function isRawMaterialScan(row){
+    const x = (row && typeof row === "object") ? row : {};
+    const sku = String(x.material_sku || x.code || x.sku || x.material_code || "").trim().toUpperCase();
     return sku.startsWith("Z-RM");
   }
 
@@ -8934,12 +9778,13 @@ DASHBOARD_HTML = """
   function rawLogsForPart(materialRows, part, totalPartCount){
     const rows = Array.isArray(materialRows) ? materialRows.filter(x => x && typeof x === "object") : [];
     const p = (part && typeof part === "object") ? part : {};
-    const keys = [p.sku, p.name, p.part_name, p.material_name, p.product_name, p.description, p.part_code, p.product_code, p.code]
+    const keys = [p.product_id, p.part_product_id, p.id, p.sku, p.name, p.part_name, p.material_name, p.product_name, p.description, p.part_code, p.product_code, p.code]
       .map(materialKeyText).filter(Boolean);
     if(!keys.length) return Number(totalPartCount || 0) <= 1 ? rows : [];
     const matched = rows.filter(raw => {
       const rawKeys = [
         raw.material,
+        raw.code,
         raw.material_name,
         raw.material_code,
         raw.material_product_id,
@@ -8955,7 +9800,7 @@ DASHBOARD_HTML = """
     const rows = rawLogsForPart(materialRows, part, totalPartCount);
     const sku = String(part?.sku || part?.part_sku || part?.product_sku || "").trim().toUpperCase();
     const name = String(part?.name || part?.part_name || part?.material_name || "").trim().toUpperCase();
-    const isMaterial = sku.startsWith("Z-") || /\bKGS?\b/.test(name);
+    const isMaterial = sku.startsWith("Z-RM") || /\bKGS?\b/.test(name);
     const fallbackPerUnit = isMaterial
       ? Math.max(0, Number(appPartQtyKg || 0))
       : Number(part?.part_qty_per_unit || part?.qty_per_unit || 0);
@@ -8982,89 +9827,153 @@ DASHBOARD_HTML = """
     return { scanned, required, used: Math.min(scanned, used), available: Math.max(0, scanned - used) };
   }
 
+  function actualPackMaterialUsage(item, part){
+    const row = item && typeof item === "object" ? item : {};
+    const partKeys = [
+      part?.part_product_id, part?.product_id, part?.id,
+      part?.sku, part?.part_sku, part?.product_sku, part?.part_code, part?.product_code, part?.code,
+      part?.name, part?.part_name, part?.material_name, part?.product_name,
+    ].map(materialKeyText).filter(Boolean);
+    const matchesPart = entry => {
+      const entryKeys = [
+        entry?.part_product_id, entry?.product_id,
+        entry?.part_sku, entry?.sku, entry?.part_code, entry?.product_code,
+        entry?.part_name, entry?.material_name, entry?.product_name,
+      ].map(materialKeyText).filter(Boolean);
+      return entryKeys.some(key => partKeys.some(partKey => key === partKey || key.includes(partKey) || partKey.includes(key)));
+    };
+    const entries = [];
+    (Array.isArray(row.product_pack_history_logs) ? row.product_pack_history_logs : [])
+      .filter(pack => pack && typeof pack === "object" && !pack.voided)
+      .forEach(pack => (Array.isArray(pack.raw_part_consumption) ? pack.raw_part_consumption : [])
+        .filter(entry => entry && typeof entry === "object" && matchesPart(entry))
+        .forEach(entry => entries.push(entry)));
+    const sku = String(firstValue(part?.sku, part?.part_sku, part?.product_sku, "")).toUpperCase();
+    const name = String(materialLabel(part)).toUpperCase();
+    const isRawMaterial = sku.startsWith("Z-RM") || /\bKGS?\b/.test(name);
+    const shiftWeight = isRawMaterial ? Math.max(0, Number(row.external_average_weight_grams || 0) / 1000) : 0;
+    const partRate = Math.max(0, Number(part?.part_qty_per_unit || part?.qty_per_unit || 0));
+    const positiveRates = entries.map(entry => Math.max(0, Number(
+      entry.part_qty_per_unit_kg ?? entry.part_qty_per_unit ?? 0
+    ))).filter(rate => rate > 0);
+    const firstRate = positiveRates[0] || shiftWeight || partRate;
+    const lastRate = positiveRates[positiveRates.length - 1] || firstRate;
+    let recordedUnits = 0;
+    let used = 0;
+    entries.forEach(entry => {
+      const produced = Math.max(0, Number(entry.produced_units || 0));
+      const rate = Math.max(0, Number(entry.part_qty_per_unit_kg ?? entry.part_qty_per_unit ?? 0)) || firstRate;
+      const stampedUsed = Math.max(0, Number(entry.used_qty_kg ?? entry.used_qty ?? 0));
+      recordedUnits += produced;
+      used += stampedUsed > 0 ? stampedUsed : produced * rate;
+    });
+    const targetUnits = Math.max(0, Number(row.good_total ?? row.total_good ?? row.partial_qty ?? 0));
+    const missingUnits = Math.max(0, targetUnits - recordedUnits);
+    if(missingUnits > 0 && lastRate > 0) used += missingUnits * lastRate;
+    return {used, recordedUnits, targetUnits, missingUnits, firstRate, lastRate, hasRate:firstRate > 0};
+  }
+
   function rawMaterialInsightsHtml(row){
     const item = (row && typeof row === "object") ? row : {};
-    const materialRows = archivedMaterialRows(item);
-    const parts = rawPartRows(item).filter(isRawMaterialPart);
+    const formatMaterialStat = value => {
+      const number = Number(value);
+      if(!Number.isFinite(number)) return "-";
+      return number.toLocaleString(undefined, {maximumFractionDigits: 4});
+    };
+    const currentMaterialRows = archivedMaterialRows(item);
+    const priorPartialTotals = (item.prior_partial_raw_material_totals && typeof item.prior_partial_raw_material_totals === "object")
+      ? item.prior_partial_raw_material_totals
+      : {};
+    const priorMaterialRows = Array.isArray(priorPartialTotals.rows)
+      ? priorPartialTotals.rows.filter(x => x && typeof x === "object")
+      : [];
+    const currentScannedRows = currentMaterialRows.filter(x => !String(x.source || "").toUpperCase().includes("CARRYOVER"));
+    const materialRows = [...priorMaterialRows, ...currentScannedRows];
+    const partMap = new Map();
+    allJobPartRows(item).forEach(part => {
+      if(!part || typeof part !== "object") return;
+      const sku = firstValue(part.sku, part.part_sku, part.product_sku, part.part_code, part.product_code, part.code, "-");
+      const productId = firstValue(part.part_product_id, part.product_id, part.id, "-");
+      const key = `${materialKeyText(productId)}|${materialKeyText(sku)}`;
+      if(!partMap.has(key)) partMap.set(key, part);
+    });
+    const parts = [...partMap.values()];
     const consumedUnits = consumedUnitCount(item);
     const appPartQtyKg = Math.max(0, Number(item.external_average_weight_grams || 0) / 1000);
-    const scannedQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
-    const expectedQty = parts.reduce((sum, part) => {
-      const fixedQty = Number(part.request_part_qty || part.required_qty || part.qty || part.quantity || 0);
-      const skuForExpected = String(part.sku || part.part_sku || part.product_sku || "").trim().toUpperCase();
-      const nameForExpected = String(part.name || part.part_name || part.material_name || "").trim().toUpperCase();
-      const isMaterialForExpected = skuForExpected.startsWith("Z-") || /\bKGS?\b/.test(nameForExpected);
-      const perUnit = isMaterialForExpected ? appPartQtyKg : Number(part.part_qty_per_unit || part.qty_per_unit || 0);
-      const consumption = rawConsumptionForPart(materialRows, part, consumedUnits, parts.length, appPartQtyKg);
-      return sum + Math.max(0, perUnit > 0 ? consumption.required : fixedQty);
-    }, 0);
-    const estimatedUsed = expectedQty > 0 ? Math.min(scannedQty, expectedQty) : "";
-    const estimatedExcess = expectedQty > 0 ? Math.max(0, scannedQty - expectedQty) : "";
-    const partMatches = parts.map(part => {
-      const keys = [part.sku, part.name, part.part_name, part.material_name, part.product_name, part.description, part.part_code, part.product_code, part.code]
-        .map(materialKeyText).filter(Boolean);
-      const consumption = rawConsumptionForPart(materialRows, part, consumedUnits, parts.length, appPartQtyKg);
-      const scanned = consumption.scanned;
-      const sku = String(part.sku || part.part_sku || part.product_sku || "").trim().toUpperCase();
-      const name = String(part.name || part.part_name || part.material_name || "").trim().toUpperCase();
-      const isMaterial = sku.startsWith("Z-") || /\bKGS?\b/.test(name);
-      const perUnit = isMaterial ? appPartQtyKg : Number(part.part_qty_per_unit || part.qty_per_unit || 0);
-      const required = Math.max(0, perUnit > 0 ? consumption.required : Number(part.request_part_qty || part.required_qty || part.qty || part.quantity || 0));
-      const status = required <= 0 ? "info" : (scanned >= required ? "good" : (scanned > 0 ? "warn" : "bad"));
-      const statusText = required <= 0 ? "No target" : (scanned >= required ? "Covered" : (scanned > 0 ? "Short" : "Missing"));
-      const displayPerUnit = isMaterial ? (appPartQtyKg > 0 ? `${appPartQtyKg.toFixed(4)} kg` : "-") : (part.part_qty_per_unit || part.qty_per_unit || "-");
-      return { part, scanned, required, status, statusText, displayPerUnit };
+    const matchedMaterialRows = new Set();
+    const statisticsRows = parts.map(part => {
+      const matchedRows = rawLogsForPart(materialRows, part, Math.max(2, parts.length));
+      matchedRows.forEach(materialRow => matchedMaterialRows.add(materialRow));
+      const scanned = matchedRows.reduce((sum, materialRow) => sum + Math.max(0, Number(materialRow.qty || materialRow.quantity || 0)), 0);
+      const scanCount = matchedRows.reduce((sum, materialRow) => sum + Math.max(1, Number(materialRow.scan_count || 1)), 0);
+      const sku = String(firstValue(part.sku, part.part_sku, part.product_sku, part.part_code, part.product_code, part.code, "")).trim().toUpperCase();
+      const name = String(materialLabel(part)).trim().toUpperCase();
+      const isRawMaterial = sku.startsWith("Z-RM") || /\bKGS?\b/.test(name);
+      const loggedPerUnit = matchedRows.map(materialRow => Number(
+        isRawMaterial ? materialRow.part_qty_per_unit_kg : materialRow.part_qty_per_unit
+      )).find(value => Number.isFinite(value) && value > 0) || 0;
+      const perUnit = isRawMaterial
+        ? (appPartQtyKg || loggedPerUnit)
+        : (Number(part.part_qty_per_unit || part.qty_per_unit || 0) || loggedPerUnit || 1);
+      const currentUsage = actualPackMaterialUsage(item, part);
+      const priorUsed = matchedRows.reduce((sum, materialRow) => sum + Math.max(0, Number(materialRow.used_qty || 0)), 0);
+      const currentUsed = currentUsage.hasRate
+        ? currentUsage.used
+        : (perUnit > 0 ? Math.max(0, Number(item.good_total || 0) * perUnit) : null);
+      const totalUsed = currentUsed === null && priorUsed <= 0 ? null : priorUsed + Math.max(0, Number(currentUsed || 0));
+      const balance = totalUsed === null ? null : scanned - totalUsed;
+      const status = totalUsed === null ? "info" : (scanned >= totalUsed ? "good" : (scanned > 0 ? "warn" : "bad"));
+      const statusText = totalUsed === null ? "No rate" : (scanned >= totalUsed ? "Covered" : (scanned > 0 ? "Short" : "Missing"));
+      return {
+        material: materialLabel(part),
+        sku: firstValue(part.sku, part.part_sku, part.product_sku, part.part_code, part.product_code, part.code, "-"),
+        unit: isRawMaterial ? "kg" : "pcs",
+        scans: scanCount,
+        scanned,
+        currentUsed,
+        totalUsed,
+        balance,
+        status,
+        statusText,
+      };
     });
-    const cards = `
-      <div class="raw-insight-grid">
-        <div class="raw-insight-card ${materialRows.length ? "good" : "bad"}"><div class="k">Scanned Bags</div><div class="v">${esc(materialRows.length)}</div></div>
-        <div class="raw-insight-card"><div class="k">Scanned Qty</div><div class="v">${esc(scannedQty || "-")}</div></div>
-        <div class="raw-insight-card"><div class="k">Expected Use</div><div class="v">${esc(expectedQty || "-")}</div></div>
-        <div class="raw-insight-card ${Number(estimatedExcess || 0) > 0 ? "warn" : "good"}"><div class="k">Est. Excess</div><div class="v">${esc(estimatedExcess === "" ? "-" : estimatedExcess)}</div></div>
-      </div>
-    `;
-    const coverage = partMatches.length ? `
-      <div class="raw-match-list">
-        ${partMatches.map(x => `
-          <div class="raw-match-item">
-            <div class="raw-match-top">
-              <div class="raw-match-name">${esc(materialLabel(x.part))}</div>
-              <span class="raw-match-status ${esc(x.status)}">${esc(x.statusText)}</span>
-            </div>
-            <div class="raw-match-meta">
-              <span>Required: ${esc(x.required || "-")}</span>
-              <span>Scanned: ${esc(x.scanned || 0)}</span>
-              <span>Per Unit: ${esc(x.displayPerUnit || "-")}</span>
-              <span>Code: ${esc(x.part.sku || x.part.part_code || x.part.product_code || x.part.code || "-")}</span>
-            </div>
-          </div>
-        `).join("")}
-      </div>
-    ` : `<div class="machine-detail-empty">No target raw material list found from the Job API.</div>`;
-    const table = tableFromRows(materialRows, [
-      { label: "#", value: x => x.index },
-      { label: "Material / Scan", value: x => x.material },
-      { label: "Qty", value: x => x.qty },
-      { label: "Lot", value: x => x.lot },
-      { label: "Scanned At", value: x => fmtDateLocal(x.time || "") },
-    ], "No raw materials scanned.", 12);
+    const unmatchedGroups = new Map();
+    materialRows.filter(materialRow => !matchedMaterialRows.has(materialRow)).forEach(materialRow => {
+      const sku = firstValue(materialRow.material_sku, materialRow.code, materialRow.sku, materialRow.material_code, "-");
+      const material = materialLabel(materialRow);
+      const key = `${materialKeyText(sku)}|${materialKeyText(material)}`;
+      const group = unmatchedGroups.get(key) || {material, sku, scans:0, scanned:0};
+      group.scans += Math.max(1, Number(materialRow.scan_count || 1));
+      group.scanned += Math.max(0, Number(materialRow.qty || materialRow.quantity || 0));
+      unmatchedGroups.set(key, group);
+    });
+    unmatchedGroups.forEach(group => {
+      const rawUnit = String(group.sku || "").toUpperCase().startsWith("Z-RM") || /\bKGS?\b/i.test(group.material || "");
+      statisticsRows.push({...group, unit:rawUnit ? "kg" : "pcs", currentUsed:null, totalUsed:null, balance:null, status:"info", statusText:"Unmatched"});
+    });
+    if(!statisticsRows.length) return '<div class="machine-detail-empty">No material requirements or scans recorded for this job.</div>';
+    const quantity = (value, unit) => value === null || value === undefined
+      ? "-"
+      : `${formatMaterialStat(value)} ${unit}`;
     return `
-      ${cards}
-      <div class="review-group-list">
-        <div class="review-group-card wide">
-          <div class="review-group-head">Scanned Materials</div>
-          <div class="review-group-body">${table}</div>
-        </div>
-        <div class="review-group-card wide">
-          <div class="review-group-head">Raw Material Scanned QR History</div>
-          <div class="review-group-body">${rawMaterialQrHistoryHtml(materialRows)}</div>
-        </div>
-        <div class="review-group-card wide">
-          <div class="review-group-head">Material Coverage</div>
-          <div class="review-group-body">${coverage}</div>
-        </div>
-      </div>
-    `;
+      <div class="raw-stat-note">Same-job saved partials plus the current shift. Quantities are calculated separately for each material.</div>
+      <div class="raw-stat-table">
+        <table class="review-kv-table review-data-table">
+          <thead><tr><th>#</th><th>Material</th><th>Scans</th><th>Scanned Qty</th><th>Current Used</th><th>Total Used</th><th>Balance</th><th>Status</th></tr></thead>
+          <tbody>${statisticsRows.map((stat, index) => `
+            <tr>
+              <td>${esc(index + 1)}</td>
+              <td><div class="raw-stat-material">${esc(stat.material)}</div><div class="raw-stat-sku">${esc(stat.sku)}</div></td>
+              <td>${esc(stat.scans)}</td>
+              <td>${esc(quantity(stat.scanned, stat.unit))}</td>
+              <td>${esc(quantity(stat.currentUsed, stat.unit))}</td>
+              <td>${esc(quantity(stat.totalUsed, stat.unit))}</td>
+              <td>${esc(quantity(stat.balance, stat.unit))}</td>
+              <td><span class="raw-match-status ${esc(stat.status)}">${esc(stat.statusText)}</span></td>
+            </tr>
+          `).join("")}</tbody>
+        </table>
+      </div>`;
   }
 
   function archivePrintRows(session){
@@ -9111,6 +10020,7 @@ DASHBOARD_HTML = """
     const reviewLogs = Array.isArray(row.reject_review_logs) ? row.reject_review_logs : [];
     const approvedBy = row.supervisor_name || row.qc_name || (reviewLogs.find(x => x?.actor_name)?.actor_name) || "-";
     machineDetailTitle.textContent = `${session.machine_name || session.machine_code || "Archived Job"} Archive`;
+    if(machineDetailHistoryBtn) machineDetailHistoryBtn.style.display = "none";
     if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "none";
     if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
     machineDetailBody.innerHTML = `
@@ -9166,14 +10076,14 @@ DASHBOARD_HTML = """
         </div>
         ${productionVisualHtml(session)}
       </div>
-      <div class="machine-detail-section">
-        <h4>Raw Materials</h4>
-        ${rawMaterialInsightsHtml(row)}
-      </div>
-      <div class="machine-detail-section">
-        <h4>Product Pack History</h4>
-        ${productPackHistoryHtml(session, 12)}
-      </div>
+      <section class="machine-detail-info-panel raw-material-stat-panel">
+        <div class="machine-detail-info-title">Raw Materials Statistics</div>
+        <div class="raw-material-stat-panel-body">${rawMaterialInsightsHtml(row)}</div>
+      </section>
+      <section class="machine-detail-info-panel product-pack-panel">
+        <div class="machine-detail-info-title">Product Pack History</div>
+        <div class="product-pack-panel-body">${productPackHistoryHtml(session, 12)}</div>
+      </section>
       <div class="machine-detail-section">
         <h4>Transfer / Print Records</h4>
         ${tableFromRows(printRows, [
@@ -9238,8 +10148,8 @@ DASHBOARD_HTML = """
     return "ACTION";
   }
 
-  function renderMachineClientActivity(items){
-    const rows = (Array.isArray(items) ? items : []).map((row, idx) => ({
+  function machineHistoryRows(items){
+    return (Array.isArray(items) ? items : []).map((row, idx) => ({
       index: idx + 1,
       time: fmtDateLocal(row?.timestamp_utc || ""),
       level: clientActivityLevel(row),
@@ -9247,28 +10157,233 @@ DASHBOARD_HTML = """
       actor: row?.actor || "-",
       message: row?.message || "-",
     }));
-    return tableFromRows(rows, [
-      ["#", "index"],
-      ["Time", "time"],
-      ["Type", "level"],
-      ["Source", "source"],
-      ["Actor", "actor"],
-      ["Action / Error", "message"],
-    ], "No client activity has been received for this machine yet.", 400);
   }
 
-  async function loadMachineClientActivity(machineCode){
-    const target = document.getElementById("machineClientActivityLog");
-    if(!target) return;
+  function renderMachineHistory(){
+    if(!machineHistoryBody) return;
+    const rows = machineHistoryRows(machineHistoryItems);
+    const query = String(machineHistorySearch?.value || "").trim().toLocaleLowerCase();
+    const queryTerms = query.split(" ").filter(Boolean);
+    const filtered = query ? rows.filter(row => {
+      const searchable = [row.index, row.time, row.level, row.source, row.actor, row.message]
+        .map(value => String(value ?? ""))
+        .join(" ")
+        .toLocaleLowerCase();
+      return queryTerms.every(term => searchable.includes(term));
+    }) : rows;
+    if(machineHistoryCount){
+      machineHistoryCount.textContent = query
+        ? `${filtered.length} of ${rows.length} records`
+        : `${rows.length} record${rows.length === 1 ? "" : "s"}`;
+    }
+    if(!filtered.length){
+      machineHistoryBody.innerHTML = `<div class="machine-history-empty">${query ? "No history matches your search." : "No client activity has been received for this machine yet."}</div>`;
+      return;
+    }
+    machineHistoryBody.innerHTML = `
+      <div class="machine-history-table-wrap">
+        <table class="machine-history-table">
+          <thead><tr>
+            <th class="machine-history-series">#</th>
+            <th class="machine-history-time">Time</th>
+            <th class="machine-history-type">Type</th>
+            <th class="machine-history-source">Source</th>
+            <th class="machine-history-actor">Actor</th>
+            <th>Action / Error</th>
+          </tr></thead>
+          <tbody>${filtered.map(row => `
+            <tr>
+              <td class="machine-history-series">${esc(row.index)}</td>
+              <td>${esc(row.time)}</td>
+              <td>${esc(row.level)}</td>
+              <td>${esc(row.source)}</td>
+              <td>${esc(row.actor)}</td>
+              <td title="${escAttr(row.message)}"><div class="machine-history-message">${esc(row.message)}</div></td>
+            </tr>
+          `).join("")}</tbody>
+        </table>
+      </div>`;
+  }
+
+  function closeMachineHistory(){
+    machineHistoryOverlay?.classList.remove("active");
+    machineHistoryMachineCode = "";
+  }
+
+  async function openMachineHistory(){
+    const machineCode = String(activeMachineDetailCode || "").trim();
+    if(!machineCode || !machineHistoryOverlay || !machineHistoryBody) return;
+    machineHistoryMachineCode = machineCode;
+    machineHistoryItems = [];
+    if(machineHistorySearch) machineHistorySearch.value = "";
+    if(machineHistoryCount) machineHistoryCount.textContent = "Loading...";
+    const detailName = String(machineDetailTitle?.textContent || MACHINE_NAME_MAP[machineCode] || machineCode)
+      .replace(/[ ]+(Details|Archive)$/i, "");
+    if(machineHistoryTitle) machineHistoryTitle.textContent = `${detailName} History`;
+    machineHistoryBody.innerHTML = '<div class="machine-history-empty">Loading machine history...</div>';
+    machineHistoryOverlay.classList.add("active");
     try{
       const response = await fetch(`/api/machines/${encodeURIComponent(machineCode)}/activity?limit=400`, {cache:"no-store"});
       const body = await response.json();
       if(!response.ok || !body?.ok) throw new Error(body?.error || `HTTP ${response.status}`);
-      if(String(activeMachineDetailCode || "") !== String(machineCode || "")) return;
-      target.innerHTML = renderMachineClientActivity(body.items || []);
+      if(machineHistoryMachineCode !== machineCode) return;
+      machineHistoryItems = Array.isArray(body.items) ? body.items : [];
+      renderMachineHistory();
     }catch(error){
-      target.innerHTML = `<div class="machine-detail-empty">Unable to load client activity: ${esc(error?.message || error)}</div>`;
+      if(machineHistoryMachineCode !== machineCode) return;
+      if(machineHistoryCount) machineHistoryCount.textContent = "Unable to load";
+      machineHistoryBody.innerHTML = `<div class="machine-history-empty">Unable to load machine history: ${esc(error?.message || error)}</div>`;
     }
+  }
+
+  function shiftActionTimestamp(row){
+    return String(
+      row?.timestamp_utc || row?.scanned_at_utc || row?.scanned_at || row?.changed_at_utc ||
+      row?.approved_at_utc || row?.started_at_utc || row?.start_time || row?.finished_at_utc ||
+      row?.ended_at_utc || row?.end_time || ""
+    ).trim();
+  }
+
+  function shiftActionActor(row, fallback="-"){
+    return String(
+      row?.actor || row?.actor_name || row?.operator_name || row?.operator || row?.supervisor_name ||
+      row?.approved_by || row?.confirmed_by || row?.maintenance || fallback || "-"
+    ).trim() || "-";
+  }
+
+  function shiftActionRowsFor(job){
+    const item = job && typeof job === "object" ? job : {};
+    const startedAt = Date.parse(String(item.started_at_utc || ""));
+    const endedAt = Date.parse(String(item.ended_at_utc || item.finished_at_utc || ""));
+    const withinShift = row => {
+      const stamp = Date.parse(shiftActionTimestamp(row));
+      if(!Number.isFinite(stamp)) return true;
+      if(Number.isFinite(startedAt) && stamp < startedAt) return false;
+      if(Number.isFinite(endedAt) && stamp > endedAt + 60000) return false;
+      return true;
+    };
+    const rows = [];
+    const seen = new Set();
+    const push = (sourceRow, source, message, actor="-") => {
+      const timestamp = shiftActionTimestamp(sourceRow);
+      const cleanSource = String(source || sourceRow?.source || "APP").trim().toUpperCase() || "APP";
+      const cleanMessage = String(message || sourceRow?.message || "-").trim() || "-";
+      const cleanActor = shiftActionActor(sourceRow, actor);
+      const signature = [timestamp, cleanSource, cleanActor, cleanMessage].join("|").toLocaleLowerCase();
+      if(seen.has(signature)) return;
+      seen.add(signature);
+      rows.push({timestamp_utc:timestamp, source:cleanSource, actor:cleanActor, message:cleanMessage});
+    };
+    const clientRows = (Array.isArray(item.client_app_logs) ? item.client_app_logs : []).filter(withinShift);
+    clientRows.forEach(row => push(row, row?.source, row?.message, row?.actor));
+
+    // Older shift records may predate the client action log. Rebuild a useful
+    // history from their saved scan/audit records only when that log is absent.
+    if(!clientRows.length){
+      (item.product_pack_history_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+        row, "SCAN",
+        `PACK scanned${row.series != null ? ` | Series ${row.series}` : ""}${row.sku || row.product_sku ? ` | SKU ${row.sku || row.product_sku}` : ""} | Qty ${row.qty ?? row.good_qty ?? row.pack_qty ?? 0}`,
+        item.operator_name || displayNameForId(item.operator_id || "-")
+      ));
+      (item.raw_material_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+        row, "SCAN",
+        `RAW MATERIAL scanned | ${row.material_sku || row.sku || row.material_name || row.material || "-"} | Qty ${row.qty ?? row.quantity ?? 0}`,
+        item.operator_name || displayNameForId(item.operator_id || "-")
+      ));
+      (item.butal_scan_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+        row, "SCAN", `BUTAL scanned | Qty ${row.qty ?? row.quantity ?? 0}`,
+        item.operator_name || displayNameForId(item.operator_id || "-")
+      ));
+      (item.reject_review_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+        row, "REJECT", `${row.entry_type || row.action || "REJECT"} | ${row.reason_text || row.reason_code || "-"} | Qty ${row.qty ?? row.quantity ?? 0}`
+      ));
+      (item.cycle_time_change_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+        row, "STATUS", `Cycle time changed | ${row.old_value ?? "-"} to ${row.new_value ?? row.current ?? "-"}`
+      ));
+      (item.machine_counter_overwrite_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+        row, "STATUS", `Machine counter changed | ${row.old_value ?? "-"} to ${row.new_value ?? "-"}`
+      ));
+      (item.pdr_downtime_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+        row, "DOWNTIME", `${row.reason_text || row.reason || row.reason_code || "Downtime"}${row.duration_seconds != null ? ` | ${fmtDowntimeSeconds(row.duration_seconds)}` : ""}`
+      ));
+      (item.supervisor_review_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+        row, "SUPERVISOR", row.message || row.action || "Supervisor check"
+      ));
+    }
+    (item.review_history || []).filter(row => row && typeof row === "object").forEach(row => push(
+      row, "REVIEW", `${row.action || row.review_status || "Shift review"}${row.remarks ? ` | ${row.remarks}` : ""}`
+    ));
+    return rows.sort((a, b) => String(b.timestamp_utc || "").localeCompare(String(a.timestamp_utc || "")));
+  }
+
+  function syncShiftActionSourceFilter(){
+    if(!shiftActionHistorySource) return;
+    const selected = String(shiftActionHistorySource.value || "");
+    const sources = [...new Set(shiftActionHistoryItems.map(row => String(row?.source || "APP").toUpperCase()))].sort();
+    shiftActionHistorySource.innerHTML = '<option value="">All sources</option>' + sources.map(source =>
+      `<option value="${escAttr(source)}">${esc(source)}</option>`
+    ).join("");
+    if(sources.includes(selected)) shiftActionHistorySource.value = selected;
+  }
+
+  function renderShiftActionHistory(){
+    if(!shiftActionHistoryBody) return;
+    const rows = machineHistoryRows(shiftActionHistoryItems);
+    const query = String(shiftActionHistorySearch?.value || "").trim().toLocaleLowerCase();
+    const terms = query.split(" ").filter(Boolean);
+    const typeFilter = String(shiftActionHistoryType?.value || "").toUpperCase();
+    const sourceFilter = String(shiftActionHistorySource?.value || "").toUpperCase();
+    const filtered = rows.filter(row => {
+      if(typeFilter && row.level !== typeFilter) return false;
+      if(sourceFilter && String(row.source || "").toUpperCase() !== sourceFilter) return false;
+      const searchable = [row.index, row.time, row.level, row.source, row.actor, row.message]
+        .map(value => String(value ?? "")).join(" ").toLocaleLowerCase();
+      return terms.every(term => searchable.includes(term));
+    });
+    if(shiftActionHistoryCount){
+      const filteredActive = Boolean(query || typeFilter || sourceFilter);
+      shiftActionHistoryCount.textContent = filteredActive
+        ? `${filtered.length} of ${rows.length} records`
+        : `${rows.length} record${rows.length === 1 ? "" : "s"}`;
+    }
+    if(!filtered.length){
+      shiftActionHistoryBody.innerHTML = `<div class="machine-history-empty">${rows.length ? "No shift actions match your search and filters." : "No actions were saved for this shift."}</div>`;
+      return;
+    }
+    shiftActionHistoryBody.innerHTML = `
+      <div class="machine-history-table-wrap">
+        <table class="machine-history-table">
+          <thead><tr>
+            <th class="machine-history-series">#</th><th class="machine-history-time">Time</th>
+            <th class="machine-history-type">Type</th><th class="machine-history-source">Source</th>
+            <th class="machine-history-actor">Actor</th><th>Action / Error</th>
+          </tr></thead>
+          <tbody>${filtered.map((row, index) => `<tr>
+            <td class="machine-history-series">${index + 1}</td><td>${esc(row.time)}</td>
+            <td>${esc(row.level)}</td><td>${esc(row.source)}</td><td>${esc(row.actor)}</td>
+            <td title="${escAttr(row.message)}"><div class="machine-history-message">${esc(row.message)}</div></td>
+          </tr>`).join("")}</tbody>
+        </table>
+      </div>`;
+  }
+
+  function openShiftActionHistory(){
+    if(!activeJobRow || overlayReviewMode !== "shift" || !shiftActionHistoryOverlay) return;
+    shiftActionHistoryItems = shiftActionRowsFor(activeJobRow);
+    if(shiftActionHistorySearch) shiftActionHistorySearch.value = "";
+    if(shiftActionHistoryType) shiftActionHistoryType.value = "";
+    if(shiftActionHistorySource) shiftActionHistorySource.value = "";
+    const machine = activeJobRow.machine_name || MACHINE_NAME_MAP[String(activeJobRow.machine_code || "").trim()] || activeJobRow.machine_code || "Machine";
+    const shiftIndex = activeJobRow.shift_index != null ? ` | Shift ${activeJobRow.shift_index}` : "";
+    if(shiftActionHistoryTitle) shiftActionHistoryTitle.textContent = `${machine}${shiftIndex} Action History`;
+    syncShiftActionSourceFilter();
+    renderShiftActionHistory();
+    shiftActionHistoryOverlay.classList.add("active");
+    setTimeout(() => shiftActionHistorySearch?.focus(), 0);
+  }
+
+  function closeShiftActionHistory(){
+    shiftActionHistoryOverlay?.classList.remove("active");
   }
 
   function openMachineDetail(session){
@@ -9279,6 +10394,7 @@ DASHBOARD_HTML = """
       return;
     }
     activeMachineDetailCode = String(session.machine_code || "").trim();
+    if(machineDetailHistoryBtn) machineDetailHistoryBtn.style.display = "";
     if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "";
     const activeTtlSeconds = Number((latestState && latestState.active_ttl_seconds) || 30);
     const manual = machineStatusOverrideFor(activeMachineDetailCode);
@@ -9286,17 +10402,11 @@ DASHBOARD_HTML = """
     const manualReason = String((manual && manual.reason) || "").trim();
     const manualRemarks = String((manual && manual.remarks) || "").trim();
     const status = manualStatus || statusClass(session.last_seen_utc, activeTtlSeconds, "", session).toUpperCase();
-    const maintenanceMode = isMaintenanceSession(session);
     const totalGood = Number(session.good_total || 0) + Number(session.butal_total || 0);
     const job = extractJobRecord(session) || {};
     const rejectBreakdown = (session && typeof session.reject_breakdown === "object" && session.reject_breakdown) || {};
     const rejectRows = Object.entries(rejectBreakdown).sort((a,b) => String(a[0]).localeCompare(String(b[0])));
-    const rawScans = Array.isArray(session.raw_material_scans) ? session.raw_material_scans : [];
-    const rawLogs = Array.isArray(session.raw_material_logs) ? session.raw_material_logs : [];
-    const materialRows = archivedMaterialRows(session);
-    const packHistoryRows = productPackHistoryRows(session);
     const shiftJobRows = operatorShiftJobRows(session);
-    const scannedRawQty = materialRows.reduce((sum, x) => sum + Math.max(0, Number(x.qty || 0)), 0);
     const supervisorReviewRows = Array.isArray(session.supervisor_review_logs) ? session.supervisor_review_logs : [];
     const downtimeHistory = Array.isArray(session.pdr_downtime_logs)
       ? session.pdr_downtime_logs.filter(row => row && typeof row === "object")
@@ -9308,6 +10418,17 @@ DASHBOARD_HTML = """
     const totalDowntimeSeconds = downtimeHistory.reduce(
       (sum, row) => sum + Math.max(0, Number(row.duration_seconds || 0)), 0
     ) + activeDowntimeSeconds;
+    const hasDowntimeData = Boolean(
+      session.downtime_active ||
+      totalDowntimeSeconds > 0 ||
+      downtimeHistory.length ||
+      String(session.downtime_reason_code || "").trim() ||
+      String(session.downtime_reason_text || "").trim()
+    );
+    const latestDowntime = downtimeHistory.length ? downtimeHistory[downtimeHistory.length - 1] : {};
+    const downtimeDateSource = latestDowntime.started_at_utc
+      || latestDowntime.finished_at_utc
+      || (session.downtime_started_at ? Number(session.downtime_started_at) * 1000 : "");
     const downtimeHistoryRows = downtimeHistory.map((row, idx) => {
       const segments = Array.isArray(row.reason_segments) ? row.reason_segments : [];
       const reasons = segments.length
@@ -9319,7 +10440,7 @@ DASHBOARD_HTML = """
         duration: fmtDowntimeSeconds(row.duration_seconds || 0),
         maintenance: row.maintenance || "-",
         confirmed_by: row.confirmed_by || "-",
-        finished: fmtDateLocal(row.finished_at_utc || ""),
+        period: `${fmtTimeOnly(row.started_at_utc || "")} → ${fmtTimeOnly(row.finished_at_utc || "")}`,
       };
     });
     const counterOverwriteRows = (Array.isArray(session.machine_counter_overwrite_logs)
@@ -9348,106 +10469,119 @@ DASHBOARD_HTML = """
     }));
     const openSupervisorReview = session.current_supervisor_review && typeof session.current_supervisor_review === "object" ? session.current_supervisor_review : null;
     const latestSupervisorReview = openSupervisorReview && Object.keys(openSupervisorReview).length ? openSupervisorReview : (supervisorReviewRows.length ? supervisorReviewRows[supervisorReviewRows.length - 1] : null);
-    const activeJobSummaryHtml = session.job_code || session.job_name ? `
-      <div class="archive-detail-hero">
-        <div>
-          <h3>${esc(jobDisplayName(session, "Active Job"))}</h3>
-          <div class="sub">${esc(session.machine_name || session.machine_code || "-")} | ${esc(jobSecondaryLabel(session))}</div>
-          <div class="archive-pill-row">
-            <span class="archive-pill">${esc(status)}</span>
-            <span class="archive-pill">Operator ${esc(displayNameForId(session.operator_id || "-"))}</span>
-            ${shiftJobRows.length > 1 ? `<span class="archive-pill">${esc(shiftJobRows.length)} jobs in shift</span>` : ""}
-            <span class="archive-pill">Raw Bags ${esc(session.raw_sacks_count || materialRows.length || 0)}</span>
-          </div>
-        </div>
-        <div class="archive-detail-hero-side">
-          <div class="archive-hero-stat"><div class="k">Good</div><div class="v">${esc(session.good_total || 0)}</div></div>
-          <div class="archive-hero-stat"><div class="k">Butal</div><div class="v">${esc(session.butal_total || 0)}</div></div>
-          <div class="archive-hero-stat"><div class="k">Reject</div><div class="v">${esc(session.reject_total || 0)}</div></div>
-          <div class="archive-hero-stat"><div class="k">Total Good</div><div class="v">${esc(totalGood)}</div></div>
-        </div>
+    const jobDetails = extractJobDetailsRecord(session) || {};
+    const goodPackRows = productPackHistoryRows(session);
+    const goodPackCount = Math.max(0, Number(session.pack_total ?? session.pack_count ?? goodPackRows.length) || 0);
+    const latestPackQty = goodPackRows.slice().reverse().map(row => Number(row.qty || 0)).find(value => value > 0) || 0;
+    const configuredPackQty = Number(firstValue(
+      jobDetails.qty_per_packing, jobDetails.packing_qty, jobDetails.qty_per_pack, jobDetails.pack_qty,
+      job.qty_per_packing, job.packing_qty, job.qty_per_pack, job.pack_qty,
+      session.qty_per_packing, session.packing_qty, session.qty_per_pack
+    )) || 0;
+    const inferredPackQty = goodPackCount > 0 && Number(session.good_total || 0) > 0
+      ? Number(session.good_total || 0) / goodPackCount
+      : 0;
+    const goodPackingQty = latestPackQty || configuredPackQty || inferredPackQty || 0;
+    const statusUpper = String(status || "").trim().toUpperCase();
+    const statusTone = statusUpper === "ACTIVE"
+      ? "active"
+      : statusUpper === "DISCONNECTED"
+        ? "disconnected"
+        : statusUpper === "INACTIVE"
+          ? "inactive"
+          : "manual";
+    const averageWeight = Number(session.external_average_weight_grams || 0) > 0
+      ? `${(Number(session.external_average_weight_grams) / 1000).toFixed(4)} kg`
+      : "-";
+    const operatorName = displayNameForId(session.operator_id || "-");
+    const productName = firstValue(session.product_name, jobDetails.product_name, job.product_name, "-");
+    const lastMeaningfulAction = meaningfulMachineAction(session) || "-";
+    const scannedRejectRows = rejectRows.filter(([, value]) => Number(value || 0) > 0);
+    const rejectBubbleRows = scannedRejectRows.length
+      ? scannedRejectRows.map(([label, value]) => `
+          <div class="machine-detail-reject-bubble-row"><span>${esc(machineRejectDisplayName(label))}</span><strong>${esc(value)}</strong></div>
+        `).join("")
+      : `<div class="machine-detail-reject-bubble-row"><span>Standard Rejects</span><strong>${esc(Number(session.reject_total || 0))}</strong></div>`;
+    const rejectBubbleHtml = `
+      <div class="machine-detail-reject-bubble" role="tooltip">
+        <div class="machine-detail-reject-bubble-title">Reject Details</div>
+        ${rejectBubbleRows}
+        <div class="machine-detail-reject-bubble-row"><span>Startup Reject</span><strong>${esc(Number(session.startup_reject_total || 0))}</strong></div>
+        <div class="machine-detail-reject-bubble-row"><span>No Shot</span><strong>${esc(Number(session.no_shot_total || 0))}</strong></div>
       </div>
-    ` : "";
-    const rawMaterialsHtml = materialRows.length
-      ? tableFromRows(materialRows, [
-          { label: "#", value: x => x.index },
-          { label: "Material / Scan", value: x => x.material },
-          { label: "Qty", value: x => x.qty },
-          { label: "Lot", value: x => x.lot },
-          { label: "Scanned At", value: x => fmtDateLocal(x.time || "") },
-        ], "No raw materials scanned.", 12)
-      : `<div class="machine-detail-empty">No raw materials scanned.</div>`;
-    const rejectHtml = rejectRows.length
-      ? `<ol class="machine-detail-list">${rejectRows.map(([k,v]) => `<li>${esc(k)} = ${esc(v)}</li>`).join("")}</ol>`
-      : `<div class="machine-detail-empty">No reject details recorded.</div>`;
+    `;
 
-    machineDetailTitle.textContent = `${session.machine_name || session.machine_code || "Machine"} Details`;
+    machineDetailTitle.textContent = "Machine Details";
     if(machineDetailStatusSelect) machineDetailStatusSelect.value = manualStatus;
     if(machineDetailStatusReason) machineDetailStatusReason.value = manualReason;
     if(machineDetailStatusRemarks) machineDetailStatusRemarks.value = manualRemarks;
     if(machineDetailStatusSetterBadge) machineDetailStatusSetterBadge.value = "";
     if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
     machineDetailBody.innerHTML = `
-      ${activeJobSummaryHtml}
-      ${operatorShiftTabsHtml(session)}
-      ${operatorReliefTabsHtml(session)}
-      <div class="machine-detail-section">
-        <h4>Overview</h4>
-        <div class="machine-detail-grid">
-          ${detailItem("Machine", session.machine_code || "-")}
-          ${detailItem("Machine Name", session.machine_name || "-")}
-          ${detailItem("Status", status)}
-          ${detailItem("Status Reason", manualReason || "-")}
-          ${detailItem("Status Remarks", manualRemarks || "-")}
-          ${detailItem("Status Set By", (manual && manual.set_by_name) ? `${manual.set_by_name}${manual.set_by_role ? ` (${manual.set_by_role})` : ""}` : "-")}
-          ${detailItem("Status Set At", fmtDateLocal((manual && (manual.started_at_utc || manual.updated_at_utc)) || ""))}
-          ${detailItem("Client", displayNameForId(session.client_id || "-"))}
-          ${detailItem("SKU", jobSku(session) || "-")}
-          ${detailItem("Job Name", session.job_name || "-")}
-          ${detailItem("Operator", displayNameForId(session.operator_id || "-"))}
-          ${detailItem("Average Weight", Number(session.external_average_weight_grams || 0) > 0 ? `${(Number(session.external_average_weight_grams) / 1000).toFixed(4)} kg` : "-")}
-          ${detailItem("Weight Source", session.external_average_weight_source || "-")}
-          ${detailItem("Weight Sender", session.external_average_weight_sender || "-")}
-          ${detailItem("Weight Sent At", fmtDateLocal(session.external_average_weight_sent_at || ""))}
-          ${detailItem("Weight Received At", fmtDateLocal(session.external_average_weight_received_at || ""))}
-          ${detailItem("Supervisor Review", latestSupervisorReview ? `${latestSupervisorReview.actor_name || "-"} | ${latestSupervisorReview.status || "-"}` : "-")}
-          ${detailItem("Review Opened", latestSupervisorReview ? fmtDateLocal(latestSupervisorReview.opened_at_utc || "") : "-")}
-          ${detailItem("Review Closed", latestSupervisorReview ? fmtDateLocal(latestSupervisorReview.closed_at_utc || "") : "-")}
-          ${detailItem("Review Minutes", latestSupervisorReview && latestSupervisorReview.duration_seconds != null ? (Number(latestSupervisorReview.duration_seconds || 0) / 60).toFixed(2) : "-")}
-          ${detailItem("Machine Counter Start", machineCounterStartValue(session))}
-          ${detailItem("Machine Counter Current", session.machine_counter_current ?? "-")}
-          ${detailItem("Last Seen", fmtDateLocal(session.last_seen_utc))}
-          ${detailItem("Last Event", session.last_event || "-")}
-        </div>
-      </div>
-      <div class="machine-detail-section">
-        <h4>Production Counters</h4>
-        <div class="archive-metric-grid">
-          ${archiveMetric("Pack", Number(session.pack_total || 0))}
-          ${archiveMetric("Good", Number(session.good_total || 0), "good")}
-          ${archiveMetric("Butal", Number(session.butal_total || 0), Number(session.butal_total || 0) > 0 ? "warn" : "")}
-          ${archiveMetric("Reject", Number(session.reject_total || 0), Number(session.reject_total || 0) > 0 ? "bad" : "")}
-          ${archiveMetric("No Shot", Number(session.no_shot_total || 0))}
-          ${archiveMetric("Total Good", totalGood, "good")}
-          ${archiveMetric("Startup Reject", Number(session.startup_reject_total || 0))}
-          ${archiveMetric("Raw Sacks", Number(session.raw_sacks_count || 0))}
-          ${archiveMetric("Pack QR Scans", Number(packHistoryRows.length || 0))}
-          ${archiveMetric("Scanned Raw Qty", scannedRawQty || "-")}
-          ${archiveMetric("Counter Start", machineCounterStartValue(session))}
-          ${archiveMetric("Counter Current", session.machine_counter_current ?? "-")}
-          ${archiveMetric("Cycle Time", session.cycle_time_current || "-")}
-          ${archiveMetric("Maintenance", maintenanceMode ? "YES" : "NO")}
-          ${archiveMetric("Downtime Active", session.downtime_active ? "YES" : "NO")}
-        </div>
-        ${productionVisualHtml(session)}
-      </div>
-      <div class="machine-detail-section">
-        <h4>Parts Needed for Job</h4>
-        ${jobPartsNeededHtml(session)}
-      </div>
-      <div class="machine-detail-section">
-        <h4>Machine Counter Overwrite Audit</h4>
-        ${tableFromRows(counterOverwriteRows, [
+      <div class="machine-detail-layout">
+        <aside class="machine-detail-sidebar">
+          <div class="machine-detail-machine-identity">
+            <div class="machine-detail-machine-image"><img src="/Images/FRAME%206.png" alt="Machine" /></div>
+            <div>
+              <div class="machine-detail-machine-name">${esc(session.machine_name || session.machine_code || "Machine")}</div>
+              <div class="machine-detail-machine-code"><span class="machine-detail-status-chip ${esc(statusTone)}">${esc(status)}</span></div>
+            </div>
+          </div>
+          <div class="machine-detail-side-metrics">
+            <div class="machine-detail-side-metric good machine-detail-good-metric" tabindex="0">
+              <div class="k">Good</div><div class="v">${esc(Number(session.good_total || 0))}</div>
+              <div class="machine-detail-good-bubble" role="tooltip">
+                <div class="machine-detail-good-bubble-title">Good Output Details</div>
+                <div class="machine-detail-good-bubble-row"><span>Packs</span><strong>${esc(goodPackCount)}</strong></div>
+                <div class="machine-detail-good-bubble-row"><span>Packing Qty</span><strong>${esc(goodPackingQty ? `${Number(goodPackingQty.toFixed(4))} pcs` : "-")}</strong></div>
+              </div>
+            </div>
+            <div class="machine-detail-side-metric butal"><div class="k">Butal</div><div class="v">${esc(Number(session.butal_total || 0))}</div></div>
+            <div class="machine-detail-side-metric reject machine-detail-reject-metric" tabindex="0"><div class="k">Reject</div><div class="v">${esc(Number(session.reject_total || 0))}</div>${rejectBubbleHtml}</div>
+            <div class="machine-detail-side-metric total"><div class="k">Total Good</div><div class="v">${esc(totalGood)}</div></div>
+          </div>
+          <div class="machine-detail-side-list">
+            ${machineDetailSideRow("SKU", jobSku(session) || "-")}
+            ${machineDetailSideRow("Product Name", productName)}
+            ${machineDetailSideRow("Job Name", session.job_name || session.job_code || "-")}
+            ${machineDetailSideRow("Mold", firstValue(jobDetails.mold, jobDetails.mold_no, job.custom_05, "-"))}
+            ${machineDetailSideRow("Client", displayNameForId(session.client_id || "-"))}
+            ${machineDetailSideRow("Color", firstValue(jobDetails.color, job.custom_06, "-"))}
+            ${machineDetailSideRow("Cycle Time", session.cycle_time_current || "-")}
+            ${machineDetailSideRow("Counter Start", machineCounterStartValue(session))}
+            ${machineDetailSideRow("Counter Current", session.machine_counter_current ?? "-")}
+            ${machineDetailSideRow("Operator", operatorName)}
+            ${machineDetailSideRow("Job Status", job.status || "-")}
+            ${machineDetailSideRow("Job Remarks", job.remarks || "-")}
+          </div>
+          <div class="machine-detail-side-callout"><div class="k">Last Action</div><div class="v">${esc(lastMeaningfulAction)}</div></div>
+        </aside>
+
+        <main class="machine-detail-main">
+          <section class="machine-detail-info-panel">
+            <div class="machine-detail-info-title">Product Weight Information</div>
+            <div class="machine-detail-info-grid product-weight-info-grid">
+              ${machineDetailInfoItem("Weight Sender", session.external_average_weight_sender || "-")}
+              ${machineDetailInfoItem("Average Weight", averageWeight)}
+              ${machineDetailInfoItem("Weight Source", session.external_average_weight_source || "-")}
+              ${machineDetailInfoItem("Weight Received At", fmtDateLocal(session.external_average_weight_received_at || ""))}
+            </div>
+          </section>
+
+          ${operatorShiftTabsHtml(session)}
+          ${operatorReliefTabsHtml(session)}
+          <div class="machine-detail-records-title">Detailed Records</div>
+      <section class="machine-detail-info-panel job-parts-panel">
+        <div class="machine-detail-info-title">Parts Needed for Job</div>
+        <div class="job-parts-panel-body">${jobPartsNeededHtml(session)}</div>
+      </section>
+      <section class="machine-detail-info-panel product-pack-panel">
+        <div class="machine-detail-info-title">Product Pack History</div>
+        <div class="product-pack-panel-body">${productPackHistoryHtml(session, 12)}</div>
+      </section>
+      ${counterOverwriteRows.length ? `<section class="machine-detail-info-panel machine-detail-record-panel">
+        <div class="machine-detail-info-title">Machine Counter Overwrite Audit</div>
+        <div class="machine-detail-record-panel-body">${tableFromRows(counterOverwriteRows, [
           ["#", "index"],
           ["Old Counter", "old_value"],
           ["New Counter", "new_value"],
@@ -9455,11 +10589,11 @@ DASHBOARD_HTML = """
           ["Changed At", "changed_at"],
           ["Job", "job"],
           ["Operator", "operator"],
-        ], "No machine counter overwrite recorded for this shift.")}
-      </div>
-      <div class="machine-detail-section">
-        <h4>Cycle Time Change History</h4>
-        ${tableFromRows(cycleTimeChangeRows, [
+        ], "No machine counter overwrite recorded for this shift.")}</div>
+      </section>` : ""}
+      ${cycleTimeChangeRows.length ? `<section class="machine-detail-info-panel machine-detail-record-panel">
+        <div class="machine-detail-info-title">Cycle Time Change History</div>
+        <div class="machine-detail-record-panel-body">${tableFromRows(cycleTimeChangeRows, [
           ["#", "index"],
           ["Old", "old_value"],
           ["Current", "new_value"],
@@ -9467,83 +10601,84 @@ DASHBOARD_HTML = """
           ["Role", "role"],
           ["Changed At", "changed_at"],
           ["Source", "source"],
-        ], "No cycle-time change recorded for this shift.")}
-      </div>
-      <div class="machine-detail-section">
-        <h4>Product Pack History</h4>
-        ${productPackHistoryHtml(session, 12)}
-      </div>
-      <div class="machine-detail-section">
-        <h4>Downtime</h4>
-        <div class="machine-detail-grid">
-          ${detailItem("Total Downtime", fmtDowntimeSeconds(totalDowntimeSeconds))}
-          ${detailItem("Occurrences", downtimeHistory.length)}
-          ${detailItem("Reason Code", session.downtime_reason_code || "-")}
-          ${detailItem("Reason", session.downtime_reason_text || "-")}
-          ${detailItem("Current/Last Duration", fmtDowntimeSeconds(session.downtime_active ? activeDowntimeSeconds : session.downtime_last_seconds))}
-          ${detailItem("Downtime Start", session.downtime_started_at ? fmtDateLocal(Number(session.downtime_started_at) * 1000) : "-")}
+        ], "No cycle-time change recorded for this shift.")}</div>
+      </section>` : ""}
+      ${hasDowntimeData ? `<section class="machine-detail-info-panel machine-detail-record-panel">
+        <div class="machine-detail-info-title">Downtime Monitoring</div>
+        <div class="machine-detail-info-grid downtime-summary-grid">
+          ${machineDetailInfoItem("Total Downtime", fmtDowntimeSeconds(totalDowntimeSeconds))}
+          ${machineDetailInfoItem("Occurrences", downtimeHistory.length)}
+          ${machineDetailInfoItem("Current/Last Duration", fmtDowntimeSeconds(session.downtime_active ? activeDowntimeSeconds : session.downtime_last_seconds))}
+          ${machineDetailInfoItem("Date", fmtDateOnly(downtimeDateSource))}
         </div>
-        ${tableFromRows(downtimeHistoryRows, [
+        <div class="machine-detail-record-panel-body machine-detail-downtime-history">${tableFromRows(downtimeHistoryRows, [
           ["#", "index"],
           ["Reason(s)", "reasons"],
           ["Duration", "duration"],
           ["Maintenance", "maintenance"],
           ["Confirmed By", "confirmed_by"],
-          ["Finished", "finished"],
-        ], "No completed downtime recorded for this shift.")}
-      </div>
-      <div class="machine-detail-section">
-        <h4>Reject Details</h4>
-        ${rejectHtml}
-      </div>
-      <div class="machine-detail-section">
-        <h4>Raw Materials</h4>
-        ${rawMaterialInsightsHtml(session)}
-        ${rawScans.length ? `
-          <details class="archive-raw-details">
-            <summary>Show scanned raw text</summary>
-            <div class="machine-detail-code" style="margin-top:8px;">${esc(rawScans.map(x => typeof x === "string" ? x : compactValue(x)).join("\\n"))}</div>
-          </details>
-        ` : ""}
-      </div>
-      <div class="machine-detail-section">
-        <h4>Client Activity Log</h4>
-        <div class="hint" style="margin-bottom:8px;">Newest first. Includes scans, accepted/rejected messages, errors, connection/queue events, and app actions reported by this client.</div>
-        <div id="machineClientActivityLog"><div class="machine-detail-empty">Loading client activity...</div></div>
-      </div>
-      <div class="machine-detail-section">
-        <h4>Job Details</h4>
-        <div class="machine-detail-grid">
-          ${detailItem("Job Ref", job.ref_no || job.reference || job.id || "-")}
-          ${detailItem("Product ID", job.product_id || "-")}
-          ${detailItem("Mold", job.custom_05 || "-")}
-          ${detailItem("Color", job.custom_06 || "-")}
-          ${detailItem("System Code", job.custom_09 || "-")}
-          ${detailItem("Target / Cavity Info", job.custom_11 || "-")}
-          ${detailItem("Status", job.status || "-")}
-          ${detailItem("Remarks", job.remarks || "-")}
-        </div>
-        <details class="archive-raw-details">
-          <summary>Show raw Job API payload</summary>
-          <div class="machine-detail-code" style="margin-top:8px;">${escJson(session.job_payload || {})}</div>
-        </details>
+          ["Started / Finished", "period"],
+        ], "No completed downtime recorded for this shift.")}</div>
+      </section>` : ""}
+      <section class="machine-detail-info-panel raw-material-stat-panel">
+        <div class="machine-detail-info-title">Raw Materials Statistics</div>
+        <div class="raw-material-stat-panel-body">${rawMaterialInsightsHtml(session)}</div>
+      </section>
+        </main>
       </div>
     `;
     machineDetailOverlay.classList.add("active");
-    loadMachineClientActivity(activeMachineDetailCode);
+    const rejectMetric = machineDetailBody.querySelector(".machine-detail-reject-metric");
+    if(rejectMetric){
+      rejectMetric.addEventListener("pointerenter", () => positionMachineRejectBubble(rejectMetric));
+      rejectMetric.addEventListener("focus", () => positionMachineRejectBubble(rejectMetric));
+    }
+    const goodMetric = machineDetailBody.querySelector(".machine-detail-good-metric");
+    if(goodMetric){
+      goodMetric.addEventListener("pointerenter", () => positionMachineGoodBubble(goodMetric));
+      goodMetric.addEventListener("focus", () => positionMachineGoodBubble(goodMetric));
+    }
   }
 
   function closeMachineDetail(){
+    closeMachineHistory();
     machineDetailOverlay.classList.remove("active");
     activeMachineDetailCode = "";
     if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
     if(machineStatusSaveFeedback) machineStatusSaveFeedback.classList.remove("active");
     if(machineStatusSaveBar) machineStatusSaveBar.style.width = "0%";
     if(machineStatusSaveCheck) machineStatusSaveCheck.classList.remove("done");
+    if(machineDetailHistoryBtn) machineDetailHistoryBtn.style.display = "";
     if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "";
   }
 
   document.addEventListener("click", (ev) => {
+    const partButton = ev.target && ev.target.closest ? ev.target.closest(".job-part-sku-button") : null;
+    if(partButton){
+      partButton.classList.add("tooltip-dismissed");
+      partButton.blur();
+      const drawerId = String(partButton.dataset.partsDrawer || "");
+      const drawer = drawerId ? document.getElementById(drawerId) : null;
+      if(drawer){
+        const shouldOpen = !drawer.classList.contains("open");
+        drawer.classList.toggle("open", shouldOpen);
+        partButton.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+      }
+      return;
+    }
+    const packButton = ev.target && ev.target.closest ? ev.target.closest(".pack-item-drawer-button") : null;
+    if(packButton){
+      packButton.classList.add("tooltip-dismissed");
+      packButton.blur();
+      const drawerId = String(packButton.dataset.packDrawer || "");
+      const drawer = drawerId ? document.getElementById(drawerId) : null;
+      if(drawer){
+        const shouldOpen = !drawer.classList.contains("open");
+        drawer.classList.toggle("open", shouldOpen);
+        packButton.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+      }
+      return;
+    }
     const btn = ev.target && ev.target.closest ? ev.target.closest(".shift-job-tab-button") : null;
     if(!btn) return;
     const host = btn.closest(".shift-job-tabs");
@@ -10389,7 +11524,8 @@ DASHBOARD_HTML = """
     return {
       title: "Scanned Pack QR",
       payload,
-      product: x.product,
+      product: firstValue(x.item_name, x.product),
+      code: firstValue(x.item_sku, x.product),
       index: x.series === "-" ? x.index : x.series,
       qty: x.qty,
       timestamp: x.time,
@@ -10426,11 +11562,16 @@ DASHBOARD_HTML = """
       .map((x, idx) => ({...x, history_index: idx + 1}));
     return tableFromRows(items, [
       { label: "#", value: x => x.history_index },
-      { label: "Material", value: x => x.material },
+      { label: "Material", html: x => {
+        const encoded = encodeURIComponent(JSON.stringify(qrRawMaterialDetails(x)));
+        const sku = firstValue(x.display_sku, x.material_sku, x.code, "-");
+        const name = firstValue(x.display_name, x.material, "Name unavailable");
+        return `<button type="button" class="qr-view-btn material-qr-link" data-qr-view="${escAttr(encoded)}" aria-label="${escAttr(`${sku}: ${name}`)}">${esc(sku)}<span class="material-qr-name-tooltip" role="tooltip">${esc(name)}</span></button>`;
+      } },
       { label: "Qty", value: x => firstValue(x.scan_qty, x.qty) },
+      { label: "Index", value: x => firstValue(x.scan_index, x.index, "-") },
       { label: "Lot", value: x => firstValue(x.scan_lot, x.lot) },
       { label: "Scanned At", value: x => fmtDateLocal(x.time || "") || "-" },
-      { label: "QR", html: x => qrViewButton(qrRawMaterialDetails(x)) },
     ], "No raw-material QR scans recorded.", Math.max(1, items.length));
   }
 
@@ -10962,6 +12103,24 @@ DASHBOARD_HTML = """
       }));
     const packRows = (Array.isArray(item.product_pack_history_logs) ? item.product_pack_history_logs : []).filter(x => x && typeof x === "object" && !x.voided);
     const packedQty = packRows.reduce((sum, x) => sum + Math.max(0, Number(x.completed_pack_qty ?? x.qty_q ?? x.good_qty ?? x.qty ?? 0)), 0);
+    const reportedPackedQty = Math.max(packedQty, Number(item.good_total ?? item.total_good ?? item.partial_qty ?? 0));
+    const acceptedPackCount = Math.max(packRows.length, Number(item.pack_count || 0));
+    const allConsumptionEntries = packRows.flatMap(pack =>
+      (Array.isArray(pack.raw_part_consumption) ? pack.raw_part_consumption : [])
+        .filter(entry => entry && typeof entry === "object")
+    );
+    const consumptionEntryIdentity = entry => [
+      entry?.part_product_id, entry?.product_id,
+      entry?.part_sku, entry?.sku, entry?.part_code, entry?.product_code,
+      entry?.part_name, entry?.material_name, entry?.product_name,
+    ].map(materialKeyText).filter(Boolean);
+    const matchingConsumptionEntries = entry => {
+      const keys = consumptionEntryIdentity(entry);
+      return allConsumptionEntries.filter(candidate => {
+        const candidateKeys = consumptionEntryIdentity(candidate);
+        return candidateKeys.some(key => keys.includes(key));
+      });
+    };
     const actualConsumptionMap = new Map();
     packRows.forEach(pack => {
       (Array.isArray(pack.raw_part_consumption) ? pack.raw_part_consumption : []).forEach(entry => {
@@ -10969,9 +12128,21 @@ DASHBOARD_HTML = """
         const material = firstValue(entry.part_name, entry.material_name, entry.product_name, entry.part_sku, entry.sku, entry.part_code, entry.product_code, "-");
         const code = firstValue(entry.part_sku, entry.sku, entry.part_code, entry.product_code, entry.part_product_id, entry.product_id, "-");
         const unit = String(entry.unit || (entry.part_qty_per_unit_kg != null ? "kg" : "pc")).trim().toLowerCase() || "pc";
-        const perUnit = Math.max(0, Number(entry.part_qty_per_unit ?? entry.part_qty_per_unit_kg ?? 0));
-        const usedQty = Math.max(0, Number(entry.used_qty ?? entry.used_qty_kg ?? (Number(entry.produced_units || 0) * perUnit)));
-        const weightAppliedAt = firstValue(entry.weight_received_at, entry.default_weight_replaced_at, "");
+        const siblingEntries = matchingConsumptionEntries(entry);
+        const positiveSiblings = siblingEntries.filter(candidate => Number(candidate.part_qty_per_unit_kg ?? candidate.part_qty_per_unit ?? 0) > 0);
+        const firstPositive = positiveSiblings[0] || null;
+        const entryRate = Math.max(0, Number(entry.part_qty_per_unit_kg ?? entry.part_qty_per_unit ?? 0));
+        const fallbackRate = Math.max(0, Number(firstPositive?.part_qty_per_unit_kg ?? firstPositive?.part_qty_per_unit ?? 0));
+        const shiftRate = unit === "kg" ? Math.max(0, Number(item.external_average_weight_grams || 0) / 1000) : 0;
+        const perUnit = entryRate || fallbackRate || shiftRate;
+        const producedUnits = Math.max(0, Number(entry.produced_units || 0));
+        const stampedUsedQty = Math.max(0, Number(entry.used_qty_kg ?? entry.used_qty ?? 0));
+        const usedQty = stampedUsedQty > 0 ? stampedUsedQty : producedUnits * perUnit;
+        const weightAppliedAt = firstValue(
+          entry.weight_received_at, entry.default_weight_replaced_at,
+          firstPositive?.weight_received_at, firstPositive?.default_weight_replaced_at,
+          item.external_average_weight_received_at, ""
+        );
         const baseKey = `${String(code).trim().toLowerCase()}|${String(material).trim().toLowerCase()}`;
         const weightKey = unit === "kg"
           ? `${perUnit.toFixed(9)}|${String(weightAppliedAt || "").trim()}`
@@ -10981,10 +12152,14 @@ DASHBOARD_HTML = """
           material, code, unit, packed_qty: 0, qty_per_unit: 0, actual_consumed: 0,
           weight_source: new Set(), weight_applied_at: weightAppliedAt,
         };
-        current.packed_qty += Math.max(0, Number(entry.produced_units || 0));
+        current.packed_qty += producedUnits;
         current.qty_per_unit = perUnit || current.qty_per_unit;
         current.actual_consumed += usedQty;
-        const source = String(entry.weight_label || entry.part_qty_per_unit_source || "").trim();
+        const source = String(
+          entryRate > 0
+            ? (entry.weight_label || entry.part_qty_per_unit_source || "")
+            : (firstPositive ? "SHIFT WEIGHT BACKFILL" : (entry.weight_label || entry.part_qty_per_unit_source || "DEFAULT WEIGHT"))
+        ).trim();
         if(source) current.weight_source.add(source);
         actualConsumptionMap.set(key, current);
       });
@@ -10997,18 +12172,29 @@ DASHBOARD_HTML = """
       const material = firstValue(part.part_name, part.product_name, part.name, part.material_name, part.description, "-");
       const code = firstValue(part.part_code, part.product_code, part.sku, part.code, "-");
       const key = `${String(code).trim().toLowerCase()}|${String(material).trim().toLowerCase()}`;
-      const alreadyRecorded = Array.from(actualConsumptionMap.values()).some(
-        consumption => matchesConsumptionPart(part, consumption)
-      );
-      if(alreadyRecorded) return;
+      const recordedRows = Array.from(actualConsumptionMap.values()).filter(consumption => matchesConsumptionPart(part, consumption));
       const unitText = String(firstValue(part.unit, part.uom, part.part_unit, part.qty_unit, "")).toLowerCase();
       const sku = String(firstValue(part.sku, part.part_sku, part.product_sku, "")).toUpperCase();
       const unit = sku.startsWith("Z-RM") || /\bkg(s)?\b/.test(unitText) ? "kg" : "pc";
-      const perUnit = Math.max(0, Number(part.part_qty_per_unit || part.qty_per_unit || part.quantity_per_unit || 0));
+      const partRate = Math.max(0, Number(part.part_qty_per_unit || part.qty_per_unit || part.quantity_per_unit || 0));
+      if(recordedRows.length){
+        const recordedUnits = recordedRows.reduce((sum, consumption) => sum + Math.max(0, Number(consumption.packed_qty || 0)), 0);
+        const missingUnits = Math.max(0, reportedPackedQty - recordedUnits);
+        if(missingUnits > 0){
+          const target = recordedRows[recordedRows.length - 1];
+          const perUnit = Math.max(0, Number(target.qty_per_unit || 0)) || (unit === "kg" ? Math.max(0, Number(item.external_average_weight_grams || 0) / 1000) : partRate);
+          target.packed_qty += missingUnits;
+          target.actual_consumed += missingUnits * perUnit;
+          target.qty_per_unit = perUnit || target.qty_per_unit;
+          target.weight_source.add("MISSING PACK RECONCILIATION");
+        }
+        return;
+      }
+      const perUnit = unit === "kg" ? (Math.max(0, Number(item.external_average_weight_grams || 0) / 1000) || partRate) : partRate;
       actualConsumptionMap.set(key, {
-        material, code, unit, packed_qty: packedQty, qty_per_unit: perUnit,
-        actual_consumed: packedQty * perUnit, weight_source: new Set(["Job API"]),
-        weight_applied_at: "",
+        material, code, unit, packed_qty: reportedPackedQty, qty_per_unit: perUnit,
+        actual_consumed: reportedPackedQty * perUnit, weight_source: new Set([unit === "kg" ? "SHIFT WEIGHT BACKFILL" : "Job API"]),
+        weight_applied_at: unit === "kg" ? (item.external_average_weight_received_at || "") : "",
       });
     });
     const actualConsumptionRows = Array.from(actualConsumptionMap.values()).map(x => ({ ...x, weight_source: Array.from(x.weight_source).join(", ") || "-" }));
@@ -11083,8 +12269,8 @@ DASHBOARD_HTML = """
         </header>
         <div class="consumption-report-layout">
           <aside class="pdr-kpis consumption-kpis">
-            <div class="pdr-kpi"><div class="k">ACCEPTED PACKS</div><div class="v">${esc(packRows.length)}</div></div>
-            <div class="pdr-kpi good"><div class="k">ACTUAL PACKED QTY</div><div class="v">${esc(packedQty)}</div></div>
+            <div class="pdr-kpi"><div class="k">ACCEPTED PACKS</div><div class="v">${esc(acceptedPackCount)}</div></div>
+            <div class="pdr-kpi good"><div class="k">ACTUAL PACKED QTY</div><div class="v">${esc(reportedPackedQty)}</div></div>
             <div class="pdr-kpi good"><div class="k">PRODUCT PARTS TRACKED</div><div class="v">${esc(trackedProductParts)}</div></div>
           </aside>
           <div class="consumption-content-grid">
@@ -11787,7 +12973,16 @@ DASHBOARD_HTML = """
   }
 
   function renderFinishedJobs(rows){
-    const allItems = Array.isArray(rows) ? rows : [];
+    const incomingItems = Array.isArray(rows) ? rows : [];
+    let allItems = incomingItems;
+    if(Array.isArray(completeFinishedHistoryState)){
+      const merged = new Map(completeFinishedHistoryState.map(row => [jobKeyOf(row), row]));
+      incomingItems.forEach(row => merged.set(jobKeyOf(row), row));
+      allItems = Array.from(merged.values()).sort((a, b) =>
+        String(a?.finished_at_utc || a?.ended_at_utc || "").localeCompare(String(b?.finished_at_utc || b?.ended_at_utc || ""))
+      );
+      completeFinishedHistoryState = allItems;
+    }
     const shiftItems = allItems.filter(row => {
       if(!isShiftPartialRecord(row)) return false;
       const stamp = String(row?.finished_at_utc || row?.ended_at_utc || "").trim();
@@ -11857,6 +13052,30 @@ DASHBOARD_HTML = """
         </div>
       `;
     }).join("");
+  }
+
+  async function loadCompleteFinishedHistory(){
+    if(completeFinishedHistoryLoading || Array.isArray(completeFinishedHistoryState)) return;
+    completeFinishedHistoryLoading = true;
+    try{
+      const newestFirst = [];
+      let page = 1;
+      let hasMore = true;
+      while(hasMore){
+        const response = await fetch(`/api/finished-jobs?page=${page}&page_size=200`, {cache:"no-store"});
+        const body = await response.json();
+        if(!response.ok || !body?.ok) throw new Error(body?.error || `HTTP ${response.status}`);
+        newestFirst.push(...(Array.isArray(body.items) ? body.items : []));
+        hasMore = Boolean(body.has_more);
+        page += 1;
+      }
+      completeFinishedHistoryState = newestFirst.reverse();
+      renderFinishedJobs(completeFinishedHistoryState);
+    }catch(error){
+      console.error("Unable to load complete finish-shift history", error);
+    }finally{
+      completeFinishedHistoryLoading = false;
+    }
   }
 
   function archivedRowToMachineSessionLike(row){
@@ -13350,6 +14569,7 @@ DASHBOARD_HTML = """
     activeJobRow = job || null;
     overlayReviewSavedApproved = false;
     overlayReviewMode = isShiftPartialRecord(activeJobRow) ? "shift" : "job";
+    if(overlayShiftHistoryBtn) overlayShiftHistoryBtn.style.display = overlayReviewMode === "shift" ? "" : "none";
     const approvedShiftViewAtOpen = overlayReviewMode === "shift" && isApprovedShiftRecord(activeJobRow);
     const approvePrintOverlayTitle = document.getElementById("approvePrintOverlayTitle");
     if(approvePrintOverlayTitle) approvePrintOverlayTitle.textContent = approvedShiftViewAtOpen
@@ -13451,11 +14671,13 @@ DASHBOARD_HTML = """
   }
 
   function closeApprovePrintOverlay(){
+    closeShiftActionHistory();
     approvePrintOverlay.classList.remove("active");
     approvePrintOverlay.classList.remove("linked-shift-report");
     activeJobRow = null;
     overlayReviewSavedApproved = false;
     overlayReviewMode = "job";
+    if(overlayShiftHistoryBtn) overlayShiftHistoryBtn.style.display = "none";
     reviewSlideIndex = 0;
     syncReviewSubslides();
     setOverlayStep("review");
@@ -13508,6 +14730,7 @@ DASHBOARD_HTML = """
       card.className = nextClassName;
     }
     card.dataset.renderSig = `${nextClassName}|${nextHtml}`;
+    syncMachineNoScheduleAnimation(code, statusLabel, s.machine_name || MACHINE_NAME_MAP[code] || code);
   }
 
   function cycleMachineLinkageCard(code){
@@ -13545,84 +14768,343 @@ DASHBOARD_HTML = """
     machineLinkageFlipTimers.set(code, [swapTimer]);
   }
 
+  function stopMachinePackAnimation(code){
+    const machineCode = String(code || "").trim();
+    const active = machinePackAnimations.get(machineCode);
+    if(!active) return;
+    (active.timers || []).forEach(timer => clearTimeout(timer));
+    active.overlay?.remove();
+    machinePackAnimations.delete(machineCode);
+  }
+
+  function machinePackSmokeHtml(){
+    const puffs = [
+      ["10px", "-9px", "-720ms"],
+      ["13px", "-22px", "-570ms"],
+      ["16px", "8px", "-420ms"],
+      ["11px", "-31px", "-270ms"],
+      ["15px", "18px", "-120ms"],
+      ["9px", "-16px", "30ms"],
+    ];
+    const plume = side => puffs.map(([size, y, delay]) => (
+      `<i style="--smoke-size:${size};--smoke-y:${y};--smoke-delay:${delay}"></i>`
+    )).join("");
+    return `<span class="machine-pack-smoke left">${plume("left")}</span><span class="machine-pack-smoke right">${plume("right")}</span>`;
+  }
+
+  function startMachinePackAnimation(code){
+    const machineCode = String(code || "").trim();
+    const card = machineCardEls.get(machineCode);
+    if(!card || card.hidden) return;
+    stopMachinePackAnimation(machineCode);
+
+    const overlay = document.createElement("div");
+    overlay.className = "machine-pack-overlay closing";
+    overlay.setAttribute("aria-hidden", "true");
+    overlay.innerHTML = `
+      <div class="machine-pack-stage">
+        <img class="machine-pack-image" src="${MACHINE_PACK_FRAME_URLS[5]}" alt="" draggable="false" />
+        <span class="machine-pack-signal"><span class="red"></span><span class="green"></span></span>
+        ${machinePackSmokeHtml()}
+      </div>
+    `;
+    card.appendChild(overlay);
+
+    const timers = [];
+    const controller = { overlay, timers };
+    machinePackAnimations.set(machineCode, controller);
+    const dismiss = () => stopMachinePackAnimation(machineCode);
+    const fadeDismiss = () => {
+      if(overlay.classList.contains("hover-fading")) return;
+      overlay.classList.add("hover-fading");
+      timers.push(setTimeout(dismiss, 350));
+    };
+    overlay.addEventListener("pointerenter", fadeDismiss, { once:true });
+
+    const schedule = (delay, callback) => {
+      timers.push(setTimeout(() => {
+        if(machinePackAnimations.get(machineCode) !== controller || !overlay.isConnected) return;
+        callback();
+      }, delay));
+    };
+    const showFrame = frameNumber => {
+      const image = overlay.querySelector(".machine-pack-image");
+      if(image) image.src = MACHINE_PACK_FRAME_URLS[frameNumber - 1];
+    };
+
+    [5, 4, 3, 2, 1].forEach((frameNumber, index) => {
+      schedule((index + 1) * MACHINE_PACK_FRAME_DELAY_MS, () => showFrame(frameNumber));
+    });
+
+    const pressingAt = 6 * MACHINE_PACK_FRAME_DELAY_MS;
+    schedule(pressingAt, () => {
+      overlay.classList.remove("closing");
+      overlay.classList.add("pressing");
+      showFrame(1);
+    });
+
+    const openingAt = pressingAt + MACHINE_PACK_PRESS_DURATION_MS;
+    [2, 3, 4, 5, 6].forEach((frameNumber, index) => {
+      schedule(openingAt + (index * MACHINE_PACK_FRAME_DELAY_MS), () => {
+        overlay.classList.remove("pressing");
+        overlay.classList.add("opening");
+        showFrame(frameNumber);
+      });
+    });
+    schedule(MACHINE_PACK_TOTAL_DURATION_MS, dismiss);
+  }
+
+  function isNoScheduleStatus(value){
+    return String(value || "").trim().replace(/[_-]+/g, " ").replace(/\\s+/g, " ").toUpperCase() === "NO SCHEDULE";
+  }
+
+  function stopMachineNoScheduleAnimation(code){
+    const machineCode = String(code || "").trim();
+    const controller = machineNoScheduleAnimations.get(machineCode);
+    controller?.overlay?.remove();
+    machineNoScheduleAnimations.delete(machineCode);
+  }
+
+  function updateMachineNoScheduleAnimation(controller){
+    if(!controller || controller.completed || !controller.overlay?.isConnected) return;
+    const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+    const elapsed = Math.max(0, Date.now() - controller.startedAt);
+    const walkDuration = MACHINE_NO_SCHEDULE_WALK_URLS.length * MACHINE_NO_SCHEDULE_WALK_FRAME_MS;
+    const poseUrls = controller.mode === "sleep" ? MACHINE_NO_SCHEDULE_SLEEP_URLS : MACHINE_NO_SCHEDULE_WAIT_URLS;
+    const poseFrameMs = controller.mode === "sleep" ? MACHINE_NO_SCHEDULE_SLEEP_FRAME_MS : MACHINE_NO_SCHEDULE_WAIT_FRAME_MS;
+    const poseSequence = controller.mode === "sleep"
+      ? [...poseUrls]
+      : [...poseUrls, ...poseUrls.slice().reverse()];
+    const poseElapsed = elapsed - walkDuration;
+    const poseIndex = Math.floor(Math.max(0, poseElapsed) / poseFrameMs);
+    const poseDuration = poseSequence.length * poseFrameMs;
+    const sleepHolding = controller.mode === "sleep"
+      && poseElapsed >= poseDuration
+      && poseElapsed < poseDuration + MACHINE_NO_SCHEDULE_SLEEP_HOLD_MS;
+    const poseFinished = poseElapsed >= poseDuration + (controller.mode === "sleep" ? MACHINE_NO_SCHEDULE_SLEEP_HOLD_MS : 0);
+    if(reduceMotion || poseFinished){
+      controller.completed = true;
+      controller.nextRunAt = controller.startedAt + MACHINE_NO_SCHEDULE_REPEAT_MS;
+      controller.overlay.classList.remove("waiting", "sleeping", "snoring");
+      controller.overlay.classList.add("finishing");
+      window.setTimeout(() => controller.overlay?.remove(), MACHINE_NO_SCHEDULE_FADE_MS);
+      return;
+    }
+    let frameUrl = MACHINE_NO_SCHEDULE_WALK_URLS[0];
+    let frameKey = "walk1";
+    let xPercent = 0;
+    let yPixels = 0;
+    let scale = 1;
+    let poseActive = false;
+    if(elapsed < walkDuration){
+      const progress = elapsed / walkDuration;
+      const walkIndex = Math.min(MACHINE_NO_SCHEDULE_WALK_URLS.length - 1, Math.floor(elapsed / MACHINE_NO_SCHEDULE_WALK_FRAME_MS));
+      frameUrl = MACHINE_NO_SCHEDULE_WALK_URLS[walkIndex];
+      frameKey = `walk${walkIndex + 1}`;
+      xPercent = 105 * (1 - progress);
+      scale = .94 + (.01 * progress);
+      yPixels = 2;
+    } else {
+      poseActive = true;
+      frameUrl = sleepHolding ? poseUrls[poseUrls.length - 1] : poseSequence[Math.min(poseIndex, poseSequence.length - 1)];
+      frameKey = sleepHolding ? "sleep-hold" : `${controller.mode}${poseIndex}`;
+      scale = .95;
+    }
+    if(controller.frameKey !== frameKey){
+      controller.frameKey = frameKey;
+      controller.image.src = frameUrl;
+    }
+    controller.stage.style.transform = `translate3d(${xPercent}%,${yPixels}px,0) scale(${scale})`;
+    controller.overlay.classList.toggle("waiting", poseActive && controller.mode === "wait");
+    controller.overlay.classList.toggle("sleeping", poseActive && controller.mode === "sleep");
+    controller.overlay.classList.toggle("snoring", sleepHolding);
+  }
+
+  function syncMachineNoScheduleAnimation(code, statusLabel, machineName){
+    const machineCode = String(code || "").trim();
+    const card = machineCardEls.get(machineCode);
+    if(!isNoScheduleStatus(statusLabel) || !card || card.hidden){
+      stopMachineNoScheduleAnimation(machineCode);
+      return;
+    }
+    let controller = machineNoScheduleAnimations.get(machineCode);
+    if(!controller){
+      controller = {
+        startedAt:Date.now(),
+        mode:Math.random() < .5 ? "wait" : "sleep",
+        overlay:null,
+        stage:null,
+        image:null,
+        frameKey:"",
+        completed:false,
+        nextRunAt:0,
+        machineName:machineName || machineCode,
+      };
+      machineNoScheduleAnimations.set(machineCode, controller);
+    }
+    controller.machineName = machineName || controller.machineName || machineCode;
+    if(controller.completed) return;
+    if(!controller.overlay?.isConnected){
+      const overlay = document.createElement("div");
+      overlay.className = "machine-no-schedule-overlay";
+      overlay.setAttribute("aria-hidden", "true");
+      overlay.innerHTML = `
+        <div class="machine-no-schedule-caption"><strong>${esc(machineName || machineCode)}</strong><span>NO SCHEDULE</span></div>
+        <div class="machine-no-schedule-stage">
+          <span class="machine-no-schedule-symbol question">?</span>
+          <span class="machine-no-schedule-symbol sleep">ZZZ</span>
+          <img class="machine-no-schedule-image" src="${MACHINE_NO_SCHEDULE_WALK_URLS[0]}" alt="" draggable="false" />
+        </div>
+      `;
+      card.appendChild(overlay);
+      controller.overlay = overlay;
+      controller.stage = overlay.querySelector(".machine-no-schedule-stage");
+      controller.image = overlay.querySelector(".machine-no-schedule-image");
+      controller.frameKey = "";
+      overlay.addEventListener("pointerenter", () => {
+        if(controller.completed) return;
+        controller.completed = true;
+        controller.nextRunAt = controller.startedAt + MACHINE_NO_SCHEDULE_REPEAT_MS;
+        overlay.classList.add("hover-fading");
+        window.setTimeout(() => overlay.remove(), 350);
+      }, {once:true});
+    }
+    updateMachineNoScheduleAnimation(controller);
+  }
+
+  window.setInterval(() => {
+    for(const [code, controller] of machineNoScheduleAnimations.entries()){
+      const card = machineCardEls.get(code);
+      if(!card || !card.isConnected){
+        stopMachineNoScheduleAnimation(code);
+        continue;
+      }
+      const statusText = String(card.querySelector(".machine-status-badge")?.textContent || "").trim();
+      if(!isNoScheduleStatus(statusText)){
+        stopMachineNoScheduleAnimation(code);
+        continue;
+      }
+      if(controller.completed && Date.now() >= Number(controller.nextRunAt || 0)){
+        controller.startedAt = Date.now();
+        controller.mode = Math.random() < .5 ? "wait" : "sleep";
+        controller.frameKey = "";
+        controller.completed = false;
+        controller.nextRunAt = 0;
+        syncMachineNoScheduleAnimation(code, statusText, controller.machineName || code);
+        continue;
+      }
+      updateMachineNoScheduleAnimation(controller);
+    }
+  }, 90);
+
+  function isNewServerPackEvent(previous, current){
+    if(!previous || !current) return false;
+    const description = String(current.last_event || "").trim().toUpperCase();
+    if(!description.startsWith("PACK SCANNED")) return false;
+    const currentStamp = String(current.last_event_at_utc || "").trim();
+    const previousStamp = String(previous.last_event_at_utc || "").trim();
+    return Boolean(currentStamp && currentStamp !== previousStamp);
+  }
+
+  function positiveDashboardNumber(value){
+    if(value === null || value === undefined || value === "") return 0;
+    const match = String(value).replace(/,/g, "").match(/-?\\d+(?:\\.\\d+)?/);
+    const parsed = match ? Number(match[0]) : 0;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  function resolveMachinePackQty(session, code){
+    const machineCode = String(code || session?.machine_code || "").trim();
+    const sessionKey = String(session?.production_session_id || session?.job_code || "").trim();
+    const description = String(session?.last_event || "");
+    const eventQtyMatch = description.match(/\\bQTY\\s*[:=]?\\s*(\\d+(?:\\.\\d+)?)/i);
+    const eventQty = eventQtyMatch ? positiveDashboardNumber(eventQtyMatch[1]) : 0;
+    if(/^PACK\\s+SCANNED\\b/i.test(description.trim()) && eventQty > 0){
+      machinePackQtyBySession.set(machineCode, { sessionKey, qty:eventQty });
+      return eventQty;
+    }
+
+    const cached = machinePackQtyBySession.get(machineCode);
+    if(cached && cached.sessionKey === sessionKey && positiveDashboardNumber(cached.qty) > 0){
+      return positiveDashboardNumber(cached.qty);
+    }
+
+    const packLogs = Array.isArray(session?.product_pack_history_logs) ? session.product_pack_history_logs : [];
+    for(let index = packLogs.length - 1; index >= 0; index -= 1){
+      const row = packLogs[index];
+      if(!row || typeof row !== "object" || row.voided) continue;
+      const logQty = positiveDashboardNumber(
+        row.scanned_pack_qty ?? row.completed_pack_qty ?? row.qty_q ?? row.good_qty ?? row.qty
+      );
+      if(logQty > 0){
+        machinePackQtyBySession.set(machineCode, { sessionKey, qty:logQty });
+        return logQty;
+      }
+    }
+
+    const payload = (session?.job_payload && typeof session.job_payload === "object") ? session.job_payload : {};
+    const data = (payload.data && typeof payload.data === "object") ? payload.data : payload;
+    const job = (data.job && typeof data.job === "object") ? data.job : {};
+    const details = (data.job_details && typeof data.job_details === "object") ? data.job_details : {};
+    const jobQty = positiveDashboardNumber(
+      job.custom_03 ?? details.custom_03 ?? job.packing_per_sales ?? details.packing_per_sales
+    );
+    if(jobQty > 0) machinePackQtyBySession.set(machineCode, { sessionKey, qty:jobQty });
+    return jobQty;
+  }
+
+  function meaningfulMachineAction(session){
+    const text = String(session?.last_event || "").trim();
+    if(!text) return "";
+    const upper = text.toUpperCase();
+    if(upper === "NO DATA YET" || upper === "NO JOB RUNNING") return "";
+    if(upper.includes("RECONNECT")) return "";
+    const transportPrefixes = [
+      "HEARTBEAT",
+      "PING",
+      "CLIENT STATUS",
+      "CLIENT ONLINE",
+      "CLIENT POLL",
+      "SESSION SYNC",
+      "SESSION SNAPSHOT SYNC",
+    ];
+    if(transportPrefixes.some(prefix => upper === prefix || upper.startsWith(`${prefix} `))) return "";
+    return text;
+  }
+
   function machineCardHtml(s, code, css, statusLabel, flipLinkage = false){
     const manual = machineStatusOverrideFor(code);
     const manualStatus = String((manual && manual.status) || "").trim();
-    if(manualStatus){
-      const machineName = s.machine_name || MACHINE_NAME_MAP[code] || s.machine_code || code || "-";
-      const supervisor = firstValue(manual.set_by_name, manual.supervisor_name, manual.set_by_badge, "-");
-      const supervisorRole = String(manual.set_by_role || "").trim();
-      const reason = firstValue(manual.reason, manual.status_reason, "-");
-      const remarks = firstValue(manual.remarks, manual.remark, manual.notes, "-");
-      const statusStartedAt = String(manual.started_at_utc || manual.updated_at_utc || "").trim();
-      const statusStartedMs = Date.parse(statusStartedAt);
-      const statusDuration = Number.isFinite(statusStartedMs)
-        ? fmtStatusDuration(Math.max(0, Math.floor((Date.now() - statusStartedMs) / 1000)))
-        : "-";
-      return `
-        <div class="machine-status-flashcard">
-          <div class="machine-status-flash-head">
-            <div class="machine-status-flash-title">
-              <div class="eyebrow">Machine Status</div>
-              <h3>${esc(machineName)}</h3>
-            </div>
-            <span class="machine-status-flash-chip">${esc(manualStatus)}</span>
-          </div>
-          <div class="machine-status-flash-grid">
-            <div class="machine-status-flash-item">
-              <div class="k">Supervisor</div>
-              <div class="v">${esc(supervisor)}${supervisorRole ? ` (${esc(supervisorRole)})` : ""}</div>
-            </div>
-            <div class="machine-status-flash-item">
-              <div class="k">Reason / Status</div>
-              <div class="v">${esc(reason || manualStatus)}</div>
-            </div>
-            <div class="machine-status-flash-item">
-              <div class="k">Remarks</div>
-              <div class="v">${esc(remarks || "-")}</div>
-            </div>
-            <div class="machine-status-flash-item">
-              <div class="k">Status Duration</div>
-              <div class="v machine-status-live-duration" data-status-started="${esc(statusStartedAt)}">${esc(statusDuration)}</div>
-            </div>
-          </div>
-        </div>
-      `;
-    }
-    const linkageJobs = Array.isArray(s.linkage_jobs) ? s.linkage_jobs : [];
-    const hasLinkage = Boolean(s.linkage_enabled) && linkageJobs.length > 0;
-    const linkageDisplay = hasLinkage ? machineLinkageDisplay(s, code) : null;
-    const displayedJob = linkageDisplay ? linkageDisplay.current : null;
-    const displayedJobCode = String(displayedJob?.job_code || s.job_code || "").trim();
-    const mainJobCode = String(s.job_code || "").trim();
-    const showingMainJob = !displayedJob || displayedJobCode === mainJobCode;
-    const butalByJob = (s.butal_by_job && typeof s.butal_by_job === "object") ? s.butal_by_job : {};
-    const jobPackTotal = showingMainJob
-      ? Number(s.pack_total || 0)
-      : Number(displayedJob?.linkage_pack_count || 0);
-    const jobGoodTotal = showingMainJob
-      ? Number(s.good_total || 0)
-      : Number(displayedJob?.linkage_good_total || 0);
-    const jobButalTotal = Number(
-      butalByJob[displayedJobCode]
-      ?? (showingMainJob ? s.butal_total : 0)
-      ?? 0
-    );
-    // Reject/no-shot records currently belong to the original job unless a
-    // per-job allocation is supplied. Do not repeat the main totals while the
-    // operator switches to a linked job card.
-    const jobRejectTotal = showingMainJob ? Number(s.reject_total || 0) : Number(displayedJob?.reject_total || 0);
-    const jobNoShotTotal = showingMainJob ? Number(s.no_shot_total || 0) : Number(displayedJob?.no_shot_total || 0);
-    const total = jobGoodTotal + jobButalTotal;
-    const currentJobLabel = jobDisplayName(s, "No Job Set");
-    const jobLabel = displayedJob ? jobDisplayName(displayedJob, currentJobLabel) : currentJobLabel;
-    const seenLabel = s.last_seen_utc ? fmtDateLocal(s.last_seen_utc) : "-";
+    const machineName = s.machine_name || MACHINE_NAME_MAP[code] || s.machine_code || code || "-";
+    const supervisor = firstValue(manual?.set_by_name, manual?.supervisor_name, manual?.set_by_badge, "-");
+    const supervisorRole = String(manual?.set_by_role || "").trim();
+    const statusStartedAt = String(manual?.started_at_utc || manual?.updated_at_utc || "").trim();
+    const statusStartedMs = Date.parse(statusStartedAt);
+    const statusDuration = Number.isFinite(statusStartedMs)
+      ? fmtStatusDuration(Math.max(0, Math.floor((Date.now() - statusStartedMs) / 1000)))
+      : "-";
+    const jobLabel = jobDisplayName(s, "No Job Set");
+    const lastAction = meaningfulMachineAction(s);
     const statusText = statusLabel || css.toUpperCase();
-    const operatorText = displayNameForId(s.operator_id || "-");
-    const clientText = displayNameForId(s.client_id || "-");
-    const supervisorCheckName = String(s.last_supervisor_check_name || "").trim();
-    const supervisorCheckAt = s.last_supervisor_check_at_utc ? fmtDateLocal(s.last_supervisor_check_at_utc) : "-";
-    const lastEventAt = s.last_event_at_utc ? fmtDateLocal(s.last_event_at_utc) : "-";
+    const operatorText = manualStatus
+      ? `${supervisor}${supervisorRole ? ` (${supervisorRole})` : ""}`
+      : displayNameForId(s.operator_id || "-");
+    const cycleTimeSeconds = positiveDashboardNumber(s.cycle_time_current);
+    const packQty = resolveMachinePackQty(s, code);
+    const producedPerShift = cycleTimeSeconds > 0 ? Math.floor((12 * 60 * 60) / cycleTimeSeconds) : 0;
+    const targetPackCount = producedPerShift > 0 && packQty > 0
+      ? Math.ceil(producedPerShift / packQty)
+      : 0;
+    const currentPackCount = Math.max(0, Number(s.pack_total || 0));
+    const progressPct = targetPackCount > 0
+      ? Math.max(0, Math.min(100, Math.round((currentPackCount / targetPackCount) * 100)))
+      : 0;
+    const progressCountText = targetPackCount > 0
+      ? `${currentPackCount} / ${targetPackCount} packs`
+      : `${currentPackCount} packs`;
+    const progressTooltip = targetPackCount > 0
+      ? `${cycleTimeSeconds} sec cycle | ${producedPerShift} units / 12-hour shift | ${packQty} units / pack`
+      : "Cycle time or pack quantity is not available";
     const supervisorTooltip = [
       "Supervisor QR pending",
       "Scan Supervisor QR on the client to continue downtime resolution.",
@@ -13635,38 +15117,43 @@ DASHBOARD_HTML = """
     ` : "";
     return `
       ${supervisorNotif}
-      ${hasLinkage ? `
-        <div class="machine-linkage-flag">
-          <span>LINKED JOBS: ${esc(linkageJobs.length)}</span>
-          <button class="machine-linkage-switch" type="button" data-machine-code="${esc(code)}">Switch</button>
-        </div>
-      ` : ""}
       <div class="machine-card-head">
         <div class="machine-card-title">
-          <h3>${esc(s.machine_name || s.machine_code)}</h3>
+          <h3>${esc(machineName)}</h3>
         </div>
         <span class="machine-status-badge ${esc(css)}">${esc(statusText)}</span>
       </div>
-      <div class="machine-job-block">
-        <div class="machine-job-name">${esc(jobLabel)}</div>
-        <div class="machine-job-meta">
-          <span>Operator: <strong>${esc(operatorText)}</strong></span>
-          <span>Client: <strong>${esc(clientText)}</strong></span>
+      <div class="machine-compact-meta">
+        <div class="machine-compact-row">
+          <span class="k">${manualStatus ? "Supervisor" : "Operator"}</span>
+          <span class="v" title="${esc(operatorText)}">${esc(operatorText)}</span>
         </div>
+        <div class="machine-compact-row">
+          <span class="k">Job</span>
+          <span class="v" title="${esc(jobLabel)}">${esc(jobLabel)}</span>
+        </div>
+        ${lastAction ? `<div class="machine-last-action" title="${esc(lastAction)}">${esc(lastAction)}</div>` : ""}
       </div>
-      <div class="machine-metrics">
-        <div class="machine-metric"><div class="k">Pack</div><div class="v">${esc(jobPackTotal)}</div></div>
-        <div class="machine-metric good"><div class="k">Good</div><div class="v">${esc(jobGoodTotal)}</div></div>
-        <div class="machine-metric"><div class="k">Butal</div><div class="v">${esc(jobButalTotal)}</div></div>
-        <div class="machine-metric bad"><div class="k">Reject</div><div class="v">${esc(jobRejectTotal)}</div></div>
-        <div class="machine-metric"><div class="k">No Shot</div><div class="v">${esc(jobNoShotTotal)}</div></div>
-        <div class="machine-metric good"><div class="k">Total</div><div class="v">${esc(total)}</div></div>
-        <div class="machine-metric"><div class="k">Counter Start</div><div class="v">${esc(machineCounterStartValue(s))}</div></div>
-      </div>
-      <div class="machine-card-foot">
-        <div>Last seen: ${esc(seenLabel)}</div>
-        <div>Last event: ${esc(s.last_event || "-")} · ${esc(lastEventAt)}</div>
-        <div>Supervisor check: ${esc(supervisorCheckName || "-")} · ${esc(supervisorCheckAt)}</div>
+      <div class="machine-compact-bottom">
+        ${manualStatus ? `
+          <div class="machine-compact-duration">
+            <span class="clock">◷</span>
+            <span class="machine-status-live-duration" data-status-started="${esc(statusStartedAt)}">${esc(statusDuration)}</span>
+          </div>
+        ` : css === "disconnected" ? `
+          <div class="machine-offline-note">
+            <span class="offline-icon" aria-hidden="true">⊘</span>
+            <strong>No internet</strong>
+          </div>
+        ` : `
+          <div class="machine-progress-row ${esc(css)}">
+            <div class="machine-progress-summary" title="${esc(progressTooltip)}">
+              <span class="machine-progress-count">${esc(progressCountText)}</span>
+              <strong>${esc(progressPct)}%</strong>
+            </div>
+            <div class="machine-progress-track"><span class="machine-progress-fill" style="width:${esc(progressPct)}%"></span></div>
+          </div>
+        `}
       </div>
     `;
   }
@@ -13697,6 +15184,7 @@ DASHBOARD_HTML = """
       card.innerHTML = nextHtml;
       card.dataset.renderSig = nextRenderSig;
     }
+    syncMachineNoScheduleAnimation(code, statusLabel, s.machine_name || MACHINE_NAME_MAP[code] || code);
     return card;
   }
 
@@ -13709,6 +15197,12 @@ DASHBOARD_HTML = """
       (latestState?.sessions || []).map(row => [String(row?.machine_code || "").trim(), row])
     );
     const incomingSessions = Array.isArray(state?.sessions) ? state.sessions : (latestState?.sessions || []);
+    const packAnimationCodes = incomingSessions
+      .filter(row => {
+        const code = String(row?.machine_code || "").trim();
+        return Boolean(code && isNewServerPackEvent(previousSessions.get(code), row));
+      })
+      .map(row => String(row.machine_code || "").trim());
     const mergedSessions = incomingSessions.map(row => {
       const code = String(row?.machine_code || "").trim();
       return row?.summary_only ? { ...(previousSessions.get(code) || {}), ...row } : row;
@@ -13771,10 +15265,14 @@ DASHBOARD_HTML = """
       }
     }
 
+    packAnimationCodes.forEach(startMachinePackAnimation);
+
     for(const [code, card] of machineCardEls.entries()){
       if(desiredCodes.has(code)) continue;
       if(card && card.parentNode) card.parentNode.removeChild(card);
       machineCardEls.delete(code);
+      machinePackQtyBySession.delete(code);
+      stopMachineNoScheduleAnimation(code);
     }
     renderJobQueue(state.job_queue || []);
     renderFinishedJobs(state.finished_jobs || []);
@@ -13795,8 +15293,23 @@ DASHBOARD_HTML = """
       document.querySelectorAll(".main-tab-content").forEach(c => c.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById(target)?.classList.add("active");
+      if(target === "finishShiftTab") loadCompleteFinishedHistory();
       if(target === "userKpiTab") loadUserKpis();
     });
+  });
+  document.addEventListener("pointerout", (ev) => {
+    const partButton = ev.target && ev.target.closest ? ev.target.closest(".job-part-sku-button") : null;
+    if(partButton && !partButton.contains(ev.relatedTarget)) partButton.classList.remove("tooltip-dismissed");
+    const packButton = ev.target && ev.target.closest ? ev.target.closest(".pack-item-drawer-button") : null;
+    if(packButton && !packButton.contains(ev.relatedTarget)) packButton.classList.remove("tooltip-dismissed");
+  });
+  document.addEventListener("pointerover", (ev) => {
+    const packButton = ev.target && ev.target.closest ? ev.target.closest(".pack-item-link, .pack-scan-qr-link") : null;
+    if(packButton) positionPackItemTooltip(packButton);
+  });
+  document.addEventListener("focusin", (ev) => {
+    const packButton = ev.target && ev.target.closest ? ev.target.closest(".pack-item-link, .pack-scan-qr-link") : null;
+    if(packButton) positionPackItemTooltip(packButton);
   });
   if(hideInactiveMachinesFilter) hideInactiveMachinesFilter.checked = hideInactiveMachines;
   if(machineFilterBtn) machineFilterBtn.classList.toggle("active", hideInactiveMachines);
@@ -14226,6 +15739,14 @@ DASHBOARD_HTML = """
     syncReviewSubslides();
   });
   machineDetailCloseBtn.addEventListener("click", closeMachineDetail);
+  overlayShiftHistoryBtn?.addEventListener("click", openShiftActionHistory);
+  shiftActionHistoryCloseBtn?.addEventListener("click", closeShiftActionHistory);
+  shiftActionHistorySearch?.addEventListener("input", renderShiftActionHistory);
+  shiftActionHistoryType?.addEventListener("change", renderShiftActionHistory);
+  shiftActionHistorySource?.addEventListener("change", renderShiftActionHistory);
+  machineDetailHistoryBtn?.addEventListener("click", openMachineHistory);
+  machineHistoryCloseBtn?.addEventListener("click", closeMachineHistory);
+  machineHistorySearch?.addEventListener("input", renderMachineHistory);
   machineDetailSettingsBtn?.addEventListener("click", () => {
     if(!machineDetailStatusPanel) return;
     machineDetailStatusPanel.style.display = (machineDetailStatusPanel.style.display === "none") ? "" : "none";
@@ -14297,6 +15818,12 @@ DASHBOARD_HTML = """
   });
   machineDetailOverlay.addEventListener("click", (ev) => {
     if(ev.target === machineDetailOverlay) closeMachineDetail();
+  });
+  machineHistoryOverlay?.addEventListener("click", (ev) => {
+    if(ev.target === machineHistoryOverlay) closeMachineHistory();
+  });
+  shiftActionHistoryOverlay?.addEventListener("click", (ev) => {
+    if(ev.target === shiftActionHistoryOverlay) closeShiftActionHistory();
   });
 
   overlayProductSelect.addEventListener("focus", () => {
@@ -14581,6 +16108,7 @@ DASHBOARD_HTML = """
     if(!button) return;
     ev.preventDefault();
     ev.stopPropagation();
+    button.blur();
     try {
       openQrViewer(JSON.parse(decodeURIComponent(button.dataset.qrView || "")));
     } catch(err) {
@@ -15712,6 +17240,121 @@ def _apply_reject_counter_event(
         sess.reject_breakdown[bucket_code] = sess.reject_breakdown.get(bucket_code, 0) + qty
 
 
+def _append_reject_event_records(
+    sess: MachineSession,
+    event_type: str,
+    event: Dict[str, Any],
+    event_id: str,
+    event_created_at_utc: Any,
+) -> int:
+    """Persist the exact reject ledger rows carried by the counter event."""
+    ev_type = str(event_type or "").strip().upper()
+    ev = event if isinstance(event, dict) else {}
+    qty = max(1, int(ev.get("qty", 1) or 1))
+    reason = str(ev.get("reason") or ("SUR" if ev_type == "STARTUP_REJECT" else "")).strip().upper()
+    entry_type = "STARTUP_REJECT_SCAN" if ev_type == "STARTUP_REJECT" else "REJECT_SCAN"
+    incoming = ev.get("reject_records") if isinstance(ev.get("reject_records"), list) else []
+    existing_ids = {
+        str(row.get("reject_scan_id") or "").strip()
+        for row in (sess.reject_review_logs or [])
+        if isinstance(row, dict) and str(row.get("reject_scan_id") or "").strip()
+    }
+    rows = [dict(row) for row in (sess.reject_review_logs or []) if isinstance(row, dict)]
+    appended = 0
+    for idx in range(qty):
+        source = incoming[idx] if idx < len(incoming) and isinstance(incoming[idx], dict) else {}
+        row = dict(source)
+        reject_scan_id = str(row.get("reject_scan_id") or "").strip()
+        if not reject_scan_id:
+            stable_event = re.sub(r"[^A-Za-z0-9]+", "", str(event_id or "")) or uuid.uuid4().hex
+            reject_scan_id = f"RS-SERVER-{stable_event.upper()}-{idx + 1}"
+        if reject_scan_id in existing_ids:
+            continue
+        row["reject_scan_id"] = reject_scan_id
+        row.setdefault("entry_type", entry_type)
+        row.setdefault("reason_code", reason)
+        row.setdefault("reason_text", "Start Up Reject" if reason == "SUR" else reason)
+        row.setdefault("raw_scan", reason)
+        row.setdefault("operator", str(sess.operator_id or "").strip() or "-")
+        row.setdefault("operator_name", str(sess.operator_id or "").strip() or "-")
+        row.setdefault("scanned_at", str(event_created_at_utc or utc_now().isoformat()))
+        row.setdefault("voided", False)
+        rows.append(row)
+        existing_ids.add(reject_scan_id)
+        appended += 1
+    sess.reject_review_logs = rows
+    return appended
+
+
+def _apply_reject_void_event(sess: MachineSession, event: Dict[str, Any]) -> bool:
+    """Void one reject ledger row and its matching aggregate atomically."""
+    ev = event if isinstance(event, dict) else {}
+    supplied = ev.get("reject_record") if isinstance(ev.get("reject_record"), dict) else {}
+    reject_scan_id = str(ev.get("reject_scan_id") or supplied.get("reject_scan_id") or "").strip()
+    reason = str(ev.get("reason") or supplied.get("reason_code") or "").strip().upper()
+    rows = [dict(row) for row in (sess.reject_review_logs or []) if isinstance(row, dict)]
+    target_idx: Optional[int] = None
+    already_voided_match = False
+    for idx in range(len(rows) - 1, -1, -1):
+        row = rows[idx]
+        row_id = str(row.get("reject_scan_id") or "").strip()
+        row_reason = str(row.get("reason_code") or "").strip().upper()
+        if reject_scan_id and row_id == reject_scan_id:
+            if bool(row.get("voided")):
+                already_voided_match = True
+                break
+            target_idx = idx
+            break
+        if bool(row.get("voided")):
+            continue
+        if not reject_scan_id and reason and row_reason == reason:
+            target_idx = idx
+            break
+
+    if already_voided_match:
+        return True
+
+    counter_only_recovery = bool(supplied.get("counter_only_recovery"))
+    if target_idx is None and counter_only_recovery:
+        recovered = dict(supplied)
+        recovered.setdefault("reject_scan_id", reject_scan_id or f"RS-SERVER-RECOVERED-{uuid.uuid4().hex.upper()}")
+        recovered.setdefault("reason_code", reason)
+        recovered.setdefault("entry_type", "STARTUP_REJECT_SCAN" if reason == "SUR" else "REJECT_SCAN")
+        recovered["voided"] = True
+        recovered.setdefault("voided_at", utc_now().isoformat())
+        rows.append(recovered)
+        target = recovered
+    elif target_idx is not None:
+        target = rows[target_idx]
+        target["voided"] = True
+        target["voided_at"] = str(supplied.get("voided_at") or utc_now().isoformat())
+        if supplied.get("voided_by"):
+            target["voided_by"] = supplied.get("voided_by")
+        rows[target_idx] = target
+    else:
+        return False
+
+    entry_type = str(target.get("entry_type") or "").strip().upper()
+    target_reason = str(target.get("reason_code") or reason).strip().upper()
+    bucket_code = _canonical_reject_code(target_reason)
+    if entry_type == "STARTUP_REJECT_SCAN":
+        if int(sess.startup_reject_total or 0) <= 0:
+            return False
+        sess.startup_reject_total = max(0, int(sess.startup_reject_total or 0) - 1)
+    else:
+        current_bucket = int((sess.reject_breakdown or {}).get(bucket_code, 0) or 0)
+        if current_bucket <= 0:
+            return False
+        if bucket_code == "NO":
+            sess.no_shot_total = max(0, int(sess.no_shot_total or 0) - 1)
+        else:
+            sess.reject_total = max(0, int(sess.reject_total or 0) - 1)
+        sess.reject_breakdown = _canonical_reject_breakdown(sess.reject_breakdown)
+        sess.reject_breakdown[bucket_code] = max(0, int(sess.reject_breakdown.get(bucket_code, 0)) - 1)
+    sess.reject_review_logs = rows
+    return True
+
+
 PACK_COUNTER_EVENT_TYPES = {"PACK", "LAST_SHIFT_BUTAL_PACK", "BUTAL_COMPLETION_PACK"}
 
 
@@ -15858,11 +17501,19 @@ async def api_virtual_pack_reserve(req: Request):
 
     normalized_job = job_code.lstrip("0") or "0"
     normalized_product = product_id.lstrip("0") or "0"
+    requested_session_id = str(data.get("production_session_id") or "").strip()
     max_used_index = 0
     sess = SESSIONS.get(machine_code)
-    if sess is not None:
+    server_session_id = str(getattr(sess, "production_session_id", "") or "").strip() if sess is not None else ""
+    if sess is not None and (
+        not requested_session_id
+        or requested_session_id == server_session_id
+    ):
         for row in sess.product_pack_history_logs or []:
             if not isinstance(row, dict) or bool(row.get("voided")):
+                continue
+            row_session_id = str(row.get("production_session_id") or "").strip()
+            if requested_session_id and row_session_id != requested_session_id:
                 continue
             row_job = str(row.get("po_number") or row.get("job_code") or "").strip()
             row_product = str(row.get("product_p") or row.get("product_id") or "").strip()
@@ -15884,6 +17535,7 @@ async def api_virtual_pack_reserve(req: Request):
             "machine_code": machine_code,
             "job_code": job_code,
             "product_id": product_id,
+            "production_session_id": requested_session_id,
             "requested_index": requested_index,
             "reserved_index": reserved_index,
             "virtual_scan_id": virtual_scan_id,
@@ -16789,7 +18441,23 @@ async def api_event(req: Request):
             rows[assigned_job_code] = int(rows.get(assigned_job_code, 0) or 0) + qty
             sess.butal_by_job = rows
     elif ev_type in {"REJECT", "STARTUP_REJECT"}:
-        _apply_reject_counter_event(sess, ev_type, ev)
+        appended_rejects = _append_reject_event_records(
+            sess,
+            ev_type,
+            ev,
+            event_id,
+            data.get("event_created_at_utc"),
+        )
+        if appended_rejects > 0:
+            counter_event = dict(ev)
+            counter_event["qty"] = appended_rejects
+            _apply_reject_counter_event(sess, ev_type, counter_event)
+    elif ev_type == "REJECT_VOID":
+        if not _apply_reject_void_event(sess, ev):
+            return JSONResponse(
+                {"ok": False, "error": "Reject entry or matching positive counter was not found"},
+                status_code=409,
+            )
 
     if ev_type in PACK_COUNTER_EVENT_TYPES:
         _append_pack_counter_event_record(sess, ev, data.get("event_created_at_utc"))
@@ -16822,11 +18490,12 @@ async def api_event(req: Request):
     state_persisted = True
     if ev_type not in ("HEARTBEAT", "FINISH_JOB"):
         state_persisted = _persist_active_sessions_state(machine_code)
-    if ev_type in PACK_COUNTER_EVENT_TYPES and not state_persisted:
-        # Do not acknowledge/remove the client's durable PACK outbox entry
-        # until its counter and pack identity have reached durable storage.
+    durable_production_events = PACK_COUNTER_EVENT_TYPES | {"REJECT", "STARTUP_REJECT", "REJECT_VOID"}
+    if ev_type in durable_production_events and not state_persisted:
+        # Do not acknowledge/remove a durable production event until both its
+        # aggregate and exact ledger identity have reached server storage.
         return JSONResponse(
-            {"ok": False, "error": "PACK state was not durably saved; retry required"},
+            {"ok": False, "error": f"{ev_type} state was not durably saved; retry required"},
             status_code=503,
         )
 

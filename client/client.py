@@ -10923,8 +10923,52 @@ QWidget#ClientUIRoot {{
         review_from = max(0, int(s.operator_shift_baseline_reject_review_logs_len or 0))
         butal_from = max(0, int(s.operator_shift_baseline_butal_scan_logs_len or 0))
         adjustment_from = max(0, int(s.operator_shift_baseline_production_adjustment_logs_len or 0))
+        shift_pack_rows = list((s.product_pack_history_logs or [])[pack_from:])
         pack_count = max(0, int(s.pack_count or 0) - int(s.operator_shift_baseline_pack_count or 0))
         good_total = max(0, int(s.good_total or 0) - int(s.operator_shift_baseline_good_total or 0))
+        # The detailed PACK ledger is written before the live counters are
+        # incremented.  If an older/stale snapshot ever leaves the aggregate
+        # exactly one or more full packs ahead of that ledger, keep the shift
+        # boundary owned by the durable scan rows.  This prevents a phantom
+        # +packing-qty from being saved into the shift that is closing.
+        active_pack_rows = [
+            row for row in shift_pack_rows
+            if isinstance(row, dict) and not bool(row.get("voided"))
+        ]
+        ledger_pack_count = len(active_pack_rows)
+        ledger_good_total = 0
+        ledger_quantities: List[int] = []
+        for row in active_pack_rows:
+            try:
+                row_qty = int(
+                    row.get("new_good_qty")
+                    or row.get("main_job_output_qty")
+                    or row.get("good_qty")
+                    or row.get("qty_q")
+                    or row.get("completed_pack_qty")
+                    or row.get("qty")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                row_qty = 0
+            if row_qty > 0:
+                ledger_good_total += row_qty
+                ledger_quantities.append(row_qty)
+        pack_ledger_reconciled = False
+        if (
+            ledger_pack_count > 0
+            and ledger_pack_count < pack_count
+            and ledger_good_total > 0
+            and ledger_good_total < good_total
+        ):
+            missing_packs = pack_count - ledger_pack_count
+            missing_good = good_total - ledger_good_total
+            common_qty = ledger_quantities[0] if ledger_quantities else 0
+            uniform_ledger = bool(common_qty) and all(qty == common_qty for qty in ledger_quantities)
+            if uniform_ledger and missing_good == missing_packs * common_qty:
+                pack_count = ledger_pack_count
+                good_total = ledger_good_total
+                pack_ledger_reconciled = True
         if s.linkage_enabled and (s.linkage_jobs or []):
             butal_total = self._shift_butal_qty_for_job(s.job_code, fallback_current=True)
         else:
@@ -11002,7 +11046,10 @@ QWidget#ClientUIRoot {{
             "raw_material_logs": list((s.raw_material_logs or [])[raw_from:]),
             "raw_material_scans": list(s.raw_material_scans or []),
             "part_availability_carryover_logs": self._build_part_availability_carryover_logs(),
-            "product_pack_history_logs": list((s.product_pack_history_logs or [])[pack_from:]),
+            "product_pack_history_logs": shift_pack_rows,
+            "pack_ledger_count": ledger_pack_count,
+            "pack_ledger_good_total": ledger_good_total,
+            "pack_ledger_reconciled": pack_ledger_reconciled,
             "butal_scan_logs": list((s.butal_scan_logs or [])[butal_from:]),
             "reject_review_logs": list((s.reject_review_logs or [])[review_from:]),
             "supervisor_review_logs": list(s.supervisor_review_logs or []),
@@ -11960,7 +12007,7 @@ QWidget#ClientUIRoot {{
                 if key in server_snap:
                     merged[key] = server_snap.get(key)
         elif ack_event_type == "REJECT_VOID":
-            for key in ("reject_total", "startup_reject_total", "no_shot_total", "reject_breakdown"):
+            for key in ("reject_total", "startup_reject_total", "no_shot_total", "reject_breakdown", "reject_review_logs"):
                 if key in server_snap:
                     merged[key] = server_snap.get(key)
         self._restore_state_from_snapshot(merged)
@@ -13054,6 +13101,7 @@ QWidget#ClientUIRoot {{
         self._floating_pack_qr_context_key = ""
         self._floating_pack_qr_recent_payloads = []
         self._floating_pack_qr_scan_pending_payload = ""
+        self._pending_pack_prereq_raw = ""
         self._last_accepted_pack_scan_at = 0.0
         self._last_accepted_pack_scan_cooldown_seconds = 0.0
         s.butal_scan_logs = []
@@ -20944,8 +20992,39 @@ QWidget#ClientUIRoot {{
             return True
         return False
 
+    def _append_reject_scan_records(
+        self,
+        reason_code: str,
+        reason_text: str,
+        qty: int,
+        *,
+        entry_type: str = "REJECT_SCAN",
+    ) -> List[Dict[str, Any]]:
+        """Write the durable reject ledger before its aggregate is changed."""
+        rows: List[Dict[str, Any]] = []
+        safe_qty = max(1, int(qty or 1))
+        code = str(reason_code or "").strip().upper()
+        text = str(reason_text or REJECT_REASON_MAP.get(code, code)).strip()
+        for _ in range(safe_qty):
+            row = {
+                "reject_scan_id": f"RS-{uuid.uuid4().hex.upper()}",
+                "entry_type": str(entry_type or "REJECT_SCAN").strip().upper(),
+                "reason_code": code,
+                "reason_text": text,
+                "raw_scan": code,
+                "operator": str(self.state.operator_id or "").strip() or "-",
+                "operator_name": self._operator_display_name(self.state.operator_id),
+                **self._scan_owner_context(),
+                "scanned_at": datetime.now(timezone.utc).isoformat(),
+                "voided": False,
+            }
+            self.state.reject_review_logs.append(row)
+            rows.append(dict(row))
+        return rows
+
     def _void_reject_scan(self, raw_scan: str) -> bool:
         s = self.state
+        self._last_voided_reject_record = None
         supervisor_name = str(s.supervisor_review_actor_name or s.supervisor_name or "").strip()
         target_reason = str(raw_scan or "").strip().upper()
         for row in reversed(list(s.reject_review_logs or [])):
@@ -20963,6 +21042,7 @@ QWidget#ClientUIRoot {{
             row["voided_at"] = datetime.now(timezone.utc).isoformat()
             if supervisor_name:
                 row["voided_by"] = supervisor_name
+            self._last_voided_reject_record = dict(row)
             if entry_type == "STARTUP_REJECT_SCAN":
                 s.startup_reject_total = max(0, int(s.startup_reject_total or 0) - 1)
                 self._sync_machine_counter_current()
@@ -20992,6 +21072,57 @@ QWidget#ClientUIRoot {{
                 self.log_last(self._format_reject_history_action_text(row, voided=True))
                 self.status.setText(f"Reject voided: {reason_code}")
             return True
+
+        # Older clients sent only the aggregate REJECT delta to the server.
+        # If that left a positive counter without a ledger row, create one
+        # explicit recovery/void record so the correction remains auditable.
+        entry_type = "STARTUP_REJECT_SCAN" if target_reason == "SUR" else "REJECT_SCAN"
+        bucket_code = self._reject_detail_bucket_code(target_reason)
+        available = (
+            int(s.startup_reject_total or 0)
+            if entry_type == "STARTUP_REJECT_SCAN"
+            else int((s.reject_breakdown or {}).get(bucket_code, 0) or 0)
+        )
+        if available <= 0:
+            return False
+        now_utc = datetime.now(timezone.utc).isoformat()
+        recovered = {
+            "reject_scan_id": f"RS-RECOVERED-{uuid.uuid4().hex.upper()}",
+            "entry_type": entry_type,
+            "reason_code": target_reason,
+            "reason_text": "Start Up Reject" if target_reason == "SUR" else REJECT_REASON_MAP.get(target_reason, target_reason),
+            "raw_scan": target_reason,
+            "operator": str(s.operator_id or "").strip() or "-",
+            "operator_name": self._operator_display_name(s.operator_id),
+            **self._scan_owner_context(),
+            "scanned_at": now_utc,
+            "voided": True,
+            "voided_at": now_utc,
+            "voided_by": supervisor_name or "-",
+            "counter_only_recovery": True,
+        }
+        s.reject_review_logs.append(recovered)
+        self._last_voided_reject_record = dict(recovered)
+        if entry_type == "STARTUP_REJECT_SCAN":
+            s.startup_reject_total = max(0, int(s.startup_reject_total or 0) - 1)
+            adjustment_kind = "STARTUP_REJECT"
+        else:
+            if bucket_code == "NO":
+                s.no_shot_total = max(0, int(s.no_shot_total or 0) - 1)
+            else:
+                s.reject_total = max(0, int(s.reject_total or 0) - 1)
+                self.lblReject.add_points(-1)
+            s.reject_breakdown[bucket_code] = max(0, int(s.reject_breakdown.get(bucket_code, 0)) - 1)
+            adjustment_kind = "REJECT"
+        self._sync_machine_counter_current()
+        self._append_adjustment_log(
+            adjustment_kind,
+            "VOID_COUNTER_ONLY_RECOVERY",
+            {"reason_code": target_reason, "qty": 1, "supervisor_name": supervisor_name},
+        )
+        self.log_last(self._format_reject_history_action_text(recovered, voided=True))
+        self.status.setText(f"Reject voided from recovered counter: {target_reason}")
+        return True
         return False
 
     def _scan_display_text(self, res, raw: str) -> str:
@@ -23004,8 +23135,14 @@ QWidget#ClientUIRoot {{
                 self._clear_void_modes()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
+                voided_reject_record = dict(getattr(self, "_last_voided_reject_record", {}) or {})
                 self.push_event(
-                    {"type": "REJECT_VOID", "reason": void_raw},
+                    {
+                        "type": "REJECT_VOID",
+                        "reason": void_raw,
+                        "reject_record": voided_reject_record,
+                        "reject_scan_id": str(voided_reject_record.get("reject_scan_id") or ""),
+                    },
                     f"REJECT VOID {void_raw}",
                     defer_snapshot=True,
                 )
@@ -23456,6 +23593,7 @@ QWidget#ClientUIRoot {{
                     reason_text = REJECT_REASON_MAP.get(reason_code, reason_code)
                 bucket_code = self._reject_detail_bucket_code(reason_code)
                 qty = self._reject_multiplier_value() if bucket_code == "NO" else 1
+                reject_records = self._append_reject_scan_records(reason_code, reason_text, qty)
                 if bucket_code == "NO":
                     s.no_shot_total += qty
                 else:
@@ -23463,18 +23601,6 @@ QWidget#ClientUIRoot {{
                 self._sync_machine_counter_current()
                 if bucket_code:
                     s.reject_breakdown[bucket_code] = s.reject_breakdown.get(bucket_code, 0) + qty
-                for _ in range(qty):
-                    s.reject_review_logs.append(
-                        {
-                            "entry_type": "REJECT_SCAN",
-                            "reason_code": reason_code,
-                            "reason_text": reason_text,
-                            "operator": str(s.operator_id or "").strip() or "-",
-                            "operator_name": self._operator_display_name(s.operator_id),
-                            **self._scan_owner_context(),
-                            "scanned_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                    )
                 s.waiting_reject_reason = False
                 self._clear_reject_multiplier()
                 self.status.setText(f"Reject recorded: {reason_code} x{qty}" if qty > 1 else f"Reject recorded: {reason_code}")
@@ -23482,29 +23608,26 @@ QWidget#ClientUIRoot {{
                     self.lblReject.add_points(qty)
                 self._refresh_ui()
                 self._pulse_card(self.cardStatReject)
-                self.push_event({"type": "REJECT", "qty": qty, "reason": reason_code}, f"REJECT {reason_code} +{qty}")
+                self.push_event(
+                    {"type": "REJECT", "qty": qty, "reason": reason_code, "reject_records": reject_records},
+                    f"REJECT {reason_code} +{qty}",
+                )
                 return
             if res.kind == "STARTUP_REJECT":
                 qty = self._reject_multiplier_value()
+                reject_records = self._append_reject_scan_records(
+                    "SUR", "Start Up Reject", qty, entry_type="STARTUP_REJECT_SCAN"
+                )
                 s.startup_reject_total += qty
                 self._sync_machine_counter_current()
-                for _ in range(qty):
-                    s.reject_review_logs.append(
-                        {
-                            "entry_type": "STARTUP_REJECT_SCAN",
-                            "reason_code": "SUR",
-                            "reason_text": "Start Up Reject",
-                            "operator": str(s.operator_id or "").strip() or "-",
-                            "operator_name": self._operator_display_name(s.operator_id),
-                            **self._scan_owner_context(),
-                            "scanned_at": datetime.now(timezone.utc).isoformat(),
-                        }
-                    )
                 s.waiting_reject_reason = False
                 self._clear_reject_multiplier()
                 self.status.setText(f"Start Up Reject recorded x{qty}." if qty > 1 else "Start Up Reject recorded.")
                 self._refresh_ui()
-                self.push_event({"type": "STARTUP_REJECT", "qty": qty}, f"STARTUP REJECT +{qty}")
+                self.push_event(
+                    {"type": "STARTUP_REJECT", "qty": qty, "reason": "SUR", "reject_records": reject_records},
+                    f"STARTUP REJECT +{qty}",
+                )
                 return
             self.status.setText('Reject mode: scan reject details QR or "SUR".')
             return
@@ -23516,24 +23639,18 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay(msg)
                 return
             qty = self._reject_multiplier_value()
+            reject_records = self._append_reject_scan_records(
+                "SUR", "Start Up Reject", qty, entry_type="STARTUP_REJECT_SCAN"
+            )
             s.startup_reject_total += qty
             self._sync_machine_counter_current()
-            for _ in range(qty):
-                s.reject_review_logs.append(
-                    {
-                        "entry_type": "STARTUP_REJECT_SCAN",
-                        "reason_code": "SUR",
-                        "reason_text": "Start Up Reject",
-                        "operator": str(s.operator_id or "").strip() or "-",
-                        "operator_name": self._operator_display_name(s.operator_id),
-                        **self._scan_owner_context(),
-                        "scanned_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
             self._clear_reject_multiplier()
             self.status.setText(f"Start Up Reject recorded x{qty}." if qty > 1 else "Start Up Reject recorded.")
             self._refresh_ui()
-            self.push_event({"type": "STARTUP_REJECT", "qty": qty}, f"STARTUP REJECT +{qty}")
+            self.push_event(
+                {"type": "STARTUP_REJECT", "qty": qty, "reason": "SUR", "reject_records": reject_records},
+                f"STARTUP REJECT +{qty}",
+            )
             return
 
         if res.kind == "REJECT_REASON" and str(res.value or "").strip().upper() == "NO":
@@ -23550,28 +23667,20 @@ QWidget#ClientUIRoot {{
                 reason_text = REJECT_REASON_MAP.get(reason_code, "NO SHOT")
             bucket_code = self._reject_detail_bucket_code(reason_code)
             qty = self._reject_multiplier_value()
+            reject_records = self._append_reject_scan_records(reason_code, reason_text, qty)
             s.no_shot_total += qty
             self._sync_machine_counter_current()
             if bucket_code:
                 s.reject_breakdown[bucket_code] = s.reject_breakdown.get(bucket_code, 0) + qty
-            for _ in range(qty):
-                s.reject_review_logs.append(
-                    {
-                        "entry_type": "REJECT_SCAN",
-                        "reason_code": reason_code,
-                        "reason_text": reason_text,
-                        "operator": str(s.operator_id or "").strip() or "-",
-                        "operator_name": self._operator_display_name(s.operator_id),
-                        **self._scan_owner_context(),
-                        "scanned_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
             s.waiting_reject_reason = False
             self._clear_reject_multiplier()
             self.status.setText(f"Reject recorded: NO x{qty}" if qty > 1 else "Reject recorded: NO")
             self._refresh_ui()
             self._pulse_card(self.cardStatReject)
-            self.push_event({"type": "REJECT", "qty": qty, "reason": reason_code}, f"REJECT NO +{qty}")
+            self.push_event(
+                {"type": "REJECT", "qty": qty, "reason": reason_code, "reject_records": reject_records},
+                f"REJECT NO +{qty}",
+            )
             return
 
         if res.kind == "MACHINE":
