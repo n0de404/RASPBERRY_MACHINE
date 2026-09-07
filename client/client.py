@@ -2211,9 +2211,17 @@ class ScannerFilter(QObject):
     scanned = pyqtSignal(str)
     minimize_requested = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self, plain_digit_numpad_enabled=None):
         super().__init__()
         self._buf = []
+        self._plain_digit_numpad_enabled = plain_digit_numpad_enabled
+
+    def _plain_digit_numpad_is_enabled(self) -> bool:
+        enabled = self._plain_digit_numpad_enabled
+        try:
+            return bool(enabled()) if callable(enabled) else bool(enabled)
+        except Exception:
+            return False
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
@@ -2235,7 +2243,16 @@ class ScannerFilter(QObject):
             # numpad QRs, while leaving ordinary keyboard/scanner input
             # buffered until Return as before.
             is_numpad_key = bool(modifiers & Qt.KeyboardModifier.KeypadModifier)
-            if is_numpad_key and Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+            # Some Raspberry Pi/Linux keyboard stacks expose USB numpad digits
+            # as plain 0-9 keys without KeypadModifier. When the QR scanner is
+            # serial, keyboard digits are unambiguously operator numpad input.
+            plain_digit_numpad = bool(
+                self._plain_digit_numpad_is_enabled()
+                and not self._buf
+                and len(str(event.text() or "")) == 1
+                and str(event.text() or "").isdigit()
+            )
+            if (is_numpad_key or plain_digit_numpad) and Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
                 self._buf.clear()
                 self.scanned.emit(f"num_{key - Qt.Key.Key_0}")
                 return True
@@ -2253,7 +2270,7 @@ class ScannerFilter(QObject):
                 self._buf.clear()
                 if text:
                     self.scanned.emit(text)
-                elif key == Qt.Key.Key_Enter or is_numpad_key:
+                elif key == Qt.Key.Key_Enter or is_numpad_key or self._plain_digit_numpad_is_enabled():
                     self.scanned.emit("confirm")
                 return True
 
@@ -3505,6 +3522,7 @@ class ClientUI(QWidget):
         self._active_session_file_worker_thread.start()
         self._serial_stop = threading.Event()
         self._serial_thread: Optional[threading.Thread] = None
+        self._serial_scanner_connected = False
         self._motion_index = 0
         self._label_icon_candidates = {
             "machine": ["machine.png", "machine.jpg", "machine.jpeg", "machine_icon.png", "icon_machine.png"],
@@ -14380,8 +14398,12 @@ QWidget#ClientUIRoot {{
         if self._serial_thread and self._serial_thread.is_alive():
             self._serial_thread.join(timeout=1.0)
         self._serial_thread = None
+        self._serial_scanner_connected = False
         if hasattr(self, "filter"):
             try:
+                app = QApplication.instance()
+                if app is not None:
+                    app.removeEventFilter(self.filter)
                 self.removeEventFilter(self.filter)
             except Exception:
                 pass
@@ -21547,7 +21569,11 @@ QWidget#ClientUIRoot {{
 
         # The operator numpad is a keyboard device and must remain available
         # even when the QR scanner itself is configured on a serial port.
-        self.filter = ScannerFilter()
+        self.filter = ScannerFilter(
+            plain_digit_numpad_enabled=lambda: bool(
+                mode == "serial" or self._serial_scanner_connected
+            )
+        )
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self.filter)
@@ -21590,6 +21616,7 @@ QWidget#ClientUIRoot {{
                     baudrate=scanner_baudrate,
                     timeout=scanner_timeout,
                 ) as ser:
+                    self._serial_scanner_connected = True
                     self.scanner_status.emit(
                         f"Scanner serial connected: {scanner_port} @ {scanner_baudrate}"
                     )
@@ -21602,8 +21629,11 @@ QWidget#ClientUIRoot {{
                         if text:
                             self.scan_received.emit(text)
             except Exception as e:
+                self._serial_scanner_connected = False
                 self.scanner_status.emit(f"Scanner serial retry ({scanner_port}): {e}")
                 self._serial_stop.wait(2.0)
+            finally:
+                self._serial_scanner_connected = False
 
     def can_accept_production_scans(self) -> bool:
         s = self.state
