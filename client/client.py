@@ -2217,6 +2217,11 @@ class ScannerFilter(QObject):
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
+            # Settings text boxes must keep normal editing behaviour. Operator
+            # keypad/scanner input is captured everywhere else in the kiosk,
+            # including when a full-screen overlay currently owns focus.
+            if isinstance(obj, QLineEdit):
+                return False
             key = event.key()
             modifiers = event.modifiers()
 
@@ -21541,7 +21546,11 @@ QWidget#ClientUIRoot {{
 
         if mode in ("auto", "keyboard"):
             self.filter = ScannerFilter()
-            self.installEventFilter(self.filter)
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self.filter)
+            else:
+                self.installEventFilter(self.filter)
             self.filter.scanned.connect(self.scan_received.emit)
             self.filter.minimize_requested.connect(self._minimize_to_desktop)
             if mode == "keyboard":
