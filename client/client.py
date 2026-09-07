@@ -2210,6 +2210,9 @@ class BmsLoadingSpinner(QWidget):
 class ScannerFilter(QObject):
     scanned = pyqtSignal(str)
     minimize_requested = pyqtSignal()
+    packing_guide_requested = pyqtSignal()
+    reject_details_requested = pyqtSignal()
+    job_api_refresh_requested = pyqtSignal()
 
     def __init__(self, plain_digit_numpad_enabled=None):
         super().__init__()
@@ -2225,12 +2228,25 @@ class ScannerFilter(QObject):
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            media_shortcuts = {
+                Qt.Key.Key_Home: self.packing_guide_requested,
+                Qt.Key.Key_HomePage: self.packing_guide_requested,
+                Qt.Key.Key_OfficeHome: self.packing_guide_requested,
+                Qt.Key.Key_LaunchMail: self.reject_details_requested,
+                Qt.Key.Key_Calculator: self.job_api_refresh_requested,
+            }
+            shortcut_signal = media_shortcuts.get(key)
+            if shortcut_signal is not None:
+                self._buf.clear()
+                shortcut_signal.emit()
+                return True
+
             # Settings text boxes must keep normal editing behaviour. Operator
             # keypad/scanner input is captured everywhere else in the kiosk,
             # including when a full-screen overlay currently owns focus.
             if isinstance(obj, QLineEdit):
                 return False
-            key = event.key()
             modifiers = event.modifiers()
 
             if key == Qt.Key.Key_F3 and bool(modifiers & Qt.KeyboardModifier.AltModifier):
@@ -21581,6 +21597,9 @@ QWidget#ClientUIRoot {{
             self.installEventFilter(self.filter)
         self.filter.scanned.connect(self.scan_received.emit)
         self.filter.minimize_requested.connect(self._minimize_to_desktop)
+        self.filter.packing_guide_requested.connect(self._toggle_packing_guide)
+        self.filter.reject_details_requested.connect(self._open_reject_details_shortcut)
+        self.filter.job_api_refresh_requested.connect(self._refresh_running_jobs_shortcut)
         if mode == "keyboard":
             self._set_status_text("Scanner input: Keyboard mode")
             return
@@ -21599,6 +21618,34 @@ QWidget#ClientUIRoot {{
             self._set_status_text(f"Scanner input: Auto mode (keyboard + serial {scanner_port})")
         else:
             self._set_status_text(f"Scanner input: Serial mode ({scanner_port}) + keyboard numpad")
+
+    def _toggle_packing_guide(self):
+        guide_is_open = bool(
+            self.invalidOverlay.isVisible()
+            and str(self.invalidTextLabel.text() or "").strip().upper() == "PACKING GUIDE"
+        )
+        if guide_is_open:
+            self._hide_invalid_overlay()
+            self.status.setText("Packing Guide closed.")
+            return
+        self._show_info_overlay(
+            "PACKING GUIDE",
+            "SAMPLE PACKING GUIDE\n\n"
+            "1. Confirm the running job and product.\n"
+            "2. Verify the correct packaging material and label.\n"
+            "3. Check the required quantity and product condition.\n"
+            "4. Scan the completed PACK QR after packing.\n\n"
+            "Press Home again to close this guide.",
+            hide_ms=0,
+        )
+        self.status.setText("Packing Guide opened. Press Home again to close.")
+
+    def _open_reject_details_shortcut(self):
+        self.on_scanned("rejectsummary")
+
+    def _refresh_running_jobs_shortcut(self):
+        self.status.setText("Calculator shortcut: refreshing all running jobs from BMS...")
+        QTimer.singleShot(0, self._refresh_all_running_job_details)
 
     def _minimize_to_desktop(self):
         self._hide_invalid_overlay()
