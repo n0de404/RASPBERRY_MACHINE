@@ -2225,12 +2225,31 @@ class ScannerFilter(QObject):
                 self.minimize_requested.emit()
                 return True
 
+            # A dedicated USB numpad is also used as the operator keypad. Send
+            # its keys through the same num_* command path as the printed
+            # numpad QRs, while leaving ordinary keyboard/scanner input
+            # buffered until Return as before.
+            is_numpad_key = bool(modifiers & Qt.KeyboardModifier.KeypadModifier)
+            if is_numpad_key and Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+                self._buf.clear()
+                self.scanned.emit(f"num_{key - Qt.Key.Key_0}")
+                return True
+
+            if key == Qt.Key.Key_Backspace:
+                if self._buf:
+                    self._buf.pop()
+                else:
+                    self.scanned.emit("backspace")
+                return True
+
             # scanners usually end with Enter/Return
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 text = "".join(self._buf).strip()
                 self._buf.clear()
                 if text:
                     self.scanned.emit(text)
+                elif key == Qt.Key.Key_Enter or is_numpad_key:
+                    self.scanned.emit("confirm")
                 return True
 
             # ignore modifier keys
