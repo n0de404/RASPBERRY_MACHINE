@@ -21545,18 +21545,19 @@ QWidget#ClientUIRoot {{
         if mode not in ("auto", "keyboard", "serial"):
             mode = "auto"
 
-        if mode in ("auto", "keyboard"):
-            self.filter = ScannerFilter()
-            app = QApplication.instance()
-            if app is not None:
-                app.installEventFilter(self.filter)
-            else:
-                self.installEventFilter(self.filter)
-            self.filter.scanned.connect(self.scan_received.emit)
-            self.filter.minimize_requested.connect(self._minimize_to_desktop)
-            if mode == "keyboard":
-                self._set_status_text("Scanner input: Keyboard mode")
-                return
+        # The operator numpad is a keyboard device and must remain available
+        # even when the QR scanner itself is configured on a serial port.
+        self.filter = ScannerFilter()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self.filter)
+        else:
+            self.installEventFilter(self.filter)
+        self.filter.scanned.connect(self.scan_received.emit)
+        self.filter.minimize_requested.connect(self._minimize_to_desktop)
+        if mode == "keyboard":
+            self._set_status_text("Scanner input: Keyboard mode")
+            return
 
         # auto or serial path
         if serial is None:
@@ -21571,7 +21572,7 @@ QWidget#ClientUIRoot {{
         if mode == "auto":
             self._set_status_text(f"Scanner input: Auto mode (keyboard + serial {scanner_port})")
         else:
-            self._set_status_text(f"Scanner input: Serial mode ({scanner_port})")
+            self._set_status_text(f"Scanner input: Serial mode ({scanner_port}) + keyboard numpad")
 
     def _minimize_to_desktop(self):
         self._hide_invalid_overlay()
