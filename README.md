@@ -12,10 +12,21 @@ use `~/.local/share/raspberry-machine-client`.
 New Raspberry Pi installation:
 
 ```bash
-git clone https://github.com/n0de404/RASPBERRY_MACHINE.git Raspberry_Machine
-cd Raspberry_Machine/client
-chmod +x update_pi_client.sh
-./update_pi_client.sh --server-url http://SERVER-IP:8000
+cd "$HOME"
+
+git clone --filter=blob:none --no-checkout \
+  https://github.com/n0de404/RASPBERRY_MACHINE.git Raspberry_Machine
+
+cd Raspberry_Machine
+git sparse-checkout init --no-cone
+git sparse-checkout set /client /.gitignore /README.md
+git checkout main
+
+cd client
+chmod +x *.sh
+./update_pi_client.sh \
+  --server-url http://192.168.10.49:8000 \
+  --scanner-port /dev/ttyACM0
 ```
 
 Server installation:

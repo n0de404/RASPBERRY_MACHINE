@@ -6,11 +6,21 @@ the server source or the server's `Database` directory.
 ## First installation
 
 ```bash
-git clone https://github.com/n0de404/RASPBERRY_MACHINE.git Raspberry_Machine
-cd Raspberry_Machine/client
-chmod +x update_pi_client.sh
+cd "$HOME"
+
+git clone --filter=blob:none --no-checkout \
+  https://github.com/n0de404/RASPBERRY_MACHINE.git Raspberry_Machine
+
+cd Raspberry_Machine
+git sparse-checkout init --no-cone
+git sparse-checkout set /client /.gitignore /README.md
+git checkout main
+
+cd client
+chmod +x *.sh
+
 ./update_pi_client.sh \
-  --server-url http://SERVER-IP:8000 \
+  --server-url http://192.168.10.49:8000 \
   --scanner-port /dev/ttyACM0
 ```
 
@@ -38,6 +48,9 @@ Git updates code and assets only. Machine data survives in:
 ```text
 ~/.local/share/raspberry-machine-client/
 ```
+
+The update command's `--skip-system-setup` option requires an existing
+`client/.venv`. If it is missing, run the command once without that option.
 
 This directory owns active-session recovery, locally pending finished jobs and
 shifts, the compact offline event queue, same-job shift carryover, settings,

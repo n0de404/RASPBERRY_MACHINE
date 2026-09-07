@@ -3485,6 +3485,7 @@ class ClientUI(QWidget):
         self._server_last_success_at = 0.0
         self._server_authoritative_reconcile_needed = True
         self._server_recovery_snapshot_queued = False
+        self._server_recovery_cutoff_by_session: Dict[str, str] = {}
         self._pending_server_recovery: Optional[Dict[str, Any]] = None
         self._skip_server_recovery_machine = ""
         self._event_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max(16, SERVER_EVENT_QUEUE_MAXSIZE))
@@ -25120,20 +25121,16 @@ QWidget#ClientUIRoot {{
             return
         self.push_event({"type": "SESSION_SYNC", "session_snapshot": snapshot}, note)
 
-    def _enqueue_reconnect_session_snapshot_sync(self, note: str = "SESSION SNAPSHOT SYNC (RECONNECT)"):
-        if int(getattr(self, "_server_sync_protocol", 0) or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
-            # Protocol 2 reconnects replay durable deltas and accept the
-            # canonical response. Uploading a client snapshot would let stale
-            # local downtime/counters overwrite the server.
-            return
-        if bool(getattr(self, "_server_recovery_snapshot_queued", False)):
-            return
+    def _build_session_recovery_event_item(
+        self,
+        note: str = "SESSION SNAPSHOT SYNC (RECOVERY)",
+    ) -> Optional[Dict[str, Any]]:
         if not str(self.state.machine_code or "").strip():
-            return
+            return None
         snapshot = self._state_to_active_snapshot()
         if not self._snapshot_is_recoverable(snapshot):
-            return
-        self._server_recovery_snapshot_queued = True
+            return None
+        session_id = str(snapshot.get("production_session_id") or "").strip()
         payload = {
             "client_id": self._current_client_id(),
             "machine_code": self.state.machine_code,
@@ -25141,12 +25138,70 @@ QWidget#ClientUIRoot {{
             "job_code": self.state.job_code,
             "job_name": self.state.job_name,
             "operator_id": self.state.operator_id,
-            "production_session_id": snapshot.get("production_session_id"),
-            "event": {"type": "SESSION_SYNC", "session_snapshot": snapshot},
+            "production_session_id": session_id,
+            "sync_protocol_requested": SERVER_SYNC_PROTOCOL_VERSION,
+            "event": {
+                "type": "SESSION_SYNC",
+                "production_session_id": session_id,
+                "session_recovery": True,
+                "recovery_cutoff_utc": snapshot.get("saved_at_utc"),
+                "session_snapshot": snapshot,
+            },
             "last_event": note,
         }
-        if not self._enqueue_server_event(payload, silent=True):
+        return self._normalize_server_event_item({"payload": payload, "silent": True}, silent=True)
+
+    def _enqueue_reconnect_session_snapshot_sync(self, note: str = "SESSION SNAPSHOT SYNC (RECONNECT)"):
+        if bool(getattr(self, "_server_recovery_snapshot_queued", False)):
+            return
+        item = self._build_session_recovery_event_item(note)
+        if not isinstance(item, dict):
+            return
+        self._server_recovery_snapshot_queued = True
+        if not self._persist_server_event_item(item):
             self._server_recovery_snapshot_queued = False
+            return
+        try:
+            self._event_queue.put_nowait(item)
+        except queue.Full:
+            # The item is durable. A successful dispatch refills persisted
+            # entries, and a session conflict promotes a recovery item directly.
+            pass
+
+    def _event_superseded_by_recovery_snapshot(self, item: Dict[str, Any]) -> bool:
+        payload = item.get("payload") if isinstance(item, dict) else {}
+        if not isinstance(payload, dict):
+            return False
+        event_type = self._server_event_type_from_item(item)
+        if event_type in {"FINISH_SHIFT", "FINISH_JOB", "SESSION_SYNC"}:
+            return False
+        session_id = str(payload.get("production_session_id") or "").strip()
+        cutoff_raw = str(self._server_recovery_cutoff_by_session.get(session_id) or "").strip()
+        created_raw = str(item.get("created_at_utc") or "").strip()
+        if not session_id or not cutoff_raw or not created_raw:
+            return False
+        try:
+            cutoff = datetime.fromisoformat(cutoff_raw.replace("Z", "+00:00"))
+            created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            if cutoff.tzinfo is None:
+                cutoff = cutoff.replace(tzinfo=timezone.utc)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            return created.astimezone(timezone.utc) <= cutoff.astimezone(timezone.utc)
+        except Exception:
+            return False
+
+    def _prune_persisted_mutations_represented_by_snapshot(self, session_id: str, cutoff_utc: str) -> None:
+        sid = str(session_id or "").strip()
+        cutoff = str(cutoff_utc or "").strip()
+        if not sid or not cutoff:
+            return
+        self._server_recovery_cutoff_by_session[sid] = cutoff
+        with self._server_event_queue_lock:
+            rows = _load_server_event_queue_json()
+            kept = [row for row in rows if not self._event_superseded_by_recovery_snapshot(row)]
+            if len(kept) != len(rows):
+                _save_server_event_queue_json(kept)
 
     def sync_local_finish_shifts_to_server(self, force: bool = False):
         if not bool(getattr(self, "_server_connection_ok", False)):
@@ -25433,6 +25488,11 @@ QWidget#ClientUIRoot {{
                 except queue.Empty:
                     continue
             item = self._normalize_server_event_item(item, silent=bool(item.get("silent")))
+            if self._event_superseded_by_recovery_snapshot(item):
+                self._remove_persisted_server_event(str(item.get("id") or ""))
+                if item_from_queue:
+                    self._event_queue.task_done()
+                continue
             if not self._server_event_belongs_to_current_client(item):
                 self._remove_persisted_server_event(str(item.get("id") or ""))
                 if item_from_queue:
@@ -25478,6 +25538,7 @@ QWidget#ClientUIRoot {{
             discard_item = False
             request_reached_server = False
             identity_conflict = False
+            session_conflict = False
             last_error: Any = ""
             try:
                 server_url = str(self.client_config.get("server_url", SERVER_URL)).strip().rstrip("/")
@@ -25502,6 +25563,14 @@ QWidget#ClientUIRoot {{
                     )
                     if identity_conflict:
                         last_error = str(response_body.get("error") or "Client identity conflict")
+                        raise RuntimeError(last_error)
+                    session_conflict = (
+                        status_code == 409
+                        and str(response_body.get("error_code") or "").strip().upper()
+                        in {"STALE_PRODUCTION_SESSION", "MISSING_PRODUCTION_SESSION"}
+                    )
+                    if session_conflict:
+                        last_error = str(response_body.get("error") or "Production session conflict")
                         raise RuntimeError(last_error)
                     # Permanent client errors cannot be fixed by retrying the
                     # same payload. Remove them so one bad event cannot poison
@@ -25550,6 +25619,23 @@ QWidget#ClientUIRoot {{
                 self._server_connection_ok = True
                 self._server_last_success_at = time.time()
                 self._remove_persisted_server_event(str(item.get("id") or ""))
+                successful_event_body = item_payload.get("event") if isinstance(item_payload.get("event"), dict) else {}
+                if event_type == "SESSION_SYNC" and bool(successful_event_body.get("session_recovery")):
+                    recovery_session_id = str(item_payload.get("production_session_id") or "").strip()
+                    recovery_cutoff = str(
+                        successful_event_body.get("recovery_cutoff_utc")
+                        or (successful_event_body.get("session_snapshot") or {}).get("saved_at_utc")
+                        or ""
+                    ).strip()
+                    acknowledged_recovery_session = response_body.get("session") if isinstance(response_body.get("session"), dict) else {}
+                    if (
+                        recovery_session_id
+                        and recovery_session_id == str(acknowledged_recovery_session.get("production_session_id") or "").strip()
+                    ):
+                        self._prune_persisted_mutations_represented_by_snapshot(
+                            recovery_session_id,
+                            recovery_cutoff,
+                        )
                 pending_pack_key = _server_event_queue_pack_key(item)
                 if pending_pack_key and not discard_item:
                     self._mark_pack_qr_used_permanently(
@@ -25576,6 +25662,15 @@ QWidget#ClientUIRoot {{
                 event_payload = item.get("payload") if isinstance(item, dict) else {}
                 event_body = event_payload.get("event") if isinstance(event_payload, dict) else {}
                 acknowledged_session = response_body.get("session") if isinstance(response_body, dict) else None
+                if event_type == "HEARTBEAT" and isinstance(acknowledged_session, dict):
+                    local_session_id = str(self.state.production_session_id or "").strip()
+                    server_session_id = str(acknowledged_session.get("production_session_id") or "").strip()
+                    if local_session_id and server_session_id and local_session_id != server_session_id:
+                        self._server_authoritative_reconcile_needed = True
+                        self._enqueue_reconnect_session_snapshot_sync(
+                            "SESSION SNAPSHOT SYNC (SERVER FENCE REPAIR)"
+                        )
+                        acknowledged_session = None
                 void_event_types = {"PACK_VOID", "PRODUCT_PART_VOID", "BUTAL_VOID", "REJECT_VOID"}
                 heartbeat_reconcile = bool(
                     event_type == "HEARTBEAT"
@@ -25627,7 +25722,17 @@ QWidget#ClientUIRoot {{
                 self._mark_persisted_server_event_failed(item, last_error)
                 if event_type in ("FINISH_SHIFT", "FINISH_JOB"):
                     self._last_finish_shift_sync_signature = ""
-            if retry_item and not self._event_worker_stop.is_set():
+            if session_conflict and not self._event_worker_stop.is_set():
+                recovery_item = self._build_session_recovery_event_item(
+                    "SESSION SNAPSHOT SYNC (409 FENCE REPAIR)"
+                )
+                if isinstance(recovery_item, dict) and self._persist_server_event_item(recovery_item):
+                    self._server_recovery_snapshot_queued = True
+                    priority_retry_item = recovery_item
+                    self.scanner_status.emit("Repairing server production session; scans remain saved locally.")
+                else:
+                    retry_item = True
+            if retry_item and priority_retry_item is None and not self._event_worker_stop.is_set():
                 time.sleep(2.0)
                 if int((item.get("payload") or {}).get("sync_protocol_requested") or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
                     # Retry the failed mutation before later scans, preserving

@@ -4,3 +4,4 @@ requests>=2.31
 qrcode[pil]>=7.4
 PyMySQL>=1.1
 cryptography>=44
+openpyxl>=3.1

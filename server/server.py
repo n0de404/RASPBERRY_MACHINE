@@ -11,6 +11,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,11 @@ from urllib import error as urllib_error
 from urllib.parse import quote, urlencode
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    from openpyxl import load_workbook
+except Exception:
+    load_workbook = None
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -107,6 +113,11 @@ PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"  # leg
 PRODUCT_API_CONFIG_FILE = Path(__file__).resolve().parent / "Database" / "product_api_config.json"
 PRODUCT_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "product_catalog_cache.json"
 LOW_STOCK_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "low_stock_recommendations.json"
+SERVING_RATE_CACHE_FILE = Path(__file__).resolve().parent / "Database" / "serving_rate_abc_cache.json"
+SERVING_RATE_API_URL = os.environ.get(
+    "SERVING_RATE_API_URL",
+    "http://192.168.11.173:8765/api/serving-rate",
+).strip()
 ACTIVE_MACHINE_SESSIONS_FILE = Path(__file__).resolve().parent / "Database" / "active_machine_sessions.json"
 SERVER_APP_LOG_FILE = Path(__file__).resolve().parent / "Database" / "server_app_logs.jsonl"
 SERVER_APP_LOG_MAX_BYTES = max(
@@ -119,6 +130,10 @@ DASHBOARD_INITIAL_HISTORY_LIMIT = max(
 )
 PROCESSED_EVENT_IDS_FILE = Path(__file__).resolve().parent / "Database" / "processed_event_ids.json"
 PLANNING_BOARD_FILE = Path(__file__).resolve().parent / "Database" / "planning_board.json"
+TRIAL_BOARD_FILE = Path(__file__).resolve().parent / "Database" / "trial_board.json"
+PLANNING_ACTIVITY_FILE = Path(__file__).resolve().parent / "Database" / "planning_activity_log.json"
+PLANNING_ACTIVITY_MAX_ENTRIES = max(500, int(os.environ.get("MACHINE_PLANNING_ACTIVITY_MAX_ENTRIES", "5000") or 5000))
+PLANNING_ACTIVITY_LOCK = threading.Lock()
 PROFILE_REPRINT_ADMIN_PASSWORD = "adminphiltop"
 QRGEN_BASE_URL = os.environ.get("QRGEN_BASE_URL", "http://192.168.11.173:5000").strip().rstrip("/")
 RAW_QR_O_SEGMENT = "O000000000240000010237800000000000"
@@ -183,6 +198,7 @@ ADDITIONAL_MACHINE_CODES = {
 SUPERVISOR_BADGES: Dict[str, str] = {"3000001": "Charlie Brown"}
 QC_BADGES: Dict[str, str] = {"4000001": "Lucy Van Pelt"}
 APP_BASE_DIR = Path(__file__).resolve().parent
+MACHINE_DATA_FILE = APP_BASE_DIR / "MACHINE_DATA" / "MACHINES.xlsx"
 SQL_CONFIG_FILE = APP_BASE_DIR / "Database" / "sql_config.json"
 FINISHED_JOBS_FALLBACK_FILE = APP_BASE_DIR / "Database" / "finished_jobs_server.json"
 ARCHIVED_JOBS_FALLBACK_FILE = APP_BASE_DIR / "Database" / "archived_jobs_server.json"
@@ -193,14 +209,13 @@ SERVER_ACCEPT_FINISH_EVENTS = str(os.environ.get("MACHINE_SERVER_ACCEPT_FINISH_E
     "1", "true", "yes", "on",
 }
 SERVER_FINISH_EVENT_CUTOFF_UTC = datetime.now(timezone.utc)
-# A client can retain production events while the server/network is unavailable.
-# Acknowledging old transport entries drains that retry queue without replaying
-# stale PACK/BUTAL/etc. values into the live dashboard. The client's next
-# successful connection sends a fresh full SESSION_SYNC snapshot.
-SERVER_EVENT_REPLAY_CUTOFF_UTC = datetime.now(timezone.utc)
+# Protocol events carry durable IDs and production-session fences.  Do not make
+# a server restart an implicit replay cutoff: doing so discarded every mutation
+# queued before the restart, including the JOB_SET/SESSION_SYNC needed to bind
+# the client and server to the same production session.
 SERVER_EVENT_REPLAY_MAX_AGE_SECONDS = max(
     5,
-    int(os.environ.get("MACHINE_SERVER_EVENT_REPLAY_MAX_AGE_SECONDS", "30")),
+    int(os.environ.get("MACHINE_SERVER_EVENT_REPLAY_MAX_AGE_SECONDS", "604800")),
 )
 CLIENT_IDENTITY_LEASE_SECONDS = max(
     10,
@@ -2866,6 +2881,9 @@ def _build_job_queue_rows() -> List[Dict[str, Any]]:
                 "machine_name": str(sess.machine_name or sess.machine_code or "").strip(),
                 "job_code": str(sess.job_code or "").strip(),
                 "job_name": str(sess.job_name or "").strip(),
+                "product_id": str(sess.product_id or job_details.get("product_id") or job.get("product_id") or "").strip(),
+                "product_sku": str(sess.product_sku or job_details.get("product_sku") or job_details.get("sku") or job.get("product_sku") or job.get("sku") or "").strip(),
+                "product_name": str(sess.product_name or job_details.get("product_name") or job.get("product_name") or "").strip(),
                 "operator_id": str(sess.operator_id or "").strip(),
                 "job_started_at": str(sess.job_started_at or "").strip(),
                 "last_seen_utc": str(sess.last_seen_utc or "").strip(),
@@ -4068,8 +4086,9 @@ def _lookup_product_meta(product_id: str) -> Dict[str, str]:
                 "id": str(it.get("id", "")).strip(),
                 "name": str(it.get("name", "")).strip(),
                 "sku": str(it.get("sku", "")).strip(),
+                "tonnage": str(it.get("tonnage", "")).strip(),
             }
-    return {"id": str(product_id or "").strip(), "name": "", "sku": ""}
+    return {"id": str(product_id or "").strip(), "name": "", "sku": "", "tonnage": ""}
 
 
 def _lookup_product_meta_by_text(text: str) -> Dict[str, str]:
@@ -4669,13 +4688,27 @@ def _extract_products_from_payload(payload: Any) -> List[Dict[str, Any]]:
         pid = str(it.get("id", "") or it.get("product_id", "") or it.get("productId", "")).strip()
         name = str(it.get("name", "") or it.get("product_name", "") or it.get("productName", "")).strip()
         sku = str(it.get("sku", "") or it.get("product_sku", "")).strip()
+        category_id = str(it.get("categoryId", "") or it.get("category_id", "")).strip()
+        category_name = str(it.get("categoryName", "") or it.get("category_name", "") or it.get("category", "")).strip()
+        parent_sku = str(it.get("parentSku", "") or it.get("parent_sku", "")).strip()
+        custom_fields = it.get("customFields") if isinstance(it.get("customFields"), dict) else it.get("custom_fields")
+        if not isinstance(custom_fields, dict):
+            custom_fields = {}
         tonnage = str(
-            it.get("tonnage", "")
-            or it.get("tons", "")
+            it.get("custom_16", "")
+            or it.get("custom16", "")
             or it.get("machine_tons", "")
             or it.get("machineTons", "")
+            or it.get("tonnage", "")
+            or it.get("tons", "")
             or it.get("clamping_force", "")
             or it.get("clampingForce", "")
+            or custom_fields.get("custom_16", "")
+            or custom_fields.get("custom16", "")
+            or custom_fields.get("machine_tons", "")
+            or custom_fields.get("machineTons", "")
+            or custom_fields.get("tonnage", "")
+            or custom_fields.get("tons", "")
             or ""
         ).strip()
         default_qty = next(
@@ -4709,6 +4742,9 @@ def _extract_products_from_payload(payload: Any) -> List[Dict[str, Any]]:
                 "sku": sku,
                 "tonnage": tonnage,
                 "default_qty": default_qty,
+                "category_id": category_id,
+                "category_name": category_name,
+                "parent_sku": parent_sku,
             })
     return out
 
@@ -4840,6 +4876,99 @@ def save_planning_board(board: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def load_planning_activity_log() -> List[Dict[str, Any]]:
+    raw = _load_server_document_sql("planning_activity_log")
+    if raw is None:
+        raw = _load_json_object(PLANNING_ACTIVITY_FILE)
+    entries = raw.get("entries") if isinstance(raw, dict) and isinstance(raw.get("entries"), list) else []
+    return [dict(entry) for entry in entries[-PLANNING_ACTIVITY_MAX_ENTRIES:] if isinstance(entry, dict)]
+
+
+def append_planning_activity_log(entries: List[Dict[str, Any]], source_ip: str = "") -> List[Dict[str, Any]]:
+    global PLANNING_ACTIVITY_LOG
+    if not isinstance(entries, list) or not entries:
+        return []
+    allowed_actions = {"QUEUED", "ASSIGNED", "MOVED", "REORDERED", "REMOVED", "LINKED", "STARTED"}
+    now_text = utc_now().isoformat()
+    clean_entries: List[Dict[str, Any]] = []
+    def safe_position(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+    for entry in entries[:100]:
+        if not isinstance(entry, dict):
+            continue
+        action = str(entry.get("action") or "MOVED").strip().upper()
+        if action not in allowed_actions:
+            action = "MOVED"
+        clean_entries.append({
+            "id": str(uuid.uuid4()),
+            "timestamp_utc": now_text,
+            "action": action,
+            "card_id": str(entry.get("card_id") or "")[:160],
+            "item": str(entry.get("item") or entry.get("job") or "Planned item")[:240],
+            "sku": str(entry.get("sku") or "")[:160],
+            "job_id": str(entry.get("job_id") or "")[:160],
+            "from_lane": str(entry.get("from_lane") or "")[:80],
+            "to_lane": str(entry.get("to_lane") or "")[:80],
+            "from_position": safe_position(entry.get("from_position")),
+            "to_position": safe_position(entry.get("to_position")),
+            "note": str(entry.get("note") or "")[:500],
+            "source_ip": str(source_ip or "")[:80],
+        })
+    if not clean_entries:
+        return []
+    with PLANNING_ACTIVITY_LOCK:
+        PLANNING_ACTIVITY_LOG = (PLANNING_ACTIVITY_LOG + clean_entries)[-PLANNING_ACTIVITY_MAX_ENTRIES:]
+        payload = {"entries": PLANNING_ACTIVITY_LOG, "updated_at_utc": now_text}
+        if not _save_server_document_sql("planning_activity_log", payload):
+            PLANNING_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            PLANNING_ACTIVITY_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return clean_entries
+
+
+def load_trial_board() -> Dict[str, Any]:
+    raw = _load_server_document_sql("trial_board")
+    if raw is None:
+        raw = _load_json_object(TRIAL_BOARD_FILE)
+    rows = raw.get("rows") if isinstance(raw, dict) and isinstance(raw.get("rows"), list) else []
+    clean_rows = []
+    for row in rows[:200]:
+        if not isinstance(row, dict):
+            continue
+        clean_rows.append({
+            "date": str(row.get("date") or "")[:40],
+            "imm_mold": str(row.get("imm_mold") or "")[:200],
+            "material": str(row.get("material") or "")[:200],
+            "reason": str(row.get("reason") or "")[:200],
+            "remarks": str(row.get("remarks") or "")[:500],
+        })
+    return {"rows": clean_rows, "updated_at_utc": str(raw.get("updated_at_utc") or "") if isinstance(raw, dict) else ""}
+
+
+def save_trial_board(board: Dict[str, Any]) -> Dict[str, Any]:
+    rows = board.get("rows") if isinstance(board.get("rows"), list) else []
+    clean_rows = []
+    for row in rows[:200]:
+        if not isinstance(row, dict):
+            continue
+        clean = {
+            "date": str(row.get("date") or "").strip()[:40],
+            "imm_mold": str(row.get("imm_mold") or "").strip()[:200],
+            "material": str(row.get("material") or "").strip()[:200],
+            "reason": str(row.get("reason") or "").strip()[:200],
+            "remarks": str(row.get("remarks") or "").strip()[:500],
+        }
+        if any(clean.values()):
+            clean_rows.append(clean)
+    payload = {"rows": clean_rows, "updated_at_utc": utc_now().isoformat()}
+    if not _save_server_document_sql("trial_board", payload):
+        TRIAL_BOARD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TRIAL_BOARD_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
 def _planning_extract_job_record(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -4917,6 +5046,22 @@ def _planning_job_card_from_payload(identifier: str, payload: Dict[str, Any]) ->
     job_id = str(job.get("id") or job.get("job_id") or identifier or "").strip()
     product_id = str(details.get("product_id") or job.get("product_id") or "").strip()
     product_meta = _lookup_product_meta(product_id) if product_id else {"id": "", "name": "", "sku": ""}
+    job_api_tonnage = str(
+        job.get("custom_16")
+        or job.get("machine_tons")
+        or details.get("machine_tons")
+        or details.get("custom_16")
+        or ""
+    ).strip()
+    job_api_tonnage_source = ""
+    if str(job.get("custom_16") or "").strip():
+        job_api_tonnage_source = "Job API custom_16"
+    elif str(job.get("machine_tons") or "").strip():
+        job_api_tonnage_source = "Job API machine_tons"
+    elif str(details.get("machine_tons") or "").strip():
+        job_api_tonnage_source = "Job API job_details.machine_tons"
+    elif str(details.get("custom_16") or "").strip():
+        job_api_tonnage_source = "Job API job_details.custom_16"
     return {
         "id": f"plan-{re.sub(r'[^A-Za-z0-9_-]+', '-', job_id or str(identifier or 'job')).strip('-') or int(time.time())}",
         "job_id": job_id,
@@ -4925,6 +5070,9 @@ def _planning_job_card_from_payload(identifier: str, payload: Dict[str, Any]) ->
         "product_id": product_id,
         "product_name": str(product_meta.get("name") or details.get("product_name") or job.get("product_name") or "").strip(),
         "product_sku": str(product_meta.get("sku") or details.get("product_sku") or job.get("product_sku") or "").strip(),
+        "tonnage": job_api_tonnage or str(product_meta.get("tonnage") or "").strip(),
+        "job_api_tonnage": job_api_tonnage,
+        "tonnage_source": job_api_tonnage_source or ("IMS product customFields.machine_tons" if product_meta.get("tonnage") else ""),
         "mold": str(details.get("mold") or details.get("mold_no") or "").strip(),
         "color": str(details.get("color") or "").strip(),
         "std_cycle_time": str(details.get("std_cycle_time") or details.get("cycle_time") or "").strip(),
@@ -5320,6 +5468,140 @@ def _extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _normalized_sku(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip()).upper()
+
+
+def _fetch_serving_rate_abc(force_refresh: bool = False) -> Dict[str, Any]:
+    cache = _load_json_object(SERVING_RATE_CACHE_FILE)
+    cached_items = cache.get("items") if isinstance(cache.get("items"), list) else []
+    saved_at = str(cache.get("saved_at_utc") or "")
+    try:
+        cache_age = (utc_now() - datetime.fromisoformat(saved_at)).total_seconds() if saved_at else 999999
+    except Exception:
+        cache_age = 999999
+    if not force_refresh and cached_items and cache_age < 900:
+        return {
+            "items": cached_items,
+            "from_cache": True,
+            "saved_at_utc": saved_at,
+            "error": "",
+        }
+    if not SERVING_RATE_API_URL:
+        return {
+            "items": cached_items,
+            "from_cache": True,
+            "saved_at_utc": saved_at,
+            "error": "Serving-rate API URL is not configured." if not cached_items else "",
+        }
+
+    cached_by_class: Dict[str, List[Dict[str, Any]]] = {"A": [], "B": [], "C": []}
+    for item in cached_items:
+        if not isinstance(item, dict):
+            continue
+        abc_class = str(item.get("abc_class") or "").strip().upper()
+        if abc_class in cached_by_class:
+            cached_by_class[abc_class].append(item)
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    warnings: List[str] = []
+    used_cache = False
+    class_priority = {"A": 0, "B": 1, "C": 2}
+    def fetch_class(abc_class: str) -> List[Dict[str, Any]]:
+        class_items: List[Dict[str, Any]] = []
+        url = f"{SERVING_RATE_API_URL}?{urlencode({'abc_class': abc_class})}"
+        req = urllib_request.Request(url=url, method="GET")
+        req.add_header("Accept", "application/json")
+        with urllib_request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        rows = _extract_rows_from_payload(payload)
+        for row in rows:
+            sku = str(
+                row.get("sku")
+                or row.get("SKU")
+                or row.get("product_sku")
+                or row.get("item_sku")
+                or row.get("item_code")
+                or row.get("code")
+                or ""
+            ).strip()
+            sku_key = _normalized_sku(sku)
+            if not sku_key:
+                continue
+            row_class = str(
+                row.get("abc_class")
+                or row.get("abcClass")
+                or row.get("classification")
+                or abc_class
+            ).strip().upper()
+            if row_class not in ("A", "B", "C"):
+                row_class = abc_class
+            class_items.append({
+                "sku": sku,
+                "sku_key": sku_key,
+                "abc_class": row_class,
+                "description": str(row.get("description") or row.get("product_description") or row.get("name") or "").strip(),
+                "category": str(row.get("category") or row.get("product_category") or "").strip(),
+                "serving_rate": row.get("serving_rate", row.get("servingRate", row.get("rate", ""))),
+            })
+        return class_items
+
+    fetched_by_class: Dict[str, List[Dict[str, Any]]] = {}
+    errors_by_class: Dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="serving-rate") as pool:
+        futures = {pool.submit(fetch_class, abc_class): abc_class for abc_class in ("A", "B", "C")}
+        for future in as_completed(futures):
+            abc_class = futures[future]
+            try:
+                fetched_by_class[abc_class] = future.result()
+            except Exception as exc:
+                errors_by_class[abc_class] = str(exc)
+
+    for abc_class in ("A", "B", "C"):
+        class_items = fetched_by_class.get(abc_class) or []
+        if abc_class in errors_by_class:
+            warnings.append(f"Class {abc_class}: {errors_by_class[abc_class]}")
+            class_items = cached_by_class.get(abc_class) or []
+            used_cache = used_cache or bool(class_items)
+
+        for item in class_items:
+            sku_key = _normalized_sku(item.get("sku_key") or item.get("sku"))
+            if not sku_key:
+                continue
+            incoming_class = str(item.get("abc_class") or abc_class).strip().upper()
+            current = merged.get(sku_key)
+            if current is None or class_priority.get(incoming_class, 9) < class_priority.get(str(current.get("abc_class") or ""), 9):
+                merged[sku_key] = {**item, "sku_key": sku_key, "abc_class": incoming_class}
+
+    items = sorted(merged.values(), key=lambda x: (class_priority.get(str(x.get("abc_class") or ""), 9), str(x.get("sku") or "")))
+    if not items:
+        return {
+            "items": [],
+            "from_cache": False,
+            "saved_at_utc": saved_at,
+            "error": "Serving-rate API returned no A/B/C SKUs" + (f" ({'; '.join(warnings)})" if warnings else "."),
+        }
+
+    new_saved_at = utc_now().isoformat()
+    try:
+        SERVING_RATE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SERVING_RATE_CACHE_FILE.write_text(json.dumps({
+            "saved_at_utc": new_saved_at,
+            "source_url": SERVING_RATE_API_URL,
+            "count": len(items),
+            "items": items,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        warnings.append(f"Cache save: {exc}")
+    return {
+        "items": items,
+        "from_cache": used_cache,
+        "saved_at_utc": new_saved_at,
+        "error": "",
+        "warning": "; ".join(warnings),
+    }
+
+
 def _parse_stock_qty(row: Dict[str, Any]) -> float:
     for key in (
         "qty", "quantity", "stock", "stocks", "available", "available_qty",
@@ -5361,14 +5643,32 @@ def _fetch_low_stock_recommendations(threshold: float = 100.0, force_refresh: bo
         cache_age = (utc_now() - datetime.fromisoformat(saved_at)).total_seconds() if saved_at else 999999
     except Exception:
         cache_age = 999999
-    if not force_refresh and isinstance(cache.get("items"), list) and cache_age < 300 and float(cache.get("threshold", threshold) or threshold) == float(threshold):
-        return {"items": cache.get("items") or [], "from_cache": True, "saved_at_utc": saved_at, "error": ""}
+    if (
+        not force_refresh
+        and cache.get("scope") == "product-catalog-with-abc-v2"
+        and isinstance(cache.get("items"), list)
+        and cache_age < 300
+    ):
+        return {
+            "items": cache.get("items") or [],
+            "from_cache": True,
+            "saved_at_utc": saved_at,
+            "error": "",
+            "abc_counts": cache.get("abc_counts") or {},
+            "serving_rate_from_cache": bool(cache.get("serving_rate_from_cache")),
+            "classified_count": int(cache.get("classified_count") or 0),
+            "matched_product_count": int(cache.get("matched_product_count") or 0),
+            "product_count": int(cache.get("product_count") or len(cache.get("items") or [])),
+        }
 
     cfg = _load_product_source_config()
     bms = cfg.get("bms") if isinstance(cfg.get("bms"), dict) else {}
     base_url = str(bms.get("base_url", "")).strip().rstrip("/")
     if not base_url:
         return {"items": cache.get("items") or [], "from_cache": True, "saved_at_utc": saved_at, "error": "BMS base_url is not configured."}
+
+    abc_result = _fetch_serving_rate_abc(force_refresh=force_refresh)
+    abc_items = abc_result.get("items") if isinstance(abc_result.get("items"), list) else []
 
     token = _bms_login_token(bms)
     warehouse_ids = bms.get("inventory_warehouse_ids")
@@ -5381,21 +5681,75 @@ def _fetch_low_stock_recommendations(threshold: float = 100.0, force_refresh: bo
         "18": "C5",
         "2": "6116",
     }
-    products = get_products(force_refresh=False).get("items") or []
+    products = get_products(force_refresh=force_refresh).get("items") or []
+    abc_by_sku = {
+        _normalized_sku(item.get("sku_key") or item.get("sku")): item
+        for item in abc_items
+        if isinstance(item, dict) and _normalized_sku(item.get("sku_key") or item.get("sku"))
+    }
+    selected_products: List[Dict[str, Any]] = []
     by_id: Dict[str, Dict[str, Any]] = {}
     by_sku: Dict[str, Dict[str, Any]] = {}
+    selected_sku_keys: set[str] = set()
+    selected_product_keys: set[str] = set()
+    matched_classified_count = 0
     for product in products:
         if not isinstance(product, dict):
             continue
-        pid = str(product.get("id") or product.get("product_id") or "").strip()
-        sku = str(product.get("sku") or product.get("product_sku") or "").strip()
+        enriched = dict(product)
+        sku = str(enriched.get("sku") or enriched.get("product_sku") or "").strip()
+        sku_key = _normalized_sku(sku)
+        raw_pid = str(enriched.get("id") or enriched.get("product_id") or "").strip()
+        product_key = f"sku:{sku_key}" if sku_key else (f"id:{raw_pid}" if raw_pid else "")
+        if product_key and product_key in selected_product_keys:
+            continue
+        if product_key:
+            selected_product_keys.add(product_key)
+        abc_meta = abc_by_sku.get(sku_key) if sku_key else None
+        if isinstance(abc_meta, dict):
+            matched_classified_count += 1
+            enriched["abc_class"] = str(abc_meta.get("abc_class") or "").strip().upper()
+            enriched["serving_rate"] = abc_meta.get("serving_rate", "")
+            enriched["serving_category"] = str(abc_meta.get("category") or "").strip()
+            enriched["serving_description"] = str(abc_meta.get("description") or "").strip()
+            if not str(enriched.get("name") or enriched.get("product_name") or "").strip():
+                enriched["name"] = enriched["serving_description"]
+        else:
+            enriched["abc_class"] = ""
+            enriched["serving_rate"] = ""
+            enriched["serving_category"] = ""
+            enriched["serving_description"] = ""
+        selected_products.append(enriched)
+        pid = str(enriched.get("id") or enriched.get("product_id") or "").strip()
         if pid:
-            by_id[pid] = product
+            by_id[pid] = enriched
         if sku:
-            by_sku[sku] = product
+            by_sku[sku_key] = enriched
+            selected_sku_keys.add(sku_key)
+
+    # Keep Serving Rate SKUs that are not yet present in the BMS product catalog.
+    # A later catalog refresh can merge them automatically by normalized SKU.
+    for sku_key, abc_meta in abc_by_sku.items():
+        if sku_key in selected_sku_keys:
+            continue
+        sku = str(abc_meta.get("sku") or abc_meta.get("sku_key") or "").strip()
+        if not sku:
+            continue
+        enriched = {
+            "id": "",
+            "sku": sku,
+            "name": str(abc_meta.get("description") or "").strip(),
+            "abc_class": str(abc_meta.get("abc_class") or "").strip().upper(),
+            "serving_rate": abc_meta.get("serving_rate", ""),
+            "serving_category": str(abc_meta.get("category") or "").strip(),
+            "serving_description": str(abc_meta.get("description") or "").strip(),
+        }
+        selected_products.append(enriched)
+        by_sku[sku_key] = enriched
+        selected_sku_keys.add(sku_key)
 
     stock_by_key: Dict[str, Dict[str, Any]] = {}
-    for product in products:
+    for product in selected_products:
         if not isinstance(product, dict):
             continue
         pid = str(product.get("id") or product.get("product_id") or "").strip()
@@ -5408,6 +5762,12 @@ def _fetch_low_stock_recommendations(threshold: float = 100.0, force_refresh: bo
             "sku": sku,
             "name": str(product.get("name") or product.get("product_name") or "").strip(),
             "tonnage": str(product.get("tonnage") or product.get("machine_tons") or product.get("tons") or "").strip(),
+            "abc_class": str(product.get("abc_class") or "").strip().upper(),
+            "serving_rate": product.get("serving_rate", ""),
+            "serving_category": str(product.get("serving_category") or "").strip(),
+            "category_id": str(product.get("category_id") or "").strip(),
+            "category_name": str(product.get("category_name") or "").strip(),
+            "parent_sku": str(product.get("parent_sku") or "").strip(),
             "unit": "",
             "qty_source": "stock",
             "total_stock": 0.0,
@@ -5435,24 +5795,24 @@ def _fetch_low_stock_recommendations(threshold: float = 100.0, force_refresh: bo
                     product = by_id[cand]
                     key = str(product.get("id") or cand)
                     break
-                if cand in by_sku:
-                    product = by_sku[cand]
+                normalized_cand = _normalized_sku(cand)
+                if normalized_cand in by_sku:
+                    product = by_sku[normalized_cand]
                     key = str(product.get("id") or cand)
                     break
             if product is None:
-                pid = str(inv.get("product_id") or inv.get("productId") or inv.get("id") or "").strip()
-                sku = str(inv.get("sku") or inv.get("product_sku") or inv.get("code") or "").strip()
-                name = str(inv.get("name") or inv.get("product_name") or inv.get("productName") or "").strip()
-                if not (pid or sku):
-                    continue
-                tonnage = str(inv.get("tonnage") or inv.get("machine_tons") or inv.get("tons") or inv.get("clamping_force") or "").strip()
-                product = {"id": pid, "sku": sku, "name": name, "tonnage": tonnage}
-                key = pid or sku
+                continue
             entry = stock_by_key.setdefault(key, {
                 "product_id": str(product.get("id") or ""),
                 "sku": str(product.get("sku") or ""),
                 "name": str(product.get("name") or product.get("product_name") or ""),
                 "tonnage": str(product.get("tonnage") or product.get("machine_tons") or product.get("tons") or ""),
+                "abc_class": str(product.get("abc_class") or "").strip().upper(),
+                "serving_rate": product.get("serving_rate", ""),
+                "serving_category": str(product.get("serving_category") or "").strip(),
+                "category_id": str(product.get("category_id") or "").strip(),
+                "category_name": str(product.get("category_name") or "").strip(),
+                "parent_sku": str(product.get("parent_sku") or "").strip(),
                 "unit": unit,
                 "qty_source": qty_source,
                 "total_stock": 0.0,
@@ -5468,8 +5828,6 @@ def _fetch_low_stock_recommendations(threshold: float = 100.0, force_refresh: bo
     items = []
     for entry in stock_by_key.values():
         total = float(entry.get("total_stock") or 0)
-        if total > float(threshold):
-            continue
         wh_parts = []
         for wh_id in [str(x) for x in warehouse_ids]:
             wh_parts.append({
@@ -5483,16 +5841,33 @@ def _fetch_low_stock_recommendations(threshold: float = 100.0, force_refresh: bo
             "sku": entry.get("sku") or "",
             "name": entry.get("name") or "",
             "tonnage": entry.get("tonnage") or "",
+            "abc_class": entry.get("abc_class") or "",
+            "serving_rate": entry.get("serving_rate", ""),
+            "serving_category": entry.get("serving_category") or "",
+            "category_id": entry.get("category_id") or "",
+            "category_name": entry.get("category_name") or "",
+            "parent_sku": entry.get("parent_sku") or "",
             "total_stock": int(total) if total.is_integer() else round(total, 2),
             "unit": entry.get("unit") or "",
             "qty_source": entry.get("qty_source") or "",
-            "threshold": threshold,
+            "threshold": "",
             "warehouses": wh_parts,
         })
-    items.sort(key=lambda x: (float(x.get("total_stock") or 0), str(x.get("sku") or x.get("product_id") or "")))
+    class_priority = {"A": 0, "B": 1, "C": 2}
+    items.sort(key=lambda x: (class_priority.get(str(x.get("abc_class") or ""), 9), float(x.get("total_stock") or 0), str(x.get("sku") or x.get("product_id") or "")))
+    abc_counts = {
+        abc_class: sum(1 for item in items if str(item.get("abc_class") or "").upper() == abc_class)
+        for abc_class in ("A", "B", "C")
+    }
     payload = {
         "saved_at_utc": utc_now().isoformat(),
-        "threshold": threshold,
+        "scope": "product-catalog-with-abc-v2",
+        "stock_filter": "none",
+        "abc_counts": abc_counts,
+        "classified_count": len(abc_by_sku),
+        "matched_product_count": matched_classified_count,
+        "product_count": len(items),
+        "serving_rate_from_cache": bool(abc_result.get("from_cache")),
         "items": items,
     }
     _save_json_list(LOW_STOCK_CACHE_FILE, payload["items"])
@@ -5500,7 +5875,18 @@ def _fetch_low_stock_recommendations(threshold: float = 100.0, force_refresh: bo
         LOW_STOCK_CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         print(f"[JSON] Failed to save low stock recommendations: {e}")
-    return {"items": payload["items"], "from_cache": False, "saved_at_utc": payload["saved_at_utc"], "error": ""}
+    return {
+        "items": payload["items"],
+        "from_cache": False,
+        "saved_at_utc": payload["saved_at_utc"],
+        "error": "",
+        "abc_counts": abc_counts,
+        "serving_rate_from_cache": bool(abc_result.get("from_cache")),
+        "serving_rate_warning": abc_result.get("warning") or "",
+        "classified_count": len(abc_by_sku),
+        "matched_product_count": matched_classified_count,
+        "product_count": len(selected_products),
+    }
 
 
 def get_products(force_refresh: bool = False) -> Dict[str, Any]:
@@ -5508,7 +5894,11 @@ def get_products(force_refresh: bool = False) -> Dict[str, Any]:
     cached_items = cache.get("items") if isinstance(cache.get("items"), list) else []
     if cached_items and not force_refresh:
         has_any_sku = any(str((it or {}).get("sku", "")).strip() for it in cached_items if isinstance(it, dict))
-        if has_any_sku:
+        has_relationship_fields = any(
+            "parent_sku" in it and "category_name" in it
+            for it in cached_items if isinstance(it, dict)
+        )
+        if has_any_sku and has_relationship_fields:
             return {"items": cached_items, "from_cache": True, "updated": False, "error": ""}
         try:
             fetched_upgrade = _fetch_products_from_source()
@@ -5602,12 +5992,126 @@ CLOSED_PRODUCTION_SESSION_IDS: set[str] = _stored_production_session_ids(
 )
 PROFILES: List[Dict[str, Any]] = load_profiles()
 PLANNING_BOARD: Dict[str, Any] = load_planning_board()
+TRIAL_BOARD: Dict[str, Any] = load_trial_board()
+PLANNING_ACTIVITY_LOG: List[Dict[str, Any]] = load_planning_activity_log()
+PLANNING_QUEUE_ALERTS: Dict[str, Dict[str, Any]] = {}
 MACHINE_STATUS_OVERRIDES = load_machine_status_overrides()
 MACHINE_STATUS_ARCHIVE = load_machine_status_archive()
 
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _planning_lane_machine_code(machine_code: Any) -> str:
+    code = str(machine_code or "").strip().upper()
+    match = re.fullmatch(r"M004(\d{2})", code)
+    if match:
+        return f"M001{match.group(1)}"
+    return code
+
+
+def _planning_sku_key(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").strip().upper())
+
+
+def _planning_card_sku(card: Dict[str, Any]) -> str:
+    if not isinstance(card, dict):
+        return ""
+    for key in ("product_sku", "sku", "job_api_sku"):
+        value = str(card.get(key) or "").strip()
+        if value:
+            return value
+    for key in ("raw_payload", "job_payload"):
+        payload = card.get(key)
+        if isinstance(payload, dict):
+            identity = _job_product_identity_from_payload(payload)
+            value = str(identity.get("product_sku") or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _clear_planning_queue_alert(machine_code: Any) -> None:
+    lane = _planning_lane_machine_code(machine_code)
+    PLANNING_QUEUE_ALERTS.pop(lane, None)
+
+
+def _reconcile_planning_queue_for_session(sess: Optional[MachineSession]) -> str:
+    """Promote matching Plan A or publish a dashboard-only mismatch alert."""
+    global PLANNING_BOARD
+    if sess is None or not str(sess.job_code or "").strip():
+        return ""
+    _fill_session_product_identity(sess)
+    running_sku = str(sess.product_sku or "").strip()
+    running_key = _planning_sku_key(running_sku)
+    lane = _planning_lane_machine_code(sess.machine_code)
+    if not lane or not running_key:
+        return ""
+    lanes = PLANNING_BOARD.get("lanes") if isinstance(PLANNING_BOARD.get("lanes"), dict) else {}
+    cards = lanes.get(lane) if isinstance(lanes.get(lane), list) else []
+    if not cards:
+        PLANNING_QUEUE_ALERTS.pop(lane, None)
+        return "EMPTY"
+    queued = cards[0] if isinstance(cards[0], dict) else {}
+    queued_sku = _planning_card_sku(queued)
+    queued_key = _planning_sku_key(queued_sku)
+    if not queued_key:
+        PLANNING_QUEUE_ALERTS.pop(lane, None)
+        return "UNKNOWN"
+    if queued_key == running_key:
+        promoted = dict(queued)
+        lanes[lane] = cards[1:]
+        PLANNING_BOARD = save_planning_board({"lanes": lanes})
+        PLANNING_QUEUE_ALERTS.pop(lane, None)
+        append_planning_activity_log([{
+            "action": "STARTED",
+            "card_id": promoted.get("id"),
+            "item": promoted.get("job_ref") or promoted.get("job_name") or queued_sku,
+            "sku": queued_sku,
+            "job_id": promoted.get("job_id"),
+            "from_lane": lane,
+            "to_lane": "ONGOING",
+            "from_position": 1,
+            "to_position": 1,
+            "note": f"Plan A matched the scanned running SKU on {_machine_display_name(lane, lane)}",
+        }], source_ip=str(sess.client_id or ""))
+        return "MATCHED"
+    previous = PLANNING_QUEUE_ALERTS.get(lane) or {}
+    same_alert = (
+        _planning_sku_key(previous.get("running_sku")) == running_key
+        and _planning_sku_key(previous.get("queued_sku")) == queued_key
+        and str(previous.get("queued_card_id") or "") == str(queued.get("id") or "")
+    )
+    PLANNING_QUEUE_ALERTS[lane] = {
+        "id": str(previous.get("id") or uuid.uuid4()),
+        "detected_at_utc": str(previous.get("detected_at_utc") or utc_now().isoformat()) if same_alert else utc_now().isoformat(),
+        "machine_code": lane,
+        "machine_name": _machine_display_name(lane, sess.machine_name),
+        "production_session_id": str(sess.production_session_id or ""),
+        "running_job": str(sess.job_name or sess.job_code or ""),
+        "running_sku": running_sku,
+        "queued_card_id": str(queued.get("id") or ""),
+        "queued_item": str(queued.get("job_ref") or queued.get("job_name") or queued_sku),
+        "queued_sku": queued_sku,
+    }
+    return "MISMATCH"
+
+
+def _refresh_active_planning_queue_alerts() -> None:
+    if not PLANNING_QUEUE_ALERTS:
+        return
+    sessions_by_lane = {
+        _planning_lane_machine_code(session.machine_code): session
+        for session in SESSIONS.values()
+        if isinstance(session, MachineSession)
+    }
+    for lane in list(PLANNING_QUEUE_ALERTS):
+        session = sessions_by_lane.get(lane)
+        if session is None:
+            PLANNING_QUEUE_ALERTS.pop(lane, None)
+            continue
+        _reconcile_planning_queue_for_session(session)
 
 
 def prune_dead_sessions():
@@ -5682,6 +6186,64 @@ def _material_usage_identity(*values: Any) -> str:
         if text:
             return text
     return ""
+
+
+_MACHINE_TONNAGE_CACHE: Dict[str, str] = {}
+_MACHINE_TONNAGE_CACHE_MTIME_NS: Optional[int] = None
+_MACHINE_TONNAGE_CACHE_LOCK = threading.Lock()
+
+
+def _load_machine_tonnage_map() -> Dict[str, str]:
+    """Read the F03/F04 machine and tonnage pairs from MACHINES.xlsx."""
+    global _MACHINE_TONNAGE_CACHE, _MACHINE_TONNAGE_CACHE_MTIME_NS
+    try:
+        mtime_ns = MACHINE_DATA_FILE.stat().st_mtime_ns
+    except OSError:
+        return {}
+    with _MACHINE_TONNAGE_CACHE_LOCK:
+        if _MACHINE_TONNAGE_CACHE_MTIME_NS == mtime_ns:
+            return dict(_MACHINE_TONNAGE_CACHE)
+        if load_workbook is None:
+            _MACHINE_TONNAGE_CACHE = {}
+            _MACHINE_TONNAGE_CACHE_MTIME_NS = mtime_ns
+            return {}
+        workbook = None
+        try:
+            workbook = load_workbook(MACHINE_DATA_FILE, read_only=True, data_only=True)
+            sheet = workbook["MACHINE"] if "MACHINE" in workbook.sheetnames else workbook.active
+            result: Dict[str, str] = {}
+            column_pairs = ((7, 8, "F03 MACHINE"), (10, 11, "F04 MACHINE"))
+            for machine_col, tonnage_col, expected_header in column_pairs:
+                machine_header = str(sheet.cell(row=1, column=machine_col).value or "").strip().upper()
+                tonnage_header = str(sheet.cell(row=1, column=tonnage_col).value or "").strip().upper()
+                if machine_header != expected_header or tonnage_header != "TONNAGE":
+                    continue
+                for row_no in range(2, int(sheet.max_row or 1) + 1):
+                    machine_value = sheet.cell(row=row_no, column=machine_col).value
+                    tonnage_value = sheet.cell(row=row_no, column=tonnage_col).value
+                    machine_code = _normalize_machine_code_from_scan(machine_value)
+                    tonnage = str(tonnage_value or "").strip()
+                    if machine_code and tonnage:
+                        result[machine_code] = tonnage
+                        # Factory 4 clients use M004xx, while the server's
+                        # legacy planning lanes still use M001xx. Publish the
+                        # same Excel value under both identities until the
+                        # stored planning-board lanes are migrated.
+                        if expected_header == "F04 MACHINE":
+                            machine_digits = re.sub(r"\D+", "", str(machine_value or ""))
+                            if machine_digits and 400 <= int(machine_digits) <= 499:
+                                result[f"M{int(machine_digits):05d}"] = tonnage
+            _MACHINE_TONNAGE_CACHE = result
+            _MACHINE_TONNAGE_CACHE_MTIME_NS = mtime_ns
+            return dict(result)
+        except Exception as exc:
+            print(f"[MACHINE DATA] Could not read {MACHINE_DATA_FILE.name}: {exc}")
+            _MACHINE_TONNAGE_CACHE = {}
+            _MACHINE_TONNAGE_CACHE_MTIME_NS = mtime_ns
+            return {}
+        finally:
+            if workbook is not None:
+                workbook.close()
 
 
 def _finished_shift_material_usage(row: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -5918,9 +6480,12 @@ def _state_payload(*, include_history: bool = False) -> Dict[str, Any]:
         "job_queue": _build_job_queue_rows(),
         "machine_status_overrides": MACHINE_STATUS_OVERRIDES,
         "machine_status_archive": MACHINE_STATUS_ARCHIVE,
+        "machine_tonnage": _load_machine_tonnage_map(),
         "client_statuses": _client_status_rows(),
         "visible_machine_codes": SERVER_SETTINGS.get("visible_machine_codes", []),
         "planning_board": PLANNING_BOARD,
+        "planning_queue_alerts": list(PLANNING_QUEUE_ALERTS.values()),
+        "trial_board": TRIAL_BOARD,
         "server_time_utc": utc_now().isoformat(),
     }
     if include_history:
@@ -5999,11 +6564,17 @@ DASHBOARD_HTML = """
     .main-tab-button:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(15,23,42,0.10); }
     .main-tab-button:active { transform: translateY(0) scale(0.985); }
     .main-tab-button.active { background: #1f8ef1; color: #fff; }
-    .machine-filter-wrap { position:relative; margin-left:auto; display:flex; align-items:center; }
+    .machine-filter-wrap { position:relative; margin-left:auto; display:flex; align-items:center; gap:8px; }
     .machine-filter-btn { width:38px; height:38px; display:inline-flex; align-items:center; justify-content:center; border:1px solid #cdd6e2; border-radius:50%; background:#fff; color:#475569; cursor:pointer; box-shadow:0 4px 12px rgba(15,23,42,.07); }
+    .machine-filter-btn[hidden] { display:none; }
     .machine-filter-btn:hover { color:#0f64bd; border-color:#93b8df; background:#f8fbff; }
     .machine-filter-btn.active { color:#fff; border-color:#0f64bd; background:#0f64bd; }
     .machine-filter-btn svg { width:18px; height:18px; display:block; }
+    .planning-overview-btn { color:#0f64bd; }
+    .planning-overview-btn svg { width:20px; height:20px; }
+    .trial-board-btn { color:#0f64bd; }
+    .trial-board-btn img { width:20px; height:20px; display:block; }
+    .trial-board-btn.active img { filter:brightness(0) invert(1); }
     .machine-filter-menu { position:absolute; z-index:80; top:calc(100% + 8px); right:0; width:230px; padding:10px; border:1px solid #cfd9e6; border-radius:10px; background:#fff; box-shadow:0 14px 32px rgba(15,23,42,.18); }
     .machine-filter-menu[hidden] { display:none; }
     .machine-filter-option { display:flex; align-items:center; gap:9px; padding:9px 10px; border-radius:8px; color:#0f172a; font-size:.84rem; font-weight:850; cursor:pointer; }
@@ -6212,10 +6783,53 @@ DASHBOARD_HTML = """
     #machineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; animation:none; background:#fffafa; }
     #machineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; animation:none; background:#fffdf8; }
     #machineGrid .card.status-alert { border-color:#fed7aa; background:#fffdf8; animation:none; }
+    .machine-card-face { min-width:0; height:100%; transition:opacity .24s ease, transform .28s cubic-bezier(.2,.72,.25,1); }
+    .machine-card-face-normal { display:grid; grid-template-rows:auto 1fr auto; gap:8px; opacity:1; transform:translateY(0) scale(1); }
+    .machine-card-face-hover { position:absolute; inset:0; z-index:4; display:grid; grid-template-rows:auto auto auto 1fr; gap:5px; padding:9px 10px; background:linear-gradient(145deg,rgba(255,255,255,.99),rgba(244,249,255,.99)); opacity:0; transform:translateY(10px) scale(.97); pointer-events:none; }
+    #machineGrid .card:hover .machine-card-face-normal,
+    #additionalMachineGrid .card:hover .machine-card-face-normal { opacity:0; transform:translateY(-8px) scale(.98); }
+    #machineGrid .card:hover .machine-card-face-hover,
+    #additionalMachineGrid .card:hover .machine-card-face-hover { opacity:1; transform:translateY(0) scale(1); }
+    .machine-hover-head { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:7px; }
+    .machine-hover-head strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#1e293b; font-size:.78rem; line-height:1; font-weight:950; }
+    .machine-hover-head span { flex:0 0 auto; color:#64748b; font-size:.56rem; line-height:1; font-weight:850; }
+    .machine-hover-counters { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:4px; }
+    .machine-hover-counter { min-width:0; min-height:42px; padding:5px 2px; border:1px solid #dbe5f0; border-radius:7px; background:rgba(255,255,255,.88); text-align:center; box-shadow:0 3px 8px rgba(15,23,42,.035); display:flex; flex-direction:column; align-items:center; justify-content:center; }
+    .machine-hover-counter .k { display:flex; align-items:center; justify-content:center; min-height:16px; overflow:hidden; color:#94a3b8; font-size:.42rem; line-height:1.05; font-weight:950; text-transform:uppercase; white-space:normal; text-overflow:ellipsis; }
+    .machine-hover-counter .v { display:block; margin-top:3px; overflow:hidden; color:#0f172a; font-size:.82rem; line-height:1; font-weight:950; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-hover-counter.good .v, .machine-hover-counter.total .v { color:#059669; }
+    .machine-hover-counter.butal .v { color:#d97706; }
+    .machine-hover-counter.reject .v { color:#dc2626; }
+    .machine-hover-lines { display:grid; grid-template-columns:minmax(0,1fr); gap:2px; }
+    .machine-hover-line { min-width:0; display:flex; align-items:center; gap:5px; padding:2px 5px; border-radius:5px; background:#f8fafc; color:#64748b; font-size:.52rem; line-height:1.05; font-weight:850; }
+    .machine-hover-line .k { flex:0 0 auto; color:#94a3b8; text-transform:uppercase; }
+    .machine-hover-line .v { min-width:0; flex:1; overflow:hidden; color:#334155; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-hover-info-row { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:5px; }
+    .machine-linked-btn { display:flex; align-items:center; justify-content:flex-start; width:34px; height:34px; padding:0; border:0; border-radius:50%; cursor:pointer; position:relative; overflow:hidden; transition:width .48s cubic-bezier(.2,.72,.25,1), border-radius .48s ease, transform .12s ease; box-shadow:2px 2px 10px rgba(37,99,235,.24); background:rgb(37,99,235); pointer-events:auto; }
+    .machine-linked-btn .sign { width:34px; min-width:34px; height:34px; transition:width .48s cubic-bezier(.2,.72,.25,1), padding-left .48s ease; display:flex; align-items:center; justify-content:center; }
+    .machine-linked-btn .sign img { display:block; width:17px; height:17px; filter:brightness(0) invert(1); }
+    .machine-linked-btn .text { position:absolute; right:0; width:0; opacity:0; overflow:hidden; color:#fff; font-size:.60rem; line-height:1; font-weight:800; white-space:nowrap; transition:width .48s cubic-bezier(.2,.72,.25,1), opacity .38s ease .08s, padding-right .48s ease; }
+    .machine-linked-btn:hover { width:108px; border-radius:40px; }
+    .machine-linked-btn:hover .sign { width:31%; padding-left:7px; }
+    .machine-linked-btn:hover .text { width:69%; opacity:1; padding-right:7px; }
+    .machine-linked-btn:active { transform:translate(2px,2px); }
+    #machinesTab #machineGrid .machine-linked-btn,
+    #machinesTab #additionalMachineGrid .machine-linked-btn { padding:0 !important; border:0 !important; border-radius:50% !important; background:#2563eb !important; color:#fff !important; box-shadow:2px 2px 10px rgba(37,99,235,.24) !important; }
+    #machinesTab #machineGrid .machine-linked-btn:hover,
+    #machinesTab #additionalMachineGrid .machine-linked-btn:hover { width:108px; border-radius:40px !important; background:#1d4ed8 !important; }
+    .machine-job-estimate { align-self:end; display:grid; gap:4px; padding-top:5px; border-top:1px solid #e8eef5; }
+    .machine-job-estimate-head { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:7px; color:#64748b; font-size:.52rem; line-height:1; font-weight:900; }
+    .machine-job-estimate-head span { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-job-estimate-head strong { flex:0 0 auto; color:#0f64bd; font-size:.61rem; }
+    .machine-job-estimate-track { height:7px; overflow:hidden; border-radius:999px; background:#dfe8f2; }
+    .machine-job-estimate-fill { display:block; height:100%; border-radius:inherit; background:linear-gradient(90deg,#0ea5e9,#2563eb); transition:width .35s ease; }
+    .machine-job-estimate-caption { min-width:0; overflow:hidden; color:#64748b; font-size:.49rem; line-height:1.15; font-weight:800; white-space:nowrap; text-overflow:ellipsis; }
     .machine-card-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px; align-items:center; }
     .machine-card-title { min-width:0; display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
     #machineGrid .card .machine-card-title h3 { margin:0; padding:0; border:0; color:#1e293b; font-size:.90rem; line-height:1.15; letter-spacing:.01em; }
     .machine-card-code { display:none; }
+    .machine-card-status-stack { display:flex; flex-direction:column; align-items:flex-end; justify-content:center; gap:3px; }
+    .machine-tonnage { color:#64748b; font-size:.62rem; line-height:1; font-weight:850; letter-spacing:.015em; white-space:nowrap; }
     .machine-status-badge { flex:0 0 auto; display:inline-flex; align-items:center; gap:5px; border-radius:6px; padding:5px 7px; font-size:.56rem; line-height:1; font-weight:950; letter-spacing:.04em; text-transform:uppercase; background:#f1f5f9; color:#475569; border:1px solid #e2e8f0; box-shadow:0 3px 10px rgba(15,23,42,.06); }
     .machine-status-badge::before { content:""; flex:0 0 auto; width:6px; height:6px; border-radius:999px; background:#94a3b8; box-shadow:none; }
     .machine-status-badge.active { background:#dcfce7; color:#047857; border-color:#86efac; }
@@ -6287,8 +6901,10 @@ DASHBOARD_HTML = """
     .machine-job-name { color:#0f172a; font-size:1rem; line-height:1.3; font-weight:900; overflow-wrap:anywhere; }
     .machine-job-meta { margin-top:5px; display:grid; grid-template-columns:1fr 1fr; gap:4px 10px; color:#64748b; font-size:.86rem; line-height:1.3; }
     .machine-job-meta span { min-width:0; overflow-wrap:anywhere; }
-    #machineGrid .card.linkage-flip-out, #additionalMachineGrid .card.linkage-flip-out { animation:linkageCardFlipOut .24s cubic-bezier(.45,0,.7,.2) forwards; transform-origin:center center; pointer-events:none; }
-    #machineGrid .card.linkage-flip-in, #additionalMachineGrid .card.linkage-flip-in { animation:linkageCardFlipIn .34s cubic-bezier(.18,.82,.28,1) forwards; transform-origin:center center; pointer-events:none; }
+    #machineGrid .card.linkage-fade-out .machine-card-face-hover,
+    #additionalMachineGrid .card.linkage-fade-out .machine-card-face-hover { animation:linkageJobFadeOut .72s ease-in forwards; }
+    #machineGrid .card.linkage-slide-in .machine-card-face-hover,
+    #additionalMachineGrid .card.linkage-slide-in .machine-card-face-hover { animation:linkageJobSlideIn .78s cubic-bezier(.2,.72,.25,1) forwards; }
     .machine-linkage-panel { display:grid; gap:7px; padding:9px 10px; border:1px solid #bfdbfe; border-radius:8px; background:#eff6ff; }
     .machine-linkage-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
     .machine-linkage-label { color:#1d4ed8; font-size:.68rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
@@ -6432,39 +7048,51 @@ DASHBOARD_HTML = """
     .planning-shell { background:linear-gradient(180deg, #f8fbff, #eef4fb); border:1px solid #d5e1ed; border-radius:18px; padding:16px; box-shadow:0 18px 44px rgba(15,23,42,.10); }
     .planning-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
     .planning-title h3 { margin:0; color:#0f172a; font-size:1.22rem; }
-    .planning-controls { display:grid; grid-template-columns:minmax(0, 360px) auto auto; gap:8px; align-items:center; }
-    .planning-controls input { border:1px solid #cbd5e1; border-radius:10px; padding:10px 12px; font:inherit; background:#fff; color:#0f172a; }
-    .planning-controls button { border:0; border-radius:10px; padding:10px 14px; font-weight:800; cursor:pointer; background:#2563eb; color:#fff; box-shadow:0 8px 18px rgba(37,99,235,.22); }
+    .planning-controls { display:grid; grid-template-columns:minmax(0, 280px) auto auto; gap:7px; align-items:center; }
+    .planning-controls input { border:1px solid #cbd5e1; border-radius:9px; padding:8px 10px; font:inherit; background:#fff; color:#0f172a; }
+    .planning-controls button { border:0; border-radius:9px; padding:8px 11px; font-weight:800; cursor:pointer; background:#2563eb; color:#fff; box-shadow:0 8px 18px rgba(37,99,235,.22); }
     .planning-controls button.secondary { background:#fff; color:#334155; border:1px solid #cbd5e1; box-shadow:none; }
     .planning-status { margin-top:10px; min-height:20px; color:#64748b; font-size:.85rem; }
-    .planning-ops-summary { display:grid; grid-template-columns:repeat(5, minmax(140px,1fr)); gap:12px; margin-top:14px; }
-    .planning-ops-metric { min-width:0; border-radius:14px; background:#111827; color:#fff; padding:13px 16px; box-shadow:0 12px 26px rgba(15,23,42,.14); }
+    .planning-ops-summary { display:grid; grid-template-columns:repeat(5, minmax(140px,1fr)); gap:8px; margin-top:0; }
+    .planning-ops-metric { min-width:0; border-radius:11px; background:#111827; color:#fff; padding:9px 12px; box-shadow:0 8px 18px rgba(15,23,42,.11); }
     .planning-ops-metric.warn { background:#92400e; }
     .planning-ops-metric.good { background:#065f46; }
-    .planning-ops-metric .k { color:#aeb8c8; font-size:.68rem; font-weight:900; letter-spacing:.06em; text-transform:uppercase; }
-    .planning-ops-metric .v { margin-top:5px; color:#fff; font-size:1.55rem; line-height:1; font-weight:900; }
-    .planning-ops-metric .s { margin-top:6px; color:#cbd5e1; font-size:.74rem; line-height:1.25; overflow-wrap:break-word; }
-    .planning-board { display:grid; grid-template-columns:minmax(520px, 620px) minmax(0,1fr); gap:14px; margin-top:14px; }
+    .planning-ops-metric .k { color:#aeb8c8; font-size:.61rem; font-weight:900; letter-spacing:.055em; text-transform:uppercase; }
+    .planning-ops-metric .v { margin-top:3px; color:#fff; font-size:1.25rem; line-height:1; font-weight:900; }
+    .planning-ops-metric .s { margin-top:4px; color:#cbd5e1; font-size:.65rem; line-height:1.2; overflow-wrap:break-word; }
+    .planning-workspace { height:680px; display:grid; grid-template-columns:minmax(480px, 520px) minmax(0,1fr); gap:12px; margin-top:14px; align-items:stretch; }
+    .planning-main { min-width:0; min-height:0; height:100%; display:grid; grid-template-rows:auto minmax(0,1fr); gap:14px; align-content:stretch; }
+    .planning-board { position:relative; min-height:0; height:100%; display:grid; grid-template-columns:minmax(0,1fr); gap:0; margin-top:0; overflow:hidden; }
     .planning-lane, .planning-running { border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.88); box-shadow:0 10px 24px rgba(15,23,42,.06); min-width:0; }
-    .planning-lane.backlog { display:flex; flex-direction:column; height:620px; min-height:0; overflow:hidden; }
+    .planning-lane.backlog { display:flex; flex-direction:column; height:100%; min-height:0; overflow:hidden; }
     .planning-left-grid { display:grid; grid-template-columns:1fr; gap:14px; min-width:0; align-items:stretch; height:100%; }
     .planning-lane-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 12px 8px; border-bottom:1px solid #e2e8f0; }
     .planning-lane-title { font-weight:800; color:#0f172a; }
+    .planning-lane-title-row { min-width:0; display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+    .planning-machine-tonnage { display:inline-flex; align-items:center; border:1px solid #dbe5ef; border-radius:999px; padding:3px 7px; background:#f8fafc; color:#64748b; font-size:.62rem; line-height:1; font-weight:850; white-space:nowrap; }
     .planning-lane-count { color:#64748b; font-size:.78rem; }
     .planning-lane-time { grid-column:1/-1; display:grid; gap:4px; margin-top:8px; color:#475569; font-size:.72rem; line-height:1.35; }
     .planning-lane-time span { display:block; overflow-wrap:break-word; }
     .planning-dropzone { min-height:140px; padding:10px; display:grid; gap:10px; align-content:start; }
     .planning-dropzone.drag-over { outline:2px dashed #2563eb; outline-offset:-8px; background:#eff6ff; }
-    .planning-machine-grid { display:grid; grid-template-columns:1fr; gap:10px; align-content:start; max-height:620px; overflow-y:auto; padding-right:4px; }
+    .planning-machine-grid { grid-area:1/1; height:100%; min-height:0; display:grid; grid-template-columns:1fr; gap:10px; align-content:start; max-height:none; overflow-y:auto; padding-right:4px; opacity:1; transform:translateX(0); transition:opacity .22s ease,transform .28s cubic-bezier(.2,.72,.25,1); }
     .planning-machine-grid .planning-lane { width:100%; }
     .planning-machine-grid .planning-lane-head { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; padding:10px 12px; }
     .planning-machine-grid .planning-lane-time { display:flex; flex-wrap:wrap; column-gap:12px; row-gap:3px; margin-top:5px; }
-    .planning-machine-grid .planning-dropzone { min-height:112px; max-height:128px; overflow-x:auto; overflow-y:hidden; padding:8px 10px; gap:8px; grid-auto-flow:column; grid-template-rows:1fr; grid-auto-columns:260px; align-content:start; justify-content:start; }
-    .planning-machine-grid .planning-dropzone > * { width:260px; min-width:260px; box-sizing:border-box; }
+    .planning-machine-grid .planning-dropzone { min-height:112px; max-height:none; overflow-x:auto; overflow-y:hidden; padding:8px 10px; gap:8px; grid-auto-flow:column; grid-template-rows:auto; grid-auto-columns:270px; align-content:start; align-items:start; justify-content:start; }
+    .planning-machine-grid .planning-dropzone > * { width:270px; min-width:270px; box-sizing:border-box; }
     .planning-machine-grid .planning-empty { border:0; background:transparent; padding:2px 0; }
-    .planning-machine-grid .planning-card { padding:8px 10px; box-shadow:none; max-height:104px; overflow:hidden; }
-    .planning-machine-grid .planning-job { font-size:.9rem; }
-    .planning-machine-grid .planning-meta { margin-top:4px; font-size:.72rem; line-height:1.28; }
+    .planning-machine-grid .planning-card { position:relative; padding:7px 8px; box-shadow:none; min-height:104px; max-height:none; overflow:visible; }
+    .planning-machine-grid .planning-card-top { gap:4px; }
+    .planning-machine-grid .planning-card-top-actions { max-width:none; margin-right:22px; justify-content:flex-end; flex-wrap:nowrap; gap:3px; }
+    .planning-machine-grid .planning-job { font-size:.82rem; line-height:1.15; }
+    .planning-machine-grid .planning-meta { max-width:100%; margin-top:3px; font-size:.66rem; line-height:1.2; white-space:normal; overflow-wrap:break-word; word-break:normal; }
+    .planning-product-line { display:block; min-width:0; white-space:normal; }
+    .planning-product-name { display:inline; min-width:0; white-space:normal; overflow-wrap:break-word; word-break:normal; }
+    .planning-machine-grid .planning-item-tonnage { padding:2px 5px; font-size:.54rem; }
+    .planning-machine-grid .planning-chip { padding:3px 5px; font-size:.56rem; }
+    .planning-machine-grid .product-relation-badge { min-height:18px; padding:0 5px; font-size:.5rem; }
+    .planning-machine-grid .planning-remove { position:absolute; top:7px; right:7px; width:18px !important; height:18px !important; min-width:18px !important; font-size:.78rem !important; }
     .planning-machine-grid .planning-card-actions { margin-top:5px; }
     .planning-card { border:1px solid #dbe5ef; border-radius:12px; background:#fff; padding:11px; box-shadow:0 8px 18px rgba(15,23,42,.07); cursor:default; }
     .planning-card[draggable="true"] { cursor:default; }
@@ -6473,7 +7101,9 @@ DASHBOARD_HTML = """
     .planning-card.next-job { border-color:#bfdbfe; background:#eff6ff; }
     .planning-card.queue-job { border-color:#dbe5ef; background:#fff; }
     .planning-card-top { display:flex; align-items:flex-start; justify-content:space-between; gap:8px; min-width:0; }
+    .planning-card-top-actions { flex:0 0 auto; display:flex; align-items:center; gap:5px; }
     .planning-job { min-width:0; font-weight:900; color:#0f172a; overflow-wrap:break-word; word-break:normal; }
+    .planning-item-tonnage { border:1px solid #cbd5e1; border-radius:999px; padding:2px 6px; background:#f8fafc; color:#334155; font-size:.62rem; line-height:1.1; font-weight:850; white-space:nowrap; }
     .planning-chip { border-radius:999px; padding:3px 7px; font-size:.68rem; font-weight:800; background:#dbeafe; color:#1d4ed8; white-space:nowrap; }
     .planning-chip.ongoing { background:#dcfce7; color:#047857; }
     .planning-chip.next { background:#dbeafe; color:#1d4ed8; }
@@ -6481,32 +7111,234 @@ DASHBOARD_HTML = """
     .planning-meta { margin-top:7px; color:#475569; font-size:.78rem; line-height:1.4; overflow-wrap:break-word; word-break:normal; }
     .planning-card-actions { display:flex; justify-content:flex-end; margin-top:8px; }
     .planning-remove { border:0; background:#fee2e2; color:#b91c1c; border-radius:8px; padding:4px 8px; cursor:pointer; font-size:.72rem; font-weight:800; }
+    #planningTab .planning-remove { width:20px; height:20px; min-width:20px; display:inline-flex; align-items:center; justify-content:center; padding:0 !important; border:1px solid #fecaca !important; border-radius:999px !important; background:#fee2e2 !important; color:#b91c1c !important; box-shadow:2px 2px 5px rgba(185,28,28,.12),-2px -2px 5px #fff !important; font-size:.9rem; line-height:1; font-weight:900; cursor:pointer; }
+    #planningTab .planning-remove:hover { background:#fecaca !important; color:#991b1b !important; transform:translateY(-1px); }
     .planning-empty { color:#94a3b8; border:1px dashed #cbd5e1; border-radius:10px; padding:12px; font-size:.84rem; }
     .planning-recommend { border-top:1px solid #e2e8f0; background:#f8fbff; overflow:hidden; display:flex; flex-direction:column; height:100%; min-height:0; }
-    .planning-recommend-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px; border-bottom:1px solid #e2e8f0; flex-wrap:wrap; }
+    .planning-recommend-head { display:block; padding:7px 9px 6px; border-bottom:1px solid #e2e8f0; }
     .planning-recommend-title { font-weight:900; color:#0f172a; }
-    .planning-recommend-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-    .planning-recommend-actions input, .planning-recommend-actions select { width:70px; border:1px solid #cbd5e1; border-radius:10px; padding:7px 8px; font:inherit; background:#fff; }
-    .planning-recommend-actions button { border:0; border-radius:10px; padding:8px 10px; font-weight:800; cursor:pointer; background:#0f766e; color:#fff; }
-    .planning-recommend-list { padding:10px; display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px; overflow:auto; min-height:0; flex:1; align-content:start; }
-    .planning-stock-search-row { padding:0 10px 10px; display:grid; gap:7px; }
-    .planning-stock-search-row input { width:100%; box-sizing:border-box; border:1px solid #cbd5e1; border-radius:10px; padding:9px 10px; font:inherit; background:#fff; }
-    .planning-stock-range { display:grid; grid-template-columns:1fr 1fr; gap:7px; }
-    .stock-rec-card { border:1px solid #dbe5ef; border-radius:12px; background:#fff; padding:10px 11px; box-shadow:0 8px 18px rgba(15,23,42,.06); }
+    .planning-recommend-head .planning-status { min-height:15px; margin-top:3px; font-size:.7rem; line-height:1.2; }
+    .planning-recommend-actions { display:contents; }
+    .planning-recommend-actions select { width:100%; min-width:0; border:1px solid #cbd5e1; border-radius:8px; padding:5px 4px; font:inherit; font-size:.72rem; background:#fff; }
+    .planning-recommend-actions button { min-width:0; border:0; border-radius:8px; padding:6px 7px; font-size:.72rem; font-weight:800; cursor:pointer; background:#0f766e; color:#fff; }
+    .planning-recommend-list { padding:7px; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; overflow-y:scroll; overflow-x:hidden; scrollbar-gutter:stable; scrollbar-width:auto; scrollbar-color:#94a3b8 #dfe7ef; min-height:0; flex:1 1 0; align-content:start; align-items:start; }
+    .planning-recommend-list > .planning-empty { grid-column:1/-1; }
+    .planning-recommend-list .stock-rec-card { height:120px; min-height:120px; box-sizing:border-box; padding:6px; overflow:hidden; }
+    .planning-recommend-list .stock-rec-top { display:flex; align-items:flex-start; justify-content:space-between; gap:5px; min-width:0; }
+    .planning-recommend-list .stock-rec-sku { flex:1 1 auto; min-width:42px; font-size:.88rem; line-height:1.15; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .planning-recommend-list .stock-rec-top-actions { flex:0 1 auto; justify-content:flex-end; flex-wrap:wrap; gap:3px; }
+    .planning-recommend-list .stock-rec-name { min-height:27px; margin-top:3px; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; font-size:.66rem; line-height:1.2; }
+    .planning-recommend-list .stock-rec-meta { max-height:36px; margin-top:4px; overflow:hidden; gap:3px; font-size:.58rem; }
+    .planning-recommend-list .stock-rec-meta span { padding:2px 4px; }
+    .planning-recommend-list .planning-meta { margin-top:4px; overflow:hidden; font-size:.61rem; line-height:1.15; white-space:nowrap; text-overflow:ellipsis; }
+    .planning-recommend-list .abc-class-badge { min-width:20px; height:20px; padding:0 5px; font-size:.61rem; }
+    .planning-recommend-list .stock-rec-badge { padding:3px 6px; font-size:.61rem; }
+    .planning-recommend-list .product-relation-badge { min-height:20px; padding:0 6px; font-size:.52rem; }
+    .planning-recommend-list .stock-rec-expand { width:20px; height:20px; flex-basis:20px; }
+    .planning-recommend-list > .planning-card .planning-card-top { display:grid; grid-template-columns:minmax(0,1fr); gap:5px; }
+    .planning-recommend-list > .planning-card .planning-card-top-actions { justify-content:flex-start; flex-wrap:wrap; }
+    .planning-recommend-list::-webkit-scrollbar { width:10px; }
+    .planning-recommend-list::-webkit-scrollbar-track { border-radius:999px; background:#dfe7ef; }
+    .planning-recommend-list::-webkit-scrollbar-thumb { border:2px solid #dfe7ef; border-radius:999px; background:#94a3b8; }
+    .planning-recommend-list::-webkit-scrollbar-thumb:hover { background:#64748b; }
+    .planning-stock-search-row { padding:5px 8px 6px; display:grid; gap:5px; }
+    .planning-stock-search-row > input { width:100%; height:31px; box-sizing:border-box; border:1px solid #cbd5e1; border-radius:8px; padding:5px 8px; font:inherit; font-size:.75rem; background:#fff; }
+    .planning-stock-range { display:grid; grid-template-columns:50px auto; justify-content:end; gap:5px; }
+    .planning-stock-range > input { width:100%; min-width:0; height:31px; box-sizing:border-box; border-radius:8px; padding:5px 7px; font-size:.75rem; }
+    .stock-rec-card { border:1px solid #dbe5ef; border-radius:10px; background:#fff; padding:7px 8px; box-shadow:0 6px 13px rgba(15,23,42,.06); }
     .stock-rec-card[draggable="true"] { cursor:default; }
     .stock-rec-top { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
+    .stock-rec-top-actions { display:flex; align-items:center; gap:5px; flex:0 0 auto; }
     .stock-rec-sku { min-width:0; font-weight:900; color:#0f172a; overflow-wrap:break-word; word-break:normal; }
     .stock-rec-badge { border-radius:999px; padding:4px 8px; font-size:.68rem; font-weight:900; background:#fee2e2; color:#991b1b; white-space:nowrap; }
+    .abc-class-badge { display:inline-flex; align-items:center; justify-content:center; min-width:23px; height:23px; border-radius:999px; padding:0 7px; font-size:.68rem; line-height:1; font-weight:950; white-space:nowrap; }
+    .abc-class-badge.class-a { border:1px solid #fca5a5; background:#fee2e2; color:#b91c1c; }
+    .abc-class-badge.class-b { border:1px solid #fcd34d; background:#fef3c7; color:#92400e; }
+    .abc-class-badge.class-c { border:1px solid #93c5fd; background:#dbeafe; color:#1d4ed8; }
+    .product-relation-badge { display:inline-flex; align-items:center; justify-content:center; min-height:21px; border-radius:999px; padding:0 7px; font-size:.58rem; line-height:1; font-weight:950; letter-spacing:.025em; white-space:nowrap; }
+    .product-relation-badge.parent { border:1px solid #a7f3d0; background:#d1fae5; color:#047857; }
+    .product-relation-badge.child { border:1px solid #c4b5fd; background:#ede9fe; color:#6d28d9; }
+    .stock-rec-family { min-width:0; display:grid; gap:0; }
+    .stock-rec-card.has-children { cursor:pointer; }
+    .stock-rec-expand { width:21px; height:21px; flex:0 0 21px; display:inline-flex; align-items:center; justify-content:center; border:1px solid #bfdbfe; border-radius:999px; padding:0; background:#eff6ff; color:#1d4ed8; cursor:pointer; }
+    .stock-rec-expand svg { width:12px; height:12px; fill:none; stroke:currentColor; stroke-width:2.4; stroke-linecap:round; stroke-linejoin:round; transition:transform .22s ease; }
+    .stock-rec-family.expanded .stock-rec-expand svg { transform:rotate(180deg); }
+    .stock-rec-children { display:grid; grid-template-rows:0fr; opacity:0; padding:0 2px 0 12px; transform:translateY(-7px); transition:grid-template-rows .36s cubic-bezier(.22,.8,.24,1),opacity .24s ease,transform .32s cubic-bezier(.22,.8,.24,1),padding .32s ease; }
+    .stock-rec-children-inner { min-height:0; overflow:hidden; display:grid; gap:5px; }
+    .stock-rec-family.expanded .stock-rec-children { grid-template-rows:1fr; opacity:1; padding-top:6px; transform:translateY(0); }
+    .stock-rec-children .stock-rec-card { border-left:3px solid #a78bfa !important; box-shadow:3px 3px 8px #d4dde7,-3px -3px 8px #fff !important; }
     .stock-rec-name { margin-top:5px; font-size:.78rem; color:#475569; line-height:1.35; overflow-wrap:break-word; word-break:normal; }
     .stock-rec-meta { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; font-size:.72rem; font-weight:800; color:#334155; }
     .stock-rec-meta span { background:#f1f5f9; border:1px solid #e2e8f0; border-radius:999px; padding:3px 7px; }
     .planning-dropzone, .planning-recommend-list, .stock-rec-card { cursor:default; }
     .planning-controls input, .planning-stock-search-row input, .planning-recommend-actions input, .planning-recommend-actions select { cursor:text; }
     .planning-recommend-actions select { cursor:pointer; }
-    .planning-live-queue { margin-top:14px; border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.9); box-shadow:0 10px 24px rgba(15,23,42,.06); overflow:hidden; }
+    .planning-live-queue { margin-top:0; border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.9); box-shadow:0 10px 24px rgba(15,23,42,.06); overflow:hidden; }
     .planning-live-queue-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid #e2e8f0; }
     .planning-live-queue-title { color:#0f172a; font-weight:900; }
     .planning-live-queue .table-wrap { margin:0; box-shadow:none; border:0; border-radius:0; }
+    .planning-queue-toggle { position:relative; width:38px; height:38px; flex:0 0 38px; color:#0f64bd; }
+    .planning-queue-toggle[hidden] { display:none; }
+    .planning-queue-toggle svg { width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+    .planning-queue-toggle-count { position:absolute; top:-7px; right:-7px; min-width:20px; height:20px; padding:0 5px; box-sizing:border-box; border:2px solid #eef3f8; border-radius:999px; background:#2563eb; color:#fff; font-size:.62rem; line-height:16px; font-weight:900; text-align:center; }
+    .planning-queue-backdrop { position:fixed; z-index:120; inset:0; background:rgba(15,23,42,.28); opacity:0; pointer-events:none; transition:opacity .22s ease; }
+    .planning-queue-backdrop.open { opacity:1; pointer-events:auto; }
+    #planningQueuePanel { position:absolute; top:0; right:0; bottom:0; width:min(1120px, calc(100vw - 24px)); margin:0; border-radius:18px 0 0 18px; background:#fff !important; box-shadow:-18px 0 42px rgba(15,23,42,.22); overflow:auto; transform:translateX(102%); transition:transform .25s ease; }
+    .planning-queue-backdrop.open #planningQueuePanel { transform:translateX(0); }
+    .plan-overview-inline,.trial-board-inline,.planning-activity-inline { grid-area:1/1; min-width:0; min-height:0; height:100%; display:flex; flex-direction:column; overflow:hidden; border:1px solid #d5e1ed; border-radius:13px; background:#f8fafc; opacity:0; transform:translateX(24px); pointer-events:none; transition:opacity .22s ease,transform .28s cubic-bezier(.2,.72,.25,1); }
+    .planning-board.compact-active .planning-machine-grid,.planning-board.trial-active .planning-machine-grid,.planning-board.activity-active .planning-machine-grid { opacity:0; transform:translateX(-24px); pointer-events:none; }
+    .planning-board.compact-active .plan-overview-inline { opacity:1; transform:translateX(0); pointer-events:auto; }
+    .planning-board.trial-active .trial-board-inline { opacity:1; transform:translateX(0); pointer-events:auto; }
+    .planning-board.activity-active .planning-activity-inline { opacity:1; transform:translateX(0); pointer-events:auto; }
+    .plan-overview-tabs { display:flex; gap:7px; padding:6px 10px; border-bottom:1px solid #dbe5ef; background:#eef3f8; }
+    .plan-overview-tab { border:1px solid #bfd0e2; border-radius:999px; padding:6px 16px; background:#fff; color:#334155; font-size:.72rem; font-weight:900; cursor:pointer; }
+    .plan-overview-tab.active { border-color:#0f64bd; background:#0f64bd; color:#fff; }
+    .plan-overview-table-wrap { min-height:0; flex:1 1 auto; overflow:auto; padding:6px; background:#fff; }
+    .plan-overview-columns { min-width:0; min-height:100%; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; align-items:stretch; }
+    .plan-overview-column { min-width:0; height:100%; overflow:hidden; border:1px solid #cbd5e1; border-radius:8px; }
+    .plan-overview-table { width:100%; height:100%; min-width:0; border-collapse:separate; border-spacing:0; table-layout:fixed; }
+    .plan-overview-table th { position:sticky; z-index:2; top:0; padding:7px 3px; border-right:1px solid #cbd5e1; border-bottom:2px solid #94a3b8; background:#e8eef5; color:#334155; font-size:.55rem; line-height:1.15; font-weight:950; letter-spacing:.01em; text-align:center; text-transform:uppercase; overflow-wrap:anywhere; }
+    .plan-overview-table td { padding:6px 4px; border-right:1px solid #d7e0e9; border-bottom:1px solid #d7e0e9; color:#0f172a; font-size:.66rem; line-height:1.2; font-weight:750; vertical-align:middle; overflow-wrap:anywhere; }
+    .plan-overview-table th:last-child,.plan-overview-table td:last-child { border-right:0; }
+    .plan-overview-machine { text-align:center; font-weight:950; }
+    .plan-overview-machine small { display:block; margin-top:2px; color:#64748b; font-size:.58rem; }
+    .plan-overview-center { text-align:center; }
+    .plan-overview-status { display:inline-flex; justify-content:center; max-width:100%; border-radius:5px; padding:4px 5px; font-size:.5rem; line-height:1.1; font-weight:950; text-align:center; overflow-wrap:anywhere; }
+    .plan-overview-status.running { background:#dcfce7; color:#166534; }
+    .plan-overview-status.disconnected,.plan-overview-status.no-schedule { background:#f1f5f9; color:#64748b; }
+    .plan-overview-status.attention { background:#fef3c7; color:#92400e; }
+    .plan-overview-plan { background:#fffdf2; font-weight:900; }
+    .plan-overview-dropzone { transition:background-color .14s ease,box-shadow .14s ease; }
+    .plan-overview-dropzone.drag-over { background:#e8f2ff; box-shadow:inset 0 0 0 2px #60a5fa; }
+    .plan-overview-card { display:flex; align-items:center; min-height:100%; cursor:grab; user-select:none; }
+    .plan-overview-card:active { cursor:grabbing; }
+    .planning-backlog-dropzone.drag-over { outline:2px dashed #2563eb; outline-offset:-4px; background:#e8f2ff; }
+    .trial-board-toolbar { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 10px; border-bottom:1px solid #dbe5ef; background:#eef3f8; }
+    .trial-board-title { color:#0f172a; font-size:.86rem; font-weight:950; letter-spacing:.025em; }
+    .trial-board-actions { display:flex; align-items:center; gap:7px; }
+    .trial-board-status { color:#64748b; font-size:.68rem; font-weight:750; }
+    #planningTab .trial-board-action { min-height:31px; padding:6px 11px; border:1px solid #cbd5e1; border-radius:8px; background:#fff; color:#164f91; font-size:.72rem; font-weight:900; cursor:pointer; }
+    #planningTab .trial-board-action.primary { border-color:#0f64bd; background:#0f64bd; color:#fff; }
+    .trial-board-table-wrap { min-height:0; flex:1 1 auto; overflow:auto; padding:6px; background:#fff; }
+    .trial-board-table { width:100%; min-width:900px; height:100%; border-collapse:separate; border-spacing:0; table-layout:fixed; border:1px solid #cbd5e1; border-radius:8px; overflow:hidden; }
+    .trial-board-table th { position:sticky; z-index:2; top:0; padding:9px 8px; border-right:1px solid #cbd5e1; border-bottom:2px solid #94a3b8; background:#e8eef5; color:#334155; font-size:.68rem; font-weight:950; letter-spacing:.025em; text-align:center; text-transform:uppercase; }
+    .trial-board-table td { height:46px; padding:4px; border-right:1px solid #d7e0e9; border-bottom:1px solid #d7e0e9; background:#fff; vertical-align:middle; }
+    .trial-board-table th:last-child,.trial-board-table td:last-child { border-right:0; }
+    .trial-board-table tbody tr:last-child td { border-bottom:0; }
+    #planningTab .trial-board-input { width:100%; height:100%; min-height:36px; box-sizing:border-box; border:0; border-radius:6px; padding:6px 7px; background:transparent; color:#0f172a; font-family:inherit; font-size:.75rem; font-weight:750; box-shadow:none; resize:none; }
+    #planningTab .trial-board-input:focus { outline:2px solid #93c5fd; background:#eff6ff; }
+    #planningTab .trial-board-delete { width:29px; height:29px; display:inline-flex; align-items:center; justify-content:center; padding:0; border:0; border-radius:50%; background:#fee2e2; color:#b91c1c; font-size:1rem; line-height:1; cursor:pointer; }
+    .trial-board-action-cell { text-align:center; }
+    .planning-activity-toolbar { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:9px 12px; border-bottom:1px solid #dbe5ef; background:#eef3f8; }
+    .planning-activity-title { color:#0f172a; font-size:.88rem; font-weight:950; letter-spacing:.025em; }
+    .planning-activity-status { margin-top:2px; color:#64748b; font-size:.68rem; font-weight:750; }
+    #planningTab .planning-activity-refresh { min-height:31px; padding:6px 12px; border:1px solid #bfdbfe; border-radius:8px; background:#eff6ff; color:#1d4ed8; font-family:inherit; font-size:.72rem; font-weight:900; cursor:pointer; }
+    .planning-activity-filters { flex:0 0 auto; display:grid; grid-template-columns:minmax(240px,1fr) 150px 180px 145px; gap:7px; padding:8px 10px; border-bottom:1px solid #dbe5ef; background:#f8fafc; }
+    #planningTab .planning-activity-filters input,#planningTab .planning-activity-filters select { width:100%; min-width:0; height:34px; box-sizing:border-box; border:1px solid #d5e1ed; border-radius:8px; padding:5px 9px; background:#eef3f8; color:#334155; font-family:inherit; font-size:.72rem; font-weight:750; box-shadow:inset 3px 3px 7px #d9e1ea,inset -3px -3px 7px #fff; }
+    .planning-activity-table-wrap { min-height:0; flex:1 1 auto; overflow:auto; padding:6px; background:#fff; }
+    .planning-activity-table { width:100%; min-width:980px; border-collapse:separate; border-spacing:0; table-layout:fixed; border:1px solid #d5e1ed; border-radius:9px; overflow:hidden; }
+    .planning-activity-table th { position:sticky; z-index:2; top:0; padding:9px 8px; border-right:1px solid #d5e1ed; border-bottom:2px solid #94a3b8; background:#e8eef5; color:#334155; font-size:.64rem; font-weight:950; letter-spacing:.025em; text-align:left; text-transform:uppercase; }
+    .planning-activity-table td { padding:9px 8px; border-right:1px solid #e1e7ee; border-bottom:1px solid #e1e7ee; color:#334155; font-size:.7rem; line-height:1.3; font-weight:700; vertical-align:middle; overflow-wrap:anywhere; }
+    .planning-activity-table th:last-child,.planning-activity-table td:last-child { border-right:0; }
+    .planning-activity-table tbody tr:last-child td { border-bottom:0; }
+    .planning-activity-table tbody tr:hover td { background:#f8fbff; }
+    .planning-activity-item { color:#0f172a; font-weight:900; }
+    .planning-activity-sub { margin-top:2px; color:#64748b; font-size:.62rem; font-weight:700; }
+    .planning-action-chip { display:inline-flex; align-items:center; justify-content:center; border-radius:999px; padding:4px 8px; background:#dbeafe; color:#1d4ed8; font-size:.6rem; font-weight:950; white-space:nowrap; }
+    .planning-action-chip.queued,.planning-action-chip.assigned { background:#dcfce7; color:#047857; }
+    .planning-action-chip.removed { background:#fee2e2; color:#b91c1c; }
+    .planning-action-chip.linked { background:#ede9fe; color:#6d28d9; }
+    .planning-action-chip.reordered { background:#fef3c7; color:#92400e; }
+    .planning-action-chip.started { background:#dcfce7; color:#047857; }
+    .planning-mismatch-alerts { position:fixed; z-index:190; top:78px; right:16px; width:min(370px,calc(100vw - 28px)); display:grid; gap:9px; pointer-events:none; }
+    .planning-mismatch-alert { width:100%; box-sizing:border-box; border:2px solid #ef4444; border-radius:13px; padding:11px 13px; background:#fff1f2; color:#7f1d1d; box-shadow:0 12px 30px rgba(185,28,28,.3); font-family:"Poppins",sans-serif; text-align:left; cursor:pointer; pointer-events:auto; animation:planningMismatchPulse 1.05s ease-in-out infinite; }
+    .planning-mismatch-alert-title { display:flex; align-items:center; gap:8px; font-size:.82rem; font-weight:950; }
+    .planning-mismatch-alert-title::before { content:"!"; width:22px; height:22px; flex:0 0 22px; display:inline-flex; align-items:center; justify-content:center; border-radius:50%; background:#dc2626; color:#fff; font-size:.76rem; }
+    .planning-mismatch-alert-line { margin-top:5px; color:#991b1b; font-size:.7rem; line-height:1.3; font-weight:750; }
+    .planning-mismatch-alert-line strong { color:#7f1d1d; font-weight:950; }
+    .planning-mismatch-alert-hint { margin-top:6px; color:#b91c1c; font-size:.61rem; font-weight:850; }
+    .planning-machine-grid .planning-card.queue-mismatch-highlight { z-index:3; border-color:#dc2626 !important; animation:planningQueueMismatchFocus 6s ease-out 1; }
+    @keyframes planningMismatchPulse { 0%,100% { transform:scale(1); box-shadow:0 10px 25px rgba(185,28,28,.22); } 50% { transform:scale(1.018); box-shadow:0 14px 34px rgba(220,38,38,.48),0 0 0 4px rgba(248,113,113,.2); } }
+    @keyframes planningQueueMismatchFocus { 0%,18%,36% { border-color:#dc2626; background:#fee2e2; box-shadow:0 0 0 4px rgba(239,68,68,.32),0 12px 28px rgba(185,28,28,.3); } 9%,27%,48% { border-color:#fca5a5; background:#fff; box-shadow:0 0 0 1px rgba(239,68,68,.12); } 100% { border-color:#dbe5ef; background:#f2f6fa; box-shadow:none; } }
+    @media (max-width:900px){ .planning-activity-filters { grid-template-columns:1fr 1fr; } }
+    .plan-overview-empty { color:#94a3b8; font-weight:650; }
+    .planning-queue-close { flex:0 0 auto; width:34px; height:34px; border:1px solid #dbe5ef; border-radius:10px; background:#eef3f8; color:#475569; box-shadow:3px 3px 7px #d4dde7,-3px -3px 7px #fff; font-size:1.25rem; line-height:1; font-weight:900; cursor:pointer; }
+    #planningQueuePanel .planning-live-queue-head { position:sticky; z-index:3; top:0; padding:18px 20px; background:rgba(255,255,255,.97); border-bottom:1px solid #e6edf5; }
+    #planningQueuePanel .planning-live-queue-title { font-size:1.2rem; font-weight:900; }
+    #planningQueuePanel .job-queue-summary { margin:16px 18px 14px; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+    #planningQueuePanel .jq-summary-card { min-width:0; min-height:82px; display:grid; grid-template-columns:42px minmax(0,1fr); gap:11px; align-items:center; padding:12px 14px; box-sizing:border-box; border:1px solid #e1e9f2; border-radius:12px; background:#fff; box-shadow:0 5px 14px rgba(15,23,42,.035); }
+    #planningQueuePanel .jq-summary-icon { width:36px; height:36px; display:flex; align-items:center; justify-content:center; border-radius:9px; color:#2563eb; background:#eaf2ff; }
+    #planningQueuePanel .jq-summary-icon.green { color:#16a34a; background:#e6f7ed; }
+    #planningQueuePanel .jq-summary-icon.red { color:#ef4444; background:#feecec; }
+    #planningQueuePanel .jq-summary-icon.purple { color:#7c3aed; background:#f1eaff; }
+    #planningQueuePanel .jq-summary-icon svg { width:19px; height:19px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+    #planningQueuePanel .jq-summary-card .k { color:#64748b; font-size:.65rem; line-height:1.1; font-weight:900; letter-spacing:.045em; text-transform:uppercase; }
+    #planningQueuePanel .jq-summary-card .v { margin-top:4px; color:#0f172a; font-size:1.28rem; line-height:1; font-weight:900; }
+    #planningQueuePanel .jq-summary-card .sub { margin-top:5px; color:#64748b; font-size:.64rem; line-height:1.15; }
+    #planningQueuePanel .table-wrap { margin:0 18px 18px; border:1px solid #e2e8f0; border-radius:12px; overflow:auto; background:#fff; }
+    #planningQueuePanel .planning-job-queue-table { width:100%; min-width:920px; border-collapse:separate; border-spacing:0; table-layout:fixed; }
+    #planningQueuePanel .planning-job-queue-table th { padding:12px 10px; border-bottom:1px solid #e5edf5; background:#f8fafc; color:#475569; font-size:.61rem; line-height:1.1; font-weight:900; letter-spacing:.035em; text-transform:uppercase; text-align:left; }
+    #planningQueuePanel .planning-job-queue-table td { padding:15px 10px; border-bottom:1px solid #e8eef5; color:#0f172a; font-size:.69rem; line-height:1.35; vertical-align:top; overflow-wrap:anywhere; }
+    #planningQueuePanel .planning-job-queue-table tbody tr:last-child td { border-bottom:0; }
+    .jq-machine-cell { display:grid; grid-template-columns:27px minmax(0,1fr); gap:8px; }
+    .jq-machine-icon { width:25px; height:25px; display:flex; align-items:center; justify-content:center; border-radius:7px; background:#eaf2ff; color:#2563eb; font-size:.78rem; font-weight:900; }
+    .jq-primary { color:#0f172a; font-weight:900; }
+    .jq-secondary { margin-top:3px; color:#64748b; font-size:.64rem; }
+    .jq-activity { display:flex; align-items:flex-start; gap:5px; }
+    .jq-activity-dot { flex:0 0 auto; width:6px; height:6px; margin-top:4px; border-radius:50%; background:#22c55e; }
+    .jq-activity-dot.offline { background:#ef4444; }
+    .jq-progress-head { display:flex; justify-content:space-between; gap:8px; font-weight:900; }
+    .jq-progress-track { height:5px; margin-top:7px; overflow:hidden; border-radius:999px; background:#e8edf3; }
+    .jq-progress-fill { display:block; height:100%; border-radius:inherit; background:#22c55e; }
+    .jq-progress-fill.offline { background:#94a3b8; }
+    .jq-inline-icon { display:inline-block; margin-right:5px; color:#2563eb; font-weight:900; }
+    .jq-cycle-icon { color:#7c3aed; }
+    .jq-queue-footer { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 12px; border-top:1px solid #e8eef5; color:#64748b; font-size:.65rem; }
+    .jq-auto-refresh { color:#475569; }
+    .jq-auto-refresh::before { content:"↻"; margin-right:5px; color:#2563eb; font-size:.9rem; }
+    #planningTab { font-family:"Poppins",sans-serif; }
+    #planningTab .planning-shell { background:#eef3f8; border:1px solid rgba(255,255,255,.82); box-shadow:12px 12px 28px #d6dee8,-10px -10px 24px rgba(255,255,255,.92),inset 0 1px 0 #fff; }
+    #planningTab .planning-ops-metric { border:1px solid rgba(255,255,255,.78); background:#eef3f8; color:#0f172a; box-shadow:7px 7px 15px #d4dde7,-7px -7px 15px #fff; }
+    #planningTab .planning-ops-metric.warn { background:#fff7ed; }
+    #planningTab .planning-ops-metric.good { background:#ecfdf5; }
+    #planningTab .planning-ops-metric .k { color:#64748b; }
+    #planningTab .planning-ops-metric .v { color:#0f172a; }
+    #planningTab .planning-ops-metric .s { color:#64748b; }
+    #planningTab .planning-lane,
+    #planningTab .planning-live-queue { border:1px solid rgba(255,255,255,.86); background:#eef3f8; box-shadow:8px 8px 18px #d5dee8,-7px -7px 16px rgba(255,255,255,.95); }
+    #planningTab .planning-lane-head,
+    #planningTab .planning-live-queue-head { border-bottom-color:#dce5ee; background:rgba(248,251,255,.48); }
+    #planningTab .planning-card,
+    #planningTab .stock-rec-card { border:1px solid rgba(255,255,255,.92); background:#f2f6fa; box-shadow:5px 5px 11px #d4dde7,-5px -5px 11px #fff; }
+    #planningTab .planning-card.live { border-color:#bbf7d0; background:#effcf5; box-shadow:5px 5px 11px #d1dfd7,-5px -5px 11px #fff; }
+    #planningTab .planning-card.next-job { border-color:#bfdbfe; background:#eff6ff; }
+    #planningTab .planning-card.queue-job { background:#f2f6fa; }
+    #planningTab .planning-controls input,
+    #planningTab .planning-stock-search-row input,
+    #planningTab .planning-recommend-actions input,
+    #planningTab .planning-recommend-actions select { border:1px solid rgba(255,255,255,.9); background:#eef3f8; box-shadow:inset 4px 4px 8px #d6dee8,inset -4px -4px 8px #fff; }
+    #planningTab .planning-controls button,
+    #planningTab .planning-recommend-actions button { box-shadow:5px 5px 11px rgba(37,99,235,.2),-4px -4px 9px #fff; }
+    #planningTab .planning-controls button.secondary { background:#eef3f8; border-color:rgba(255,255,255,.9); box-shadow:5px 5px 11px #d4dde7,-5px -5px 11px #fff; }
+    #planningTab .planning-recommend { background:#eef3f8; border-top-color:#dce5ee; }
+    #planningTab .planning-recommend-head { border-bottom-color:#dce5ee; }
+    #planningTab .planning-dropzone.drag-over { outline-color:#60a5fa; background:#e8f2ff; }
+    .planning-live-operator { margin-top:5px; min-width:0; overflow:hidden; color:#475569; font-size:.68rem; line-height:1.2; font-weight:750; white-space:nowrap; text-overflow:ellipsis; }
+    .planning-live-progress { display:grid; gap:3px; margin-top:7px; padding-top:6px; border-top:1px solid rgba(148,163,184,.22); }
+    .planning-live-progress-head { display:flex; align-items:center; justify-content:space-between; gap:7px; color:#64748b; font-size:.56rem; line-height:1; font-weight:900; text-transform:uppercase; letter-spacing:.03em; }
+    .planning-live-progress-head strong { color:#0f64bd; font-size:.62rem; }
+    .planning-live-progress-track { height:6px; overflow:hidden; border-radius:999px; background:#dbe5ef; box-shadow:inset 2px 2px 4px #c6d0db,inset -2px -2px 4px #fff; }
+    .planning-live-progress-fill { display:block; height:100%; border-radius:inherit; background:linear-gradient(90deg,#0ea5e9,#2563eb); transition:width .35s ease; }
+    .planning-live-progress-caption { min-width:0; overflow:hidden; color:#64748b; font-size:.52rem; line-height:1.15; font-weight:800; white-space:nowrap; text-overflow:ellipsis; }
+    .planning-machine-grid .planning-card.live { height:112px; max-height:112px; }
+    @media (min-width: 901px) {
+      body.planning-tab-active { height:100vh; min-height:0; overflow-y:hidden; }
+      body.planning-tab-active > .diagnostics,
+      body.planning-tab-active > .main-tabs { flex:0 0 auto; }
+      body.planning-tab-active #planningTab.main-tab-content.active { display:flex; flex:1 1 auto; min-height:0; overflow:hidden; }
+      body.planning-tab-active #planningTab .planning-shell { display:flex; flex:1 1 auto; min-height:0; }
+      body.planning-tab-active #planningTab .planning-workspace { flex:1 1 auto; height:auto; min-height:0; }
+    }
     .table-actions { display: flex; gap: 8px; }
     .mini-btn { border: 1px solid #cbd5e1; background: #fff; color: #1f2937; border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; cursor: pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .mini-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 12px rgba(15,23,42,0.08); }
@@ -6516,16 +7348,19 @@ DASHBOARD_HTML = """
     .job-progress-bar { height:14px; margin:12px 0 5px; border:1px solid #cbd5e1; border-radius:999px; background:#e8eef5; overflow:hidden; }
     .job-progress-fill { height:100%; min-width:0; border-radius:999px; background:linear-gradient(90deg,#2563eb,#22c55e); transition:width .25s ease; }
     .job-progress-caption { display:flex; justify-content:space-between; gap:10px; color:#64748b; font-size:.76rem; font-weight:800; }
-    .finished-view-toolbar { margin-top: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .finished-view-toolbar { margin-top: 4px; display: flex; align-items: center; justify-content: flex-start; gap: 8px; }
     .finished-view-label { color: #64748b; font-size: .82rem; font-weight: 700; }
-    .finish-review-selector { display:flex; align-items:center; gap:10px; margin-top:12px; margin-bottom:12px; }
-    .finish-review-selector label { color:#475569; font-size:.78rem; font-weight:900; text-transform:uppercase; letter-spacing:.04em; }
-    .finish-review-selector select { min-width:220px; padding:9px 36px 9px 12px; border:1px solid #cbd5e1; border-radius:10px; background:#fff; color:#0f172a; font:inherit; font-weight:850; cursor:pointer; }
+    .finish-review-selector { display:flex; align-items:center; gap:8px; margin-top:8px; margin-bottom:8px; }
+    .finish-review-selector label { color:#475569; font-size:.72rem; font-weight:900; text-transform:uppercase; letter-spacing:.035em; }
+    #finishShiftTab .finish-review-selector select { width:auto; min-width:184px; min-height:36px; padding:7px 32px 7px 11px; border:1px solid #cbd5e1; border-radius:10px; background:#eef3f8; color:#0f172a; font-family:inherit; font-size:.82rem; line-height:1.1; font-weight:850; box-shadow:0 4px 12px rgba(15,23,42,.06); cursor:pointer; }
     .finish-review-pane-head { margin:12px clamp(12px, 1.4vw, 22px) 0; }
     .finish-review-pane-head h3 { margin:0 0 4px; }
-    .finished-view-switch { display: inline-flex; gap: 4px; padding: 4px; border: 1px solid #d7e3f4; border-radius: 10px; background: #f1f5f9; }
-    .finished-view-btn { border: 0; border-radius: 7px; padding: 7px 12px; background: transparent; color: #475569; font: inherit; font-size: .8rem; font-weight: 800; cursor: pointer; }
+    .finished-view-switch { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid #cbd5e1; border-radius: 10px; background: #eef3f8; box-shadow:0 4px 12px rgba(15,23,42,.06); }
+    .finished-view-btn { border: 0; border-radius: 7px; padding: 6px 11px; background: transparent; color: #475569; font: inherit; font-size: .78rem; font-weight: 850; cursor: pointer; }
     .finished-view-btn.active { background: #0b2f73; color: #fff; box-shadow: 0 2px 6px rgba(11,47,115,.22); }
+    #finishShiftTab .finished-view-switch .finished-view-btn { width:32px; height:32px; display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:7px; padding:0; background:transparent; color:#475569; box-shadow:none; }
+    #finishShiftTab .finished-view-switch .finished-view-btn.active { background:#0f64bd; color:#fff; box-shadow:0 2px 6px rgba(15,100,189,.22); }
+    #finishShiftTab .finished-view-switch .finished-view-btn svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
     .finished-list-wrap { margin-top: 12px; border: 1px solid #d7e3f4; border-radius: 12px; overflow-x: auto; background: #fff; }
     .finished-list-table { width: 100%; min-width: 980px; border-collapse: collapse; }
     .finished-list-table th { padding: 10px 12px; background: #eef4fb; color: #334e78; border-bottom: 1px solid #d7e3f4; text-align: left; font-size: .74rem; text-transform: uppercase; letter-spacing: .025em; white-space: nowrap; }
@@ -7043,14 +7878,13 @@ DASHBOARD_HTML = """
       0%, 100% { transform:scale(1); box-shadow:0 0 0 3px rgba(245,158,11,.20), 0 0 8px rgba(245,158,11,.30); }
       50% { transform:scale(1.18); box-shadow:0 0 0 6px rgba(245,158,11,.12), 0 0 14px rgba(245,158,11,.52); }
     }
-    @keyframes linkageCardFlipOut {
-      0% { transform:rotateY(0deg) scale(1); opacity:1; box-shadow:0 8px 20px rgba(15,23,42,.06); }
-      100% { transform:rotateY(88deg) scale(.985); opacity:.72; box-shadow:0 18px 34px rgba(15,23,42,.16); }
+    @keyframes linkageJobFadeOut {
+      0% { transform:translateX(0); opacity:1; }
+      100% { transform:translateX(-12px); opacity:0; }
     }
-    @keyframes linkageCardFlipIn {
-      0% { transform:rotateY(-88deg) scale(.985); opacity:.72; box-shadow:0 18px 34px rgba(15,23,42,.16); }
-      58% { transform:rotateY(8deg) scale(1.002); opacity:1; box-shadow:0 14px 28px rgba(15,23,42,.12); }
-      100% { transform:rotateY(0deg) scale(1); opacity:1; box-shadow:0 8px 20px rgba(15,23,42,.06); }
+    @keyframes linkageJobSlideIn {
+      0% { transform:translateX(12px); opacity:0; }
+      100% { transform:translateX(0); opacity:1; }
     }
     .overlay-head-actions { display:flex; align-items:center; gap:8px; }
     .icon-btn {
@@ -7562,8 +8396,8 @@ DASHBOARD_HTML = """
       box-shadow: none;
     }
     @media (max-width: 1650px) {
-      .planning-board { grid-template-columns:1fr; }
-      .planning-lane.backlog { height:460px; min-height:0; }
+      .planning-workspace { grid-template-columns:minmax(450px, 490px) minmax(0,1fr); }
+      .planning-lane.backlog { height:100%; min-height:0; }
       .planning-ops-summary { grid-template-columns:repeat(3, minmax(140px,1fr)); }
       .user-kpi-card-grid { grid-template-columns:repeat(3,minmax(180px,1fr)); }
     }
@@ -7577,6 +8411,7 @@ DASHBOARD_HTML = """
       #userKpiTab .job-queue-summary { grid-template-columns:repeat(3,minmax(150px,1fr)); }
       .user-kpi-body { grid-template-columns:1fr; }
       .user-kpi-side { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .planning-workspace { grid-template-columns:minmax(410px, 440px) minmax(0,1fr); }
     }
     @media (max-width: 900px) {
       .diagnostics { grid-template-columns: repeat(4, 48px) minmax(0, 1fr); }
@@ -7590,9 +8425,11 @@ DASHBOARD_HTML = """
       .machine-detail-info-item:nth-last-child(-n+2) { border-bottom:0; }
       .main-tab-button { flex:1 1 140px; }
       .planning-head { display:grid; grid-template-columns:1fr; }
+      .planning-workspace { height:auto; grid-template-columns:1fr; }
+      .planning-lane.backlog { height:460px; min-height:0; }
       .planning-ops-summary { grid-template-columns:repeat(2, minmax(0,1fr)); }
       .planning-controls { grid-template-columns:1fr auto auto; }
-      .planning-machine-grid { grid-template-columns:1fr; max-height:560px; }
+      .planning-machine-grid { height:auto; grid-template-columns:1fr; max-height:560px; }
       .planning-machine-grid .planning-dropzone { grid-auto-columns:220px; }
       .planning-machine-grid .planning-dropzone > * { width:220px; min-width:220px; }
       .planning-recommend-list { grid-template-columns:1fr; }
@@ -7721,6 +8558,19 @@ DASHBOARD_HTML = """
       <button class="machine-filter-btn" id="machineFilterBtn" type="button" aria-label="Filter machines" aria-expanded="false" title="Filter machines">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18l-7 8v5l-4 2v-7L3 5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
       </button>
+      <button class="machine-filter-btn planning-overview-btn" id="planningOverviewBtn" type="button" aria-label="Toggle F03 and F04 production plan" aria-pressed="false" title="F03 / F04 Production Plan" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+      </button>
+      <button class="machine-filter-btn trial-board-btn" id="trialBoardBtn" type="button" aria-label="Toggle Trial Board" aria-pressed="false" title="Trial Board" hidden>
+        <img src="/Images/trial.svg" alt="" aria-hidden="true" />
+      </button>
+      <button class="machine-filter-btn planning-activity-btn" id="planningActivityBtn" type="button" aria-label="Toggle Planning Activity Log" aria-pressed="false" title="Planning Activity Log" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 8h8M8 12h5M8 16h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="17" cy="16" r="3.5" fill="#eef3f8" stroke="currentColor" stroke-width="1.8"/><path d="M17 14.3v1.9l1.3.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+      <button id="planningQueueToggle" class="machine-filter-btn planning-queue-toggle" type="button" aria-label="Open Production Progress and ETA" aria-expanded="false" aria-controls="planningQueuePanel" title="Production Progress &amp; ETA" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/><path d="M5 4l-2 2M19 4l2 2"/></svg>
+        <span id="planningQueueToggleCount" class="planning-queue-toggle-count">0</span>
+      </button>
       <div class="machine-filter-menu" id="machineFilterMenu" hidden>
         <label class="machine-filter-option">
           <input id="hideInactiveMachinesFilter" type="checkbox" />
@@ -7740,70 +8590,103 @@ DASHBOARD_HTML = """
 
   <div id="planningTab" class="main-tab-content">
     <div class="planning-shell">
-      <div class="planning-head">
-        <div class="planning-title">
-          <h3>Planning Board</h3>
-          <div class="muted">Scan or type a BMS job/work order, then drag the job card into the machine lane you want to run it on.</div>
-          <div id="planningStatus" class="planning-status"></div>
-        </div>
-        <div class="planning-controls">
-          <input id="planningJobInput" type="text" placeholder="Scan or type job / work order..." />
-          <button id="planningLookupBtn" type="button">Add Job</button>
-          <button id="planningClearBtn" class="secondary" type="button">Clear List</button>
-        </div>
-      </div>
-      <div id="planningOpsSummary" class="planning-ops-summary"></div>
-      <div class="planning-board">
+      <div class="planning-workspace">
         <div class="planning-left-grid">
-        <div class="planning-lane backlog">
+          <div class="planning-lane backlog">
             <div class="planning-recommend" style="border-top:none;">
               <div class="planning-recommend-head">
                 <div>
-                  <div class="planning-recommend-title">Jobs & Low Stock</div>
-                  <div class="muted">Scanned jobs stay at the top. Drag any item into a machine.</div>
-                </div>
-                <div class="planning-recommend-actions">
-                  <select id="planningLowStockLimit" title="Items to show">
-                    <option value="10">10</option>
-                    <option value="15" selected>15</option>
-                    <option value="25">25</option>
-                    <option value="50">50</option>
-                  </select>
-                  <button id="planningLowStockRefreshBtn" type="button">Refresh</button>
+                  <div class="planning-recommend-title">Planning Board</div>
+                  <div class="muted">Drag queued items into the machine lane you want to run them on.</div>
+                  <div id="planningStatus" class="planning-status"></div>
                 </div>
               </div>
               <div class="planning-stock-search-row">
                 <input id="planningLowStockSearch" type="text" placeholder="Search SKU, product ID, or item name..." />
                 <div class="planning-stock-range">
-                  <input id="planningLowStockMin" type="number" min="0" step="1" value="0" placeholder="Min stock" title="Minimum stock" />
-                  <input id="planningLowStockMax" type="number" min="0" step="1" value="100" placeholder="Max stock" title="Maximum stock" />
+                  <div class="planning-recommend-actions">
+                    <select id="planningLowStockLimit" title="Items to show">
+                      <option value="10">10</option>
+                      <option value="15" selected>15</option>
+                      <option value="25">25</option>
+                      <option value="50">50</option>
+                    </select>
+                    <button id="planningLowStockRefreshBtn" type="button">Refresh</button>
+                  </div>
                 </div>
               </div>
-              <div id="planningLowStockList" class="planning-recommend-list">
-                <div class="planning-empty">Refresh to load low-stock recommendations.</div>
+              <div id="planningLowStockList" class="planning-recommend-list planning-backlog-dropzone" data-lane="BACKLOG" data-slot="0">
+                <div class="planning-empty">Refresh to load product items and A/B/C classes.</div>
               </div>
             </div>
-        </div>
-        </div>
-        <div id="planningMachineGrid" class="planning-machine-grid"></div>
-      </div>
-      <div class="planning-live-queue">
-        <div class="planning-live-queue-head">
-          <div>
-            <div class="planning-live-queue-title">Job Queue</div>
-            <div class="muted">Live queue from active sessions, including target progress, excess warnings, and cycle-time ETA.</div>
           </div>
         </div>
-        <div id="jobQueueSummary" class="job-queue-summary"></div>
-        <div id="jobQueueTableWrap" class="table-wrap"></div>
+        <div class="planning-main">
+          <div id="planningOpsSummary" class="planning-ops-summary"></div>
+          <div id="planningBoardView" class="planning-board">
+            <div id="planningMachineGrid" class="planning-machine-grid"></div>
+            <section id="planOverviewInline" class="plan-overview-inline" aria-hidden="true" aria-label="F03 and F04 production plan">
+              <div class="plan-overview-tabs" role="tablist" aria-label="Factory plan">
+                <button class="plan-overview-tab active" type="button" data-plan-factory="F03">F03 PLAN</button>
+                <button class="plan-overview-tab" type="button" data-plan-factory="F04">F04 PLAN</button>
+              </div>
+              <div id="planOverviewTableWrap" class="plan-overview-table-wrap"></div>
+            </section>
+            <section id="trialBoardInline" class="trial-board-inline" aria-hidden="true" aria-label="Trial Board">
+              <div class="trial-board-toolbar">
+                <div>
+                  <div class="trial-board-title">TRIAL BOARD</div>
+                  <div id="trialBoardStatus" class="trial-board-status">Shared trial schedule</div>
+                </div>
+                <div class="trial-board-actions">
+                  <button id="trialBoardAddBtn" class="trial-board-action" type="button">Add Row</button>
+                  <button id="trialBoardSaveBtn" class="trial-board-action primary" type="button">Save</button>
+                </div>
+              </div>
+              <div id="trialBoardTableWrap" class="trial-board-table-wrap"></div>
+            </section>
+            <section id="planningActivityInline" class="planning-activity-inline" aria-hidden="true" aria-label="Planning Activity Log">
+              <div class="planning-activity-toolbar">
+                <div>
+                  <div class="planning-activity-title">PLANNING ACTIVITY LOG</div>
+                  <div id="planningActivityStatus" class="planning-activity-status">Drag, queue, reorder, and removal history</div>
+                </div>
+                <button id="planningActivityRefreshBtn" class="planning-activity-refresh" type="button">Refresh</button>
+              </div>
+              <div class="planning-activity-filters">
+                <input id="planningActivitySearch" type="search" placeholder="Search mold, SKU, job, machine, or note..." />
+                <select id="planningActivityActionFilter" aria-label="Filter planning action">
+                  <option value="">All actions</option><option value="QUEUED">Queued</option><option value="ASSIGNED">Assigned</option><option value="STARTED">Started</option><option value="MOVED">Moved</option><option value="REORDERED">Reordered</option><option value="LINKED">Linked parent</option><option value="REMOVED">Removed</option>
+                </select>
+                <select id="planningActivityMachineFilter" aria-label="Filter planning machine"><option value="">All machines</option></select>
+                <input id="planningActivityDateFilter" type="date" aria-label="Filter planning date" />
+              </div>
+              <div id="planningActivityTableWrap" class="planning-activity-table-wrap"><div class="planning-empty">Open or refresh to load activity.</div></div>
+            </section>
+          </div>
+          <div id="planningQueueBackdrop" class="planning-queue-backdrop" aria-hidden="true">
+            <div id="planningQueuePanel" class="planning-live-queue" role="dialog" aria-modal="true" aria-label="Production Progress and ETA">
+              <div class="planning-live-queue-head">
+                <div>
+                  <div class="planning-live-queue-title">Production Progress &amp; ETA</div>
+                  <div class="muted">Live queue from active sessions, including target progress, excess warnings, and cycle-time ETA.</div>
+                </div>
+                <button id="planningQueueClose" class="planning-queue-close" type="button" aria-label="Close Production Progress and ETA" title="Close">&times;</button>
+              </div>
+              <div id="jobQueueSummary" class="job-queue-summary"></div>
+              <div id="jobQueueTableWrap" class="table-wrap"></div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 
+  <div id="planningMismatchAlerts" class="planning-mismatch-alerts" aria-live="assertive" aria-label="Planning queue mismatch alerts"></div>
+
   <div id="finishShiftTab" class="main-tab-content">
     <div class="panel">
       <h3>Finish Shift Review</h3>
-      <div class="muted">Review finished shifts, job progress, and completed whole jobs from one workspace.</div>
       <div class="finish-review-selector">
         <label for="finishShiftViewSelect">View</label>
         <select id="finishShiftViewSelect">
@@ -7814,10 +8697,9 @@ DASHBOARD_HTML = """
       </div>
       <div id="finishShiftQueuePane" class="sub-tab-content active">
         <div class="finished-view-toolbar">
-          <span class="finished-view-label">Choose how finished shifts are displayed</span>
           <div class="finished-view-switch" role="group" aria-label="Finished shifts view">
-            <button id="finishedShiftGridViewBtn" class="finished-view-btn active" type="button" data-view="grid" aria-pressed="true">Grid View</button>
-            <button id="finishedShiftListViewBtn" class="finished-view-btn" type="button" data-view="list" aria-pressed="false">List View</button>
+            <button id="finishedShiftGridViewBtn" class="finished-view-btn active" type="button" data-view="grid" aria-label="Grid view" title="Grid view" aria-pressed="true"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg></button>
+            <button id="finishedShiftListViewBtn" class="finished-view-btn" type="button" data-view="list" aria-label="List view" title="List view" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg></button>
           </div>
         </div>
         <div id="finishedShiftQueueList" class="finished-wrap"></div>
@@ -8468,8 +9350,32 @@ DASHBOARD_HTML = """
   const machineFilterBtn = document.getElementById("machineFilterBtn");
   const machineFilterMenu = document.getElementById("machineFilterMenu");
   const hideInactiveMachinesFilter = document.getElementById("hideInactiveMachinesFilter");
+  const planningOverviewBtn = document.getElementById("planningOverviewBtn");
+  const trialBoardBtn = document.getElementById("trialBoardBtn");
+  const planningActivityBtn = document.getElementById("planningActivityBtn");
+  const planningBoardView = document.getElementById("planningBoardView");
+  const planOverviewInline = document.getElementById("planOverviewInline");
+  const planOverviewTableWrap = document.getElementById("planOverviewTableWrap");
+  const trialBoardInline = document.getElementById("trialBoardInline");
+  const trialBoardTableWrap = document.getElementById("trialBoardTableWrap");
+  const trialBoardStatus = document.getElementById("trialBoardStatus");
+  const trialBoardAddBtn = document.getElementById("trialBoardAddBtn");
+  const trialBoardSaveBtn = document.getElementById("trialBoardSaveBtn");
+  const planningActivityInline = document.getElementById("planningActivityInline");
+  const planningActivityStatus = document.getElementById("planningActivityStatus");
+  const planningActivityRefreshBtn = document.getElementById("planningActivityRefreshBtn");
+  const planningActivitySearch = document.getElementById("planningActivitySearch");
+  const planningActivityActionFilter = document.getElementById("planningActivityActionFilter");
+  const planningActivityMachineFilter = document.getElementById("planningActivityMachineFilter");
+  const planningActivityDateFilter = document.getElementById("planningActivityDateFilter");
+  const planningActivityTableWrap = document.getElementById("planningActivityTableWrap");
   const jobQueueSummary = document.getElementById("jobQueueSummary");
   const jobQueueTableWrap = document.getElementById("jobQueueTableWrap");
+  const planningQueueToggle = document.getElementById("planningQueueToggle");
+  const planningQueueToggleCount = document.getElementById("planningQueueToggleCount");
+  const planningQueueBackdrop = document.getElementById("planningQueueBackdrop");
+  const planningQueuePanel = document.getElementById("planningQueuePanel");
+  const planningQueueClose = document.getElementById("planningQueueClose");
   const planningJobInput = document.getElementById("planningJobInput");
   const planningLookupBtn = document.getElementById("planningLookupBtn");
   const planningClearBtn = document.getElementById("planningClearBtn");
@@ -8480,10 +9386,9 @@ DASHBOARD_HTML = """
   const planningQueueTableWrap = document.getElementById("planningQueueTableWrap");
   const planningLowStockLimit = document.getElementById("planningLowStockLimit");
   const planningLowStockSearch = document.getElementById("planningLowStockSearch");
-  const planningLowStockMin = document.getElementById("planningLowStockMin");
-  const planningLowStockMax = document.getElementById("planningLowStockMax");
   const planningLowStockRefreshBtn = document.getElementById("planningLowStockRefreshBtn");
   const planningLowStockList = document.getElementById("planningLowStockList");
+  const planningMismatchAlerts = document.getElementById("planningMismatchAlerts");
   const finishedShiftQueueList = document.getElementById("finishedShiftQueueList");
   const finishShiftViewSelect = document.getElementById("finishShiftViewSelect");
   const finishedShiftGridViewBtn = document.getElementById("finishedShiftGridViewBtn");
@@ -8650,15 +9555,27 @@ DASHBOARD_HTML = """
     return /^M0*4\\d{2}$/.test(machineCode);
   }
   const DEFAULT_MACHINE_CODES = Object.keys(MACHINE_NAME_MAP);
+  function planningLaneMachineCode(code){
+    const machineCode = String(code || "").trim().toUpperCase();
+    const factory4Match = machineCode.match(/^M004(\\d{2})$/);
+    if(factory4Match){
+      const laneCode = `M001${factory4Match[1]}`;
+      if(ADDITIONAL_MACHINE_CODES.has(laneCode)) return laneCode;
+    }
+    return machineCode;
+  }
   let latestState = { sessions: [], active_ttl_seconds: 30 };
+  let activePlanOverviewFactory = "F03";
   let planningBoard = { lanes: { BACKLOG: [] }, updated_at_utc: "" };
   let planningSaveTimer = null;
   let planningLocalDirty = false;
+  let planningPendingActivities = [];
   let planningDragActive = false;
   let planningDeferredState = null;
   let planningDropCompleted = false;
   let planningMachineDropScrollLeft = {};
   let planningMachineScrollActiveUntil = 0;
+  let planningMismatchFocus = { cardId:"", lane:"", until:0, scrollPending:false };
   let operatorDirectoryState = [];
   let operatorDirectoryFilter = "ALL";
   const machineCardEls = new Map();
@@ -8728,6 +9645,10 @@ DASHBOARD_HTML = """
   let productSuggestionIndex = -1;
   const PRODUCT_SUGGEST_LIMIT = 8;
   let lowStockItemsState = [];
+  const planningExpandedProductFamilies = new Set();
+  let trialBoardState = { rows: [], updated_at_utc: "" };
+  let trialBoardDirty = false;
+  let planningActivityState = [];
   let generatedQrState = {
     jobKey: "",
     payload: "",
@@ -8907,9 +9828,11 @@ DASHBOARD_HTML = """
 
   function jobSecondaryLabel(row){
     const item = (row && typeof row === "object") ? row : {};
-    const sku = jobSku(item);
+    const explicitSku = firstValue(item.product_sku, item.sku, "");
+    const catalogSku = explicitSku ? "" : productCatalogSku(item.product_id);
+    const sku = firstValue(explicitSku, catalogSku, "");
     if(sku) return `SKU ${sku}`;
-    return item.job_code ? `Job ${item.job_code}` : "-";
+    return "SKU -";
   }
 
   function jobProductMoldLabel(row){
@@ -10511,7 +11434,9 @@ DASHBOARD_HTML = """
       </div>
     `;
 
-    machineDetailTitle.textContent = "Machine Details";
+    machineDetailTitle.textContent = session._linkage_display_role
+      ? `${session._linkage_display_role} Details`
+      : "Machine Details";
     if(machineDetailStatusSelect) machineDetailStatusSelect.value = manualStatus;
     if(machineDetailStatusReason) machineDetailStatusReason.value = manualReason;
     if(machineDetailStatusRemarks) machineDetailStatusRemarks.value = manualRemarks;
@@ -13652,7 +14577,7 @@ DASHBOARD_HTML = """
     planningOpsSummary.innerHTML = `
       <div class="planning-ops-metric"><div class="k">Active Jobs</div><div class="v">${esc(list.length)}</div><div class="s">${esc(runningRows.length)} running now</div></div>
       <div class="planning-ops-metric"><div class="k">Active Machines</div><div class="v">${esc(activeMachineCodes.size)}</div><div class="s">${esc(machineTotal)} configured lanes</div></div>
-      <div class="planning-ops-metric warn"><div class="k">Low Stock</div><div class="v">${esc(lowStockCount)}</div><div class="s">IMS recommendations loaded</div></div>
+      <div class="planning-ops-metric warn"><div class="k">Product Items</div><div class="v">${esc(lowStockCount)}</div><div class="s">A/B/C classifications applied</div></div>
       <div class="planning-ops-metric ${nearFinishRows.length ? "warn" : "good"}"><div class="k">Nearly Finished</div><div class="v">${esc(nearFinishRows.length)}</div><div class="s">${nextFinish ? `${esc(nextFinish.machine_name || nextFinish.machine_code || "-")} in ${esc(fmtDowntimeSeconds(preferredQueueRemaining(nextFinish)))}` : "No jobs under 2h"}</div></div>
       <div class="planning-ops-metric"><div class="k">Utilization</div><div class="v">${esc(utilization)}%</div><div class="s">Running machines / lanes</div></div>
     `;
@@ -13714,16 +14639,17 @@ DASHBOARD_HTML = """
   function renderJobQueue(rows){
     if(!jobQueueTableWrap) return;
     const list = Array.isArray(rows) ? rows : [];
+    if(planningQueueToggleCount) planningQueueToggleCount.textContent = list.length > 99 ? "99+" : String(list.length);
     const runningRows = queueRunningRows(list);
     const disconnectedRows = list.filter(r => String(r?.status || "").trim() === "DISCONNECTED");
     const remainingTotal = runningRows.reduce((sum, r) => sum + Number(r?.remaining_qty || 0), 0);
 
     if(jobQueueSummary){
       jobQueueSummary.innerHTML = `
-        <div class="job-queue-metric"><div class="k">Active Jobs</div><div class="v">${esc(list.length)}</div></div>
-        <div class="job-queue-metric"><div class="k">Running Jobs</div><div class="v">${esc(runningRows.length)}</div></div>
-        <div class="job-queue-metric"><div class="k">Disconnected</div><div class="v">${esc(disconnectedRows.length)}</div></div>
-        <div class="job-queue-metric"><div class="k">Remaining Qty</div><div class="v">${esc(remainingTotal)}</div></div>
+        <div class="jq-summary-card"><div class="jq-summary-icon"><svg viewBox="0 0 24 24"><path d="M4 17l5-5 4 3 7-8"/><path d="M16 7h4v4"/></svg></div><div><div class="k">Active Jobs</div><div class="v">${esc(list.length)}</div><div class="sub">${esc(runningRows.length)} running now</div></div></div>
+        <div class="jq-summary-card"><div class="jq-summary-icon green"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M10 8l6 4-6 4z"/></svg></div><div><div class="k">Running Jobs</div><div class="v">${esc(runningRows.length)}</div><div class="sub">${esc(runningRows.length)} running now</div></div></div>
+        <div class="jq-summary-card"><div class="jq-summary-icon red"><svg viewBox="0 0 24 24"><path d="M10 13a5 5 0 007 0l2-2a5 5 0 00-7-7l-1 1"/><path d="M14 11a5 5 0 00-7 0l-2 2a5 5 0 007 7l1-1"/></svg></div><div><div class="k">Disconnected</div><div class="v">${esc(disconnectedRows.length)}</div><div class="sub">${disconnectedRows.length ? `${esc(disconnectedRows.length)} need attention` : "No disconnected"}</div></div></div>
+        <div class="jq-summary-card"><div class="jq-summary-icon purple"><svg viewBox="0 0 24 24"><path d="M4 7l8-4 8 4-8 4z"/><path d="M4 7v10l8 4 8-4V7M12 11v10"/></svg></div><div><div class="k">Remaining Qty</div><div class="v">${esc(Number(remainingTotal).toLocaleString())}</div><div class="sub">Across active jobs</div></div></div>
       `;
     }
 
@@ -13733,67 +14659,55 @@ DASHBOARD_HTML = """
     }
 
     jobQueueTableWrap.innerHTML = `
-      <table class="data-table">
+      <table class="planning-job-queue-table">
+        <colgroup><col style="width:27%"><col style="width:13%"><col style="width:24%"><col style="width:11%"><col style="width:13%"><col style="width:12%"></colgroup>
         <thead>
           <tr>
-            <th>Machine</th>
-            <th>Job</th>
-            <th>Operator</th>
+            <th>Machine / Job</th>
             <th>Started</th>
-            <th>Status</th>
-            <th>Produced</th>
-            <th>Target</th>
-            <th>Remaining</th>
-            <th>Time Remaining</th>
+            <th>Progress</th>
+            <th>Time Left</th>
             <th>Ends</th>
-            <th>Act Cycle ETA</th>
-            <th>Pack Cycle ETA</th>
+            <th>Cycle</th>
           </tr>
         </thead>
         <tbody>
           ${list.map((row) => {
-            const actCycleText = row?.act_cycle_seconds ? `${Number(row.act_cycle_seconds).toFixed(2)} sec | ${row?.act_qty_per_shift ?? "-"} / shift` : "-";
-            const packCycleText = row?.live_cycle_seconds ? `${Number(row.live_cycle_seconds).toFixed(2)} sec | ${row?.live_qty_per_shift ?? "-"} / shift` : "-";
             const noTarget = Number(row?.target_qty || 0) <= 0;
             const isDisconnected = !Boolean(row?.is_connected);
             const excessQty = Math.max(0, Number(row?.overrun_qty || 0));
             const targetReached = Boolean(row?.target_reached) || (!noTarget && Number(row?.remaining_qty || 0) <= 0);
-            const targetStateText = excessQty > 0
-              ? `Target reached — excess +${excessQty}`
-              : "Target reached";
             const startText = row?.job_started_at ? fmtDateLocal(row.job_started_at) : "-";
-            const actEtaDate = row?.expected_finish_act_utc ? fmtDateLocal(row.expected_finish_act_utc) : "";
-            const actEtaLeft = row?.expected_finish_act_utc ? `${fmtDowntimeSeconds(row?.remaining_seconds_act)} left${isDisconnected ? " (frozen)" : ""}` : (noTarget ? "No target qty" : (targetReached ? targetStateText : (actCycleText === "-" ? "No act cycle time" : targetStateText)));
-            const packEtaDate = row?.expected_finish_pack_utc ? fmtDateLocal(row.expected_finish_pack_utc) : "";
-            const packEtaLeft = row?.expected_finish_pack_utc ? `${fmtDowntimeSeconds(row?.remaining_seconds_pack)} left${isDisconnected ? " (frozen)" : ""}` : (noTarget ? "No target qty" : (targetReached ? targetStateText : (packCycleText === "-" ? "No pack cycle time" : targetStateText)));
             const preferredRemaining = row?.remaining_seconds_pack ?? row?.remaining_seconds_act ?? null;
             const preferredEnd = row?.expected_finish_pack_utc || row?.expected_finish_act_utc || "";
-            const remainingText = preferredRemaining != null
-              ? `${fmtDowntimeSeconds(preferredRemaining)}${isDisconnected ? " (frozen)" : ""}`
-              : (noTarget ? "No target qty" : (targetReached ? targetStateText : "-"));
-            const endText = preferredEnd ? fmtDateLocal(preferredEnd) : (noTarget ? "No target qty" : (targetReached ? targetStateText : "-"));
+            const remainingText = preferredRemaining != null ? fmtDowntimeSeconds(preferredRemaining) : "-";
+            const endText = preferredEnd ? fmtDateLocal(preferredEnd) : "-";
+            const produced = Math.max(0, Number(row?.produced_now || 0));
+            const target = Math.max(0, Number(row?.target_qty || 0));
+            const progressPct = target > 0 ? Math.max(0, Math.min(100, produced / target * 100)) : 0;
+            const cycleSeconds = Number(row?.act_cycle_seconds || row?.live_cycle_seconds || 0);
+            const cavity = Math.max(1, Number(row?.cavity_count || 1));
+            const hourlyRate = cycleSeconds > 0 ? Math.floor((3600 / cycleSeconds) * cavity) : 0;
+            const cycleText = cycleSeconds > 0 ? `${cycleSeconds.toFixed(1)} sec` : "No activity cycle time";
+            const machineName = row?.machine_name || row?.machine_code || "-";
+            const jobName = firstValue(row?.job_name, row?.job_code, "-");
+            const jobSub = jobSecondaryLabel(row);
             const targetWarning = targetReached
               ? `<span class="queue-target-warning ${excessQty > 0 ? "excess" : ""}">${esc(excessQty > 0 ? `TARGET REACHED • EXCESS +${excessQty}` : "TARGET REACHED")}</span>`
               : "";
             return `
               <tr>
-                <td>${esc(row?.machine_name || row?.machine_code || "-")}<br><span class="muted">${esc(row?.machine_code || "-")}</span></td>
-                <td>${esc(jobDisplayName(row, "-"))}<br><span class="muted">${esc(jobSecondaryLabel(row))}</span></td>
-                <td>${esc(displayNameForId(row?.operator_id || "-"))}${row?.last_seen_utc ? `<br><span class="muted">Last seen ${esc(fmtDateLocal(row.last_seen_utc))}</span>` : ""}</td>
-                <td>${esc(startText)}</td>
-                <td>${queueStatusBadge(row?.status || "RUNNING")}${targetWarning ? `<br>${targetWarning}` : ""}</td>
-                <td>${esc(row?.produced_now ?? 0)}<br><span class="muted">Pack ${esc(row?.pack_count ?? 0)}</span></td>
-                <td>${esc(row?.target_qty ?? 0)}<br><span class="muted">Cavity ${esc(row?.cavity_count ?? 1)}</span></td>
-                <td>${esc(row?.remaining_qty ?? 0)}${excessQty > 0 ? `<br><span class="queue-target-warning excess">EXCESS +${esc(excessQty)}</span>` : ""}</td>
-                <td>${esc(remainingText)}</td>
-                <td>${esc(endText)}</td>
-                <td>${actEtaDate ? `${esc(actEtaDate)}<br>` : ""}<span class="muted">${esc(actEtaLeft)}</span><br><span class="muted">${esc(actCycleText)}</span></td>
-                <td>${packEtaDate ? `${esc(packEtaDate)}<br>` : ""}<span class="muted">${esc(packEtaLeft)}</span><br><span class="muted">${esc(packCycleText)}</span></td>
+                <td><div class="jq-machine-cell"><div class="jq-machine-icon">M</div><div><div class="jq-primary">${esc(machineName)} · ${esc(row?.machine_code || "-")}</div><div class="jq-secondary">Job ${esc(jobName)}</div><div class="jq-secondary">${esc(jobSub)}</div></div></div></td>
+                <td><div class="jq-primary">${esc(startText)}</div></td>
+                <td><div class="jq-progress-head"><span>${esc(produced.toLocaleString())} / ${esc(target.toLocaleString())}</span><span>${esc(progressPct.toFixed(1))}%</span></div><div class="jq-progress-track"><span class="jq-progress-fill ${isDisconnected ? "offline" : ""}" style="width:${esc(progressPct.toFixed(2))}%"></span></div><div class="jq-secondary">Pack ${esc(row?.pack_count ?? 0)} &nbsp;·&nbsp; Cavity ${esc(cavity)}</div>${targetWarning}</td>
+                <td><span class="jq-inline-icon">◉</span><span class="jq-primary">${esc(remainingText)}</span></td>
+                <td><span class="jq-inline-icon">▣</span><span class="jq-primary">${esc(endText)}</span></td>
+                <td><span class="jq-inline-icon jq-cycle-icon">◷</span><span class="jq-primary">${esc(cycleText)}</span>${hourlyRate ? `<div class="jq-secondary">${esc(hourlyRate.toLocaleString())} / hr</div>` : '<div class="jq-secondary">-</div>'}</td>
               </tr>
             `;
           }).join("")}
         </tbody>
-      </table>
+      </table><div class="jq-queue-footer"><span>Showing ${esc(list.length)} of ${esc(list.length)} jobs</span><span class="jq-auto-refresh">Auto refresh: 10 sec</span></div>
     `;
   }
 
@@ -14171,41 +15085,169 @@ DASHBOARD_HTML = """
     planningStatus.style.color = isError ? "#b91c1c" : "#64748b";
   }
 
+  function planningCardTonnage(card){
+    const job = card || {};
+    const rawSource = job.raw_payload || job.job_payload;
+    const raw = rawSource && typeof rawSource === "object" ? rawSource : {};
+    const data = raw.data && typeof raw.data === "object" ? raw.data : raw;
+    const details = data.job_details && typeof data.job_details === "object" ? data.job_details : {};
+    const rawJob = data.job && typeof data.job === "object" ? data.job : {};
+    const productId = String(job.product_id || "").trim();
+    const productSku = String(job.product_sku || job.sku || "").trim();
+    const catalogItem = (lowStockItemsState || []).find(item =>
+      (productId && String(item?.product_id || "").trim() === productId)
+      || (productSku && String(item?.sku || "").trim() === productSku)
+    ) || {};
+    const candidates = [
+      job.job_api_tonnage, job.tonnage, job.machine_tons, job.custom_16,
+      details.machine_tons, details.custom_16,
+      rawJob.machine_tons, rawJob.custom_16,
+      catalogItem.tonnage, catalogItem.machine_tons, catalogItem.custom_16,
+    ];
+    for(const value of candidates){
+      const text = String(value ?? "").trim();
+      if(text && planningTonnageNumber(text) > 0) return text;
+    }
+    return "";
+  }
+
+  function planningTonnageNumber(value){
+    const match = String(value || "").replace(/,/g, "").match(/\\d+(?:\\.\\d+)?/);
+    const parsed = match ? Number(match[0]) : 0;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
   function planningCardHtml(card, lane, queueIndex=null){
     const job = card || {};
     const title = job.job_ref || job.job_name || job.job_id || "Planned Job";
     const roleLabel = queueIndex === 0 ? "NEXT" : (Number.isInteger(queueIndex) ? `QUEUE ${queueIndex + 1}` : (job.source || "PLAN"));
     const roleClass = queueIndex === 0 ? "next" : (Number.isInteger(queueIndex) ? "queue" : "");
     const cardClass = queueIndex === 0 ? " next-job" : (Number.isInteger(queueIndex) ? " queue-job" : "");
+    const itemTonnage = planningCardTonnage(job);
+    const abcClass = String(job.abc_class || "").trim().toUpperCase();
+    const abcBadge = ["A", "B", "C"].includes(abcClass) ? `<span class="abc-class-badge class-${abcClass.toLowerCase()}" title="ABC class ${esc(abcClass)}">${esc(abcClass)}</span>` : "";
+    const relationBadge = Number(job.related_child_count || 0) > 0
+      ? `<span class="product-relation-badge parent">PARENT · ${esc(job.related_child_count)}</span>`
+      : (planningItemIsChild(job) ? '<span class="product-relation-badge child">CHILD</span>' : "");
     const product = [job.product_sku, job.product_name].filter(Boolean).join(" - ") || job.product_id || "-";
-    const details = [
+    const productLine = `<span class="planning-product-line"><span>Product:</span> <span class="planning-product-name">${esc(product)}</span></span>`;
+    const details = (["LOW STOCK", "ABC ITEM", "PRODUCT"].includes(String(job.source || "")) ? [
+      productLine,
+      `Current stock: ${job.low_stock_total ?? 0}${job.low_stock_unit ? ` ${job.low_stock_unit}` : ""}`,
+    ] : [
       Number.isInteger(queueIndex) ? (queueIndex === 0 ? "Status: next after ongoing job" : `Status: queued position ${queueIndex + 1}`) : "",
-      `Product: ${product}`,
+      productLine,
       job.mold ? `Mold: ${job.mold}` : "",
       job.color ? `Color: ${job.color}` : "",
       job.std_cycle_time ? `Cycle: ${job.std_cycle_time}` : "",
       job.request_qty ? `Qty: ${job.request_qty}` : "",
-      job.source === "LOW STOCK" ? `Current stock: ${job.low_stock_total ?? 0}${job.low_stock_unit ? ` ${job.low_stock_unit}` : ""}` : "",
-      job.source === "LOW STOCK" && job.low_stock_qty_source ? `Source: IMS ${job.low_stock_qty_source}` : "",
-      job.source === "LOW STOCK" ? `Threshold: ${job.low_stock_threshold ?? "-"}` : "",
-      job.tonnage ? `Tonnage: ${job.tonnage}` : "",
-    ].filter(Boolean).join("<br>");
-    return `<div class="planning-card${cardClass}" draggable="true" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip ${esc(roleClass)}">${esc(roleLabel)}</span></div><div class="planning-meta">${details || "No BMS details available."}</div><div class="planning-card-actions"><button class="planning-remove" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}">Remove</button></div></div>`;
+    ]).filter(Boolean).join("<br>");
+    const tonnageTitle = job.tonnage_source ? `Required machine tonnage · ${job.tonnage_source}` : "Required machine tonnage";
+    return `<div class="planning-card${cardClass}" draggable="true" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><div class="planning-card-top-actions">${relationBadge}${abcBadge}${itemTonnage ? `<span class="planning-item-tonnage" title="${esc(tonnageTitle)}">${esc(itemTonnage)} T</span>` : ""}<span class="planning-chip ${esc(roleClass)}">${esc(roleLabel)}</span><button class="planning-remove" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}" title="Remove ${esc(title)}" aria-label="Remove ${esc(title)}">&times;</button></div></div><div class="planning-meta">${details || "No BMS details available."}</div></div>`;
   }
 
   function livePlanningCardHtml(session){
     const title = jobDisplayName(session, "Running Job");
-    return `<div class="planning-card live"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><span class="planning-chip ongoing">ONGOING</span></div><div class="planning-meta">Status: running now<br>Operator: ${esc(session.operator_id || "-")}<br>Counter Start: ${esc(machineCounterStartValue(session))}<br>Pack: ${esc(session.pack_total || 0)} | Good: ${esc(session.good_total || 0)} | Reject: ${esc(session.reject_total || 0)}</div></div>`;
+    const itemTonnage = planningCardTonnage(session);
+    const machineCode = String(session?.machine_code || "").trim();
+    const jobCode = String(session?.job_code || "").trim();
+    const queueRow = (Array.isArray(latestState?.job_queue) ? latestState.job_queue : []).find(row =>
+      planningLaneMachineCode(row?.machine_code) === planningLaneMachineCode(machineCode)
+      && (!jobCode || String(row?.job_code || "").trim() === jobCode)
+    ) || null;
+    const targetQty = Math.max(0, Number(queueRow?.target_qty || 0));
+    const producedQty = Math.max(0, Number(queueRow?.produced_now ?? (Number(session?.good_total || 0) + Number(session?.butal_total || 0))));
+    const progressPct = targetQty > 0 ? Math.max(0, Math.min(100, (producedQty / targetQty) * 100)) : 0;
+    const finishUtc = preferredQueueFinish(queueRow);
+    const remaining = preferredQueueRemaining(queueRow);
+    const finishText = finishUtc ? fmtDateLocal(finishUtc) : "Estimate unavailable";
+    const progressCaption = `${finishText}${remaining != null && Number(remaining) > 0 ? ` · ${fmtDowntimeSeconds(remaining)} left` : ""}`;
+    const operator = displayNameForId(session?.operator_id || "-");
+    return `
+      <div class="planning-card live">
+        <div class="planning-card-top"><div class="planning-job">${esc(title)}</div><div class="planning-card-top-actions">${itemTonnage ? `<span class="planning-item-tonnage" title="Required machine tonnage">${esc(itemTonnage)} T</span>` : ""}<span class="planning-chip ongoing">ONGOING</span></div></div>
+        <div class="planning-live-operator" title="${esc(operator)}">Operator: ${esc(operator)}</div>
+        <div class="planning-live-progress">
+          <div class="planning-live-progress-head"><span>Whole job progress</span><strong>${esc(progressPct.toFixed(1))}%</strong></div>
+          <div class="planning-live-progress-track"><span class="planning-live-progress-fill" style="width:${esc(progressPct.toFixed(2))}%"></span></div>
+          <div class="planning-live-progress-caption" title="${esc(progressCaption)}">Est. finish: ${esc(progressCaption)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function planningItemMatchesSearch(item, query){
+    const q = String(query || "").trim().toLowerCase();
+    if(!q) return true;
+    const identityValues = [
+      item?.sku, item?.product_sku, item?.product_id, item?.name, item?.product_name,
+      item?.job_ref, item?.job_name, item?.job_id, item?.parent_sku, item?.category_name,
+    ];
+    const identityHaystack = identityValues.map(value => String(value ?? "").toLowerCase()).join(" ");
+    const haystack = [identityHaystack, item?.tonnage, item?.abc_class, item?.serving_category, item?.serving_rate]
+      .map(value => String(value ?? "").toLowerCase()).join(" ");
+    if(haystack.includes(q)) return true;
+    const tokens = q.split(/[^a-z0-9]+/).filter(Boolean);
+    return tokens.length > 1 && identityValues.some(value => {
+      const field = String(value ?? "").toLowerCase();
+      return tokens.every(token => field.includes(token));
+    });
+  }
+
+  function planningRelationKey(value){
+    return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  }
+
+  const PLANNING_COMPONENT_TOKENS = new Set([
+    "BODY", "COVER", "HANDLE", "DIVIDER", "BACK", "CONNECTOR", "CORRUGATED",
+    "SIDEWALL", "FRAME", "LOCK", "WHEEL", "LID", "CAP", "BASE", "BOTTOM",
+    "TOP", "TRAY", "INSERT", "PANEL", "DOOR", "LEG", "SEAT", "ARM", "RIM",
+  ]);
+
+  function planningRelationParts(item){
+    const sku = planningRelationKey(item?.sku || item?.product_sku || item?.job_ref || item?.job_name);
+    const tokens = sku ? sku.split("-").filter(Boolean) : [];
+    let markerIndex = 0;
+    if(tokens[0] === "VO") markerIndex = 1;
+    const hasWMarker = tokens[markerIndex] === "W";
+    const components = tokens.filter(token => PLANNING_COMPONENT_TOKENS.has(token));
+    const identity = tokens.filter((token, index) => !(index === markerIndex && hasWMarker) && !PLANNING_COMPONENT_TOKENS.has(token));
+    return {
+      sku,
+      hasWMarker,
+      components,
+      signature: identity.join("-"),
+    };
+  }
+
+  function planningItemIsChild(item){
+    if(/^WIP(?:\b|-)/i.test(String(item?.category_name || "").trim())) return true;
+    const relation = planningRelationParts(item);
+    return relation.hasWMarker && relation.components.length > 0;
+  }
+
+  function planningRelationFamilyKeys(item){
+    const keys = new Set();
+    const relation = planningRelationParts(item);
+    const isChild = planningItemIsChild(item);
+    const parentKey = planningRelationKey(item?.parent_sku);
+    if(relation.signature) keys.add(`DERIVED:${relation.signature}`);
+    if(isChild && parentKey) keys.add(`DIRECT:${parentKey}`);
+    if(!isChild && relation.sku) keys.add(`DIRECT:${relation.sku}`);
+    return keys;
+  }
+
+  function planningSetsOverlap(left, right){
+    for(const key of left){
+      if(right.has(key)) return true;
+    }
+    return false;
   }
 
   function renderLowStockRecommendations(items, meta = {}){
     if(!planningLowStockList) return;
     if(Array.isArray(items)) lowStockItemsState = items;
     const q = String(planningLowStockSearch?.value || "").trim().toLowerCase();
-    const minStockRaw = String(planningLowStockMin?.value || "").trim();
-    const maxStockRaw = String(planningLowStockMax?.value || "").trim();
-    const minStock = minStockRaw === "" ? null : Number(minStockRaw);
-    const maxStock = maxStockRaw === "" ? null : Number(maxStockRaw);
     const limit = Math.max(1, Number(planningLowStockLimit?.value || 15));
     planningBoard = normalizePlanningBoard(planningBoard);
     const backlogKeys = new Set((planningBoard.lanes.BACKLOG || []).flatMap(card => [
@@ -14213,25 +15255,89 @@ DASHBOARD_HTML = """
       String(card?.product_sku || "").trim(),
       String(card?.sku || "").trim(),
     ]).filter(Boolean));
-    const rows = (Array.isArray(items) ? items : lowStockItemsState).filter(item => {
+    const catalogRows = (Array.isArray(items) ? items : lowStockItemsState);
+    const availableRows = catalogRows.filter(item => {
       const productId = String(item?.product_id || "").trim();
       const sku = String(item?.sku || "").trim();
       if((productId && backlogKeys.has(productId)) || (sku && backlogKeys.has(sku))) return false;
-      const stock = Number(item?.total_stock ?? 0);
-      if(minStock !== null && Number.isFinite(minStock) && stock < minStock) return false;
-      if(maxStock !== null && Number.isFinite(maxStock) && stock > maxStock) return false;
-      if(!q) return true;
-      return [item?.sku, item?.product_id, item?.name, item?.tonnage]
-        .some(v => String(v || "").toLowerCase().includes(q));
+      return true;
     });
-    const queuedCards = planningLaneCards("BACKLOG");
+    const directMatches = availableRows.filter(item => planningItemMatchesSearch(item, q));
+    let rows = directMatches;
+    if(q && directMatches.length){
+      const familyKeys = new Set();
+      directMatches.forEach(item => {
+        planningRelationFamilyKeys(item).forEach(key => familyKeys.add(key));
+      });
+      const directSet = new Set(directMatches);
+      rows = availableRows.filter(item => {
+        if(directSet.has(item)) return true;
+        return planningSetsOverlap(planningRelationFamilyKeys(item), familyKeys);
+      });
+      rows.sort((a, b) => {
+        const aDirect = directSet.has(a) ? 0 : 1;
+        const bDirect = directSet.has(b) ? 0 : 1;
+        if(aDirect !== bDirect) return aDirect - bDirect;
+        const aChild = planningItemIsChild(a) ? 1 : 0;
+        const bChild = planningItemIsChild(b) ? 1 : 0;
+        if(aChild !== bChild) return aChild - bChild;
+        return String(a?.sku || "").localeCompare(String(b?.sku || ""));
+      });
+    }
+    const childrenByFamily = new Map();
+    catalogRows.forEach((item, index) => {
+      if(!planningItemIsChild(item)) return;
+      const childId = String(item?.product_id || item?.sku || index);
+      planningRelationFamilyKeys(item).forEach(key => {
+        if(!childrenByFamily.has(key)) childrenByFamily.set(key, new Set());
+        childrenByFamily.get(key).add(childId);
+      });
+    });
+    const catalogByChildId = new Map();
+    catalogRows.forEach((item, index) => catalogByChildId.set(String(item?.product_id || item?.sku || index), item));
+    const relatedChildItems = item => {
+      if(planningItemIsChild(item)) return [];
+      const ids = new Set();
+      planningRelationFamilyKeys(item).forEach(key => {
+        (childrenByFamily.get(key) || []).forEach(id => ids.add(id));
+      });
+      return Array.from(ids).map(id => catalogByChildId.get(id)).filter(Boolean).sort((a, b) =>
+        String(a?.sku || "").localeCompare(String(b?.sku || ""))
+      );
+    };
+    const relatedChildren = item => relatedChildItems(item).length;
+    const queuedCards = planningLaneCards("BACKLOG").filter(card =>
+      !planningCardIsCatalogProduct(card) && planningItemMatchesSearch(card, q)
+    );
     const queuedHtml = queuedCards.length ? queuedCards.map(c => planningCardHtml(c, "BACKLOG")).join("") : "";
-    if(!rows.length && !queuedCards.length){
-      planningLowStockList.innerHTML = `<div class="planning-empty">${esc(meta.error || "No matching low-stock item.")}</div>`;
+    if(!rows.length && !queuedHtml){
+      planningLowStockList.innerHTML = `<div class="planning-empty">${esc(meta.error || "No matching product item.")}</div>`;
       return;
     }
-    const visible = rows.slice(0, limit);
-    const lowStockHtml = visible.map((item, idx) => {
+    const parentRows = rows.filter(item => !planningItemIsChild(item) && relatedChildren(item) > 0);
+    const visibleParentFamilyKeys = new Set();
+    parentRows.forEach(parent => planningRelationFamilyKeys(parent).forEach(key => visibleParentFamilyKeys.add(key)));
+    const groupedRows = rows.filter(item => {
+      if(!planningItemIsChild(item)) return true;
+      return !planningSetsOverlap(planningRelationFamilyKeys(item), visibleParentFamilyKeys);
+    });
+    const visible = groupedRows.slice(0, q ? Math.max(limit, 50) : limit);
+    const itemByDragKey = new Map();
+    const itemDragKey = (item, index = 0) => {
+      const key = String(item?.product_id || item?.sku || item?.product_sku || index);
+      itemByDragKey.set(key, item);
+      return key;
+    };
+    const familyAccordionKey = item => String(item?.product_id || item?.sku || item?.product_sku || "");
+    if(q){
+      const directChildren = directMatches.filter(planningItemIsChild);
+      visible.forEach(item => {
+        if(!planningItemIsChild(item) && directChildren.some(child => planningSetsOverlap(planningRelationFamilyKeys(item), planningRelationFamilyKeys(child)))){
+          planningExpandedProductFamilies.add(familyAccordionKey(item));
+        }
+      });
+    }
+    const stockCardHtml = (item, options = {}) => {
       const wh = Array.isArray(item.warehouses) ? item.warehouses : [];
       const whText = wh
         .filter(x => Number(x?.qty || 0) > 0)
@@ -14239,29 +15345,76 @@ DASHBOARD_HTML = """
         .map(x => `${x.warehouse_name || x.warehouse_id}: ${x.qty}${x.unit ? ` ${x.unit}` : ""}`)
         .join(" | ") || "No warehouse qty";
       const title = item.sku || item.product_id || "Product";
+      const abcClass = String(item.abc_class || "").trim().toUpperCase();
+      const abcTitle = [`ABC class ${abcClass}`, item.serving_category ? `Category: ${item.serving_category}` : "", item.serving_rate !== "" && item.serving_rate != null ? `Serving rate: ${item.serving_rate}` : ""].filter(Boolean).join(" · ");
+      const isChild = planningItemIsChild(item);
+      const childCount = relatedChildren(item);
+      const canExpand = !options.nested && childCount > 0;
+      const accordionKey = canExpand ? familyAccordionKey(item) : "";
+      const expanded = canExpand && planningExpandedProductFamilies.has(accordionKey);
+      const relationBadge = childCount
+        ? `<span class="product-relation-badge parent">PARENT · ${childCount}</span>`
+        : (isChild ? '<span class="product-relation-badge child">CHILD</span>' : "");
       return `
-        <div class="stock-rec-card" draggable="true" data-rec-index="${idx}">
+        <div class="stock-rec-card${canExpand ? " has-children" : ""}" draggable="true" data-product-key="${esc(itemDragKey(item, options.index))}"${canExpand ? ` data-family-toggle="${esc(accordionKey)}" aria-expanded="${expanded ? "true" : "false"}"` : ""}>
           <div class="stock-rec-top">
             <div class="stock-rec-sku">${esc(title)}</div>
-            <span class="stock-rec-badge">${esc(item.total_stock ?? 0)}${item.unit ? ` ${esc(item.unit)}` : ""}</span>
+            <div class="stock-rec-top-actions">
+              ${canExpand ? `<button class="stock-rec-expand" type="button" title="${expanded ? "Hide" : "Show"} production components" aria-label="${expanded ? "Hide" : "Show"} production components"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 7.5 5 5 5-5"/></svg></button>` : ""}
+              ${relationBadge}
+              ${["A", "B", "C"].includes(abcClass) ? `<span class="abc-class-badge class-${abcClass.toLowerCase()}" title="${esc(abcTitle)}">${esc(abcClass)}</span>` : ""}
+              <span class="stock-rec-badge">${esc(item.total_stock ?? 0)}${item.unit ? ` ${esc(item.unit)}` : ""}</span>
+            </div>
           </div>
           <div class="stock-rec-name">${esc(item.name || "No product name")}</div>
           <div class="stock-rec-meta">
             <span>ID ${esc(item.product_id || "-")}</span>
-            ${item.tonnage ? `<span>${esc(item.tonnage)} tons</span>` : ""}
+            <span>${item.tonnage ? `${esc(item.tonnage)} tons` : "Tonnage unavailable"}</span>
+            ${isChild && item.parent_sku ? `<span>Component family ${esc(item.parent_sku)}</span>` : ""}
+            ${childCount ? `<span>${esc(childCount)} production component${childCount === 1 ? "" : "s"}</span>` : ""}
             ${item.qty_source ? `<span>IMS ${esc(item.qty_source)}</span>` : ""}
-            <span>Range ${esc(minStockRaw || "0")}-${esc(maxStockRaw || item.threshold || "-")}</span>
           </div>
           <div class="planning-meta">${esc(whText)}</div>
         </div>
       `;
+    };
+    const lowStockHtml = visible.map((item, idx) => {
+      const children = relatedChildItems(item);
+      if(!children.length) return stockCardHtml(item, { index: idx });
+      const accordionKey = familyAccordionKey(item);
+      const expanded = planningExpandedProductFamilies.has(accordionKey);
+      return `<div class="stock-rec-family${expanded ? " expanded" : ""}" data-family="${esc(accordionKey)}">
+        ${stockCardHtml(item, { index: idx })}
+        <div class="stock-rec-children" aria-hidden="${expanded ? "false" : "true"}"><div class="stock-rec-children-inner">
+          ${children.map((child, childIndex) => stockCardHtml(child, { nested: true, index: `${idx}-${childIndex}` })).join("")}
+        </div>
+        </div>
+      </div>`;
     }).join("");
     planningLowStockList.innerHTML = `${queuedHtml}${lowStockHtml}`;
+    planningLowStockList.querySelectorAll(".stock-rec-card[data-family-toggle]").forEach(cardEl => {
+      cardEl.addEventListener("click", ev => {
+        if(planningDragActive || ev.target.closest("a,input,select")) return;
+        const key = String(cardEl.getAttribute("data-family-toggle") || "");
+        if(!key) return;
+        if(planningExpandedProductFamilies.has(key)) planningExpandedProductFamilies.delete(key);
+        else planningExpandedProductFamilies.add(key);
+        const expanded = planningExpandedProductFamilies.has(key);
+        const familyEl = cardEl.closest(".stock-rec-family");
+        familyEl?.classList.toggle("expanded", expanded);
+        cardEl.setAttribute("aria-expanded", expanded ? "true" : "false");
+        familyEl?.querySelector(".stock-rec-children")?.setAttribute("aria-hidden", expanded ? "false" : "true");
+        const button = cardEl.querySelector(".stock-rec-expand");
+        if(button){
+          button.title = `${expanded ? "Hide" : "Show"} production components`;
+          button.setAttribute("aria-label", button.title);
+        }
+      });
+    });
     planningLowStockList.querySelectorAll(".stock-rec-card[draggable='true']").forEach(cardEl => {
       cardEl.addEventListener("dragstart", ev => {
-        const idx = Number(cardEl.getAttribute("data-rec-index") || -1);
-        const item = visible[idx];
-        const card = item ? queueLowStockPlanningItem(item, { render: false, status: false }) : null;
+        const item = itemByDragKey.get(String(cardEl.getAttribute("data-product-key") || ""));
+        const card = item ? queueLowStockPlanningItem(item, { render: false, status: false, deferSave: true }) : null;
         if(!card) return;
         planningDragActive = true;
         planningDropCompleted = false;
@@ -14270,19 +15423,47 @@ DASHBOARD_HTML = """
       });
       cardEl.addEventListener("dragend", () => {
         planningDragActive = false;
-        document.querySelectorAll(".planning-dropzone.drag-over").forEach(zone => zone.classList.remove("drag-over"));
+        document.querySelectorAll(".planning-dropzone.drag-over,.plan-overview-dropzone.drag-over,.planning-backlog-dropzone.drag-over").forEach(zone => zone.classList.remove("drag-over"));
+        if(!planningDropCompleted) returnPlanningCardToCatalog(card?.id, true);
         renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+        renderLowStockRecommendations(lowStockItemsState);
+        planningDropCompleted = false;
       });
     });
+  }
+
+  function planningParentForChild(child, catalog = lowStockItemsState){
+    if(!planningItemIsChild(child)) return null;
+    const childKeys = planningRelationFamilyKeys(child);
+    const childSignature = planningRelationParts(child).signature;
+    return (Array.isArray(catalog) ? catalog : [])
+      .filter(candidate => !planningItemIsChild(candidate) && planningSetsOverlap(childKeys, planningRelationFamilyKeys(candidate)))
+      .sort((left, right) => {
+        const leftExact = planningRelationParts(left).signature === childSignature ? 1 : 0;
+        const rightExact = planningRelationParts(right).signature === childSignature ? 1 : 0;
+        return rightExact - leftExact;
+      })[0] || null;
   }
 
   function lowStockItemToPlanningCard(item){
     planningBoard = normalizePlanningBoard(planningBoard);
     const productId = String(item?.product_id || "").trim();
     const sku = String(item?.sku || "").trim();
-    const title = sku || productId || "Low Stock Item";
+    const title = sku || productId || "Product Item";
+    const abcClass = String(item?.abc_class || "").trim().toUpperCase();
+    const relatedChildIds = new Set();
+    if(!planningItemIsChild(item)){
+      const familyKeys = planningRelationFamilyKeys(item);
+      (lowStockItemsState || []).forEach((candidate, index) => {
+        if(!planningItemIsChild(candidate)) return;
+        if(planningSetsOverlap(familyKeys, planningRelationFamilyKeys(candidate))){
+          relatedChildIds.add(String(candidate?.product_id || candidate?.sku || index));
+        }
+      });
+    }
+    const relatedChildCount = relatedChildIds.size;
     const card = {
-      id: `low-stock-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      id: `product-item-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       job_id: "",
       job_ref: title,
       job_name: title,
@@ -14291,62 +15472,532 @@ DASHBOARD_HTML = """
       product_sku: sku,
       tonnage: String(item?.tonnage || "").trim(),
       request_qty: "",
-      source: "LOW STOCK",
+      source: ["A", "B", "C"].includes(abcClass) ? "ABC ITEM" : "PRODUCT",
       low_stock_total: item?.total_stock ?? 0,
       low_stock_unit: item?.unit || "",
       low_stock_qty_source: item?.qty_source || "",
       low_stock_threshold: item?.threshold ?? "",
+      abc_class: abcClass,
+      serving_rate: item?.serving_rate ?? "",
+      serving_category: String(item?.serving_category || "").trim(),
+      category_id: String(item?.category_id || "").trim(),
+      category_name: String(item?.category_name || "").trim(),
+      parent_sku: String(item?.parent_sku || "").trim(),
+      catalog_origin: true,
+      related_child_count: relatedChildCount,
       warehouses: Array.isArray(item?.warehouses) ? item.warehouses : [],
       created_at_utc: new Date().toISOString(),
     };
     return card;
   }
 
+  function planningCardIsCatalogProduct(card){
+    const source = String(card?.source || "").trim().toUpperCase();
+    return !!card?.catalog_origin || ["LOW STOCK", "ABC ITEM", "PRODUCT"].includes(source);
+  }
+
+  function planningCatalogItemFromCard(card){
+    if(!card || !planningCardIsCatalogProduct(card)) return null;
+    return {
+      product_id: String(card.product_id || "").trim(),
+      sku: String(card.product_sku || card.sku || "").trim(),
+      name: card.product_name || "",
+      tonnage: card.tonnage || "",
+      total_stock: card.low_stock_total ?? 0,
+      unit: card.low_stock_unit || "",
+      qty_source: card.low_stock_qty_source || "stock",
+      threshold: card.low_stock_threshold || "",
+      abc_class: card.abc_class || "",
+      serving_rate: card.serving_rate ?? "",
+      serving_category: card.serving_category || "",
+      category_id: card.category_id || "",
+      category_name: card.category_name || "",
+      parent_sku: card.parent_sku || "",
+      warehouses: Array.isArray(card.warehouses) ? card.warehouses : [],
+    };
+  }
+
+  function restorePlanningCatalogCard(card){
+    const item = planningCatalogItemFromCard(card);
+    if(!item) return false;
+    const exists = (lowStockItemsState || []).some(existing =>
+      (item.product_id && String(existing?.product_id || "").trim() === item.product_id)
+      || (item.sku && String(existing?.sku || "").trim() === item.sku)
+    );
+    if(!exists){
+      const returnIndex = Number(card.catalog_return_index);
+      if(Number.isInteger(returnIndex) && returnIndex >= 0){
+        lowStockItemsState.splice(Math.min(returnIndex, lowStockItemsState.length), 0, item);
+      }else{
+        lowStockItemsState.push(item);
+      }
+    }
+    return true;
+  }
+
+  function removePlanningCardEverywhere(cardId){
+    planningBoard = normalizePlanningBoard(planningBoard);
+    let removed = null;
+    Object.keys(planningBoard.lanes || {}).forEach(lane => {
+      const cards = planningBoard.lanes[lane] || [];
+      const index = cards.findIndex(card => String(card?.id || "") === String(cardId || ""));
+      if(index >= 0){
+        if(!removed) removed = { card: cards[index], lane, index };
+        cards.splice(index, 1);
+      }
+    });
+    return removed;
+  }
+
+  function returnPlanningCardToCatalog(cardId, includeLinked=true){
+    const location = findPlanningCardLocation(cardId);
+    const card = location?.card || null;
+    if(!card || !planningCardIsCatalogProduct(card)) return [];
+    const linkedIds = includeLinked
+      ? [card.linked_parent_card_id, card.linked_child_card_id].filter(Boolean)
+      : [];
+    const returned = [];
+    const removed = removePlanningCardEverywhere(cardId);
+    if(removed?.card){
+      restorePlanningCatalogCard(removed.card);
+      returned.push(removed);
+    }
+    linkedIds.forEach(linkedId => {
+      const linked = removePlanningCardEverywhere(linkedId);
+      if(linked?.card && planningCardIsCatalogProduct(linked.card)){
+        restorePlanningCatalogCard(linked.card);
+        returned.push(linked);
+      }
+    });
+    return returned;
+  }
+
   function queueLowStockPlanningItem(item, options = {}){
     planningBoard = normalizePlanningBoard(planningBoard);
     const card = lowStockItemToPlanningCard(item);
+    card.catalog_return_index = Math.max(0, (lowStockItemsState || []).indexOf(item));
     const productId = String(card.product_id || "").trim();
     const sku = String(card.product_sku || card.sku || "").trim();
-    const title = card.job_ref || card.job_name || "Low Stock Item";
+    const title = card.job_ref || card.job_name || "Product Item";
     planningBoard.lanes.BACKLOG.unshift(card);
+    let linkedParentCard = null;
+    const parentItem = planningParentForChild(item);
+    if(parentItem){
+      const parentKeys = planningRelationFamilyKeys(parentItem);
+      const remainingChildren = (lowStockItemsState || []).filter(candidate => {
+        if(candidate === item || !planningItemIsChild(candidate)) return false;
+        return planningSetsOverlap(parentKeys, planningRelationFamilyKeys(candidate));
+      });
+      if(remainingChildren.length === 0){
+        linkedParentCard = lowStockItemToPlanningCard(parentItem);
+        linkedParentCard.catalog_return_index = Math.max(0, (lowStockItemsState || []).indexOf(parentItem));
+        linkedParentCard.related_child_count = Math.max(1, Number(linkedParentCard.related_child_count || 0));
+        linkedParentCard.linked_child_card_id = card.id;
+        linkedParentCard.linked_component_completion = true;
+        card.linked_parent_card_id = linkedParentCard.id;
+        card.linked_component_completion = true;
+        planningBoard.lanes.BACKLOG.splice(1, 0, linkedParentCard);
+      }
+    }
     lowStockItemsState = (lowStockItemsState || []).filter(x => {
       const sameProduct = productId && String(x?.product_id || "").trim() === productId;
       const sameSku = sku && String(x?.sku || "").trim() === sku;
-      return !(sameProduct || sameSku);
+      const linkedParentProductId = String(linkedParentCard?.product_id || "").trim();
+      const linkedParentSku = String(linkedParentCard?.product_sku || "").trim();
+      const sameParentProduct = linkedParentProductId && String(x?.product_id || "").trim() === linkedParentProductId;
+      const sameParentSku = linkedParentSku && String(x?.sku || "").trim() === linkedParentSku;
+      return !(sameProduct || sameSku || sameParentProduct || sameParentSku);
     });
-    schedulePlanningSave();
+    const queueActivities = [planningActivityEntry(card, "QUEUED", "CATALOG", "BACKLOG", -1, 0, "Added from the Planning product list")];
+    if(linkedParentCard){
+      queueActivities.push(planningActivityEntry(
+        linkedParentCard, "LINKED", "CATALOG", "BACKLOG", -1, 1,
+        `Automatically linked after final component ${title}`
+      ));
+    }
+    if(options.deferSave !== true) schedulePlanningSave(queueActivities);
     if(options.render !== false){
       renderPlanningBoard({ ...latestState, planning_board: planningBoard });
       renderLowStockRecommendations(lowStockItemsState);
     }
-    if(options.status !== false) planningSetStatus(`Queued low-stock recommendation ${title}.`);
+    if(options.status !== false){
+      planningSetStatus(linkedParentCard
+        ? `Queued ${title} with finished-good parent ${linkedParentCard.job_ref || linkedParentCard.job_name || "item"}.`
+        : `Queued product item ${title}.`);
+    }
     return card;
   }
 
   async function loadLowStockRecommendations(forceRefresh = false){
     if(!planningLowStockList) return;
-    const threshold = Number(planningLowStockMax?.value || 100);
-    planningLowStockList.innerHTML = '<div class="planning-empty">Loading IMS stock recommendations...</div>';
-    planningSetStatus("Checking IMS low-stock products...");
+    planningLowStockList.innerHTML = '<div class="planning-empty">Loading product items, A/B/C classes, and IMS stock...</div>';
+    planningSetStatus("Matching the product catalog with serving-rate classes A-C and IMS stock...");
     try {
-      const resp = await fetch(`/api/planning/low-stock?threshold=${encodeURIComponent(threshold)}&refresh=${forceRefresh ? 1 : 0}`);
+      const resp = await fetch(`/api/planning/low-stock?refresh=${forceRefresh ? 1 : 0}`);
       const out = await resp.json();
       if(!out.ok){
         lowStockItemsState = [];
-        renderLowStockRecommendations([], { error: out.error || "Failed to load low-stock recommendations." });
-        planningSetStatus(out.error || "Failed to load low-stock recommendations.", true);
+        renderLowStockRecommendations([], { error: out.error || "Failed to load product items." });
+        planningSetStatus(out.error || "Failed to load product items.", true);
         return;
       }
       lowStockItemsState = out.items || [];
+      planningBoard = normalizePlanningBoard(planningBoard);
+      const staleCatalogBacklog = (planningBoard.lanes.BACKLOG || [])
+        .map((card, index) => ({ card, index }))
+        .filter(entry => planningCardIsCatalogProduct(entry.card));
+      if(staleCatalogBacklog.length){
+        planningBoard.lanes.BACKLOG = (planningBoard.lanes.BACKLOG || []).filter(card => !planningCardIsCatalogProduct(card));
+        staleCatalogBacklog.forEach(entry => restorePlanningCatalogCard(entry.card));
+        schedulePlanningSave(staleCatalogBacklog.map(entry => planningActivityEntry(
+          entry.card, "REMOVED", "BACKLOG", "CATALOG", entry.index, -1, "Restored to the Planning product list"
+        )));
+      }
       renderLowStockRecommendations(lowStockItemsState, out);
+      renderPlanningBoard({ ...latestState, planning_board: planningBoard });
       renderPlanningOpsSummary(latestState || {}, latestState?.job_queue || []);
       const suffix = out.from_cache ? " from cache" : "";
-      planningSetStatus(`Loaded ${(out.items || []).length} low-stock recommendation(s)${suffix}.`);
+      const counts = out.abc_counts || {};
+      const classSummary = `A ${Number(counts.A || 0)} · B ${Number(counts.B || 0)} · C ${Number(counts.C || 0)}`;
+      planningSetStatus(`Loaded ${(out.items || []).length} product item(s) with IMS stock; classifications: ${classSummary}${suffix}.`);
     } catch(e){
-      renderLowStockRecommendations([], { error: `Low-stock lookup failed: ${e}` });
+      renderLowStockRecommendations([], { error: `Product item lookup failed: ${e}` });
       renderPlanningOpsSummary(latestState || {}, latestState?.job_queue || []);
-      planningSetStatus(`Low-stock lookup failed: ${e}`, true);
+      planningSetStatus(`Product item lookup failed: ${e}`, true);
     }
+  }
+
+  function normalizeTrialBoard(board){
+    const rows = Array.isArray(board?.rows) ? board.rows : [];
+    return {
+      rows: rows.slice(0, 200).map(row => ({
+        date: String(row?.date || ""),
+        imm_mold: String(row?.imm_mold || ""),
+        material: String(row?.material || ""),
+        reason: String(row?.reason || ""),
+        remarks: String(row?.remarks || ""),
+      })),
+      updated_at_utc: String(board?.updated_at_utc || ""),
+    };
+  }
+
+  function captureTrialBoardRows(){
+    if(!trialBoardTableWrap) return;
+    trialBoardState.rows = Array.from(trialBoardTableWrap.querySelectorAll("tbody tr")).map(row => ({
+      date: String(row.querySelector("[data-trial-field='date']")?.value || ""),
+      imm_mold: String(row.querySelector("[data-trial-field='imm_mold']")?.value || ""),
+      material: String(row.querySelector("[data-trial-field='material']")?.value || ""),
+      reason: String(row.querySelector("[data-trial-field='reason']")?.value || ""),
+      remarks: String(row.querySelector("[data-trial-field='remarks']")?.value || ""),
+    }));
+  }
+
+  function renderTrialBoard(board, options={}){
+    if(!trialBoardTableWrap || (trialBoardDirty && !options.force)) return;
+    const keepDirty = Boolean(options.keepDirty);
+    trialBoardState = normalizeTrialBoard(board || trialBoardState);
+    while(trialBoardState.rows.length < 12){
+      trialBoardState.rows.push({ date:"", imm_mold:"", material:"", reason:"", remarks:"" });
+    }
+    const input = (field, value, multiline=false) => multiline
+      ? `<textarea class="trial-board-input" data-trial-field="${field}" rows="2">${esc(value)}</textarea>`
+      : `<input class="trial-board-input" data-trial-field="${field}" type="text" value="${esc(value)}" />`;
+    trialBoardTableWrap.innerHTML = `
+      <table class="trial-board-table">
+        <colgroup><col style="width:11%"><col style="width:22%"><col style="width:22%"><col style="width:18%"><col style="width:23%"><col style="width:4%"></colgroup>
+        <thead><tr><th>Date</th><th>IMM / Mold</th><th>Material</th><th>Reason</th><th>Remarks</th><th aria-label="Actions"></th></tr></thead>
+        <tbody>${trialBoardState.rows.map((row, index) => `<tr data-trial-index="${index}">
+          <td>${input("date", row.date)}</td>
+          <td>${input("imm_mold", row.imm_mold, true)}</td>
+          <td>${input("material", row.material, true)}</td>
+          <td>${input("reason", row.reason, true)}</td>
+          <td>${input("remarks", row.remarks, true)}</td>
+          <td class="trial-board-action-cell"><button class="trial-board-delete" type="button" data-trial-delete="${index}" aria-label="Delete trial row ${index + 1}" title="Delete row">&times;</button></td>
+        </tr>`).join("")}</tbody>
+      </table>`;
+    trialBoardTableWrap.querySelectorAll(".trial-board-input").forEach(field => {
+      field.addEventListener("input", () => {
+        captureTrialBoardRows();
+        trialBoardDirty = true;
+        if(trialBoardStatus) trialBoardStatus.textContent = "Unsaved changes";
+      });
+    });
+    trialBoardTableWrap.querySelectorAll("[data-trial-delete]").forEach(button => {
+      button.addEventListener("click", () => {
+        captureTrialBoardRows();
+        const index = Number(button.getAttribute("data-trial-delete"));
+        if(Number.isInteger(index)) trialBoardState.rows.splice(index, 1);
+        trialBoardDirty = true;
+        renderTrialBoard(trialBoardState, { force:true, keepDirty:true });
+        if(trialBoardStatus) trialBoardStatus.textContent = "Unsaved changes";
+      });
+    });
+    trialBoardDirty = keepDirty;
+    if(trialBoardStatus && !keepDirty){
+      trialBoardStatus.textContent = trialBoardState.updated_at_utc ? `Saved ${fmtDateLocal(trialBoardState.updated_at_utc)}` : "Shared trial schedule";
+    }
+  }
+
+  async function saveTrialBoard(){
+    captureTrialBoardRows();
+    if(trialBoardSaveBtn) trialBoardSaveBtn.disabled = true;
+    if(trialBoardStatus) trialBoardStatus.textContent = "Saving...";
+    try{
+      const response = await fetch("/api/planning/trial-board", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body:JSON.stringify({ board:trialBoardState }),
+      });
+      const out = await response.json();
+      if(!response.ok || !out.ok) throw new Error(out.error || `HTTP ${response.status}`);
+      trialBoardDirty = false;
+      trialBoardState = normalizeTrialBoard(out.board);
+      renderTrialBoard(trialBoardState, { force:true });
+    }catch(error){
+      trialBoardDirty = true;
+      if(trialBoardStatus) trialBoardStatus.textContent = `Save failed: ${error}`;
+    }finally{
+      if(trialBoardSaveBtn) trialBoardSaveBtn.disabled = false;
+    }
+  }
+
+  function planningActivityLaneLabel(lane){
+    const key = String(lane || "").trim();
+    if(!key) return "-";
+    if(key === "BACKLOG") return "Planning list";
+    if(key === "CATALOG") return "Product catalog";
+    if(key === "JOB LOOKUP") return "Job lookup";
+    if(key === "REMOVED") return "Removed";
+    return MACHINE_NAME_MAP[key] || key;
+  }
+
+  function planningActivityLocalDate(value){
+    const date = new Date(value || "");
+    if(Number.isNaN(date.getTime())) return "";
+    const pad = number => String(number).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  }
+
+  function renderPlanningActivity(){
+    if(!planningActivityTableWrap) return;
+    if(planningActivityMachineFilter && planningActivityMachineFilter.options.length <= 1){
+      const options = ['<option value="">All machines</option>', '<option value="BACKLOG">Planning list</option>'];
+      DEFAULT_MACHINE_CODES.forEach(code => options.push(`<option value="${esc(code)}">${esc(MACHINE_NAME_MAP[code] || code)}</option>`));
+      planningActivityMachineFilter.innerHTML = options.join("");
+    }
+    const query = String(planningActivitySearch?.value || "").trim().toLowerCase();
+    const action = String(planningActivityActionFilter?.value || "").trim().toUpperCase();
+    const machine = String(planningActivityMachineFilter?.value || "").trim().toUpperCase();
+    const dateFilter = String(planningActivityDateFilter?.value || "").trim();
+    const rows = (planningActivityState || []).filter(entry => {
+      if(action && String(entry?.action || "").toUpperCase() !== action) return false;
+      if(machine && ![entry?.from_lane, entry?.to_lane].some(value => String(value || "").toUpperCase() === machine)) return false;
+      if(dateFilter && planningActivityLocalDate(entry?.timestamp_utc) !== dateFilter) return false;
+      if(query){
+        const haystack = [entry?.item, entry?.sku, entry?.job_id, entry?.action, planningActivityLaneLabel(entry?.from_lane), planningActivityLaneLabel(entry?.to_lane), entry?.note, entry?.source_ip]
+          .map(value => String(value || "").toLowerCase()).join(" ");
+        if(!haystack.includes(query)) return false;
+      }
+      return true;
+    });
+    if(planningActivityStatus) planningActivityStatus.textContent = `Showing ${rows.length} of ${(planningActivityState || []).length} recorded action(s)`;
+    if(!rows.length){
+      planningActivityTableWrap.innerHTML = '<div class="planning-empty">No planning activity matches the selected filters.</div>';
+      return;
+    }
+    planningActivityTableWrap.innerHTML = `<table class="planning-activity-table">
+      <colgroup><col style="width:15%"><col style="width:10%"><col style="width:22%"><col style="width:13%"><col style="width:13%"><col style="width:11%"><col style="width:16%"></colgroup>
+      <thead><tr><th>Timestamp</th><th>Action</th><th>Mold / Job</th><th>From</th><th>To</th><th>Queue Position</th><th>Notes</th></tr></thead>
+      <tbody>${rows.map(entry => {
+        const actionText = String(entry?.action || "MOVED").toUpperCase();
+        const fromPosition = Number(entry?.from_position || 0);
+        const toPosition = Number(entry?.to_position || 0);
+        const positionText = fromPosition && toPosition ? `${fromPosition} → ${toPosition}` : (toPosition ? `Position ${toPosition}` : (fromPosition ? `Was ${fromPosition}` : "-"));
+        return `<tr>
+          <td><span class="planning-activity-item">${esc(fmtDateLocal(entry?.timestamp_utc))}</span><div class="planning-activity-sub">${esc(entry?.source_ip || "Server")}</div></td>
+          <td><span class="planning-action-chip ${esc(actionText.toLowerCase())}">${esc(actionText)}</span></td>
+          <td><span class="planning-activity-item">${esc(entry?.item || "Planned item")}</span><div class="planning-activity-sub">${esc(entry?.sku || entry?.job_id || "-")}</div></td>
+          <td>${esc(planningActivityLaneLabel(entry?.from_lane))}</td>
+          <td>${esc(planningActivityLaneLabel(entry?.to_lane))}</td>
+          <td>${esc(positionText)}</td>
+          <td>${esc(entry?.note || "-")}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table>`;
+  }
+
+  async function loadPlanningActivity(){
+    if(!planningActivityTableWrap) return;
+    if(planningActivityStatus) planningActivityStatus.textContent = "Loading planning activity...";
+    try{
+      const response = await fetch("/api/planning/activity?limit=5000");
+      const out = await response.json();
+      if(!response.ok || !out.ok) throw new Error(out.error || `HTTP ${response.status}`);
+      planningActivityState = Array.isArray(out.entries) ? out.entries : [];
+      renderPlanningActivity();
+    }catch(error){
+      if(planningActivityStatus) planningActivityStatus.textContent = `Activity load failed: ${error}`;
+      planningActivityTableWrap.innerHTML = '<div class="planning-empty">Unable to load planning activity.</div>';
+    }
+  }
+
+  function setPlanningActivityOpen(open){
+    const shouldOpen = Boolean(open);
+    if(shouldOpen){
+      setPlanOverviewOpen(false);
+      setTrialBoardOpen(false);
+    }
+    planningBoardView?.classList.toggle("activity-active", shouldOpen);
+    planningActivityBtn?.classList.toggle("active", shouldOpen);
+    planningActivityBtn?.setAttribute("aria-pressed", shouldOpen ? "true" : "false");
+    planningActivityInline?.setAttribute("aria-hidden", shouldOpen ? "false" : "true");
+    planningMachineGrid?.setAttribute("aria-hidden", shouldOpen ? "true" : "false");
+    if(shouldOpen){
+      setPlanningQueueOpen(false);
+      loadPlanningActivity();
+    }
+  }
+
+  function setTrialBoardOpen(open){
+    const shouldOpen = Boolean(open);
+    if(shouldOpen){
+      setPlanOverviewOpen(false);
+      setPlanningActivityOpen(false);
+    }
+    planningBoardView?.classList.toggle("trial-active", shouldOpen);
+    trialBoardBtn?.classList.toggle("active", shouldOpen);
+    trialBoardBtn?.setAttribute("aria-pressed", shouldOpen ? "true" : "false");
+    trialBoardInline?.setAttribute("aria-hidden", shouldOpen ? "false" : "true");
+    planningMachineGrid?.setAttribute("aria-hidden", shouldOpen ? "true" : "false");
+    if(shouldOpen){
+      setPlanningQueueOpen(false);
+      renderTrialBoard(latestState?.trial_board || trialBoardState, { force:!trialBoardDirty, keepDirty:trialBoardDirty });
+    }
+  }
+
+  function compactPlanCardLabel(card){
+    const item = card || {};
+    return firstValue(item.product_sku, item.job_ref, item.job_name, item.job_id, "-");
+  }
+
+  function compactPlanStatus(session, queueRow, code){
+    const manual = machineStatusOverrideFor(code);
+    const manualStatus = String(manual?.status || "").trim();
+    if(manualStatus) return { label: manualStatus, css: "attention" };
+    const queueStatus = String(queueRow?.status || "").trim().toUpperCase();
+    if(queueStatus === "DISCONNECTED") return { label: "DISCONNECTED", css: "disconnected" };
+    if(queueStatus && queueStatus !== "RUNNING") return { label: queueStatus, css: "attention" };
+    if(session?.job_code) return { label: "RUNNING", css: "running" };
+    return { label: "NO SCHEDULE", css: "no-schedule" };
+  }
+
+  function renderCompactPlanOverview(){
+    if(!planOverviewTableWrap) return;
+    const factory4 = activePlanOverviewFactory === "F04";
+    const codes = DEFAULT_MACHINE_CODES.filter(code => ADDITIONAL_MACHINE_CODES.has(code) === factory4);
+    const sessionsByMachine = new Map((latestState?.sessions || []).map(session => [planningLaneMachineCode(session?.machine_code), session]));
+    const queueByMachine = new Map((latestState?.job_queue || []).map(row => [planningLaneMachineCode(row?.machine_code), row]));
+    const tonnageMap = latestState?.machine_tonnage || {};
+    const rowHtml = code => {
+      const session = sessionsByMachine.get(code) || null;
+      const queueRow = queueByMachine.get(code) || null;
+      const cards = planningLaneCards(code);
+      const status = compactPlanStatus(session, queueRow, code);
+      const currentSku = firstValue(session?.product_sku, session?.job_name, session?.job_code, "-");
+      const currentJob = firstValue(session?.job_name, session?.job_code, "");
+      const currentHtml = session?.job_code
+        ? `<strong>${esc(currentSku)}</strong>${currentJob && currentJob !== currentSku ? `<br><span class="plan-overview-empty">${esc(currentJob)}</span>` : ""}`
+        : '<span class="plan-overview-empty">-</span>';
+      const planCellHtml = (card, slot) => card
+        ? `<div class="plan-overview-card" draggable="true" data-card-id="${esc(card.id || "")}" data-lane="${esc(code)}" title="Drag to another plan slot or back to the Planning Board">${esc(compactPlanCardLabel(card))}</div>`
+        : '<span class="plan-overview-empty">-</span>';
+      const finish = preferredQueueFinish(queueRow);
+      const reason = firstValue(session?.downtime_reason_text, session?.downtime_reason_code, "");
+      const more = cards.length > 2 ? `+${cards.length - 2} more queued` : "";
+      const remarks = [reason, more].filter(Boolean).join(" · ") || "-";
+      return `<tr>
+        <td class="plan-overview-machine">${esc((MACHINE_NAME_MAP[code] || code).replace(/^IMM\\s*/i,""))}<small>${esc(tonnageMap[code] || "-")}</small></td>
+        <td>${currentHtml}</td>
+        <td class="plan-overview-center">${session?.operator_id ? "1" : "-"}</td>
+        <td class="plan-overview-center"><span class="plan-overview-status ${esc(status.css)}">${esc(status.label)}</span></td>
+        <td class="plan-overview-plan plan-overview-dropzone" data-lane="${esc(code)}" data-slot="0">${planCellHtml(cards[0], 0)}</td>
+        <td class="plan-overview-plan plan-overview-dropzone" data-lane="${esc(code)}" data-slot="1">${planCellHtml(cards[1], 1)}</td>
+        <td class="plan-overview-center">${finish ? esc(fmtDateLocal(finish)) : '<span class="plan-overview-empty">-</span>'}</td>
+        <td>${remarks === "-" ? '<span class="plan-overview-empty">-</span>' : esc(remarks)}</td>
+      </tr>`;
+    };
+    const midpoint = Math.ceil(codes.length / 2);
+    const columns = [codes.slice(0, midpoint), codes.slice(midpoint)];
+    const tableHtml = machineCodes => `
+      <div class="plan-overview-column">
+        <table class="plan-overview-table">
+          <colgroup><col style="width:8%"><col style="width:19%"><col style="width:8%"><col style="width:11%"><col style="width:14%"><col style="width:14%"><col style="width:13%"><col style="width:13%"></colgroup>
+          <thead><tr><th>IMM</th><th>Current Mold / Job</th><th>Man</th><th>Status</th><th>Plan A</th><th>Plan B</th><th>Est. End</th><th>Remarks</th></tr></thead>
+          <tbody>${machineCodes.map(rowHtml).join("")}</tbody>
+        </table>
+      </div>`;
+    planOverviewTableWrap.innerHTML = `<div class="plan-overview-columns">${columns.map(tableHtml).join("")}</div>`;
+  }
+
+  function setPlanOverviewOpen(open){
+    const shouldOpen = Boolean(open);
+    if(shouldOpen){
+      setTrialBoardOpen(false);
+      setPlanningActivityOpen(false);
+    }
+    planningBoardView?.classList.toggle("compact-active", shouldOpen);
+    planningOverviewBtn?.classList.toggle("active", shouldOpen);
+    planningOverviewBtn?.setAttribute("aria-pressed", shouldOpen ? "true" : "false");
+    planOverviewInline?.setAttribute("aria-hidden", shouldOpen ? "false" : "true");
+    planningMachineGrid?.setAttribute("aria-hidden", shouldOpen ? "true" : "false");
+    if(shouldOpen){
+      setPlanningQueueOpen(false);
+      renderCompactPlanOverview();
+      bindPlanningDragHandlers(planOverviewInline);
+    }
+  }
+
+  function applyPlanningMismatchFocus(){
+    if(!planningMismatchFocus.cardId || Date.now() >= Number(planningMismatchFocus.until || 0)) return;
+    const card = Array.from(document.querySelectorAll(".planning-machine-grid .planning-card[data-card-id]")).find(element =>
+      String(element.getAttribute("data-card-id") || "") === String(planningMismatchFocus.cardId)
+    );
+    if(!card) return;
+    card.classList.add("queue-mismatch-highlight");
+    if(planningMismatchFocus.scrollPending){
+      planningMismatchFocus.scrollPending = false;
+      card.scrollIntoView({ behavior:"smooth", block:"center", inline:"center" });
+    }
+  }
+
+  function focusPlanningQueueMismatch(cardId, lane){
+    planningMismatchFocus = { cardId:String(cardId || ""), lane:String(lane || ""), until:Date.now() + 6500, scrollPending:true };
+    const planningTabButton = document.querySelector('.main-tab-button[data-target="planningTab"]');
+    if(!document.getElementById("planningTab")?.classList.contains("active")) planningTabButton?.click();
+    setPlanningQueueOpen(false);
+    setPlanOverviewOpen(false);
+    setTrialBoardOpen(false);
+    setPlanningActivityOpen(false);
+    planningMachineScrollActiveUntil = 0;
+    renderPlanningBoard({ ...latestState, planning_board:planningBoard });
+    requestAnimationFrame(applyPlanningMismatchFocus);
+  }
+
+  function renderPlanningQueueMismatchAlerts(alerts){
+    if(!planningMismatchAlerts) return;
+    const rows = Array.isArray(alerts) ? alerts : [];
+    planningMismatchAlerts.innerHTML = rows.map(alert => `
+      <button class="planning-mismatch-alert" type="button" data-mismatch-card="${esc(alert?.queued_card_id || "")}" data-mismatch-lane="${esc(alert?.machine_code || "")}">
+        <span class="planning-mismatch-alert-title">${esc(alert?.machine_name || alert?.machine_code || "Machine")} queue mismatch</span>
+        <span class="planning-mismatch-alert-line">Running now: <strong>${esc(alert?.running_sku || "Unknown SKU")}</strong><br>Plan A queue: <strong>${esc(alert?.queued_sku || "Unknown SKU")}</strong></span>
+        <span class="planning-mismatch-alert-hint">Click to open and highlight this queued item in Planning.</span>
+      </button>`).join("");
+    planningMismatchAlerts.querySelectorAll("[data-mismatch-card]").forEach(button => {
+      button.addEventListener("click", () => focusPlanningQueueMismatch(
+        button.getAttribute("data-mismatch-card") || "",
+        button.getAttribute("data-mismatch-lane") || ""
+      ));
+    });
   }
 
   function renderPlanningBoard(state){
@@ -14358,23 +16009,26 @@ DASHBOARD_HTML = """
     planningBoard = normalizePlanningBoard((planningLocalDirty ? planningBoard : state?.planning_board) || planningBoard);
     renderLowStockRecommendations(lowStockItemsState);
     if(planningMachineGrid){
-      const sessionsByMachine = new Map((state?.sessions || []).map(s => [String(s.machine_code || ""), s]));
-      const queueByMachine = new Map(((state?.job_queue || [])).map(row => [String(row?.machine_code || "").trim(), row]));
+      const sessionsByMachine = new Map((state?.sessions || []).map(s => [planningLaneMachineCode(s?.machine_code), s]));
+      const queueByMachine = new Map(((state?.job_queue || [])).map(row => [planningLaneMachineCode(row?.machine_code), row]));
       planningMachineGrid.innerHTML = DEFAULT_MACHINE_CODES.map(code => {
         const cards = planningLaneCards(code);
         const live = sessionsByMachine.get(code);
         const queueRow = queueByMachine.get(code);
-        return `<div class="planning-lane"><div class="planning-lane-head"><div><div class="planning-lane-title">${esc(MACHINE_NAME_MAP[code] || code)}</div>${planningMachineTimingHtml(code, queueRow, cards)}</div><div class="planning-lane-count">${esc(cards.length)} planned</div></div><div class="planning-dropzone" data-lane="${esc(code)}">${live && live.job_code ? livePlanningCardHtml(live) : ""}${cards.map((c, idx) => planningCardHtml(c, code, idx)).join("") || (!live || !live.job_code ? '<div class="planning-empty">Drop jobs here.</div>' : "")}</div></div>`;
+        const machineTonnage = String((state?.machine_tonnage && state.machine_tonnage[code]) || "").trim();
+        return `<div class="planning-lane"><div class="planning-lane-head"><div><div class="planning-lane-title-row"><div class="planning-lane-title">${esc(MACHINE_NAME_MAP[code] || code)}</div>${machineTonnage ? `<span class="planning-machine-tonnage">${esc(machineTonnage)}</span>` : ""}</div>${planningMachineTimingHtml(code, queueRow, cards)}</div><div class="planning-lane-count">${esc(cards.length)} planned</div></div><div class="planning-dropzone" data-lane="${esc(code)}">${live && live.job_code ? livePlanningCardHtml(live) : ""}${cards.map((c, idx) => planningCardHtml(c, code, idx)).join("") || (!live || !live.job_code ? '<div class="planning-empty">Drop jobs here.</div>' : "")}</div></div>`;
       }).join("");
     }
+    if(planningBoardView?.classList.contains("compact-active")) renderCompactPlanOverview();
     bindPlanningDragHandlers();
+    applyPlanningMismatchFocus();
     document.querySelectorAll(".planning-machine-grid .planning-dropzone").forEach(zone => {
       const lane = zone.getAttribute("data-lane") || "";
       if(lane && planningMachineDropScrollLeft[lane] != null) zone.scrollLeft = planningMachineDropScrollLeft[lane];
     });
   }
 
-  function findAndMovePlanningCard(cardId, targetLane){
+  function findAndMovePlanningCard(cardId, targetLane, targetIndex=null){
     planningBoard = normalizePlanningBoard(planningBoard);
     let found = null;
     for(const [lane, cards] of Object.entries(planningBoard.lanes)){
@@ -14386,14 +16040,69 @@ DASHBOARD_HTML = """
     }
     if(!found) return false;
     if(!Array.isArray(planningBoard.lanes[targetLane])) planningBoard.lanes[targetLane] = [];
-    planningBoard.lanes[targetLane].push(found);
+    if(Number.isInteger(targetIndex)){
+      const insertAt = Math.max(0, Math.min(targetIndex, planningBoard.lanes[targetLane].length));
+      planningBoard.lanes[targetLane].splice(insertAt, 0, found);
+    }else{
+      planningBoard.lanes[targetLane].push(found);
+    }
     return true;
   }
 
-  function bindPlanningDragHandlers(){
+  function findPlanningCard(cardId){
+    planningBoard = normalizePlanningBoard(planningBoard);
+    for(const cards of Object.values(planningBoard.lanes)){
+      const found = (cards || []).find(c => String(c.id || "") === String(cardId || ""));
+      if(found) return found;
+    }
+    return null;
+  }
+
+  function findPlanningCardLocation(cardId){
+    planningBoard = normalizePlanningBoard(planningBoard);
+    for(const [lane, cards] of Object.entries(planningBoard.lanes)){
+      const index = (cards || []).findIndex(card => String(card?.id || "") === String(cardId || ""));
+      if(index >= 0) return { lane, index, card:cards[index] };
+    }
+    return null;
+  }
+
+  function planningActivityEntry(card, action, fromLane, toLane, fromIndex = -1, toIndex = -1, note = ""){
+    const item = card || {};
+    return {
+      action,
+      card_id:String(item.id || ""),
+      item:String(item.job_ref || item.job_name || item.product_sku || item.job_id || "Planned item"),
+      sku:String(item.product_sku || item.sku || ""),
+      job_id:String(item.job_id || ""),
+      from_lane:String(fromLane || ""),
+      to_lane:String(toLane || ""),
+      from_position:Number.isInteger(fromIndex) && fromIndex >= 0 ? fromIndex + 1 : 0,
+      to_position:Number.isInteger(toIndex) && toIndex >= 0 ? toIndex + 1 : 0,
+      note:String(note || ""),
+    };
+  }
+
+  function confirmPlanningTonnageFit(card, targetLane){
+    if(!card || !targetLane || targetLane === "BACKLOG") return true;
+    const requiredText = planningCardTonnage(card);
+    const machineText = String((latestState?.machine_tonnage && latestState.machine_tonnage[targetLane]) || "").trim();
+    const requiredTons = planningTonnageNumber(requiredText);
+    const machineTons = planningTonnageNumber(machineText);
+    if(!requiredTons || !machineTons || requiredTons <= machineTons) return true;
+    const jobLabel = String(card.job_ref || card.job_name || card.job_id || card.product_sku || "This item").trim();
+    const machineLabel = MACHINE_NAME_MAP[targetLane] || targetLane;
+    return window.confirm(
+      `${jobLabel} requires ${requiredText} tons, but ${machineLabel} is ${machineText}.\n\n` +
+      `The item may not fit this machine. Place it here anyway?`
+    );
+  }
+
+  function bindPlanningDragHandlers(root=document){
+    const scope = root && typeof root.querySelectorAll === "function" ? root : document;
     const clearPlanningDragState = () => {
       planningDragActive = false;
-      document.querySelectorAll(".planning-dropzone.drag-over").forEach(zone => zone.classList.remove("drag-over"));
+      document.querySelectorAll(".planning-dropzone.drag-over,.plan-overview-dropzone.drag-over,.planning-backlog-dropzone.drag-over").forEach(zone => zone.classList.remove("drag-over"));
     };
     const flushPlanningDeferredRender = () => {
       if(!planningDeferredState) return false;
@@ -14402,7 +16111,9 @@ DASHBOARD_HTML = """
       render(state);
       return true;
     };
-    document.querySelectorAll(".planning-card[draggable='true']").forEach(card => {
+    scope.querySelectorAll(".planning-card[draggable='true'],.plan-overview-card[draggable='true']").forEach(card => {
+      if(card.dataset.planningDragBound === "1") return;
+      card.dataset.planningDragBound = "1";
       card.addEventListener("dragstart", ev => {
         planningDragActive = true;
         planningDropCompleted = false;
@@ -14417,12 +16128,16 @@ DASHBOARD_HTML = """
         planningDropCompleted = false;
       });
     });
-    document.querySelectorAll(".planning-dropzone").forEach(zone => {
-      zone.addEventListener("scroll", () => {
-        const lane = zone.getAttribute("data-lane") || "";
-        if(lane) planningMachineDropScrollLeft[lane] = zone.scrollLeft || 0;
-        if(zone.closest(".planning-machine-grid")) planningMachineScrollActiveUntil = Date.now() + 900;
-      }, { passive: true });
+    scope.querySelectorAll(".planning-dropzone,.plan-overview-dropzone,.planning-backlog-dropzone").forEach(zone => {
+      if(zone.dataset.planningDropBound === "1") return;
+      zone.dataset.planningDropBound = "1";
+      if(zone.classList.contains("planning-dropzone")){
+        zone.addEventListener("scroll", () => {
+          const lane = zone.getAttribute("data-lane") || "";
+          if(lane) planningMachineDropScrollLeft[lane] = zone.scrollLeft || 0;
+          if(zone.closest(".planning-machine-grid")) planningMachineScrollActiveUntil = Date.now() + 900;
+        }, { passive: true });
+      }
       zone.addEventListener("dragover", ev => {
         ev.preventDefault();
         if(!zone.classList.contains("drag-over")) zone.classList.add("drag-over");
@@ -14438,70 +16153,142 @@ DASHBOARD_HTML = """
         zone.classList.remove("drag-over");
         const cardId = ev.dataTransfer.getData("text/plain");
         const lane = zone.getAttribute("data-lane") || "BACKLOG";
+        const slotText = zone.getAttribute("data-slot");
+        const slot = slotText === null ? null : Number(slotText);
+        const targetIndex = Number.isInteger(slot) ? slot : null;
         planningDragActive = false;
         planningDropCompleted = true;
-        if(findAndMovePlanningCard(cardId, lane)){
+        const movingLocation = findPlanningCardLocation(cardId);
+        const movingCard = movingLocation?.card || null;
+        const linkedParentCard = movingCard?.linked_parent_card_id ? findPlanningCard(movingCard.linked_parent_card_id) : null;
+        const linkedParentLocation = linkedParentCard ? findPlanningCardLocation(linkedParentCard.id) : null;
+        if(lane === "BACKLOG" && planningCardIsCatalogProduct(movingCard)){
+          const returned = returnPlanningCardToCatalog(cardId, true);
+          const jobLabel = String(movingCard?.job_ref || movingCard?.job_name || movingCard?.product_sku || "Item").trim();
           renderPlanningBoard({ ...latestState, planning_board: planningBoard });
-          schedulePlanningSave();
+          renderLowStockRecommendations(lowStockItemsState);
+          if(movingLocation?.lane && movingLocation.lane !== "BACKLOG"){
+            schedulePlanningSave(returned.map(entry => planningActivityEntry(
+              entry.card, "REMOVED", entry.lane, "CATALOG", entry.index, -1, "Returned to the Planning product list"
+            )));
+          }
+          planningSetStatus(`Returned ${jobLabel} to the product list.`);
+          clearPlanningDragState();
+          return;
+        }
+        if(movingCard && !confirmPlanningTonnageFit(movingCard, lane)){
+          const jobLabel = String(movingCard.job_ref || movingCard.job_name || movingCard.job_id || movingCard.product_sku || "Item").trim();
+          if(movingLocation?.lane === "BACKLOG" && planningCardIsCatalogProduct(movingCard)){
+            returnPlanningCardToCatalog(cardId, true);
+            renderLowStockRecommendations(lowStockItemsState);
+          }
+          planningSetStatus(`${jobLabel} was not moved because its required tonnage exceeds the machine capacity.`, true);
+          renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+          clearPlanningDragState();
+          return;
+        }
+        if(linkedParentCard && !confirmPlanningTonnageFit(linkedParentCard, lane)){
+          const jobLabel = String(linkedParentCard.job_ref || linkedParentCard.job_name || linkedParentCard.product_sku || "Linked parent").trim();
+          if(movingLocation?.lane === "BACKLOG" && planningCardIsCatalogProduct(movingCard)){
+            returnPlanningCardToCatalog(cardId, true);
+            renderLowStockRecommendations(lowStockItemsState);
+          }
+          planningSetStatus(`${jobLabel} was not moved because its required tonnage exceeds the machine capacity.`, true);
+          renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+          clearPlanningDragState();
+          return;
+        }
+        if(findAndMovePlanningCard(cardId, lane, targetIndex)){
+          const savedActivities = [];
+          const placedLocation = findPlanningCardLocation(cardId);
+          const fromCatalog = movingLocation?.lane === "BACKLOG" && planningCardIsCatalogProduct(movingCard);
+          const moveAction = movingLocation?.lane === lane
+            ? "REORDERED"
+            : (fromCatalog ? "QUEUED" : (movingLocation?.lane === "BACKLOG" ? "ASSIGNED" : "MOVED"));
+          savedActivities.push(planningActivityEntry(
+            movingCard, moveAction, fromCatalog ? "CATALOG" : (movingLocation?.lane || ""), lane,
+            movingLocation?.index ?? -1, placedLocation?.index ?? -1
+          ));
+          if(linkedParentCard){
+            const placedCards = planningBoard.lanes[lane] || [];
+            const childIndex = placedCards.findIndex(card => String(card?.id || "") === String(cardId));
+            findAndMovePlanningCard(linkedParentCard.id, lane, childIndex >= 0 ? childIndex + 1 : null);
+            const placedParentLocation = findPlanningCardLocation(linkedParentCard.id);
+            savedActivities.push(planningActivityEntry(
+              linkedParentCard, "LINKED", fromCatalog ? "CATALOG" : (linkedParentLocation?.lane || "BACKLOG"), lane,
+              linkedParentLocation?.index ?? -1, placedParentLocation?.index ?? -1,
+              `Automatically placed after ${movingCard?.job_ref || movingCard?.product_sku || "final component"}`
+            ));
+            const childLabel = String(movingCard?.job_ref || movingCard?.job_name || movingCard?.product_sku || "Component");
+            const parentLabel = String(linkedParentCard.job_ref || linkedParentCard.job_name || linkedParentCard.product_sku || "finished good");
+            planningSetStatus(`Placed ${childLabel}; linked parent ${parentLabel} was placed next in the same queue.`);
+          }
+          renderPlanningBoard({ ...latestState, planning_board: planningBoard });
+          schedulePlanningSave(savedActivities);
         }
         clearPlanningDragState();
       });
     });
-    document.querySelectorAll(".planning-remove").forEach(btn => {
-      btn.addEventListener("click", () => {
+    scope.querySelectorAll(".planning-remove").forEach(btn => {
+      if(btn.dataset.planningRemoveBound === "1") return;
+      btn.dataset.planningRemoveBound = "1";
+      btn.addEventListener("pointerdown", ev => ev.stopPropagation());
+      btn.addEventListener("click", ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
         const cardId = btn.getAttribute("data-card-id") || "";
         const lane = btn.getAttribute("data-lane") || "BACKLOG";
         planningBoard = normalizePlanningBoard(planningBoard);
-        const removed = (planningBoard.lanes[lane] || []).find(c => String(c.id || "") === cardId);
-        planningBoard.lanes[lane] = (planningBoard.lanes[lane] || []).filter(c => String(c.id || "") !== cardId);
-        if(removed && String(removed.source || "") === "LOW STOCK"){
-          const productId = String(removed.product_id || "").trim();
-          const sku = String(removed.product_sku || removed.sku || "").trim();
-          const exists = (lowStockItemsState || []).some(x =>
-            (productId && String(x?.product_id || "").trim() === productId)
-            || (sku && String(x?.sku || "").trim() === sku)
-          );
-          if(!exists){
-            lowStockItemsState.unshift({
-              product_id: productId,
-              sku,
-              name: removed.product_name || "",
-              tonnage: removed.tonnage || "",
-              total_stock: removed.low_stock_total ?? 0,
-              unit: removed.low_stock_unit || "",
-              qty_source: removed.low_stock_qty_source || "stock",
-              threshold: removed.low_stock_threshold || "",
-              warehouses: Array.isArray(removed.warehouses) ? removed.warehouses : [],
-            });
-          }
+        const removedIndex = (planningBoard.lanes[lane] || []).findIndex(c => String(c.id || "") === cardId);
+        const removed = removedIndex >= 0 ? planningBoard.lanes[lane][removedIndex] : null;
+        if(!removed){
+          planningSetStatus("That queued job could not be found. Refresh Planning and try again.", true);
+          return;
         }
+        const jobLabel = String(removed.job_ref || removed.job_name || removed.job_id || removed.product_sku || "Queued job").trim();
+        const laneLabel = lane === "BACKLOG" ? "the Planning backlog" : (MACHINE_NAME_MAP[lane] || lane);
+        if(!window.confirm(`Remove ${jobLabel} from ${laneLabel}?`)) return;
+        planningBoard.lanes[lane] = (planningBoard.lanes[lane] || []).filter(c => String(c.id || "") !== cardId);
+        restorePlanningCatalogCard(removed);
+        planningMachineScrollActiveUntil = 0;
         renderPlanningBoard({ ...latestState, planning_board: planningBoard });
         renderLowStockRecommendations(lowStockItemsState);
-        schedulePlanningSave();
+        schedulePlanningSave(planningActivityEntry(removed, "REMOVED", lane, "REMOVED", removedIndex, -1));
+        planningSetStatus(`Removed ${jobLabel} from ${laneLabel}.`);
       });
     });
   }
 
-  function schedulePlanningSave(){
+  function schedulePlanningSave(activities = []){
     planningLocalDirty = true;
+    const rows = Array.isArray(activities) ? activities : (activities ? [activities] : []);
+    planningPendingActivities.push(...rows.filter(row => row && typeof row === "object"));
     if(planningSaveTimer) clearTimeout(planningSaveTimer);
     planningSaveTimer = setTimeout(savePlanningBoard, 350);
   }
 
   async function savePlanningBoard(){
     planningBoard = normalizePlanningBoard(planningBoard);
-    const resp = await fetch("/api/planning/board", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ board: planningBoard }),
-    });
-    const out = await resp.json();
-    if(out.ok && out.board){
-      planningBoard = normalizePlanningBoard(out.board);
-      planningLocalDirty = false;
-      planningSetStatus("Planning board saved.");
-    } else {
-      planningSetStatus(out.error || "Failed to save planning board.", true);
+    const activities = planningPendingActivities.splice(0);
+    try{
+      const resp = await fetch("/api/planning/board", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ board: planningBoard, activities }),
+      });
+      const out = await resp.json();
+      if(out.ok && out.board){
+        planningBoard = normalizePlanningBoard(out.board);
+        planningLocalDirty = false;
+        planningSetStatus("Planning board saved.");
+        if(planningBoardView?.classList.contains("activity-active")) loadPlanningActivity();
+      } else {
+        planningPendingActivities.unshift(...activities);
+        planningSetStatus(out.error || "Failed to save planning board.", true);
+      }
+    }catch(error){
+      planningPendingActivities.unshift(...activities);
+      planningSetStatus(`Failed to save planning board: ${error}`, true);
     }
   }
 
@@ -14529,7 +16316,7 @@ DASHBOARD_HTML = """
       planningBoard.lanes.BACKLOG.unshift(card);
       if(planningJobInput) planningJobInput.value = "";
       renderPlanningBoard({ ...latestState, planning_board: planningBoard });
-      schedulePlanningSave();
+      schedulePlanningSave(planningActivityEntry(card, "QUEUED", "JOB LOOKUP", "BACKLOG", -1, 0, "Added by job/work-order lookup"));
       planningSetStatus(`Added ${card.job_ref || card.job_id || value} to the top of the planning list.`);
     }catch(e){
       planningSetStatus(`Planning lookup failed: ${e}`, true);
@@ -14684,7 +16471,7 @@ DASHBOARD_HTML = """
   }
 
   function machineLinkageDisplay(s, code){
-    const linkedRows = Array.isArray(s.linkage_jobs) ? s.linkage_jobs : [];
+    const linkedRows = Array.isArray(s.linkage_jobs) ? s.linkage_jobs.slice() : [];
     const jobs = [
       {
         role: "Original Job",
@@ -14708,6 +16495,39 @@ DASHBOARD_HTML = """
     const index = ((rawIndex % total) + total) % total;
     machineLinkageDisplayIndex.set(code, index);
     return { jobs, index, current: jobs[index], total };
+  }
+
+  function machineDetailSessionForDisplayedJob(session, code){
+    const linkageDisplay = machineLinkageDisplay(session, code);
+    if(linkageDisplay.index === 0) return session;
+    const selected = linkageDisplay.current || {};
+    const payload = (selected.job_payload && typeof selected.job_payload === "object")
+      ? selected.job_payload
+      : {};
+    const data = (payload.data && typeof payload.data === "object") ? payload.data : {};
+    const job = (data.job && typeof data.job === "object")
+      ? data.job
+      : ((payload.job && typeof payload.job === "object") ? payload.job : {});
+    const details = (data.job_details && typeof data.job_details === "object")
+      ? data.job_details
+      : ((payload.job_details && typeof payload.job_details === "object") ? payload.job_details : {});
+    return {
+      ...session,
+      job_code: selected.job_code || "",
+      job_name: selected.job_name || selected.job_code || "Linked Job",
+      job_payload: payload,
+      product_id: firstValue(selected.product_id, details.product_id, job.product_id, ""),
+      product_sku: jobSku(selected) || "",
+      product_name: firstValue(
+        selected.product_name,
+        details.product_name,
+        details.name,
+        job.product_name,
+        job.name,
+        ""
+      ),
+      _linkage_display_role: selected.role || `Linked Job ${linkageDisplay.index}`,
+    };
   }
 
   function renderMachineCardNow(code, flipLinkage = false){
@@ -14737,34 +16557,35 @@ DASHBOARD_HTML = """
     const card = machineCardEls.get(code);
     const fresh = (latestState.sessions || []).find(x => String(x.machine_code || "").trim() === code);
     if(!card || !fresh) return;
-    const linkedRows = Array.isArray(fresh.linkage_jobs) ? fresh.linkage_jobs : [];
-    const total = 1 + linkedRows.length;
+    const total = machineLinkageDisplay(fresh, code).total;
     if(total <= 1) return;
+    if(machineLinkageFlipTimers.has(code)) return;
 
-    const existingTimers = machineLinkageFlipTimers.get(code) || [];
-    existingTimers.forEach(t => clearTimeout(t));
-    card.classList.remove("linkage-flip-out", "linkage-flip-in");
+    const current = machineLinkageDisplayIndex.has(code) ? Number(machineLinkageDisplayIndex.get(code) || 0) : 0;
+    const next = (current + 1) % total;
+    card.classList.remove("linkage-fade-out", "linkage-slide-in");
     void card.offsetWidth;
-    card.classList.add("linkage-flip-out");
+    card.classList.add("linkage-fade-out");
 
     const swapTimer = setTimeout(() => {
-      const current = machineLinkageDisplayIndex.has(code) ? Number(machineLinkageDisplayIndex.get(code) || 0) : -1;
-      const next = (current + 1) % total;
       machineLinkageDisplayIndex.set(code, next);
       renderMachineCardNow(code, false);
       const nextCard = machineCardEls.get(code);
-      if(!nextCard) return;
-      nextCard.classList.remove("linkage-flip-out", "linkage-flip-in");
+      if(!nextCard){
+        machineLinkageFlipTimers.delete(code);
+        return;
+      }
+      nextCard.classList.remove("linkage-fade-out", "linkage-slide-in");
       void nextCard.offsetWidth;
-      nextCard.classList.add("linkage-flip-in");
+      nextCard.classList.add("linkage-slide-in");
 
       const cleanupTimer = setTimeout(() => {
         const doneCard = machineCardEls.get(code);
-        if(doneCard) doneCard.classList.remove("linkage-flip-out", "linkage-flip-in");
+        if(doneCard) doneCard.classList.remove("linkage-slide-in");
         machineLinkageFlipTimers.delete(code);
-      }, 380);
+      }, 820);
       machineLinkageFlipTimers.set(code, [cleanupTimer]);
-    }, 230);
+    }, 720);
     machineLinkageFlipTimers.set(code, [swapTimer]);
   }
 
@@ -15076,6 +16897,10 @@ DASHBOARD_HTML = """
     const manual = machineStatusOverrideFor(code);
     const manualStatus = String((manual && manual.status) || "").trim();
     const machineName = s.machine_name || MACHINE_NAME_MAP[code] || s.machine_code || code || "-";
+    const linkageDisplay = machineLinkageDisplay(s, code);
+    const displayedJob = linkageDisplay.current || {};
+    const hasLinkedJobs = linkageDisplay.total > 1;
+    const showLinkedJobButton = hasLinkedJobs;
     const supervisor = firstValue(manual?.set_by_name, manual?.supervisor_name, manual?.set_by_badge, "-");
     const supervisorRole = String(manual?.set_by_role || "").trim();
     const statusStartedAt = String(manual?.started_at_utc || manual?.updated_at_utc || "").trim();
@@ -15083,9 +16908,10 @@ DASHBOARD_HTML = """
     const statusDuration = Number.isFinite(statusStartedMs)
       ? fmtStatusDuration(Math.max(0, Math.floor((Date.now() - statusStartedMs) / 1000)))
       : "-";
-    const jobLabel = jobDisplayName(s, "No Job Set");
+    const jobLabel = firstValue(displayedJob.job_name, displayedJob.job_code, s.job_name, s.job_code, "No Job Set");
     const lastAction = meaningfulMachineAction(s);
     const statusText = statusLabel || css.toUpperCase();
+    const tonnage = String((latestState?.machine_tonnage && latestState.machine_tonnage[code]) || "").trim();
     const operatorText = manualStatus
       ? `${supervisor}${supervisorRole ? ` (${supervisorRole})` : ""}`
       : displayNameForId(s.operator_id || "-");
@@ -15105,6 +16931,26 @@ DASHBOARD_HTML = """
     const progressTooltip = targetPackCount > 0
       ? `${cycleTimeSeconds} sec cycle | ${producedPerShift} units / 12-hour shift | ${packQty} units / pack`
       : "Cycle time or pack quantity is not available";
+    const queueRow = (Array.isArray(latestState?.job_queue) ? latestState.job_queue : []).find(row =>
+      String(row?.machine_code || "").trim() === String(code || "").trim()
+      && (!s.job_code || String(row?.job_code || "").trim() === String(s.job_code || "").trim())
+    ) || null;
+    const jobTargetQty = Math.max(0, Number(queueRow?.target_qty || 0));
+    const jobProducedQty = Math.max(0, Number(queueRow?.produced_now || (Number(s.good_total || 0) + Number(s.butal_total || 0))));
+    const jobProgressPct = jobTargetQty > 0
+      ? Math.max(0, Math.min(100, (jobProducedQty / jobTargetQty) * 100))
+      : 0;
+    const expectedFinishUtc = String(queueRow?.expected_finish_act_utc || queueRow?.expected_finish_pack_utc || "").trim();
+    const estimatedFinish = jobTargetQty > 0 && jobProducedQty >= jobTargetQty
+      ? "Completed"
+      : (expectedFinishUtc ? fmtDateLocal(expectedFinishUtc) : "Estimate unavailable");
+    const remainingSeconds = Number(queueRow?.remaining_seconds_act ?? queueRow?.remaining_seconds_pack);
+    const estimateCaption = jobTargetQty > 0
+      ? `${jobProducedQty} / ${jobTargetQty} pcs${Number.isFinite(remainingSeconds) && remainingSeconds > 0 ? ` | ${fmtDowntimeSeconds(remainingSeconds)} remaining` : ""}`
+      : "No job target quantity available";
+    const totalGoodNow = Math.max(0, Number(s.good_total || 0) + Number(s.butal_total || 0));
+    const machineCounterNow = firstValue(s.machine_counter_current, s.machine_counter_shift_end, "-");
+    const skuName = firstValue(jobSku(displayedJob), linkageDisplay.index === 0 ? s.product_sku : "", "-");
     const supervisorTooltip = [
       "Supervisor QR pending",
       "Scan Supervisor QR on the client to continue downtime resolution.",
@@ -15117,43 +16963,79 @@ DASHBOARD_HTML = """
     ` : "";
     return `
       ${supervisorNotif}
-      <div class="machine-card-head">
-        <div class="machine-card-title">
-          <h3>${esc(machineName)}</h3>
-        </div>
-        <span class="machine-status-badge ${esc(css)}">${esc(statusText)}</span>
-      </div>
-      <div class="machine-compact-meta">
-        <div class="machine-compact-row">
-          <span class="k">${manualStatus ? "Supervisor" : "Operator"}</span>
-          <span class="v" title="${esc(operatorText)}">${esc(operatorText)}</span>
-        </div>
-        <div class="machine-compact-row">
-          <span class="k">Job</span>
-          <span class="v" title="${esc(jobLabel)}">${esc(jobLabel)}</span>
-        </div>
-        ${lastAction ? `<div class="machine-last-action" title="${esc(lastAction)}">${esc(lastAction)}</div>` : ""}
-      </div>
-      <div class="machine-compact-bottom">
-        ${manualStatus ? `
-          <div class="machine-compact-duration">
-            <span class="clock">◷</span>
-            <span class="machine-status-live-duration" data-status-started="${esc(statusStartedAt)}">${esc(statusDuration)}</span>
+      <div class="machine-card-face machine-card-face-normal">
+        <div class="machine-card-head">
+          <div class="machine-card-title">
+            <h3>${esc(machineName)}</h3>
           </div>
-        ` : css === "disconnected" ? `
-          <div class="machine-offline-note">
-            <span class="offline-icon" aria-hidden="true">⊘</span>
-            <strong>No internet</strong>
+          <div class="machine-card-status-stack">
+            <span class="machine-status-badge ${esc(css)}">${esc(statusText)}</span>
+            ${tonnage ? `<span class="machine-tonnage">${esc(tonnage)}</span>` : ""}
           </div>
-        ` : `
-          <div class="machine-progress-row ${esc(css)}">
-            <div class="machine-progress-summary" title="${esc(progressTooltip)}">
-              <span class="machine-progress-count">${esc(progressCountText)}</span>
-              <strong>${esc(progressPct)}%</strong>
+        </div>
+        <div class="machine-compact-meta">
+          <div class="machine-compact-row">
+            <span class="k">${manualStatus ? "Supervisor" : "Operator"}</span>
+            <span class="v" title="${esc(operatorText)}">${esc(operatorText)}</span>
+          </div>
+          <div class="machine-compact-row">
+            <span class="k">Job</span>
+            <span class="v" title="${esc(jobLabel)}">${esc(jobLabel)}</span>
+          </div>
+          ${lastAction ? `<div class="machine-last-action" title="${esc(lastAction)}">${esc(lastAction)}</div>` : ""}
+        </div>
+        <div class="machine-compact-bottom">
+          ${manualStatus ? `
+            <div class="machine-compact-duration">
+              <span class="clock">◷</span>
+              <span class="machine-status-live-duration" data-status-started="${esc(statusStartedAt)}">${esc(statusDuration)}</span>
             </div>
-            <div class="machine-progress-track"><span class="machine-progress-fill" style="width:${esc(progressPct)}%"></span></div>
+          ` : css === "disconnected" ? `
+            <div class="machine-offline-note">
+              <span class="offline-icon" aria-hidden="true">⊘</span>
+              <strong>No internet</strong>
+            </div>
+          ` : `
+            <div class="machine-progress-row ${esc(css)}">
+              <div class="machine-progress-summary" title="${esc(progressTooltip)}">
+                <span class="machine-progress-count">${esc(progressCountText)}</span>
+                <strong>${esc(progressPct)}%</strong>
+              </div>
+              <div class="machine-progress-track"><span class="machine-progress-fill" style="width:${esc(progressPct)}%"></span></div>
+            </div>
+          `}
+        </div>
+      </div>
+      <div class="machine-card-face machine-card-face-hover">
+        <div class="machine-hover-head">
+          <strong>${esc(machineName)}</strong>
+          <span>${esc(tonnage || statusText)}</span>
+        </div>
+        <div class="machine-hover-counters">
+          <div class="machine-hover-counter good"><span class="k">Good</span><span class="v">${esc(s.good_total || 0)}</span></div>
+          <div class="machine-hover-counter butal"><span class="k">Butal</span><span class="v">${esc(s.butal_total || 0)}</span></div>
+          <div class="machine-hover-counter reject"><span class="k">Reject</span><span class="v">${esc(s.reject_total || 0)}</span></div>
+          <div class="machine-hover-counter total"><span class="k">Total Good</span><span class="v">${esc(totalGoodNow)}</span></div>
+        </div>
+        <div class="machine-hover-info-row">
+          <div class="machine-hover-lines">
+            <div class="machine-hover-line"><span class="k">Job Name</span><span class="v" title="${esc(jobLabel)}">${esc(jobLabel)}</span></div>
+            <div class="machine-hover-line"><span class="k">SKU</span><span class="v" title="${esc(skuName)}">${esc(skuName)}</span></div>
+            <div class="machine-hover-line"><span class="k">Operator Name</span><span class="v" title="${esc(operatorText)}">${esc(operatorText)}</span></div>
+            <div class="machine-hover-line"><span class="k">Machine Counter</span><span class="v" title="${esc(machineCounterNow)}">${esc(machineCounterNow)}</span></div>
           </div>
-        `}
+          ${showLinkedJobButton ? `
+            <button class="machine-linked-btn machine-linkage-switch" type="button" title="${esc(`Show linked job (${linkageDisplay.index + 1} of ${linkageDisplay.total})`)}" aria-label="Show linked job">
+              <span class="sign"><img src="/Images/linkchain.svg" alt=""></span>
+              <span class="text">Linked Job</span>
+            </button>
+          ` : ""}
+        </div>
+        <div class="machine-job-estimate">
+          <div class="machine-job-estimate-head"><span>Estimated finish</span><strong>${esc(jobProgressPct.toFixed(1))}%</strong></div>
+          <div class="machine-job-estimate-track"><span class="machine-job-estimate-fill" style="width:${esc(jobProgressPct.toFixed(2))}%"></span></div>
+          <div class="machine-job-estimate-caption" title="${esc(`${estimatedFinish} | ${estimateCaption}`)}">${esc(estimatedFinish)} · ${esc(estimateCaption)}</div>
+        </div>
       </div>
     `;
   }
@@ -15283,7 +17165,80 @@ DASHBOARD_HTML = """
     renderPlanningOpsSummary(state || {}, state.job_queue || []);
     renderPlanningQueue(state.job_queue || []);
     renderPlanningBoard(state || {});
+    renderPlanningQueueMismatchAlerts(state.planning_queue_alerts || []);
+    if(!trialBoardDirty) trialBoardState = normalizeTrialBoard(state.trial_board || trialBoardState);
+    if(planningBoardView?.classList.contains("trial-active")) renderTrialBoard(trialBoardState);
   }
+
+  function setPlanningQueueOpen(open){
+    const shouldOpen = Boolean(open);
+    planningQueueBackdrop?.classList.toggle("open", shouldOpen);
+    planningQueueBackdrop?.setAttribute("aria-hidden", shouldOpen ? "false" : "true");
+    planningQueueToggle?.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+    if(shouldOpen) planningQueueClose?.focus();
+  }
+  planningQueueToggle?.addEventListener("click", () => setPlanningQueueOpen(true));
+  planningQueueClose?.addEventListener("click", () => {
+    setPlanningQueueOpen(false);
+    planningQueueToggle?.focus();
+  });
+  planningQueueBackdrop?.addEventListener("click", ev => {
+    if(ev.target !== planningQueueBackdrop) return;
+    setPlanningQueueOpen(false);
+    planningQueueToggle?.focus();
+  });
+  planningOverviewBtn?.addEventListener("click", () => {
+    setPlanOverviewOpen(!planningBoardView?.classList.contains("compact-active"));
+  });
+  trialBoardBtn?.addEventListener("click", () => {
+    setTrialBoardOpen(!planningBoardView?.classList.contains("trial-active"));
+  });
+  planningActivityBtn?.addEventListener("click", () => {
+    setPlanningActivityOpen(!planningBoardView?.classList.contains("activity-active"));
+  });
+  planningActivityRefreshBtn?.addEventListener("click", loadPlanningActivity);
+  [planningActivitySearch, planningActivityActionFilter, planningActivityMachineFilter, planningActivityDateFilter].forEach(control => {
+    control?.addEventListener("input", renderPlanningActivity);
+    control?.addEventListener("change", renderPlanningActivity);
+  });
+  trialBoardAddBtn?.addEventListener("click", () => {
+    captureTrialBoardRows();
+    trialBoardState.rows.push({ date:"", imm_mold:"", material:"", reason:"", remarks:"" });
+    trialBoardDirty = true;
+    renderTrialBoard(trialBoardState, { force:true, keepDirty:true });
+    trialBoardTableWrap?.querySelector("tbody tr:last-child .trial-board-input")?.focus();
+    if(trialBoardStatus) trialBoardStatus.textContent = "Unsaved changes";
+  });
+  trialBoardSaveBtn?.addEventListener("click", saveTrialBoard);
+  document.querySelectorAll(".plan-overview-tab").forEach(tab => {
+    tab.addEventListener("click", () => {
+      activePlanOverviewFactory = tab.getAttribute("data-plan-factory") === "F04" ? "F04" : "F03";
+      document.querySelectorAll(".plan-overview-tab").forEach(button => button.classList.toggle("active", button === tab));
+      renderCompactPlanOverview();
+      bindPlanningDragHandlers(planOverviewInline);
+    });
+  });
+  document.addEventListener("keydown", ev => {
+    if(ev.key === "Escape" && planningQueueBackdrop?.classList.contains("open")){
+      setPlanningQueueOpen(false);
+      planningQueueToggle?.focus();
+      return;
+    }
+    if(ev.key === "Escape" && planningBoardView?.classList.contains("compact-active")){
+      setPlanOverviewOpen(false);
+      planningOverviewBtn?.focus();
+      return;
+    }
+    if(ev.key === "Escape" && planningBoardView?.classList.contains("trial-active")){
+      setTrialBoardOpen(false);
+      trialBoardBtn?.focus();
+      return;
+    }
+    if(ev.key === "Escape" && planningBoardView?.classList.contains("activity-active")){
+      setPlanningActivityOpen(false);
+      planningActivityBtn?.focus();
+    }
+  });
 
   // tab handling
   document.querySelectorAll(".main-tab-button").forEach(btn => {
@@ -15293,8 +17248,26 @@ DASHBOARD_HTML = """
       document.querySelectorAll(".main-tab-content").forEach(c => c.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById(target)?.classList.add("active");
+      const planningActive = target === "planningTab";
+      document.body.classList.toggle("planning-tab-active", planningActive);
+      if(machineFilterBtn) machineFilterBtn.hidden = planningActive;
+      if(planningOverviewBtn) planningOverviewBtn.hidden = !planningActive;
+      if(trialBoardBtn) trialBoardBtn.hidden = !planningActive;
+      if(planningActivityBtn) planningActivityBtn.hidden = !planningActive;
+      if(planningQueueToggle) planningQueueToggle.hidden = !planningActive;
+      if(planningActive && machineFilterMenu){
+        machineFilterMenu.hidden = true;
+        machineFilterBtn?.setAttribute("aria-expanded", "false");
+      }
       if(target === "finishShiftTab") loadCompleteFinishedHistory();
       if(target === "userKpiTab") loadUserKpis();
+      if(target === "planningTab" && !lowStockItemsState.length) loadLowStockRecommendations(false);
+      if(target !== "planningTab"){
+        setPlanningQueueOpen(false);
+        setPlanOverviewOpen(false);
+        setTrialBoardOpen(false);
+        setPlanningActivityOpen(false);
+      }
     });
   });
   document.addEventListener("pointerout", (ev) => {
@@ -15366,7 +17339,7 @@ DASHBOARD_HTML = """
       machine_code: code,
       machine_name: MACHINE_NAME_MAP[code] || code,
     };
-    openMachineDetail(fresh);
+    openMachineDetail(machineDetailSessionForDisplayedJob(fresh, code));
   };
   machineGrid?.addEventListener("pointerdown", handleMachineGridPointerDown);
   additionalMachineGrid?.addEventListener("pointerdown", handleMachineGridPointerDown);
@@ -15439,15 +17412,18 @@ DASHBOARD_HTML = """
     planningClearBtn.addEventListener("click", () => {
       if(!confirm("Clear all scanned/queued jobs from the planning list?")) return;
       planningBoard = normalizePlanningBoard(planningBoard);
+      const removedActivities = (planningBoard.lanes.BACKLOG || []).map((card, index) =>
+        planningActivityEntry(card, "REMOVED", "BACKLOG", "REMOVED", index, -1, "Cleared from the planning list")
+      );
       planningBoard.lanes.BACKLOG = [];
       renderPlanningBoard({ ...latestState, planning_board: planningBoard });
-      schedulePlanningSave();
+      schedulePlanningSave(removedActivities);
     });
   }
   if(planningLowStockRefreshBtn){
     planningLowStockRefreshBtn.addEventListener("click", () => loadLowStockRecommendations(true));
   }
-  [planningLowStockSearch, planningLowStockMin, planningLowStockMax, planningLowStockLimit].forEach(el => {
+  [planningLowStockSearch, planningLowStockLimit].forEach(el => {
     if(el) el.addEventListener("input", () => renderLowStockRecommendations(lowStockItemsState));
     if(el) el.addEventListener("change", () => renderLowStockRecommendations(lowStockItemsState));
   });
@@ -17151,7 +19127,10 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
     return True
 
 
-SERVER_SYNC_PROTOCOL_VERSION = 2
+SERVER_SYNC_PROTOCOL_VERSION = max(
+    1,
+    int(os.environ.get("MACHINE_SERVER_SYNC_PROTOCOL_VERSION", "2") or 2),
+)
 
 
 def _dashboard_event_description(
@@ -17373,6 +19352,77 @@ def _session_has_pack_counter_event(sess: MachineSession, pack_key: str) -> bool
         isinstance(row, dict) and str(row.get("pack_key") or "").strip() == key
         for row in (sess.product_pack_history_logs or [])
     )
+
+
+def _session_sync_can_adopt_newer_segment(
+    sess: MachineSession,
+    snap: Dict[str, Any],
+    incoming_session_id: str,
+    client_id: str,
+    machine_code: str,
+) -> bool:
+    """Allow an explicit full snapshot to repair a stale server session fence.
+
+    This is deliberately narrower than ordinary snapshot merging.  Only the
+    same client/machine may replace the fence, the incoming ID must be a modern
+    PS identity, and the snapshot must prove it belongs to a newer segment (or
+    contain scan history explicitly stamped with that identity when the legacy
+    server row has no usable start time).
+    """
+    if not isinstance(snap, dict) or not str(incoming_session_id or "").startswith("PS-"):
+        return False
+    if str(snap.get("production_session_id") or "").strip() != incoming_session_id:
+        return False
+    snap_machine = str(snap.get("machine_code") or machine_code or "").strip()
+    if snap_machine != str(machine_code or "").strip():
+        return False
+    current_client = str(sess.client_id or "").strip()
+    if current_client and current_client != str(client_id or "").strip():
+        return False
+    if not str(snap.get("job_code") or snap.get("job_name") or "").strip():
+        return False
+
+    incoming_started = _parse_iso_utc(snap.get("job_started_at"))
+    current_started = _parse_iso_utc(sess.job_started_at)
+    if incoming_started is not None and (
+        current_started is None or incoming_started > current_started
+    ):
+        return True
+
+    if not str(sess.production_session_id or "").startswith("LEGACY-"):
+        return False
+    for field in ("product_pack_history_logs", "raw_material_logs", "butal_scan_logs", "reject_review_logs"):
+        for row in snap.get(field) or []:
+            if (
+                isinstance(row, dict)
+                and str(row.get("production_session_id") or "").strip() == incoming_session_id
+            ):
+                return True
+    return False
+
+
+def _legacy_session_can_adopt_live_event(
+    sess: MachineSession,
+    incoming_session_id: str,
+    client_id: str,
+    incoming_job_code: Any,
+) -> bool:
+    """Repair an internally legacy fence without dropping the live event.
+
+    Older persisted rows did not contain a production_session_id. After a
+    restart they receive a synthesized LEGACY ID even though the same running
+    client already uses a PS ID. Matching client and job identity make this a
+    migration of the existing segment, not permission to cross job boundaries.
+    """
+    if not str(sess.production_session_id or "").startswith("LEGACY-"):
+        return False
+    if not str(incoming_session_id or "").startswith("PS-"):
+        return False
+    if str(sess.client_id or "").strip() != str(client_id or "").strip():
+        return False
+    current_job = str(sess.job_code or sess.job_name or "").strip().upper()
+    incoming_job = str(incoming_job_code or "").strip().upper()
+    return bool(current_job and incoming_job and current_job == incoming_job)
 
 
 def _append_pack_counter_event_record(
@@ -17659,13 +19709,8 @@ async def api_event(req: Request):
         event_age_seconds = max(0.0, (utc_now() - event_created_at).total_seconds())
     stale_queued_event = bool(
         event_created_at is not None
-        and (
-            event_created_at < SERVER_EVENT_REPLAY_CUTOFF_UTC
-            or (
-                event_age_seconds is not None
-                and event_age_seconds > float(SERVER_EVENT_REPLAY_MAX_AGE_SECONDS)
-            )
-        )
+        and event_age_seconds is not None
+        and event_age_seconds > float(SERVER_EVENT_REPLAY_MAX_AGE_SECONDS)
     )
     if stale_queued_event:
         # Acknowledge and discard expired transport entries immediately.  They
@@ -17764,6 +19809,61 @@ async def api_event(req: Request):
     if created_session_for_event and incoming_session_id:
         sess.production_session_id = incoming_session_id
         current_session_id = incoming_session_id
+    session_recovered = False
+    previous_session_id = ""
+    if (
+        current_session_id
+        and incoming_session_id
+        and current_session_id != incoming_session_id
+        and ev_type == "SESSION_SYNC"
+        and _session_sync_can_adopt_newer_segment(
+            sess, session_snapshot, incoming_session_id, client_id, machine_code
+        )
+    ):
+        previous_session_id = current_session_id
+        _reset_active_session_for_new_job_segment(sess, preserve_operator_shift_logs=False)
+        sess.production_session_id = incoming_session_id
+        current_session_id = incoming_session_id
+        session_recovered = True
+        _append_server_app_log(
+            "production_session_recovered",
+            {
+                "client_id": client_id,
+                "machine_code": machine_code,
+                "previous_production_session_id": previous_session_id,
+                "production_session_id": incoming_session_id,
+                "job_code": str(session_snapshot.get("job_code") or ""),
+                "snapshot_pack_count": int(session_snapshot.get("pack_count", session_snapshot.get("pack_total", 0)) or 0),
+            },
+        )
+    elif (
+        current_session_id
+        and incoming_session_id
+        and current_session_id != incoming_session_id
+        and not segment_start_event
+        and not finish_event
+        and _legacy_session_can_adopt_live_event(
+            sess,
+            incoming_session_id,
+            client_id,
+            data.get("job_code") or data.get("job_name"),
+        )
+    ):
+        previous_session_id = current_session_id
+        sess.production_session_id = incoming_session_id
+        current_session_id = incoming_session_id
+        session_recovered = True
+        _append_server_app_log(
+            "legacy_production_session_migrated",
+            {
+                "client_id": client_id,
+                "machine_code": machine_code,
+                "previous_production_session_id": previous_session_id,
+                "production_session_id": incoming_session_id,
+                "job_code": str(data.get("job_code") or ""),
+                "event_type": ev_type,
+            },
+        )
     if (
         current_session_id
         and incoming_session_id
@@ -18007,6 +20107,7 @@ async def api_event(req: Request):
                 sess.current_break_session_id = ""
                 sess.break_out_time = None
     if ev_type == "FINISH_SHIFT":
+        _clear_planning_queue_alert(machine_code)
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
             finished_job = dict(finished_job)
@@ -18045,6 +20146,7 @@ async def api_event(req: Request):
         if created_session_for_event and machine_code in SESSIONS and not str(SESSIONS[machine_code].job_code or "").strip():
             del SESSIONS[machine_code]
     elif ev_type == "FINISH_JOB":
+        _clear_planning_queue_alert(machine_code)
         finished_job = ev.get("finished_job")
         if isinstance(finished_job, dict):
             finished_job = dict(finished_job)
@@ -18205,6 +20307,7 @@ async def api_event(req: Request):
             or data.get("event_created_at_utc")
             or utc_now().isoformat()
         )
+        _reconcile_planning_queue_for_session(sess)
     elif ev_type == "OPERATOR_SHIFT_SAVE":
         shift_payload = ev.get("operator_shift")
         if isinstance(shift_payload, dict):
@@ -18229,6 +20332,7 @@ async def api_event(req: Request):
     elif ev_type == "MACHINE_STATUS":
         status = str(ev.get("status") or "").strip().upper()
         if status == "NO_JOB_RUNNING":
+            _clear_planning_queue_alert(machine_code)
             _clear_active_session_job_keep_machine(sess)
     elif ev_type in ("SESSION_SYNC", "HEARTBEAT"):
         snap = ev.get("session_snapshot")
@@ -18272,6 +20376,16 @@ async def api_event(req: Request):
                     incoming_pack_logs = list(snap.get("product_pack_history_logs") or [])
                     if incoming_pack_logs or not (sess.product_pack_history_logs or []):
                         sess.product_pack_history_logs = incoming_pack_logs
+                if isinstance(snap.get("butal_scan_logs"), list):
+                    sess.butal_scan_logs = [
+                        dict(row) for row in snap.get("butal_scan_logs") or []
+                        if isinstance(row, dict)
+                    ]
+                if isinstance(snap.get("reject_review_logs"), list):
+                    sess.reject_review_logs = [
+                        dict(row) for row in snap.get("reject_review_logs") or []
+                        if isinstance(row, dict)
+                    ]
                 sess.startup_reject_total = int(snap.get("startup_reject_total", sess.startup_reject_total) or 0)
                 if isinstance(snap.get("job_payload"), dict):
                     sess.job_payload = dict(snap.get("job_payload") or {})
@@ -18518,6 +20632,8 @@ async def api_event(req: Request):
         "ack_event_id": event_id,
         "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
         "server_authoritative": True,
+        "session_recovered": session_recovered,
+        "previous_production_session_id": previous_session_id or None,
         "session": _session_protocol_payload(resulting_session),
     }
 
@@ -19049,8 +21165,56 @@ async def api_planning_board_save(req: Request):
     if not isinstance(board, dict):
         return JSONResponse({"ok": False, "error": "board object is required"}, status_code=400)
     PLANNING_BOARD = save_planning_board(board)
+    _refresh_active_planning_queue_alerts()
+    activities = data.get("activities") if isinstance(data, dict) and isinstance(data.get("activities"), list) else []
+    saved_activities = append_planning_activity_log(
+        activities,
+        source_ip=str(req.client.host if req.client else ""),
+    )
     await broadcast_state()
-    return {"ok": True, "board": PLANNING_BOARD}
+    return {"ok": True, "board": PLANNING_BOARD, "activities_saved": len(saved_activities)}
+
+
+@APP.get("/api/planning/activity")
+def api_planning_activity(
+    q: str = "",
+    action: str = "",
+    machine: str = "",
+    limit: int = 1000,
+):
+    query = str(q or "").strip().lower()
+    action_filter = str(action or "").strip().upper()
+    machine_filter = str(machine or "").strip().upper()
+    rows = list(reversed(PLANNING_ACTIVITY_LOG))
+    if action_filter:
+        rows = [row for row in rows if str(row.get("action") or "").upper() == action_filter]
+    if machine_filter:
+        rows = [row for row in rows if machine_filter in {
+            str(row.get("from_lane") or "").upper(), str(row.get("to_lane") or "").upper()
+        }]
+    if query:
+        rows = [row for row in rows if query in " ".join(str(row.get(key) or "").lower() for key in (
+            "item", "sku", "job_id", "action", "from_lane", "to_lane", "note", "source_ip"
+        ))]
+    safe_limit = max(1, min(PLANNING_ACTIVITY_MAX_ENTRIES, int(limit or 1000)))
+    return {"ok": True, "entries": rows[:safe_limit], "total": len(rows)}
+
+
+@APP.get("/api/planning/trial-board")
+def api_planning_trial_board():
+    return {"ok": True, "board": TRIAL_BOARD}
+
+
+@APP.post("/api/planning/trial-board")
+async def api_planning_trial_board_save(req: Request):
+    global TRIAL_BOARD
+    data = await req.json()
+    board = data.get("board") if isinstance(data.get("board"), dict) else data
+    if not isinstance(board, dict):
+        return JSONResponse({"ok": False, "error": "board object is required"}, status_code=400)
+    TRIAL_BOARD = save_trial_board(board)
+    await broadcast_state()
+    return {"ok": True, "board": TRIAL_BOARD}
 
 
 @APP.post("/api/planning/lookup")
@@ -19102,7 +21266,13 @@ def api_planning_low_stock(threshold: float = 100, refresh: int = 0):
             "items": result.get("items") or [],
             "from_cache": bool(result.get("from_cache")),
             "saved_at_utc": result.get("saved_at_utc") or "",
-            "threshold": threshold,
+            "threshold": "",
+            "abc_counts": result.get("abc_counts") or {},
+            "serving_rate_from_cache": bool(result.get("serving_rate_from_cache")),
+            "serving_rate_warning": result.get("serving_rate_warning") or "",
+            "classified_count": int(result.get("classified_count") or 0),
+            "matched_product_count": int(result.get("matched_product_count") or 0),
+            "product_count": int(result.get("product_count") or len(result.get("items") or [])),
             "error": result.get("error") or "",
         }
     except urllib_error.HTTPError as e:

@@ -4,9 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-if [[ -f ".venv/bin/activate" ]]; then
-  source ".venv/bin/activate"
+if [[ ! -f ".venv/bin/activate" ]]; then
+  echo "Client virtual environment is missing: $SCRIPT_DIR/.venv" >&2
+  echo "Run ./update_pi_client.sh without --skip-system-setup once to create it." >&2
+  exit 1
 fi
+
+# Never install build packages into Debian's externally managed system Python.
+# shellcheck disable=SC1091
+source ".venv/bin/activate"
 
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install pyinstaller requests pyserial PyMySQL cryptography "qrcode[pil]"

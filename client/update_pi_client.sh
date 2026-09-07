@@ -93,6 +93,12 @@ done
 
 cd "$PROJECT_DIR"
 
+if [[ "$DO_SYSTEM_SETUP" -ne 1 && ! -f ".venv/bin/activate" ]]; then
+  echo "Cannot use --skip-system-setup because $PROJECT_DIR/.venv is missing." >&2
+  echo "Run this installer once without --skip-system-setup; later updates may use the flag." >&2
+  exit 1
+fi
+
 if [[ "$DO_SYSTEM_SETUP" -eq 1 ]]; then
   echo "Updating Raspberry Pi package index..."
   sudo apt update

@@ -14,17 +14,21 @@ Git updates never overwrite that directory.
 
 ```bash
 cd "$HOME"
+
 git clone --filter=blob:none --no-checkout \
   https://github.com/n0de404/RASPBERRY_MACHINE.git Raspberry_Machine
+
 cd Raspberry_Machine
+
 git sparse-checkout init --no-cone
 git sparse-checkout set /client /.gitignore /README.md
 git checkout main
+
 cd client
-chmod +x update_pi_client.sh
+chmod +x *.sh
+
 ./update_pi_client.sh \
-  --server-url http://SERVER_IP:8000 \
-  --client-id RPI-CLIENT-07 \
+  --server-url http://192.168.10.49:8000 \
   --scanner-port /dev/ttyACM0
 ```
 
@@ -34,8 +38,8 @@ Sparse checkout keeps server source, server logs, and development-only files
 out of the Pi working directory. Normal `git pull` updates the selected client
 files without requiring SCP.
 
-Omit `--client-id` on a genuinely new client if the server should assign the
-next available identity.
+The client ID is intentionally omitted so a genuinely new Raspberry Pi asks
+the server for the next available `RPI-CLIENT-##` identity automatically.
 
 ## Publish a patch
 
@@ -62,6 +66,10 @@ cd "$HOME/Raspberry_Machine/client"
 The update stops the client, performs a fast-forward-only pull, validates the
 Python source, rebuilds the executable locally for the Pi, refreshes its
 launcher, and starts it. Existing runtime data remains untouched.
+
+Use `--skip-system-setup` only after the first successful installation has
+created `client/.venv`. If that directory is missing, omit the flag so the
+installer can install `python3-venv` and create the isolated environment.
 
 ## Product and operator caches
 
