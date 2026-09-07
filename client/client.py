@@ -21641,7 +21641,22 @@ QWidget#ClientUIRoot {{
         self.status.setText("Packing Guide opened. Press Home again to close.")
 
     def _open_reject_details_shortcut(self):
-        self.on_scanned("rejectsummary")
+        details_are_open = bool(
+            self.invalidOverlay.isVisible()
+            and str(self.invalidTextLabel.text() or "").strip().upper() == "REJECT DETAILS"
+        )
+        if details_are_open:
+            self._hide_invalid_overlay()
+            self.status.setText("Reject Details guide closed.")
+            return
+        detail_lines = [f"{code} = {label}" for code, label in REJECT_DETAIL_ITEMS]
+        self._show_info_overlay(
+            "REJECT DETAILS",
+            "\n".join(detail_lines)
+            + "\n\nPress Email again to close this guide.",
+            hide_ms=0,
+        )
+        self.status.setText("Reject Details guide opened. Press Email again to close.")
 
     def _refresh_running_jobs_shortcut(self):
         self.status.setText("Calculator shortcut: refreshing all running jobs from BMS...")
