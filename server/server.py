@@ -7670,6 +7670,8 @@ DASHBOARD_HTML = """
     .consumption-content-grid .review-group-card { min-width:0; border:0; border-radius:0; background:#fff; box-shadow:none; }
     .consumption-content-grid .review-group-card:nth-child(2) { border-right:1px solid #b9c7da; }
     .consumption-content-grid .review-group-body { overflow:auto; }
+    .report-sku-hover { color:#1d4ed8; font-weight:950; cursor:help; text-decoration:underline dotted rgba(29,78,216,.55); text-underline-offset:3px; }
+    .report-sku-hover:hover, .report-sku-hover:focus { color:#1e40af; outline:none; }
     .scanned-shift-panel .review-group-body { overflow:hidden; }
     .scan-history-list { width:100%; min-width:0; }
     .scan-history-head, .scan-history-summary { display:grid; grid-template-columns:28px minmax(110px,1.5fr) minmax(66px,.62fr) minmax(92px,1fr) minmax(105px,1fr) 18px; gap:6px; align-items:center; min-width:0; }
@@ -12367,6 +12369,12 @@ DASHBOARD_HTML = """
     return String(value);
   }
 
+  function skuNameHoverHtml(sku, name){
+    const skuText = firstValue(sku, "-");
+    const nameText = firstValue(name, "Name unavailable");
+    return `<span class="report-sku-hover" tabindex="0" title="${escAttr(nameText)}" aria-label="${escAttr(`${skuText}: ${nameText}`)}">${esc(skuText)}</span>`;
+  }
+
   function tableFromRows(rows, columns, emptyLabel = "No data.", maxRows = 8){
     const items = Array.isArray(rows) ? rows : [];
     const cols = (Array.isArray(columns) ? columns : []).map(col => {
@@ -13202,8 +13210,10 @@ DASHBOARD_HTML = """
           <div class="review-group-card balance-panel">
             <div class="review-group-head">Product Parts Balance</div>
             <div class="review-group-body">${tableFromRows(partBalanceRows, [
-              { label:"Part", value:x => x.part_name || x.product_name || x.name || x.material_name || x.description || "-" },
-              { label:"Code", value:x => x.part_code || x.product_code || x.sku || x.code || "-" },
+              { label:"SKU", html:x => skuNameHoverHtml(
+                x.part_code || x.product_code || x.sku || x.code || "-",
+                x.part_name || x.product_name || x.name || x.material_name || x.description || "Name unavailable"
+              ) },
               { label:"Required Qty", value:x => x.request_part_qty || x.required_qty || x.qty || x.quantity || "-" },
               { label:"Produced / Issued", value:x => `${Number(x.issued_qty || 0).toFixed(4)} ${x.unit}` },
               { label:"Consumed Qty", value:x => `${Number(x.consumed_qty || 0).toFixed(4)} ${x.unit}` },
@@ -13213,8 +13223,7 @@ DASHBOARD_HTML = """
           <div class="review-group-card">
             <div class="review-group-head">Actual Consumption Based on Packing</div>
             <div class="review-group-body">${tableFromRows(actualConsumptionRows, [
-              { label:"Material", value:x => x.material },
-              { label:"Code", value:x => x.code },
+              { label:"SKU", html:x => skuNameHoverHtml(x.code, x.material) },
               { label:"Packed Qty", value:x => x.packed_qty },
               { label:"Weight / Unit", value:x => `${Number(x.qty_per_unit || 0).toFixed(4)} ${x.unit}` },
               { label:"Actual Consumed", value:x => `${Number(x.actual_consumed || 0).toFixed(4)} ${x.unit}` },
