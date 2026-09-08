@@ -7665,13 +7665,35 @@ DASHBOARD_HTML = """
     .consumption-kpis .pdr-kpi:last-child { border-bottom:0; }
     .consumption-kpis .pdr-kpi .k { display:flex; align-items:center; justify-content:center; min-height:42px; padding:9px 8px; }
     .consumption-kpis .pdr-kpi .v { display:flex; flex:1; align-items:center; justify-content:center; padding:14px 8px; font-size:clamp(25px,2.4vw,38px); }
-    .consumption-content-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:0; min-width:0; align-content:stretch; }
-    .consumption-content-grid .balance-panel { grid-column:1 / -1; border-bottom:1px solid #b9c7da !important; }
+    .consumption-content-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:0; min-width:0; align-content:stretch; }
+    .consumption-content-grid .balance-panel { grid-column:auto; border-bottom:1px solid #b9c7da !important; }
     .consumption-content-grid .review-group-card { min-width:0; border:0; border-radius:0; background:#fff; box-shadow:none; }
-    .consumption-content-grid .review-group-card:nth-child(2) { border-right:1px solid #b9c7da; }
+    .consumption-content-grid .review-group-card:not(:last-child) { border-bottom:1px solid #b9c7da; }
     .consumption-content-grid .review-group-body { overflow:auto; }
-    .report-sku-hover { color:#1d4ed8; font-weight:950; cursor:help; text-decoration:underline dotted rgba(29,78,216,.55); text-underline-offset:3px; }
-    .report-sku-hover:hover, .report-sku-hover:focus { color:#1e40af; outline:none; }
+    .consumption-data-panel .review-group-head { padding:10px 14px; background:linear-gradient(90deg,#edf4fc,#f8fbff); color:#102a67; font-size:.75rem; letter-spacing:.045em; }
+    .consumption-data-panel .review-data-table { width:100%; table-layout:fixed; border-collapse:separate; border-spacing:0; }
+    .consumption-data-panel .review-data-table th { position:sticky; top:0; z-index:2; padding:9px 10px; border-bottom:2px solid #bfd0e5; background:#f1f6fc; color:#536b91; font-size:.64rem; line-height:1.2; font-weight:950; vertical-align:middle; }
+    .consumption-data-panel .review-data-table td { padding:11px 10px; border-bottom:1px solid #dfe8f2; color:#102451; font-size:.76rem; line-height:1.3; font-weight:800; vertical-align:middle; }
+    .consumption-data-panel .review-data-table tbody tr:nth-child(even) td { background:#f7faff; }
+    .consumption-data-panel .review-data-table tbody tr:hover td { background:#eaf3ff; }
+    .consumption-data-panel .review-data-table tbody tr:last-child td { border-bottom:0; }
+    .consumption-data-panel .review-data-table th:not(:first-child),
+    .consumption-data-panel .review-data-table td:not(:first-child) { text-align:right; font-variant-numeric:tabular-nums; }
+    .balance-panel .review-data-table th:nth-child(1), .balance-panel .review-data-table td:nth-child(1) { width:24%; text-align:left; }
+    .balance-panel .review-data-table th:nth-child(2), .balance-panel .review-data-table td:nth-child(2) { width:15%; }
+    .balance-panel .review-data-table th:nth-child(3), .balance-panel .review-data-table td:nth-child(3),
+    .balance-panel .review-data-table th:nth-child(4), .balance-panel .review-data-table td:nth-child(4) { width:18%; }
+    .balance-panel .review-data-table th:nth-child(5), .balance-panel .review-data-table td:nth-child(5) { width:25%; }
+    .actual-consumption-panel .review-data-table th:nth-child(1), .actual-consumption-panel .review-data-table td:nth-child(1) { width:22%; text-align:left; }
+    .actual-consumption-panel .review-data-table th:nth-child(2), .actual-consumption-panel .review-data-table td:nth-child(2) { width:11%; }
+    .actual-consumption-panel .review-data-table th:nth-child(3), .actual-consumption-panel .review-data-table td:nth-child(3) { width:15%; }
+    .actual-consumption-panel .review-data-table th:nth-child(4), .actual-consumption-panel .review-data-table td:nth-child(4) { width:17%; }
+    .actual-consumption-panel .review-data-table th:nth-child(5), .actual-consumption-panel .review-data-table td:nth-child(5) { width:15%; }
+    .actual-consumption-panel .review-data-table th:nth-child(6), .actual-consumption-panel .review-data-table td:nth-child(6) { width:20%; }
+    .report-sku-hover { position:relative; display:inline-flex; max-width:100%; border:0 !important; border-radius:0 !important; background:transparent !important; color:#1d4ed8 !important; font:inherit; font-weight:950 !important; cursor:help !important; text-align:left; text-decoration:underline dotted rgba(29,78,216,.55); text-underline-offset:3px; box-shadow:none !important; }
+    .report-sku-hover:hover, .report-sku-hover:focus { color:#1e40af !important; outline:none; transform:none !important; }
+    .report-sku-hover .pack-item-name-tooltip { text-align:left; font-variant-numeric:normal; }
+    .report-sku-tooltip-label { display:block; margin-bottom:3px; color:#93c5fd; font-size:.56rem; font-weight:950; letter-spacing:.05em; text-transform:uppercase; }
     .scanned-shift-panel .review-group-body { overflow:hidden; }
     .scan-history-list { width:100%; min-width:0; }
     .scan-history-head, .scan-history-summary { display:grid; grid-template-columns:28px minmax(110px,1.5fr) minmax(66px,.62fr) minmax(92px,1fr) minmax(105px,1fr) 18px; gap:6px; align-items:center; min-width:0; }
@@ -12372,7 +12394,7 @@ DASHBOARD_HTML = """
   function skuNameHoverHtml(sku, name){
     const skuText = firstValue(sku, "-");
     const nameText = firstValue(name, "Name unavailable");
-    return `<span class="report-sku-hover" tabindex="0" title="${escAttr(nameText)}" aria-label="${escAttr(`${skuText}: ${nameText}`)}">${esc(skuText)}</span>`;
+    return `<span class="report-sku-hover pack-item-link" tabindex="0" aria-label="${escAttr(`${skuText}: ${nameText}`)}">${esc(skuText)}<span class="pack-item-name-tooltip" role="tooltip"><span class="report-sku-tooltip-label">Product name</span>${esc(nameText)}</span></span>`;
   }
 
   function tableFromRows(rows, columns, emptyLabel = "No data.", maxRows = 8){
@@ -13207,7 +13229,7 @@ DASHBOARD_HTML = """
             <div class="pdr-kpi good"><div class="k">PRODUCT PARTS TRACKED</div><div class="v">${esc(trackedProductParts)}</div></div>
           </aside>
           <div class="consumption-content-grid">
-          <div class="review-group-card balance-panel">
+          <div class="review-group-card consumption-data-panel balance-panel">
             <div class="review-group-head">Product Parts Balance</div>
             <div class="review-group-body">${tableFromRows(partBalanceRows, [
               { label:"SKU", html:x => skuNameHoverHtml(
@@ -13220,7 +13242,7 @@ DASHBOARD_HTML = """
               { label:"Difference / Lacking", value:x => x.balance_status },
             ], "No product parts recorded.", Math.max(1, partBalanceRows.length))}</div>
           </div>
-          <div class="review-group-card">
+          <div class="review-group-card consumption-data-panel actual-consumption-panel">
             <div class="review-group-head">Actual Consumption Based on Packing</div>
             <div class="review-group-body">${tableFromRows(actualConsumptionRows, [
               { label:"SKU", html:x => skuNameHoverHtml(x.code, x.material) },
