@@ -14494,6 +14494,22 @@ QWidget#ClientUIRoot {{
         s.external_average_weight_sender = None
         s.external_average_weight_needs_refresh = False
 
+    def _job_part_is_active(self, part: Any) -> bool:
+        """Treat an explicitly zero-approved part as an unused/replaced part."""
+        if not isinstance(part, dict):
+            return False
+        for key in ("approve_part_qty", "approved_part_qty", "approved_qty"):
+            if key not in part:
+                continue
+            raw = part.get(key)
+            if raw is None or not str(raw).strip():
+                continue
+            if not re.search(r"-?\d+(?:\.\d+)?", str(raw).replace(",", "")):
+                return True
+            return self._parse_number(raw) > 0.0
+        # Older/offline payloads may not include an approval quantity.
+        return True
+
     def _job_part_rows(self, payload: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         def _rows_from_payload(source: Any) -> List[Dict[str, Any]]:
             base_payload = source if isinstance(source, dict) else {}
@@ -14509,17 +14525,18 @@ QWidget#ClientUIRoot {{
             elif isinstance(data_obj.get("job_details"), dict):
                 job_details = data_obj.get("job_details") or {}
             if isinstance(data_obj.get("parts"), list):
-                return [r for r in data_obj.get("parts") or [] if isinstance(r, dict)]
+                return [r for r in data_obj.get("parts") or [] if self._job_part_is_active(r)]
             if isinstance(job_details.get("parts"), list):
-                return [r for r in job_details.get("parts") or [] if isinstance(r, dict)]
+                return [r for r in job_details.get("parts") or [] if self._job_part_is_active(r)]
             if isinstance(job_details.get("part_ids"), list):
-                return [r for r in job_details.get("part_ids") or [] if isinstance(r, dict)]
+                return [r for r in job_details.get("part_ids") or [] if self._job_part_is_active(r)]
             if isinstance(job_details.get("part_ids"), dict):
-                return [job_details.get("part_ids") or {}]
+                part = job_details.get("part_ids") or {}
+                return [part] if self._job_part_is_active(part) else []
             if isinstance(data_obj.get("part_ids"), list):
-                return [r for r in data_obj.get("part_ids") or [] if isinstance(r, dict)]
+                return [r for r in data_obj.get("part_ids") or [] if self._job_part_is_active(r)]
             if isinstance(base_payload.get("part_ids"), list):
-                return [r for r in base_payload.get("part_ids") or [] if isinstance(r, dict)]
+                return [r for r in base_payload.get("part_ids") or [] if self._job_part_is_active(r)]
             return []
 
         # An explicit payload lookup must stay isolated (used for linked-job

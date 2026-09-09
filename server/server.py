@@ -4169,13 +4169,29 @@ def _job_payload_data(sess: Optional[MachineSession]) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _job_part_is_active(part: Any) -> bool:
+    """Keep legacy parts, but ignore explicitly zero-approved replacements."""
+    if not isinstance(part, dict):
+        return False
+    for key in ("approve_part_qty", "approved_part_qty", "approved_qty"):
+        if key not in part:
+            continue
+        raw = part.get(key)
+        if raw is None or not str(raw).strip():
+            continue
+        if not re.search(r"-?\d+(?:\.\d+)?", str(raw).replace(",", "")):
+            return True
+        return _parse_number(raw) > 0.0
+    return True
+
+
 def _active_session_parts(sess: Optional[MachineSession]) -> List[Dict[str, Any]]:
     data = _job_payload_data(sess)
     details = data.get("job_details") if isinstance(data.get("job_details"), dict) else {}
     if isinstance(data.get("parts"), list):
-        return [dict(x) for x in data.get("parts") or [] if isinstance(x, dict)]
+        return [dict(x) for x in data.get("parts") or [] if _job_part_is_active(x)]
     if isinstance(details.get("parts"), list):
-        return [dict(x) for x in details.get("parts") or [] if isinstance(x, dict)]
+        return [dict(x) for x in details.get("parts") or [] if _job_part_is_active(x)]
     return []
 
 
@@ -10555,6 +10571,18 @@ DASHBOARD_HTML = """
       </div>`;
   }
 
+  function jobPartIsActive(part){
+    if(!part || typeof part !== "object") return false;
+    for(const key of ["approve_part_qty", "approved_part_qty", "approved_qty"]){
+      if(!Object.prototype.hasOwnProperty.call(part, key)) continue;
+      const raw = part[key];
+      if(raw === null || raw === undefined || String(raw).trim() === "") continue;
+      const match = String(raw).replaceAll(",", "").match(/-?\\d+(?:\\.\\d+)?/);
+      return !match || Number(match[0]) > 0;
+    }
+    return true;
+  }
+
   function rawPartRows(row){
     const item = (row && typeof row === "object") ? row : {};
     const payload = (item.job_payload && typeof item.job_payload === "object") ? item.job_payload : {};
@@ -10569,8 +10597,7 @@ DASHBOARD_HTML = """
       Array.isArray(payload.part_ids) ? payload.part_ids : null,
     ].filter(Boolean);
     for(const rows of candidates){
-      const clean = rows.filter(x => x && typeof x === "object");
-      if(clean.length) return clean;
+      if(rows.length) return rows.filter(jobPartIsActive);
     }
     return [];
   }
