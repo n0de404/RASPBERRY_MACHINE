@@ -386,6 +386,7 @@ def _normalized_finished_job_row(row: Dict[str, Any]) -> Dict[str, Any]:
         ("reprint_qr_logs", []),
         ("review_history", []),
         ("operator_segments", []),
+        ("crew_members", []),
     ):
         if not isinstance(out.get(key), type(default)):
             out[key] = default.copy() if isinstance(default, dict) else list(default)
@@ -393,6 +394,13 @@ def _normalized_finished_job_row(row: Dict[str, Any]) -> Dict[str, Any]:
         out["operator_count"] = int(out.get("operator_count") or 0)
     except Exception:
         out["operator_count"] = 0
+    try:
+        out["manpower_count"] = int(
+            out.get("manpower_count")
+            or ((1 if out.get("operator_id") else 0) + len(out.get("crew_members") or []))
+        )
+    except Exception:
+        out["manpower_count"] = 0
     for key in ("linkage_job_payload", "linkage_jobs", "linkage_mirror"):
         if key not in out:
             out[key] = None
@@ -1578,6 +1586,7 @@ class ClientState:
     operator_id: Optional[str] = None
     operator_qr_payload: str = ""
     operator_pending_server_validation: bool = False
+    crew_members: List[Dict[str, Any]] = None
     active_scan_operator_id: Optional[str] = None
     active_scan_owner_type: str = "ORIGINAL"
     reliever_id: Optional[str] = None
@@ -1797,6 +1806,8 @@ class ClientState:
             self.operator_shift_baseline_reject_breakdown = {}
         if self.break_sessions is None:
             self.break_sessions = []
+        if self.crew_members is None:
+            self.crew_members = []
 
 
 @dataclass
@@ -2268,6 +2279,16 @@ class ScannerFilter(QObject):
                 and len(str(event.text() or "")) == 1
                 and str(event.text() or "").isdigit()
             )
+            if key == Qt.Key.Key_Tab:
+                self._buf.clear()
+                self.scanned.emit("crewlist~1")
+                return True
+            if key in (Qt.Key.Key_Plus, Qt.Key.Key_Minus) and (
+                is_numpad_key or self._plain_digit_numpad_is_enabled()
+            ):
+                self._buf.clear()
+                self.scanned.emit("crewadd~1" if key == Qt.Key.Key_Plus else "crewremove~1")
+                return True
             if (is_numpad_key or plain_digit_numpad) and Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
                 self._buf.clear()
                 self.scanned.emit(f"num_{key - Qt.Key.Key_0}")
@@ -3456,6 +3477,7 @@ class ClientUI(QWidget):
     def __init__(self):
         super().__init__()
         self.state = ClientState()
+        self._crew_action_mode = ""
         self.client_config = _load_client_config()
         self.job_api_config = _load_job_api_config()
         # The server remains authoritative. Successful lookups populate a
@@ -10042,7 +10064,11 @@ QWidget#ClientUIRoot {{
         self._restore_job_payload_from_active_snapshot()
         self.lblMachine.setText(f"Machine: {_machine_display_name(s.machine_code, s.machine_name)}")
         self.lblJob.setText(f"Job: {s.job_name or '-'}")
-        if s.break_active and s.reliever_id:
+        manpower_count = self._crew_count()
+        if manpower_count >= 2:
+            self.lblOperator.setText(f"MANPOWER: {manpower_count}")
+            self.lblOperator.setStyleSheet("")
+        elif s.break_active and s.reliever_id:
             self.lblOperator.setText(f"RELIEVER: {self._operator_display_name(s.reliever_id)}")
             self.lblOperator.setStyleSheet("color: #f59e0b; font-weight: 900;")
         else:
@@ -11429,6 +11455,8 @@ QWidget#ClientUIRoot {{
             "operator_id": s.operator_id,
             "operator_qr_payload": str(s.operator_qr_payload or ""),
             "operator_pending_server_validation": bool(s.operator_pending_server_validation),
+            "crew_members": list(s.crew_members or []),
+            "manpower_count": self._crew_count(),
             "active_scan_operator_id": s.active_scan_operator_id or s.operator_id,
             "active_scan_owner_type": str(s.active_scan_owner_type or "ORIGINAL").strip().upper() or "ORIGINAL",
             "reliever_id": s.reliever_id,
@@ -11917,6 +11945,15 @@ QWidget#ClientUIRoot {{
                     seen.add(marker)
                     rows.append(row)
             merged[key] = rows
+        crew_by_code: Dict[str, Dict[str, Any]] = {}
+        for row in list(server_snap.get("crew_members") or []) + list(local_snap.get("crew_members") or []):
+            if not isinstance(row, dict):
+                continue
+            code = self._crew_member_code(row)
+            if code:
+                crew_by_code[code] = dict(row)
+        merged["crew_members"] = list(crew_by_code.values())
+        merged["manpower_count"] = (1 if merged.get("operator_id") else 0) + len(merged["crew_members"])
         linked_by_code: Dict[str, Dict[str, Any]] = {}
         linked_order: List[str] = []
         for row in list(server_snap.get("linkage_jobs") or []) + list(local_snap.get("linkage_jobs") or []):
@@ -12492,6 +12529,11 @@ QWidget#ClientUIRoot {{
         s.operator_id = snap.get("operator_id")
         s.operator_qr_payload = str(snap.get("operator_qr_payload") or "")
         s.operator_pending_server_validation = bool(snap.get("operator_pending_server_validation"))
+        s.crew_members = [
+            dict(row) for row in (snap.get("crew_members") or [])
+            if isinstance(row, dict)
+        ]
+        self._crew_action_mode = ""
         s.active_scan_operator_id = snap.get("active_scan_operator_id") or s.operator_id
         s.active_scan_owner_type = str(snap.get("active_scan_owner_type") or ("RELIEVER" if snap.get("break_active") else "ORIGINAL")).strip().upper() or "ORIGINAL"
         s.reliever_id = snap.get("reliever_id")
@@ -12904,6 +12946,8 @@ QWidget#ClientUIRoot {{
             "reprint_qr_logs": list(s.reprint_qr_logs or []),
             "break_sessions": list(s.break_sessions or []),
             "has_reliever": bool(s.break_sessions),
+            "crew_members": list(s.crew_members or []),
+            "manpower_count": self._crew_count(),
             "operator_shift_logs": list(s.operator_shift_logs or []),
             "partial_qty": int((s.good_total or 0) + (main_butal_total or 0)),
             "review_status": REVIEW_STATUS_CLOSED,
@@ -13049,6 +13093,8 @@ QWidget#ClientUIRoot {{
         s.operator_id = None
         s.operator_qr_payload = ""
         s.operator_pending_server_validation = False
+        s.crew_members = []
+        self._crew_action_mode = ""
         s.active_scan_operator_id = None
         s.active_scan_owner_type = "ORIGINAL"
         s.reliever_id = None
@@ -17687,6 +17733,11 @@ QWidget#ClientUIRoot {{
         self._close_open_relief_for_operator_handoff()
         self._reset_production_for_operator_handoff()
         s.operator_id = operator_value
+        new_primary_code = self._operator_code_only(operator_value)
+        s.crew_members = [
+            dict(row) for row in (s.crew_members or [])
+            if isinstance(row, dict) and self._crew_member_code(row) != new_primary_code
+        ]
         s.operator_qr_payload = str(raw_payload or "").strip() if pending_server_validation else ""
         s.operator_pending_server_validation = bool(pending_server_validation)
         s.active_scan_operator_id = operator_value
@@ -18674,6 +18725,163 @@ QWidget#ClientUIRoot {{
         if len(parts) == 2:
             return parts[1] or "-"
         return str(text)
+
+    def _crew_member_code(self, row: Any) -> str:
+        if not isinstance(row, dict):
+            return ""
+        return self._operator_code_only(
+            row.get("operator_id")
+            or row.get("code")
+            or row.get("operator")
+        )
+
+    def _crew_count(self) -> int:
+        primary_code = self._operator_code_only(self.state.operator_id)
+        helper_codes = {
+            self._crew_member_code(row)
+            for row in (self.state.crew_members or [])
+            if self._crew_member_code(row)
+        }
+        helper_codes.discard(primary_code)
+        return (1 if primary_code else 0) + len(helper_codes)
+
+    def _show_crew_list(self) -> None:
+        s = self.state
+        if not s.operator_id:
+            self.status.setText("No operator is assigned yet.")
+            self._show_info_overlay("MACHINE CREW", "Scan the primary Operator QR first.", hide_ms=5000)
+            return
+        lines = [f"PRIMARY: {self._operator_display_name(s.operator_id)}"]
+        helpers = [row for row in (s.crew_members or []) if isinstance(row, dict)]
+        for index, row in enumerate(helpers, start=1):
+            helper_value = row.get("operator_id") or row.get("name") or row.get("code") or "-"
+            lines.append(f"HELPER {index}: {self._operator_display_name(str(helper_value))}")
+        lines.append(f"MANPOWER: {self._crew_count()}")
+        lines.append("")
+        lines.append("Press + to add or - to remove a helper.")
+        self.status.setText(f"Machine crew displayed. Manpower: {self._crew_count()}.")
+        self._show_info_overlay("MACHINE CREW", "\n".join(lines), hide_ms=8000)
+
+    def _set_crew_action_mode(self, mode: str) -> None:
+        requested = str(mode or "").strip().upper()
+        if requested not in ("ADD", "REMOVE"):
+            self._crew_action_mode = ""
+            self._hide_invalid_overlay()
+            return
+        if not (self.state.machine_code and self.state.job_code and self.state.operator_id):
+            self._crew_action_mode = ""
+            self.status.setText("Complete MACHINE, JOB, and primary OPERATOR before changing manpower.")
+            self._show_invalid_overlay("Set the primary operator before changing manpower.")
+            return
+        if requested == "REMOVE" and not list(self.state.crew_members or []):
+            self._crew_action_mode = ""
+            self.status.setText("No helper operator is assigned.")
+            self._show_crew_list()
+            return
+        if str(self._crew_action_mode or "").upper() == requested:
+            self._crew_action_mode = ""
+            self._hide_invalid_overlay()
+            self.status.setText(f"{requested.title()} manpower cancelled.")
+            return
+        self._crew_action_mode = requested
+        action_text = "ADD MANPOWER" if requested == "ADD" else "REMOVE MANPOWER"
+        self.status.setText(f"{action_text}: scan the Operator QR.")
+        self._show_info_overlay(
+            action_text,
+            f"SCAN OPERATOR QR TO {requested} MANPOWER\n\n"
+            f"Press {'+' if requested == 'ADD' else '-'} again to cancel.",
+            hide_ms=0,
+        )
+
+    def _handle_crew_control_scan(self, raw_scan: str) -> bool:
+        raw_text = str(raw_scan or "").strip()
+        command = raw_text.lower()
+        if command == "crewlist~1":
+            self._show_crew_list()
+            return True
+        if command == "crewadd~1":
+            self._set_crew_action_mode("ADD")
+            return True
+        if command == "crewremove~1":
+            self._set_crew_action_mode("REMOVE")
+            return True
+        mode = str(getattr(self, "_crew_action_mode", "") or "").strip().upper()
+        if mode not in ("ADD", "REMOVE"):
+            return False
+        operator = self._operator_from_scan(raw_text)
+        pending_validation = False
+        if operator is None:
+            offline_operator = self._offline_operator_from_scan(raw_text)
+            if offline_operator is not None:
+                operator = offline_operator
+                pending_validation = True
+        if operator is None:
+            self.status.setText(f"{mode.title()} manpower: scan a valid Operator QR.")
+            self._show_invalid_overlay("Only a registered Operator QR can change machine manpower.")
+            return True
+        operator_value = self._operator_display_value(
+            str(operator.get("code") or raw_text),
+            str(operator.get("name") or ""),
+        )
+        operator_code = self._operator_code_only(operator_value)
+        primary_code = self._operator_code_only(self.state.operator_id)
+        helpers = [
+            dict(row) for row in (self.state.crew_members or [])
+            if isinstance(row, dict) and self._crew_member_code(row)
+        ]
+        existing_index = next(
+            (index for index, row in enumerate(helpers) if self._crew_member_code(row) == operator_code),
+            -1,
+        )
+        if mode == "ADD":
+            if operator_code == primary_code:
+                self.status.setText("Primary operator is already included in manpower.")
+                self._show_invalid_overlay("The primary operator cannot also be added as a helper.")
+                return True
+            if existing_index >= 0:
+                self.status.setText(f"Helper already assigned: {self._operator_display_name(operator_value)}")
+                self._show_invalid_overlay("That operator is already included in machine manpower.")
+                return True
+            helpers.append({
+                "operator_id": operator_value,
+                "operator_code": operator_code,
+                "operator_name": self._operator_display_name(operator_value),
+                "operator_qr_payload": raw_text,
+                "pending_server_validation": bool(pending_validation),
+                "joined_at_utc": datetime.now(timezone.utc).isoformat(),
+            })
+            action = "ADD"
+            message = f"Helper added: {self._operator_display_name(operator_value)}. Manpower: {1 + len(helpers)}."
+        else:
+            if operator_code == primary_code:
+                self.status.setText("The primary operator cannot be removed with the helper control.")
+                self._show_invalid_overlay("Use the normal operator-shift workflow to change the primary operator.")
+                return True
+            if existing_index < 0:
+                self.status.setText("That operator is not assigned as a helper.")
+                self._show_invalid_overlay("Scan the QR of a helper currently shown in the crew list.")
+                return True
+            removed = helpers.pop(existing_index)
+            operator_value = str(removed.get("operator_id") or operator_value)
+            action = "REMOVE"
+            message = f"Helper removed: {self._operator_display_name(operator_value)}. Manpower: {1 + len(helpers)}."
+        self.state.crew_members = helpers
+        self._crew_action_mode = ""
+        self._hide_invalid_overlay()
+        self.status.setText(message)
+        self._refresh_ui(force=True)
+        self._save_active_session_snapshot()
+        self.push_event(
+            {
+                "type": "CREW_UPDATE",
+                "action": action,
+                "operator_id": operator_value,
+                "crew_members": list(helpers),
+                "manpower_count": self._crew_count(),
+            },
+            f"CREW {action}: {self._operator_display_name(operator_value)} | MANPOWER {self._crew_count()}",
+        )
+        return True
 
     def _operator_display_value(self, code: str, name: str) -> str:
         clean_code = self._clean_badge_scan_code(code)
@@ -21383,6 +21591,9 @@ QWidget#ClientUIRoot {{
             return 'Scan "next", "prev", or "confirm".'
         if self._operator_shift_flash_active:
             return "Scan a Supervisor badge."
+        crew_mode = str(getattr(self, "_crew_action_mode", "") or "").strip().upper()
+        if crew_mode in ("ADD", "REMOVE"):
+            return f"Scan an Operator QR to {crew_mode.lower()} manpower."
         prereq = self._missing_session_prereq_message()
         if prereq:
             return prereq
@@ -21816,6 +22027,8 @@ QWidget#ClientUIRoot {{
         self._repair_initial_setup_state()
         if raw_s:
             self._append_app_log("SCAN", f"QR scanned: {raw_s}")
+        if self._handle_crew_control_scan(raw_s):
+            return
         reprint_trigger = parse_scan(raw_s)
         reprint_phase = str(getattr(self, "_reprint_qr_phase", "") or "").strip().upper()
         if reprint_phase:
@@ -23875,6 +24088,8 @@ QWidget#ClientUIRoot {{
             s.job_name = None
             s.job_started_at = None
             s.operator_id = None
+            s.crew_members = []
+            self._crew_action_mode = ""
             self._reset_relief_state(keep_history=False)
             s.waiting_reject_reason = False
             s.no_shot_total = 0
@@ -24318,6 +24533,8 @@ QWidget#ClientUIRoot {{
             s.job_started_at = datetime.now(timezone.utc).isoformat()
             s.production_session_id = self._new_production_session_id()
             s.operator_id = None
+            s.crew_members = []
+            self._crew_action_mode = ""
             self._reset_relief_state(keep_history=False)
             s.pack_count = 0
             s.good_total = 0
@@ -24530,6 +24747,8 @@ QWidget#ClientUIRoot {{
                 self.status.setText(f"Operator already active: {self._operator_display_name(s.operator_id)}")
                 return
             s.operator_id = res.value
+            s.crew_members = []
+            self._crew_action_mode = ""
             s.active_scan_operator_id = res.value
             s.active_scan_owner_type = "ORIGINAL"
             s.reliever_id = None

@@ -1813,6 +1813,7 @@ class MachineSession:
     # while it was offline.  The display/operator_id is derived from it, but
     # this provides an auditable, lossless record after the queue is replayed.
     operator_qr_payload: Optional[str] = None
+    crew_members: List[Dict[str, Any]] = None
     active_scan_operator_id: Optional[str] = None
     active_scan_owner_type: str = "ORIGINAL"
     reliever_id: Optional[str] = None
@@ -1915,6 +1916,8 @@ class MachineSession:
         d["linkage_job_payload"] = d["linkage_job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
         d["operator_shift_logs"] = d["operator_shift_logs"] or []
+        d["crew_members"] = d["crew_members"] or []
+        d["manpower_count"] = (1 if d.get("operator_id") else 0) + len(d["crew_members"])
         d["current_supervisor_review"] = d["current_supervisor_review"] or {}
         d["supervisor_review_logs"] = d["supervisor_review_logs"] or []
         d["pdr_downtime_logs"] = d["pdr_downtime_logs"] or []
@@ -1998,6 +2001,7 @@ def _reset_active_session_for_new_job_segment(sess: MachineSession, preserve_ope
     sess.linkage_jobs = []
     if not preserve_operator_shift_logs:
         sess.operator_shift_logs = []
+    sess.crew_members = []
     sess.active_scan_operator_id = sess.operator_id
     sess.active_scan_owner_type = "ORIGINAL"
     sess.reliever_id = None
@@ -2211,6 +2215,10 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         production_session_id=production_session_id or None,
         operator_id=str(raw.get("operator_id") or "").strip() or None,
         operator_qr_payload=str(raw.get("operator_qr_payload") or "").strip() or None,
+        crew_members=[
+            dict(row) for row in (raw.get("crew_members") or [])
+            if isinstance(row, dict)
+        ],
         active_scan_operator_id=str(raw.get("active_scan_operator_id") or raw.get("operator_id") or "").strip() or None,
         active_scan_owner_type=str(raw.get("active_scan_owner_type") or ("RELIEVER" if raw.get("break_active") else "ORIGINAL")).strip().upper() or "ORIGINAL",
         reliever_id=str(raw.get("reliever_id") or "").strip() or None,
@@ -20463,6 +20471,12 @@ async def api_event(req: Request):
                 client_id=sess.client_id,
                 machine_code=sess.machine_code,
             )
+    elif ev_type == "CREW_UPDATE":
+        if isinstance(ev.get("crew_members"), list):
+            sess.crew_members = [
+                dict(row) for row in (ev.get("crew_members") or [])
+                if isinstance(row, dict)
+            ]
     elif ev_type == "RAW_MATERIAL":
         _append_raw_material_scan_to_session(sess, ev)
     elif ev_type == "MACHINE_STATUS":
