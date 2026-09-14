@@ -3897,6 +3897,16 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
     payload = row.get("job_payload") if isinstance(row.get("job_payload"), dict) else {}
     data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     job = data_obj.get("job") if isinstance(data_obj.get("job"), dict) else {}
+    work_order = str(
+        po_number
+        or row.get("job_code")
+        or row.get("work_order")
+        or row.get("po_number")
+        or job.get("ref_no")
+        or job.get("job_code")
+        or job.get("id")
+        or ""
+    ).strip()
     part_row = _extract_primary_part_row(payload)
     part_qty_per_unit = _parse_number_like(row.get("external_average_weight_grams")) / 1000.0
     if part_qty_per_unit <= 0:
@@ -3923,7 +3933,7 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
     available_raw_qty = max(0.0, scanned_raw_qty - used_raw_qty)
     butal_total = max(0, int(round(_parse_number_like(row.get("butal_total", 0)))))
     plan: List[Dict[str, Any]] = []
-    base_lot = _zpad_digits(po_number, 12)
+    base_lot = _zpad_digits(work_order, 12)
     part_excess_rows = [
         item for item in (row.get("product_part_excess_logs") or [])
         if isinstance(item, dict)
@@ -3961,7 +3971,8 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
                 "index": "1",
                 "total": "1",
                 "po_required": False,
-                "po_number": "",
+                "po_number": work_order,
+                "work_order": work_order,
                 "lot_number": f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{base_lot}",
                 "excess_row_index": excess_index,
             }
@@ -3985,7 +3996,8 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
                 "index": "1",
                 "total": "1",
                 "po_required": False,
-                "po_number": "",
+                "po_number": work_order,
+                "work_order": work_order,
                 "lot_number": f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{base_lot}",
             }
         )
@@ -4016,19 +4028,26 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
             or ""
         ).strip()
         pack_meta = _lookup_product_meta(pack_product_id.lstrip("0") if pack_product_id.isdigit() else pack_product_id)
+        latest_pack_indexes = [
+            int(_parse_number_like(item.get("index") or 0))
+            for item in pack_logs
+            if isinstance(item, dict)
+        ]
+        next_pack_index = max(latest_pack_indexes or [0]) + 1
         plan.append(
             {
-                "stage_kind": "BUTAL",
-                "stage_title": "Butal Return",
+                "stage_kind": "BUTAL_PACK",
+                "stage_title": "Butal Return PACK",
                 "product_id": pack_meta.get("id", "") or (pack_product_id.lstrip("0") if pack_product_id.isdigit() else pack_product_id),
                 "product_name": pack_meta.get("name", ""),
                 "product_sku": pack_meta.get("sku", ""),
                 "pack_hist": latest_pack,
                 "qty": str(butal_total),
-                "index": "1",
+                "index": str(next_pack_index),
                 "total": "1",
                 "po_required": True,
-                "po_number": str(po_number or "").strip(),
+                "po_number": work_order,
+                "work_order": work_order,
                 "lot_number": f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{base_lot}",
             }
         )
@@ -4044,7 +4063,8 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
                 "index": "1",
                 "total": "1",
                 "po_required": False,
-                "po_number": "",
+                "po_number": work_order,
+                "work_order": work_order,
                 "lot_number": f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{base_lot}",
             }
         )
@@ -4052,13 +4072,16 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
     total_stages = len(plan)
     for idx, entry in enumerate(plan, start=1):
         entry_product_id = str(entry.get("product_id", "")).strip() or str(product_id or "").strip()
-        if str(entry.get("stage_kind") or "").upper() == "BUTAL" and isinstance(entry.get("pack_hist"), dict):
+        if str(entry.get("stage_kind") or "").upper() == "BUTAL_PACK" and isinstance(entry.get("pack_hist"), dict):
             stage_po = str(entry.get("po_number", "")).strip()
-            payload_text = ""
-            if stage_po:
-                pack_hist = dict(entry.get("pack_hist") or {})
-                pack_hist["po_number"] = stage_po
-                payload_text = _build_butal_qr_from_pack_history(pack_hist, entry.get("qty", "1"), index_value=entry.get("index", "1"))
+            pack_hist = dict(entry.get("pack_hist") or {})
+            pack_hist["po_number"] = stage_po
+            payload_text = _build_pack_qr_from_pack_history(
+                pack_hist,
+                entry.get("qty", "1"),
+                index_value=entry.get("index", "1"),
+                work_order=stage_po,
+            )
         else:
             payload_text = _build_raw_material_qr_value(
                 entry_product_id,
@@ -4079,6 +4102,11 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
                 "parsed": parsed,
             }
         )
+    enriched.sort(key=lambda item: 0 if str(item.get("stage_kind") or "").upper() == "BUTAL_PACK" else 1)
+    for idx, entry in enumerate(enriched, start=1):
+        entry["stage_index"] = idx
+        entry["stage_total"] = total_stages
+        entry["stage_label"] = f"{idx} / {total_stages} - {entry.get('stage_title', 'QR')}"
     return enriched
 
 
@@ -4140,6 +4168,33 @@ def _build_butal_qr_from_pack_history(pack_hist: Dict[str, Any], qty: Any, index
     if len(re.sub(r"\D+", "", lot_number)) != 14:
         lot_number = datetime.now().strftime("%Y%m%d%H%M%S")
     return f"{RAW_QR_O_SEGMENT}{RAW_QR_REMARK}P{p_digits}QB{q_digits}I{i_digits}T{t_digits}L{lot_number}-{_zpad_digits(po_number, 12)}"
+
+
+def _build_pack_qr_from_pack_history(
+    pack_hist: Dict[str, Any],
+    qty: Any,
+    index_value: Any = 1,
+    work_order: Any = "",
+) -> str:
+    """Create a normal PACK QR for returned BUTAL using the next series index."""
+    p_digits = _zpad_digits(pack_hist.get("product_p") or pack_hist.get("product_id"), WIDTH_P)
+    q_value = _zpad_quantity(qty, WIDTH_Q)
+    i_digits = _zpad_digits(index_value, WIDTH_I)
+    t_digits = _zpad_digits(1, WIDTH_T)
+    lot_number = str(pack_hist.get("lot_number") or "").strip()
+    if len(re.sub(r"\D+", "", lot_number)) != 14:
+        lot_number = datetime.now().strftime("%Y%m%d%H%M%S")
+    resolved_work_order = str(
+        work_order
+        or pack_hist.get("po_number")
+        or pack_hist.get("job_code")
+        or ""
+    ).strip()
+    return (
+        f"{RAW_QR_O_SEGMENT}{RAW_QR_REMARK}"
+        f"P{p_digits}Q{q_value}I{i_digits}T{t_digits}"
+        f"L{lot_number}-{_zpad_digits(resolved_work_order, 12)}"
+    )
 
 
 def _extract_seg(qr_value: str, tag: str, width: int) -> str:
