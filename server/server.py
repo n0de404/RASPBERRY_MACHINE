@@ -3784,6 +3784,26 @@ def _zpad_digits(value: Any, width: int) -> str:
     return d.zfill(width)
 
 
+def _zpad_quantity(value: Any, width: int) -> str:
+    """Encode a non-negative integer or decimal in the fixed-width Q field."""
+    quantity = max(0.0, _parse_number_like(value))
+    integer_text = str(int(quantity))
+    decimal_places = max(0, min(6, width - len(integer_text) - 1))
+    if decimal_places and abs(quantity - round(quantity)) > 1e-9:
+        text = f"{quantity:.{decimal_places}f}".rstrip("0").rstrip(".")
+    else:
+        text = integer_text
+    if len(text) > width:
+        text = integer_text[-width:]
+    return text.zfill(width)
+
+
+def _format_qr_quantity(value: Any) -> str:
+    encoded = _zpad_quantity(value, WIDTH_Q)
+    text = encoded.lstrip("0") or "0"
+    return f"0{text}" if text.startswith(".") else text
+
+
 def _build_raw_material_qr_value(
     product_id: str,
     po_number: str = "",
@@ -3795,7 +3815,7 @@ def _build_raw_material_qr_value(
 ) -> str:
     stamp = datetime.now().strftime("%Y%m%d%H%M%S")
     p = "P" + _zpad_digits(product_id, WIDTH_P)
-    q = "Q" + _zpad_digits(qty, WIDTH_Q)
+    q = "Q" + _zpad_quantity(qty, WIDTH_Q)
     i = "I" + _zpad_digits(index_value, WIDTH_I)
     t = "T" + _zpad_digits(total, WIDTH_T)
     po_digits = _zpad_digits(po_number, 12)
@@ -3913,7 +3933,7 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
             0.0,
             _parse_number_like(excess_row.get("excess_available_qty", excess_row.get("qty", 0))),
         )
-        printable_qty = max(0, int(math.floor(available_qty)))
+        printable_qty = available_qty
         if printable_qty <= 0:
             continue
         excess_product_id = str(
@@ -3936,7 +3956,7 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
                 "product_id": excess_meta.get("id", "") or excess_product_id,
                 "product_name": excess_meta.get("name", "") or excess_name,
                 "product_sku": excess_meta.get("sku", "") or excess_sku,
-                "qty": str(printable_qty),
+                "qty": _format_qr_quantity(printable_qty),
                 "available_qty": available_qty,
                 "index": "1",
                 "total": "1",
@@ -3946,7 +3966,7 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
                 "excess_row_index": excess_index,
             }
         )
-    excess_qty = max(0, int(math.floor(available_raw_qty)))
+    excess_qty = available_raw_qty
     if not part_excess_rows and excess_qty > 0:
         raw_name = ""
         raw_meta = {"id": str(product_id or "").strip(), "name": "", "sku": ""}
@@ -3961,7 +3981,7 @@ def _build_finished_job_qr_plan(finished_job: Dict[str, Any], product_id: str, p
                 "product_id": raw_meta.get("id", "") or str(product_id or "").strip(),
                 "product_name": raw_meta.get("name", "") or raw_name,
                 "product_sku": raw_meta.get("sku", ""),
-                "qty": str(excess_qty),
+                "qty": _format_qr_quantity(excess_qty),
                 "index": "1",
                 "total": "1",
                 "po_required": False,
@@ -4131,7 +4151,9 @@ def _extract_seg(qr_value: str, tag: str, width: int) -> str:
 
 def _strip_leading_zeros(digits: str) -> str:
     s = (digits or "").lstrip("0")
-    return s if s else "0"
+    if not s:
+        return "0"
+    return f"0{s}" if s.startswith(".") else s
 
 
 def _parse_qr_segments(qr_value: str) -> Dict[str, str]:
@@ -4362,7 +4384,7 @@ def _append_raw_material_scan_to_session(sess: MachineSession, ev: Dict[str, Any
         or "Raw Material"
     ).strip() or "Raw Material"
     qty_value = _parse_number_like(ev.get("qty", ev.get("quantity", parsed.get("qty") or 1)))
-    qty = int(round(qty_value)) if qty_value > 0 else 1
+    qty = float(qty_value) if qty_value > 0 else 1.0
     row = ev.get("raw_material_log")
     if isinstance(row, dict):
         row = dict(row)
@@ -4387,7 +4409,8 @@ def _append_raw_material_scan_to_session(sess: MachineSession, ev: Dict[str, Any
         }
     row["material"] = str(row.get("material") or row.get("material_name") or material_name).strip() or material_name
     row["material_name"] = str(row.get("material_name") or row.get("material") or material_name).strip() or material_name
-    row["qty"] = int(round(_parse_number_like(row.get("qty", qty)))) or qty
+    normalized_qty = _parse_number_like(row.get("qty", qty))
+    row["qty"] = float(normalized_qty) if normalized_qty > 0 else qty
     row.setdefault("material_product_id", material_product_id or material_meta.get("id", ""))
     row.setdefault("material_sku", str(ev.get("material_sku") or ev.get("sku") or material_meta.get("sku") or "").strip())
     row.setdefault("raw_scan", raw_scan)

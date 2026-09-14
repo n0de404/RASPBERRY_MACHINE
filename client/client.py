@@ -15991,7 +15991,7 @@ QWidget#ClientUIRoot {{
         *,
         part: Dict[str, Any],
         material_name: str,
-        qty: int,
+        qty: float,
         raw_scan: str,
         unique_key: str = "",
         source: str = "JOB_PART_QR",
@@ -16017,7 +16017,7 @@ QWidget#ClientUIRoot {{
             "material_name": material_name,
             "material_product_id": material_product_id or None,
             "material_sku": material_sku or part_sku or None,
-            "qty": int(qty or 0),
+            "qty": float(qty or 0.0),
             "unit": unit_kind,
             "material_type": "RAW_MATERIAL" if unit_kind == "kg" else "COMPONENT_PART",
             "job_part_name": part_name,
@@ -16079,18 +16079,19 @@ QWidget#ClientUIRoot {{
         if unique_key:
             s.raw_material_unique_keys.add(unique_key)
         label = "Raw material" if unit_kind == "kg" else "Component part"
-        self.status.setText(f"{label} scanned: {material_name} (+{qty})")
+        qty_text = f"{float(qty or 0.0):g}"
+        self.status.setText(f"{label} scanned: {material_name} (+{qty_text})")
         self._refresh_ui()
         material_event_label = f"{label.upper()} SCANNED"
         if part_sku:
             material_event_label += f" | SKU {part_sku}"
         elif material_name:
             material_event_label += f" | {material_name}"
-        material_event_label += f" | QTY {qty}"
+        material_event_label += f" | QTY {qty_text}"
         self.push_event(
             {
                 "type": "RAW_MATERIAL",
-                "qty": int(qty or 0),
+                "qty": float(qty or 0.0),
                 "material": material_name,
                 "source": source,
                 "unit": unit_kind,
@@ -19009,7 +19010,7 @@ QWidget#ClientUIRoot {{
         s = str(raw).strip()
         if "V2" not in s or "QB" in s:
             return None
-        m = re.search(r"P(\d{11})Q(\d{11})I(\d{11})T(\d{11})L(\d{14})-(\d+)", s)
+        m = re.search(r"P(\d{11})Q(\d+(?:\.\d+)?)I(\d{11})T(\d{11})L(\d{14})-(\d+)", s)
         if not m:
             return None
         p_digits, q_digits, i_digits, t_digits, lot_digits, po_digits = m.groups()
@@ -19018,7 +19019,7 @@ QWidget#ClientUIRoot {{
         return {
             "product_name": f"Product {product_code}",
             "product_p": p_digits,
-            "qty_q": str(int(q_digits)),
+            "qty_q": f"{float(q_digits):g}",
             "index": str(int(i_digits)),
             "total_labels": str(int(t_digits)),
             "lot_number": lot_digits,  # preserve QR formatting
@@ -20921,7 +20922,7 @@ QWidget#ClientUIRoot {{
         self._recent_scan_seen.pop(dedup_key, None)
         QTimer.singleShot(0, lambda value=pending_raw: self.on_scanned(value))
 
-    def _record_offline_product_part_scan(self, raw_scan: str, qty: int) -> bool:
+    def _record_offline_product_part_scan(self, raw_scan: str, qty: float) -> bool:
         pack_hist = self._extract_pack_history_fields(raw_scan)
         if not isinstance(pack_hist, dict):
             self.status.setText("Invalid product-part QR: label details cannot be read.")
@@ -20951,7 +20952,7 @@ QWidget#ClientUIRoot {{
         return self._record_job_part_scan(
             part=synthetic_part,
             material_name=display_name,
-            qty=max(0, int(qty or 0)),
+            qty=max(0.0, float(qty or 0.0)),
             raw_scan=str(raw_scan or "").strip(),
             unique_key=unique_key,
             source="OFFLINE_CONFIRMED_PRODUCT_PART",
@@ -21033,7 +21034,7 @@ QWidget#ClientUIRoot {{
                 "VOID",
                 {
                     "raw_scan": wanted_raw,
-                    "qty": int(removed.get("qty") or 0),
+                    "qty": float(removed.get("qty") or 0.0),
                     "material": material_name,
                     "unique_key": unique_key or None,
                 },
@@ -21215,12 +21216,13 @@ QWidget#ClientUIRoot {{
         if res.kind == "OPERATOR":
             return f"Operator: {self._operator_display_name(res.value)}"
         if res.kind == "RAW_MATERIAL":
+            qty_text = f"{float(res.qty or 1):g}"
             if isinstance(res.meta, dict) and res.meta.get("unique_key"):
-                return f"Raw Material: {res.value} (+{int(res.qty or 1)}) [{res.meta.get('unique_key')}]"
-            return f"Raw Material: {res.value} (+{int(res.qty or 1)})"
+                return f"Raw Material: {res.value} (+{qty_text}) [{res.meta.get('unique_key')}]"
+            return f"Raw Material: {res.value} (+{qty_text})"
         if res.kind == "PACK":
             pack_meta = self._extract_pack_history_fields(raw)
-            qty_text = str(int(res.qty or 0))
+            qty_text = f"{float(res.qty or 0):g}"
             idx_text = "-"
             product_id = ""
             if isinstance(pack_meta, dict):
@@ -22518,7 +22520,7 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay("QR code already scanned.")
                 return
 
-            qty = int(res_pre.qty or 1)
+            qty = float(res_pre.qty or 1)
             s.raw_sacks_count += 1
             material_name = str((meta.get("material_name") if isinstance(meta, dict) else None) or res_pre.value or "Raw Material").strip()
             material_product_id = material_code
@@ -24660,7 +24662,7 @@ QWidget#ClientUIRoot {{
                 return
 
             if res.kind == "PACK":
-                qty = int(res.qty or 0)
+                qty = float(res.qty or 0.0)
                 pack_hist = self._extract_pack_history_fields(raw_s)
                 pack_key = ""
                 offline_mode = not bool(getattr(self, "_server_connection_ok", False))
@@ -24780,6 +24782,13 @@ QWidget#ClientUIRoot {{
                     return
                 if self._gate_pack_start_prerequisites(raw_s):
                     return
+                if not float(qty).is_integer():
+                    self.status.setText("Invalid PACK QR: production output quantity must be a whole number.")
+                    self._show_invalid_overlay(
+                        "Decimal quantities are accepted for product parts only, not production PACK output."
+                    )
+                    return
+                qty = int(qty)
 
                 offline_override_key = re.sub(r"\s+", "", raw_s).strip()
                 offline_main_qty_override = (

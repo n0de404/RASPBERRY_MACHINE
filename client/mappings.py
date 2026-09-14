@@ -109,24 +109,23 @@ def is_operator_badge(s: str) -> bool:
     return s in OPERATOR_MAP
 
 
-def extract_qty_segment(payload: str, marker: str) -> Optional[int]:
+def extract_qty_segment(payload: str, marker: str) -> Optional[float]:
     """
-    Extract 11 digits right after marker ('Q' or 'QB').
+    Extract the 11-character numeric quantity after marker ('Q' or 'QB').
     Example marker='Q':  ...Q00000000006...
     Example marker='QB': ...QB00000000006...
-    Returns int qty (non-zero part).
+    Decimal quantities are valid for product-part labels.
     """
     idx = payload.find(marker)
     if idx < 0:
         return None
 
     start = idx + len(marker)
-    digits = payload[start:start + 11]
-    if len(digits) != 11 or not digits.isdigit():
+    quantity_text = payload[start:start + 11]
+    if len(quantity_text) != 11 or re.fullmatch(r"\d+(?:\.\d+)?", quantity_text) is None:
         return None
 
-    # "digits that is not 0" means numeric value ignoring leading zeros
-    return int(digits)
+    return float(quantity_text)
 
 
 def _parse_structured_raw_material(payload: str) -> Optional[Dict[str, Any]]:
@@ -143,14 +142,14 @@ def _parse_structured_raw_material(payload: str) -> Optional[Dict[str, Any]]:
         return None
 
     p_match = re.search(r"P(\d{11})", s)
-    q_match = re.search(r"QRM(\d{11})", s)
+    q_match = re.search(r"QRM(\d+(?:\.\d+)?)I", s)
     tail_match = re.search(r"I(\d{11})T(\d{11})L(\d{14})-(\d+)\s*$", s)
     if not p_match or not q_match or not tail_match:
         return None
 
     i_digits, t_digits, lot_digits, po_digits = tail_match.groups()
     material_code_digits = p_match.group(1).lstrip("0") or "0"
-    qty = int(q_match.group(1))
+    qty = float(q_match.group(1))
     unique_key = f"I{i_digits}T{t_digits}L{lot_digits}-{po_digits}"
     job_code = po_digits.lstrip("0") or "0"
     material_name = f"Raw Material {material_code_digits}"
@@ -195,7 +194,7 @@ class ScanResult:
     kind: str
     raw: str
     value: str
-    qty: Optional[int] = None
+    qty: Optional[float] = None
     meta: Optional[Dict[str, Any]] = None
 
 
@@ -321,12 +320,14 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
     if s_l.startswith("rawmat~") or s_l.startswith("rawmaterial~") or s_l.startswith("rm~"):
         parts = [p.strip() for p in s.split("~")]
         material = parts[1] if len(parts) > 1 and parts[1] else "Sack"
-        qty = 1
+        qty = 1.0
         if len(parts) > 2:
             try:
-                qty = max(1, int(parts[2]))
+                qty = max(0.0, float(parts[2]))
+                if qty <= 0:
+                    qty = 1.0
             except Exception:
-                qty = 1
+                qty = 1.0
         return ScanResult(kind="RAW_MATERIAL", raw=raw, value=material, qty=qty)
     if s_l in ("rawmat", "rawmaterial", "rm"):
         return ScanResult(kind="RAW_MATERIAL", raw=raw, value="Sack", qty=1)
