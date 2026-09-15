@@ -4697,19 +4697,21 @@ QWidget#ClientUIRoot {{
 
         qtyContent = QWidget()
         qtyContent.setObjectName("LinkageMirrorContent")
-        qtyContent.setLayout(QVBoxLayout())
-        # Keep the third quantity card's bottom edge aligned with the third
-        # linked-job row in Linkage Mirror.
+        qtyContent.setLayout(QGridLayout())
         qtyContent.layout().setContentsMargins(10, 0, 10, 10)
-        qtyContent.layout().setSpacing(8)
+        qtyContent.layout().setHorizontalSpacing(8)
+        qtyContent.layout().setVerticalSpacing(8)
+        qtyContent.layout().setColumnStretch(0, 1)
+        qtyContent.layout().setColumnStretch(1, 1)
 
-        progress_card, self.linkageMirrorProduced = _make_counter_card("Produced")
+        progress_card, self.linkageMirrorProduced = _make_counter_card("Total Produced")
+        reject_card, self.linkageMirrorReject = _make_counter_card("Total Reject")
         remaining_card, self.linkageMirrorRemaining = _make_counter_card("Remaining")
         overrun_card, self.linkageMirrorOverrun = _make_counter_card("Overrun")
-        qtyContent.layout().addWidget(progress_card)
-        qtyContent.layout().addWidget(remaining_card)
-        qtyContent.layout().addWidget(overrun_card)
-        qtyContent.layout().addStretch(1)
+        qtyContent.layout().addWidget(progress_card, 0, 0)
+        qtyContent.layout().addWidget(reject_card, 0, 1)
+        qtyContent.layout().addWidget(remaining_card, 1, 0)
+        qtyContent.layout().addWidget(overrun_card, 1, 1)
         qtyBody.layout().addWidget(qtyContent)
         qtyCol.addWidget(qtyBody)
         qtyFrame.setMinimumHeight(170)
@@ -6928,8 +6930,8 @@ QWidget#ClientUIRoot {{
                 self, self.cardProductionOuter.rect().bottomLeft()
             ).y()
             right_top = self.rightPanel.mapTo(self, self.rightPanel.rect().topLeft()).y()
-            # Keep enough scaled height for exactly three compact rows in
-            # Linkage Mirror and Job Quantity Request at every resolution.
+            # Keep enough scaled height for the compact Linkage Mirror and
+            # four-card Job Quantity Request grid at every resolution.
             ui_scale = float(getattr(self, "_ui_scale", self._screen_ui_scale()) or 1.0)
             desired_outer_height = max(
                 int(round(188 * ui_scale)),
@@ -10772,7 +10774,13 @@ QWidget#ClientUIRoot {{
             ]
             progress = {
                 key: sum(int(item.get(key) or 0) for item in linked_progress)
-                for key in ("produced_now", "target_qty", "remaining_qty", "overrun_qty")
+                for key in (
+                    "produced_now",
+                    "reject_now",
+                    "target_qty",
+                    "remaining_qty",
+                    "overrun_qty",
+                )
             }
         elif packing_role == "PACKING":
             mirror_pack = int(packing_row.get("linkage_pack_count") or 0)
@@ -10792,7 +10800,8 @@ QWidget#ClientUIRoot {{
         self.linkageMirrorGood.setText(str(mirror_good))
         self.linkageMirrorButal.setText(str(mirror_butal))
         self.linkageMirrorTotalGood.setText(str(mirror_good + mirror_butal))
-        self.linkageMirrorProduced.setText(f"{progress['produced_now']} / {progress['target_qty']}")
+        self.linkageMirrorProduced.setText(str(progress["produced_now"]))
+        self.linkageMirrorReject.setText(str(progress["reject_now"]))
         self.linkageMirrorRemaining.setText(str(progress["remaining_qty"]))
         self.linkageMirrorOverrun.setText(str(progress["overrun_qty"]))
         self.linkageMirrorOuter.setVisible(True)
@@ -10925,6 +10934,12 @@ QWidget#ClientUIRoot {{
         total = 0
         for row in self._local_shift_partial_rows(job_code, approved_only=approved_only):
             total += int(round(self._parse_number(row.get("partial_qty", row.get("total_good", 0)))))
+        return max(0, total)
+
+    def _local_shift_reject_total(self, job_code: str, *, approved_only: bool = False) -> int:
+        total = 0
+        for row in self._local_shift_partial_rows(job_code, approved_only=approved_only):
+            total += int(round(self._parse_number(row.get("reject_total", row.get("reject_qty", 0)))))
         return max(0, total)
 
     def _current_shift_good_total(self) -> int:
@@ -17107,6 +17122,7 @@ QWidget#ClientUIRoot {{
         payload: Optional[Dict[str, Any]] = None,
         job_code: Optional[str] = None,
         live_shift_good: Optional[int] = None,
+        live_shift_reject: Optional[int] = None,
     ) -> Dict[str, int]:
         payload = payload if isinstance(payload, dict) else (self.state.job_payload or {})
         data_obj = payload.get("data") if isinstance(payload, dict) else {}
@@ -17118,25 +17134,50 @@ QWidget#ClientUIRoot {{
             target_qty_raw = job.get("request_qty")
         target_qty = max(0, int(round(self._parse_number(target_qty_raw))))
         api_partial_total = 0
+        api_reject_total = 0
         for row in partials:
             if not isinstance(row, dict):
                 continue
             api_partial_total += int(round(self._parse_number(row.get("partial_qty"))))
+            api_reject_total += int(
+                round(self._parse_number(row.get("reject_qty", row.get("reject_total", 0))))
+            )
         local_partial_total = self._local_shift_partial_total(resolved_job_code, approved_only=False)
+        local_reject_total = self._local_shift_reject_total(resolved_job_code, approved_only=False)
         resolved_live_good = (
             self._current_shift_good_total()
             if live_shift_good is None
             else max(0, int(live_shift_good or 0))
         )
+        if live_shift_reject is None:
+            is_current_job = self._normalize_job_code(resolved_job_code) == self._normalize_job_code(
+                self.state.job_code
+            )
+            resolved_live_reject = (
+                max(
+                    0,
+                    int(self.state.reject_total or 0)
+                    - int(self.state.operator_shift_baseline_reject_total or 0),
+                )
+                if is_current_job
+                else 0
+            )
+        else:
+            resolved_live_reject = max(0, int(live_shift_reject or 0))
         produced_now = max(0, api_partial_total + local_partial_total + resolved_live_good)
+        reject_now = max(0, api_reject_total + local_reject_total + resolved_live_reject)
         remaining_qty = max(target_qty - produced_now, 0)
         overrun_qty = max(produced_now - target_qty, 0)
         return {
             "target_qty": target_qty,
             "api_partial_total": api_partial_total,
+            "api_reject_total": api_reject_total,
             "local_partial_total": local_partial_total,
+            "local_reject_total": local_reject_total,
             "live_shift_good": resolved_live_good,
+            "live_shift_reject": resolved_live_reject,
             "produced_now": produced_now,
+            "reject_now": reject_now,
             "remaining_qty": remaining_qty,
             "overrun_qty": overrun_qty,
         }
