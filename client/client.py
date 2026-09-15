@@ -4697,25 +4697,42 @@ QWidget#ClientUIRoot {{
 
         qtyContent = QWidget()
         qtyContent.setObjectName("LinkageMirrorContent")
-        qtyContent.setLayout(QGridLayout())
-        qtyContent.layout().setContentsMargins(10, 0, 10, 10)
-        qtyContent.layout().setHorizontalSpacing(8)
-        qtyContent.layout().setVerticalSpacing(8)
-        qtyContent.layout().setColumnStretch(0, 1)
-        qtyContent.layout().setColumnStretch(1, 1)
+        qtyContent.setLayout(QVBoxLayout())
+        qtyContent.layout().setContentsMargins(10, 0, 10, 8)
+        qtyContent.layout().setSpacing(4)
 
         progress_card, self.linkageMirrorProduced = _make_counter_card("Total Produced")
         reject_card, self.linkageMirrorReject = _make_counter_card("Total Reject")
         remaining_card, self.linkageMirrorRemaining = _make_counter_card("Remaining")
         overrun_card, self.linkageMirrorOverrun = _make_counter_card("Overrun")
-        qtyContent.layout().addWidget(progress_card, 0, 0)
-        qtyContent.layout().addWidget(reject_card, 0, 1)
-        qtyContent.layout().addWidget(remaining_card, 1, 0)
-        qtyContent.layout().addWidget(overrun_card, 1, 1)
+        for qty_card, qty_value in (
+            (progress_card, self.linkageMirrorProduced),
+            (reject_card, self.linkageMirrorReject),
+            (remaining_card, self.linkageMirrorRemaining),
+            (overrun_card, self.linkageMirrorOverrun),
+        ):
+            qty_card.setObjectName("JobQtyCounterCard")
+            qty_card.layout().setContentsMargins(8, 2, 8, 2)
+            qty_title = qty_card.findChild(QLabel, "LinkageMirrorCounterTitle")
+            if qty_title is not None:
+                qty_title.setObjectName("JobQtyCounterTitle")
+            qty_value.setObjectName("JobQtyCounterValue")
+            qtyContent.layout().addWidget(qty_card)
         qtyBody.layout().addWidget(qtyContent)
         qtyCol.addWidget(qtyBody)
         qtyFrame.setMinimumHeight(170)
-        qtyFrame.setStyleSheet(linkageFrame.styleSheet())
+        qtyFrame.setStyleSheet(
+            linkageFrame.styleSheet()
+            + "QFrame#JobQtyCounterCard {"
+              " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+              "                             stop:0 rgba(103,107,115,220),"
+              "                             stop:1 rgba(56,59,66,230));"
+              " border: 1px solid #7a8089; border-radius: 8px;"
+              " min-height: 24px; max-height: 24px;"
+              "}"
+              "QLabel#JobQtyCounterTitle { color: #edf0f4; font-size: 11px; font-weight: 900; }"
+              "QLabel#JobQtyCounterValue { color: #f3f4f6; font-size: 16px; font-weight: 900; }"
+        )
         qtyOuterLay.addWidget(qtyFrame)
         self.jobQtyRequestOuter = qtyOuter
         self.jobQtyRequestFrame = qtyFrame
@@ -6931,7 +6948,7 @@ QWidget#ClientUIRoot {{
             ).y()
             right_top = self.rightPanel.mapTo(self, self.rightPanel.rect().topLeft()).y()
             # Keep enough scaled height for the compact Linkage Mirror and
-            # four-card Job Quantity Request grid at every resolution.
+            # four-row Job Quantity Request list at every resolution.
             ui_scale = float(getattr(self, "_ui_scale", self._screen_ui_scale()) or 1.0)
             desired_outer_height = max(
                 int(round(188 * ui_scale)),
