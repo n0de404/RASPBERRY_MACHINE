@@ -7023,11 +7023,15 @@ QWidget#ClientUIRoot {{
     def _position_invalid_overlay(self):
         if bool(getattr(self, "_info_overlay_compact", False)):
             requested = getattr(self, "_info_overlay_size", QSize(560, 150))
-            panel_w = min(max(380, requested.width()), max(380, self.width() - 24))
-            panel_h = min(max(150, requested.height()), max(150, self.height() - 24))
+            available_w = max(1, self.width() - 24)
+            available_h = max(1, self.height() - 24)
+            minimum_w = min(380, available_w)
+            minimum_h = min(150, available_h)
+            panel_w = min(max(minimum_w, requested.width()), available_w)
+            panel_h = min(max(minimum_h, requested.height()), available_h)
             self.invalidOverlay.setGeometry(
-                max(12, (self.width() - panel_w) // 2),
-                max(12, (self.height() - panel_h) // 2),
+                max(0, (self.width() - panel_w) // 2),
+                max(0, (self.height() - panel_h) // 2),
                 panel_w,
                 panel_h,
             )
@@ -7163,7 +7167,19 @@ QWidget#ClientUIRoot {{
         if _stabilize_first_open:
             self._choice_overlay_render_token += 1
         render_token = int(self._choice_overlay_render_token or 0)
+        available_panel_w = max(1, self.width() - 24)
+        available_cards_w = max(1, available_panel_w - 54)
         columns = min(4, max(1, len(safe_choices)))
+        # Never create more fixed-width columns than the visible client can
+        # contain. Narrow displays automatically fall back to 3, 2, or 1.
+        while columns > 1 and (columns * 150 + (columns - 1) * 8) > available_cards_w:
+            columns -= 1
+        minimum_card_width = min(150, available_cards_w)
+        computed_card_width = max(
+            1,
+            (available_cards_w - (columns - 1) * 8 - 8) // columns,
+        )
+        card_width = min(210, max(minimum_card_width, computed_card_width))
         row_count = max(1, (len(safe_choices) + columns - 1) // columns)
         accents = ("#22d3ee", "#60a5fa", "#a78bfa", "#f59e0b")
         grid = self.choiceCardsWidget.layout()
@@ -7179,7 +7195,7 @@ QWidget#ClientUIRoot {{
             accent = accents[(idx - 1) % len(accents)]
             card = QFrame()
             card.setObjectName(f"ScanChoiceCard{idx}")
-            card.setFixedSize(210, 116)
+            card.setFixedSize(card_width, 116)
             card.setStyleSheet(
                 f"QFrame#ScanChoiceCard{idx} {{ background: #0f172a; border: 2px solid {accent}; border-radius: 5px; }}"
                 "QLabel { background: transparent; border: none; }"
@@ -7209,8 +7225,9 @@ QWidget#ClientUIRoot {{
             footer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             footer_label.setStyleSheet("color: #cffafe; font-size: 13px; font-weight: 800; background: transparent; border: none;")
             grid.addWidget(footer_label, max(1, (len(safe_choices) + columns - 1) // columns), 0, 1, columns)
-        card_w = min(self.width() - 24, max(440, columns * 218 + 34))
-        card_h = min(self.height() - 24, 105 + row_count * 132 + (42 if footer else 0))
+        cards_content_w = columns * card_width + max(0, columns - 1) * 8 + 8
+        card_w = min(available_panel_w, max(min(440, available_panel_w), cards_content_w + 36))
+        card_h = min(max(1, self.height() - 24), 105 + row_count * 132 + (42 if footer else 0))
         self._info_overlay_compact = True
         self._invalid_hide_timer.stop()
         if self._invalid_movie is not None:
@@ -7221,8 +7238,9 @@ QWidget#ClientUIRoot {{
         self.invalidTextLabel.setText(str(title or "SELECT OPTION").strip().upper())
         self.invalidTextLabel.setStyleSheet("background: transparent; border: none; color: #ecfeff; font-size: 26px; font-weight: 900;")
         self.invalidReasonLabel.hide()
-        self.choiceCardsWidget.setMinimumWidth(max(380, card_w - 36))
-        self.choiceCardsWidget.setMaximumWidth(max(380, card_w - 36))
+        choice_width = max(1, min(max(1, card_w - 36), available_cards_w))
+        self.choiceCardsWidget.setMinimumWidth(choice_width)
+        self.choiceCardsWidget.setMaximumWidth(choice_width)
         self.choiceCardsWidget.setMinimumHeight(row_count * 124 + (38 if footer else 0))
         self.choiceCardsWidget.show()
         self._info_overlay_size = QSize(card_w, card_h)
