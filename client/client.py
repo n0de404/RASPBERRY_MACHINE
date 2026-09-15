@@ -18317,6 +18317,29 @@ QWidget#ClientUIRoot {{
         else:
             display_part_groups = [[part] for part in part_rows]
 
+        # A separate SCANNED row is useful only when linked jobs share the
+        # same physical product-part stock pool. For an ordinary job, or a
+        # linked part required by only one job, show its live balance directly
+        # in the existing required-part row's Available column.
+        separate_scanned_part_keys: Set[str] = set()
+        if self._shared_product_part_storage_enabled():
+            for part_group in display_part_groups:
+                owner_codes = {
+                    self._normalize_job_code(part.get("required_from_job_code"))
+                    for part in part_group
+                    if isinstance(part, dict)
+                }
+                owner_codes.discard("")
+                if len(owner_codes) <= 1:
+                    continue
+                for group_part in part_group:
+                    separate_scanned_part_keys.update(
+                        self._part_material_match_keys(group_part)
+                    )
+                    separate_scanned_part_keys.update(
+                        self._part_material_name_keys(group_part)
+                    )
+
         if hasattr(self, "jobPartsTable") and self.jobPartsTable is not None:
             if table_refresh_key != self._job_parts_table_refresh_key:
                 self._job_parts_table_refresh_key = table_refresh_key
@@ -18420,10 +18443,13 @@ QWidget#ClientUIRoot {{
                         request_part_display = f"{_fmt_number(job_used_raw_qty)} / {_fmt_number(request_part_qty)}"
                     else:
                         request_part_display = _fmt_number(job_used_raw_qty)
+                    show_separate_scanned_row = bool(
+                        separate_scanned_part_keys.intersection(part_keys)
+                    )
                     values = [
                         self._safe_text(part.get("sku"), "-"),
                         self._format_part_qty_per_unit_display(part_qty_per_unit, unit_kind),
-                        "-",
+                        "-" if show_separate_scanned_row else _fmt_number(available_raw_qty),
                         request_part_display,
                         _fmt_number(remaining_part_qty),
                         " / ".join(required_jobs),
@@ -18450,6 +18476,8 @@ QWidget#ClientUIRoot {{
                         | self._raw_material_name_keys(log_row)
                     )
                     if not all_part_keys.intersection(log_keys):
+                        continue
+                    if not separate_scanned_part_keys.intersection(log_keys):
                         continue
                     group_key = self._normalize_material_match_key(
                         log_row.get("material_product_id")
