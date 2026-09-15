@@ -22053,30 +22053,70 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay("Scan num_1 for JOB/PACK, num_2 for PRODUCT PART, or printqr~1 to cancel.")
                 return
             if reprint_phase == "SCAN_PACK_TEMPLATE":
-                printable = self._printable_pack_from_scanned_template(raw_s)
-                if not isinstance(printable, dict):
-                    self._show_invalid_overlay("Invalid PACK QR. Scan a valid PACK QR or printqr~1 to cancel.")
-                    return
-                if bool(printable.get("next_index_exists")):
-                    suggested = int(printable.get("suggested_index") or 0)
-                    if suggested <= int(printable.get("next_index") or 0):
-                        self._show_invalid_overlay("No unused next PACK index is available.")
-                        return
-                    printable["payload"] = self._pack_payload_with_index(printable["payload"], suggested)
-                    printable["next_index"] = suggested
-                    self._pending_print_pack_qr = printable
-                    self._reprint_qr_phase = ""
-                    self.status.setText(f"PACK QR index already exists. Print next unused index {suggested}?")
-                    self._show_info_overlay(
-                        "PACK QR ALREADY EXISTS",
-                        f"{printable.get('product_name') or 'Product'}\n"
-                        f"Series: {suggested}   |   Qty: {int(printable.get('quantity') or 0) or '-'}\n\n"
-                        "Scan confirm to print, or printqr~1 to cancel.",
-                        hide_ms=0,
+                # A forgotten PACK reprint prompt must not intercept normal
+                # product-part replenishment. Part identity uses Product ID or
+                # SKU only; the work order carried by the part label is ignored.
+                scanned_part = None
+                if reprint_trigger is not None and reprint_trigger.kind == "RAW_MATERIAL":
+                    scanned_part = self._find_job_part_for_scan_item(reprint_trigger.meta or {})
+                elif reprint_trigger is not None and reprint_trigger.kind == "PACK":
+                    scanned_fields = self._extract_pack_history_fields(raw_s)
+                    scanned_product_id = ""
+                    if isinstance(scanned_fields, dict):
+                        scanned_product_id = (
+                            str(scanned_fields.get("product_p") or "").strip().lstrip("0") or "0"
+                        )
+                    scanned_product_sku = (
+                        self._lookup_product_sku(scanned_product_id)
+                        if scanned_product_id
+                        else ""
                     )
+                    scanned_part = self._find_job_part_for_scan_item(
+                        {
+                            "material_product_id": scanned_product_id or None,
+                            "product_id": scanned_product_id or None,
+                            "material_code": scanned_product_id or None,
+                            "material_sku": scanned_product_sku or None,
+                            "sku": scanned_product_sku or None,
+                        }
+                    )
+                    if scanned_part is not None and self._pack_output_job_code_from_product(
+                        scanned_product_id,
+                        scanned_product_sku,
+                    ):
+                        scanned_part = None
+                if scanned_part is not None:
+                    self._reprint_qr_phase = ""
+                    self._reprint_product_parts = []
+                    self._pending_print_pack_qr = None
+                    self._hide_invalid_overlay()
+                    self.status.setText("Product-part QR detected. Reprint mode cancelled; recording the scan.")
+                    # Continue into the normal scan router below.
+                else:
+                    printable = self._printable_pack_from_scanned_template(raw_s)
+                    if not isinstance(printable, dict):
+                        self._show_invalid_overlay("Invalid PACK QR. Scan a valid PACK QR or printqr~1 to cancel.")
+                        return
+                    if bool(printable.get("next_index_exists")):
+                        suggested = int(printable.get("suggested_index") or 0)
+                        if suggested <= int(printable.get("next_index") or 0):
+                            self._show_invalid_overlay("No unused next PACK index is available.")
+                            return
+                        printable["payload"] = self._pack_payload_with_index(printable["payload"], suggested)
+                        printable["next_index"] = suggested
+                        self._pending_print_pack_qr = printable
+                        self._reprint_qr_phase = ""
+                        self.status.setText(f"PACK QR index already exists. Print next unused index {suggested}?")
+                        self._show_info_overlay(
+                            "PACK QR ALREADY EXISTS",
+                            f"{printable.get('product_name') or 'Product'}\n"
+                            f"Series: {suggested}   |   Qty: {int(printable.get('quantity') or 0) or '-'}\n\n"
+                            "Scan confirm to print, or printqr~1 to cancel.",
+                            hide_ms=0,
+                        )
+                        return
+                    self._submit_pack_qr_print(printable)
                     return
-                self._submit_pack_qr_print(printable)
-                return
             if reprint_phase == "CHOOSE_PRODUCT_PART":
                 match = re.fullmatch(r"(?:num_)?([1-9]\d*)", raw_l)
                 choice = int(match.group(1)) if match else 0
