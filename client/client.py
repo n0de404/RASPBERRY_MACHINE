@@ -3501,6 +3501,7 @@ class ClientUI(QWidget):
         self._change_work_order_target: Optional[Dict[str, Any]] = None
         self._remove_job_linkage_mode = False
         self._pending_print_pack_qr: Optional[Dict[str, Any]] = None
+        self._reprint_prompt_restore_context = ""
         self._reprint_qr_phase = ""
         self._reprint_product_parts: List[Dict[str, Any]] = []
         self._color_change_options: List[Dict[str, Any]] = []
@@ -7515,9 +7516,18 @@ QWidget#ClientUIRoot {{
             self._show_session_recovery_options_prompt(options)
 
     def _hide_invalid_overlay(self):
+        restore_context = str(
+            getattr(self, "_reprint_prompt_restore_context", "") or ""
+        ).strip().upper()
+        self._reprint_prompt_restore_context = ""
         if self._invalid_movie is not None:
             self._invalid_movie.stop()
         self.invalidOverlay.hide()
+        if restore_context:
+            QTimer.singleShot(
+                0,
+                lambda context=restore_context: self._restore_reprint_prompt_after_error(context),
+            )
         self._info_overlay_compact = False
 
     def _position_pack_gap_warning(self):
@@ -19312,11 +19322,60 @@ QWidget#ClientUIRoot {{
         )
 
     def _cancel_reprint_qr_flow(self):
+        self._reprint_prompt_restore_context = ""
         self._reprint_qr_phase = ""
         self._reprint_product_parts = []
         self._pending_print_pack_qr = None
         self._hide_invalid_overlay()
         self.status.setText("QR reprint selection cancelled. Nothing was queued.")
+
+    def _show_reprint_error_then_restore(self, message: str, context: str = ""):
+        """Show an error briefly, then redraw the active reprint instruction."""
+        restore_context = str(
+            context or getattr(self, "_reprint_qr_phase", "") or ""
+        ).strip().upper()
+        self._reprint_prompt_restore_context = restore_context
+        self._show_invalid_overlay(message)
+
+    def _restore_reprint_prompt_after_error(self, context: str):
+        """Restore the reprint step hidden temporarily by an invalid-scan card."""
+        expected = str(context or "").strip().upper()
+        active_phase = str(getattr(self, "_reprint_qr_phase", "") or "").strip().upper()
+        if expected == "PENDING_CONFIRM":
+            printable = getattr(self, "_pending_print_pack_qr", None)
+            if not isinstance(printable, dict):
+                return
+            suggested = int(printable.get("next_index") or printable.get("suggested_index") or 0)
+            self.status.setText(
+                f"PACK QR index already exists. Print next unused index {suggested}?"
+            )
+            self._show_info_overlay(
+                "PACK QR ALREADY EXISTS",
+                f"{printable.get('product_name') or 'Product'}\n"
+                f"Series: {suggested or '-'}   |   Qty: {int(printable.get('quantity') or 0) or '-'}\n\n"
+                "Scan confirm to print, or printqr~1 to cancel.",
+                hide_ms=0,
+            )
+            return
+        if not expected or active_phase != expected:
+            return
+        if expected == "CHOOSE_TYPE":
+            self._start_reprint_qr_flow()
+            return
+        if expected == "SCAN_PACK_TEMPLATE":
+            self.status.setText(
+                "QR reprint: scan any PACK QR for the job. Its series number will be ignored."
+            )
+            self._show_info_overlay(
+                "SCAN JOB / PACK QR",
+                "Scan the PACK QR whose job/product details must be copied.\n"
+                "The printed index will be the last scanned PACK index + 1.\n\n"
+                "Scan printqr~1 again to cancel.",
+                hide_ms=0,
+            )
+            return
+        if expected == "CHOOSE_PRODUCT_PART":
+            self._show_reprint_product_part_choices()
 
     def _handle_color_change_number_choice(self, raw_text: str) -> bool:
         s = self.state
@@ -22019,6 +22078,9 @@ QWidget#ClientUIRoot {{
         raw_s = str(raw).strip()
         raw_l = raw_s.lower()
         s = self.state
+        # A new operator scan supersedes any pending redraw from the previous
+        # invalid reprint input. A fresh invalid result will schedule its own.
+        self._reprint_prompt_restore_context = ""
         # Server/session reconciliation can omit transient input flags while
         # the local setup overlay is still visibly asking for a value. Restore
         # the prompt mode before repair/routing so numpad scans cannot fall
@@ -22050,7 +22112,9 @@ QWidget#ClientUIRoot {{
                 if raw_l in ("num_2", "2"):
                     self._show_reprint_product_part_choices()
                     return
-                self._show_invalid_overlay("Scan num_1 for JOB/PACK, num_2 for PRODUCT PART, or printqr~1 to cancel.")
+                self._show_reprint_error_then_restore(
+                    "Scan num_1 for JOB/PACK, num_2 for PRODUCT PART, or printqr~1 to cancel."
+                )
                 return
             if reprint_phase == "SCAN_PACK_TEMPLATE":
                 # A forgotten PACK reprint prompt must not intercept normal
@@ -22095,12 +22159,16 @@ QWidget#ClientUIRoot {{
                 else:
                     printable = self._printable_pack_from_scanned_template(raw_s)
                     if not isinstance(printable, dict):
-                        self._show_invalid_overlay("Invalid PACK QR. Scan a valid PACK QR or printqr~1 to cancel.")
+                        self._show_reprint_error_then_restore(
+                            "Invalid PACK QR. Scan a valid PACK QR or printqr~1 to cancel."
+                        )
                         return
                     if bool(printable.get("next_index_exists")):
                         suggested = int(printable.get("suggested_index") or 0)
                         if suggested <= int(printable.get("next_index") or 0):
-                            self._show_invalid_overlay("No unused next PACK index is available.")
+                            self._show_reprint_error_then_restore(
+                                "No unused next PACK index is available."
+                            )
                             return
                         printable["payload"] = self._pack_payload_with_index(printable["payload"], suggested)
                         printable["next_index"] = suggested
@@ -22121,11 +22189,15 @@ QWidget#ClientUIRoot {{
                 match = re.fullmatch(r"(?:num_)?([1-9]\d*)", raw_l)
                 choice = int(match.group(1)) if match else 0
                 if choice <= 0 or choice > len(self._reprint_product_parts):
-                    self._show_invalid_overlay("Scan the num shown beside a product part, or printqr~1 to cancel.")
+                    self._show_reprint_error_then_restore(
+                        "Scan the num shown beside a product part, or printqr~1 to cancel."
+                    )
                     return
                 printable = self._build_product_part_reprint(self._reprint_product_parts[choice - 1])
                 if not isinstance(printable, dict):
-                    self._show_invalid_overlay("That product part has no valid product ID and cannot be printed.")
+                    self._show_reprint_error_then_restore(
+                        "That product part has no valid product ID and cannot be printed."
+                    )
                     return
                 self._submit_pack_qr_print(printable)
                 return
@@ -22144,7 +22216,10 @@ QWidget#ClientUIRoot {{
                 self.status.setText("PACK QR print request cancelled. Nothing was queued.")
                 return
             self.status.setText("PACK QR print confirmation pending. Scan confirm to proceed or printqr~1 to cancel.")
-            self._show_invalid_overlay("Only confirm or printqr~1 is accepted for this print request.")
+            self._show_reprint_error_then_restore(
+                "Only confirm or printqr~1 is accepted for this print request.",
+                "PENDING_CONFIRM",
+            )
             return
 
         # An offline QR classification prompt owns num_1 / num_0 until the
