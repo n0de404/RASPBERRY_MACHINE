@@ -48,6 +48,7 @@ from PyQt6.QtWidgets import (
 )
 
 from mappings import parse_scan, ScanResult, MACHINE_MAP, REJECT_REASON_MAP
+from runtime_store import ClientRuntimeStore
 from ui_theme import APP_STYLESHEET
 
 try:
@@ -127,6 +128,14 @@ SQL_CONFIG_FILE = os.path.join(DATABASE_DIR, "sql_config.json")
 APP_LOGS_FILE = os.path.join(DATABASE_DIR, "app_logs.json")
 CLIENT_SETTINGS_FILE = os.path.join(DATABASE_DIR, "client_settings.json")
 DAILY_ROLE_ASSIGNMENTS_FILE = os.path.join(DATABASE_DIR, "daily_role_assignments.json")
+RUNTIME_STORE = ClientRuntimeStore(DATABASE_DIR)
+RUNTIME_STORE.migrate_legacy_json(
+    active_sessions_file=CLIENT_ACTIVE_MACHINE_SESSIONS_FILE,
+    outbox_file=SERVER_EVENT_QUEUE_FILE,
+    scanned_keys_file=SCANNED_PACK_QR_KEYS_FILE,
+    finished_jobs_file=FINISHED_JOBS_FILE,
+    finish_shifts_file=FINISH_SHIFT_FILE,
+)
 APP_LOG_MAX_ROWS = 1000
 APP_LOG_TABLE_MAX_ROWS = 400
 RECORD_TYPE_SHIFT_PARTIAL = "SHIFT_PARTIAL"
@@ -142,6 +151,7 @@ HEARTBEAT_INTERVAL_MS = int(os.environ.get("MACHINE_HEARTBEAT_INTERVAL_MS", "500
 IDENTITY_SYNC_INTERVAL_MS = int(os.environ.get("MACHINE_IDENTITY_SYNC_INTERVAL_MS", "15000"))
 SERVER_EVENT_QUEUE_MAXSIZE = int(os.environ.get("MACHINE_SERVER_EVENT_QUEUE_MAXSIZE", "256"))
 SERVER_EVENT_QUEUE_DISK_MAX_ENTRIES = int(os.environ.get("MACHINE_SERVER_EVENT_QUEUE_DISK_MAX_ENTRIES", "5000"))
+SERVER_SYNC_BATCH_SIZE = max(2, min(200, int(os.environ.get("MACHINE_SERVER_SYNC_BATCH_SIZE", "100"))))
 SERVER_EVENT_QUEUE_MAX_AGE_SECONDS = max(
     3600,
     int(os.environ.get("MACHINE_SERVER_EVENT_REPLAY_MAX_AGE_SECONDS", "604800")),
@@ -152,6 +162,10 @@ SCANNER_MIN_TIMEOUT_SECONDS = float(os.environ.get("MACHINE_SCANNER_MIN_TIMEOUT"
 UI_REFRESH_DEBOUNCE_MS = int(os.environ.get("MACHINE_UI_REFRESH_DEBOUNCE_MS", "180"))
 SCAN_DEDUP_WINDOW_MS = int(os.environ.get("MACHINE_SCAN_DEDUP_WINDOW_MS", "900"))
 PACK_SCAN_INTERVAL_SECONDS = float(os.environ.get("MACHINE_PACK_SCAN_INTERVAL_SECONDS", "10"))
+JOB_COMPLETION_PACK_NOTICE_THRESHOLD = max(
+    1,
+    int(os.environ.get("MACHINE_JOB_COMPLETION_PACK_NOTICE_THRESHOLD", "3")),
+)
 OPERATOR_BREAK_WINDOW_SECONDS = float(os.environ.get("MACHINE_OPERATOR_BREAK_WINDOW_SECONDS", "1800"))
 MOTION_TIMER_INTERVAL_MS = int(os.environ.get("MACHINE_MOTION_TIMER_INTERVAL_MS", "250"))
 OVERLAY_PULSE_INTERVAL_MS = int(os.environ.get("MACHINE_OVERLAY_PULSE_INTERVAL_MS", "160"))
@@ -161,6 +175,39 @@ ANIMATION_BURST_WINDOW_SECONDS = float(os.environ.get("MACHINE_ANIMATION_BURST_W
 PULSE_CARD_MIN_INTERVAL_MS = int(os.environ.get("MACHINE_PULSE_CARD_MIN_INTERVAL_MS", "140"))
 CIRCLE_PROGRESS_ANIM_INTERVAL_MS = int(os.environ.get("MACHINE_CIRCLE_PROGRESS_INTERVAL_MS", "66"))
 HEAVY_ANIM_INTERVAL_MS = int(os.environ.get("MACHINE_HEAVY_ANIM_INTERVAL_MS", "100"))
+
+
+def _completion_pack_projection(
+    target_qty: Any,
+    produced_qty: Any,
+    pack_qty: Any,
+) -> Dict[str, int]:
+    """Project how many whole packs are needed to meet or exceed a job target."""
+    try:
+        target = max(0, int(round(float(target_qty or 0))))
+    except (TypeError, ValueError):
+        target = 0
+    try:
+        produced = max(0, int(round(float(produced_qty or 0))))
+    except (TypeError, ValueError):
+        produced = 0
+    try:
+        per_pack = max(0, int(round(float(pack_qty or 0))))
+    except (TypeError, ValueError):
+        per_pack = 0
+
+    remaining = max(0, target - produced)
+    packs_remaining = int(math.ceil(remaining / per_pack)) if remaining and per_pack else 0
+    projected_total = produced + (packs_remaining * per_pack)
+    return {
+        "target_qty": target,
+        "produced_qty": produced,
+        "pack_qty": per_pack,
+        "remaining_qty": remaining,
+        "packs_remaining": packs_remaining,
+        "projected_total": projected_total,
+        "projected_overrun": max(0, projected_total - target) if target else 0,
+    }
 
 
 def _default_graphics_mode() -> str:
@@ -193,14 +240,7 @@ def _load_app_logs_json() -> List[Dict[str, Any]]:
 
 
 def _load_finished_jobs_json() -> List[Dict[str, Any]]:
-    try:
-        if not os.path.exists(FINISHED_JOBS_FILE):
-            return []
-        with open(FINISHED_JOBS_FILE, "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        return [row for row in (rows or []) if isinstance(row, dict)]
-    except Exception:
-        return []
+    return RUNTIME_STORE.load_finished_records("FINISH_JOB")
 
 
 def _load_job_details_cache_json() -> List[Dict[str, Any]]:
@@ -239,34 +279,15 @@ def _save_job_details_cache_json(rows: List[Dict[str, Any]]) -> bool:
 
 
 def _load_finish_shift_json() -> List[Dict[str, Any]]:
-    try:
-        if not os.path.exists(FINISH_SHIFT_FILE):
-            return []
-        with open(FINISH_SHIFT_FILE, "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        return [row for row in (rows or []) if isinstance(row, dict)]
-    except Exception:
-        return []
+    return RUNTIME_STORE.load_finished_records("FINISH_SHIFT")
 
 
 def _save_finished_jobs_json(rows: List[Dict[str, Any]]) -> bool:
-    try:
-        os.makedirs(DATABASE_DIR, exist_ok=True)
-        with open(FINISHED_JOBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(rows or []), f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
+    return RUNTIME_STORE.replace_finished_records("FINISH_JOB", list(rows or []))
 
 
 def _save_finish_shift_json(rows: List[Dict[str, Any]]) -> bool:
-    try:
-        os.makedirs(DATABASE_DIR, exist_ok=True)
-        with open(FINISH_SHIFT_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(rows or []), f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
+    return RUNTIME_STORE.replace_finished_records("FINISH_SHIFT", list(rows or []))
 
 
 def _load_shift_carryover_json() -> List[Dict[str, Any]]:
@@ -301,17 +322,19 @@ def _save_shift_carryover_json(rows: List[Dict[str, Any]]) -> bool:
 def _append_finished_job_json(row: Dict[str, Any]) -> bool:
     if not isinstance(row, dict):
         return False
-    rows = _load_finished_jobs_json()
-    rows.append(_normalized_finished_job_row(row))
-    return _save_finished_jobs_json(rows)
+    return RUNTIME_STORE.append_finished_record(
+        "FINISH_JOB",
+        _normalized_finished_job_row(row),
+    )
 
 
 def _append_finish_shift_json(row: Dict[str, Any]) -> bool:
     if not isinstance(row, dict):
         return False
-    rows = _load_finish_shift_json()
-    rows.append(_normalized_finished_job_row(row))
-    return _save_finish_shift_json(rows)
+    return RUNTIME_STORE.append_finished_record(
+        "FINISH_SHIFT",
+        _normalized_finished_job_row(row),
+    )
 
 
 def _normalized_finished_job_row(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -555,6 +578,8 @@ def _read_active_sessions_json_file(path: str) -> Dict[str, Any]:
 
 
 def _read_active_sessions_json_file_with_source(path: str) -> tuple[Dict[str, Any], str]:
+    if os.path.abspath(str(path or "")) == os.path.abspath(CLIENT_ACTIVE_MACHINE_SESSIONS_FILE):
+        return RUNTIME_STORE.load_active_sessions(), "sqlite"
     try:
         loaded = _read_active_sessions_payload(path)
         source = "main"
@@ -578,53 +603,34 @@ def _read_active_sessions_json_file_with_source(path: str) -> tuple[Dict[str, An
 
 
 def _load_active_sessions_json() -> Dict[str, Any]:
-    return _read_active_sessions_json_file(CLIENT_ACTIVE_MACHINE_SESSIONS_FILE)
+    return RUNTIME_STORE.load_active_sessions()
 
 
 def _save_active_sessions_json(rows: Dict[str, Any]) -> bool:
-    try:
-        os.makedirs(DATABASE_DIR, exist_ok=True)
-        payload: Dict[str, Any] = {}
-        for machine_code, row in (rows or {}).items():
-            code = str(machine_code or "").strip()
-            if code and isinstance(row, dict):
-                item = dict(row)
-                item["machine_code"] = str(item.get("machine_code") or code).strip()
-                payload[code] = item
-        target = CLIENT_ACTIVE_MACHINE_SESSIONS_FILE
-        tmp = f"{target}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        _backup_active_sessions_file(target)
-        os.replace(tmp, target)
-        return True
-    except Exception as e:
-        print(f"[JSON] Active session save failed: {e}")
-        return False
+    payload: Dict[str, Any] = {}
+    for machine_code, row in (rows or {}).items():
+        code = str(machine_code or "").strip()
+        if code and isinstance(row, dict):
+            item = dict(row)
+            item["machine_code"] = str(item.get("machine_code") or code).strip()
+            payload[code] = item
+    return RUNTIME_STORE.replace_active_sessions(payload)
 
 
 def _upsert_active_session_json(row: Dict[str, Any]) -> bool:
     machine_code = str((row or {}).get("machine_code") or "").strip()
     if not machine_code:
         return False
-    rows = _load_active_sessions_json()
     payload = dict(row or {})
     payload["machine_code"] = machine_code
-    rows[machine_code] = payload
-    return _save_active_sessions_json(rows)
+    return RUNTIME_STORE.upsert_active_session(payload)
 
 
 def _delete_active_session_json(machine_code: Optional[str]) -> bool:
     code = str(machine_code or "").strip()
     if not code:
         return False
-    rows = _load_active_sessions_json()
-    if code in rows:
-        rows.pop(code, None)
-        return _save_active_sessions_json(rows)
-    return True
+    return RUNTIME_STORE.delete_active_session(code)
 
 
 def _load_confirmed_server_sessions_json() -> Dict[str, Any]:
@@ -662,18 +668,14 @@ def _upsert_confirmed_server_session_json(row: Dict[str, Any]) -> bool:
 
 
 def _load_server_event_queue_json() -> List[Dict[str, Any]]:
-    try:
-        if not os.path.exists(SERVER_EVENT_QUEUE_FILE):
-            return []
-        with open(SERVER_EVENT_QUEUE_FILE, "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        loaded = [row for row in (rows or []) if isinstance(row, dict) and isinstance(row.get("payload"), dict)]
-        clean = _trim_server_event_queue_rows(loaded)
-        if len(clean) != len(loaded):
-            _save_server_event_queue_json(clean)
-        return clean
-    except Exception:
-        return []
+    loaded = [
+        row for row in RUNTIME_STORE.load_outbox()
+        if isinstance(row, dict) and isinstance(row.get("payload"), dict)
+    ]
+    clean = _trim_server_event_queue_rows(loaded)
+    if len(clean) != len(loaded):
+        RUNTIME_STORE.replace_outbox(clean)
+    return clean
 
 
 def _server_event_queue_type(row: Dict[str, Any]) -> str:
@@ -739,6 +741,25 @@ def _server_event_queue_finished_job_key(row: Dict[str, Any]) -> str:
     event = payload.get("event") if isinstance(payload, dict) else {}
     finished = event.get("finished_job") if isinstance(event, dict) else {}
     return _server_finished_job_identity(finished)
+
+
+def _server_event_queue_finish_shift_key(row: Dict[str, Any]) -> str:
+    if _server_event_queue_type(row) != "FINISH_SHIFT":
+        return ""
+    payload = row.get("payload") if isinstance(row, dict) else {}
+    event = payload.get("event") if isinstance(payload, dict) else {}
+    finished = event.get("finished_job") if isinstance(event, dict) else {}
+    if not isinstance(finished, dict):
+        return ""
+    return "|".join([
+        str(finished.get("record_type") or "").strip().upper(),
+        str(finished.get("client_id") or "").strip(),
+        str(finished.get("machine_code") or "").strip(),
+        str(finished.get("job_code") or "").strip(),
+        str(finished.get("operator_id") or "").strip(),
+        str(finished.get("shift_index") or "").strip(),
+        str(finished.get("finished_at_utc") or finished.get("ended_at_utc") or "").strip(),
+    ])
 
 
 def _server_event_queue_row_is_defective(row: Dict[str, Any]) -> bool:
@@ -869,55 +890,25 @@ def _trim_server_event_queue_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, 
 
 
 def _save_server_event_queue_json(rows: List[Dict[str, Any]]) -> bool:
-    try:
-        os.makedirs(DATABASE_DIR, exist_ok=True)
-        # The queue is the offline source of truth.  Write it atomically so a
-        # power loss cannot leave a partially-written JSON file and discard
-        # scans that have not reached the server yet.
-        tmp = f"{SERVER_EVENT_QUEUE_FILE}.tmp"
-        payload = _trim_server_event_queue_rows(rows)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, SERVER_EVENT_QUEUE_FILE)
-        return True
-    except Exception:
-        try:
-            if os.path.exists(f"{SERVER_EVENT_QUEUE_FILE}.tmp"):
-                os.remove(f"{SERVER_EVENT_QUEUE_FILE}.tmp")
-        except Exception:
-            pass
-        return False
+    return RUNTIME_STORE.replace_outbox(_trim_server_event_queue_rows(rows))
 
 
 def _load_scanned_pack_qr_keys_json() -> Dict[str, Dict[str, Any]]:
-    try:
-        if not os.path.exists(SCANNED_PACK_QR_KEYS_FILE):
-            return {}
-        with open(SCANNED_PACK_QR_KEYS_FILE, "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        if not isinstance(rows, dict):
-            return {}
-        payload = {
-            str(key): dict(value)
-            for key, value in rows.items()
-            if str(key).strip() and isinstance(value, dict)
-        }
-        return payload
-    except Exception:
-        return {}
+    return RUNTIME_STORE.load_scan_identities()
 
 
 def _save_scanned_pack_qr_keys_json(rows: Dict[str, Dict[str, Any]]) -> bool:
     try:
-        os.makedirs(DATABASE_DIR, exist_ok=True)
-        tmp = f"{SCANNED_PACK_QR_KEYS_FILE}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(dict(rows or {}), f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, SCANNED_PACK_QR_KEYS_FILE)
+        existing = set(RUNTIME_STORE.load_scan_identities())
+        wanted = {
+            str(key).strip(): dict(value)
+            for key, value in (rows or {}).items()
+            if str(key).strip() and isinstance(value, dict)
+        }
+        for key, value in wanted.items():
+            RUNTIME_STORE.upsert_scan_identity(key, value)
+        for key in existing - set(wanted):
+            RUNTIME_STORE.delete_scan_identity(key)
         return True
     except Exception:
         return False
@@ -927,24 +918,18 @@ def _upsert_scanned_pack_qr_key(key: str, row: Dict[str, Any]) -> bool:
     k = str(key or "").strip()
     if not k:
         return False
-    rows = _load_scanned_pack_qr_keys_json()
-    existing = rows.get(k)
-    if isinstance(existing, dict):
+    if RUNTIME_STORE.scan_identity_exists(k):
         return True
-    rows[k] = dict(row or {})
-    rows[k]["key"] = k
-    return _save_scanned_pack_qr_keys_json(rows)
+    payload = dict(row or {})
+    payload["key"] = k
+    return RUNTIME_STORE.upsert_scan_identity(k, payload)
 
 
 def _delete_scanned_pack_qr_key(key: str) -> bool:
     k = str(key or "").strip()
     if not k:
         return False
-    rows = _load_scanned_pack_qr_keys_json()
-    if k not in rows:
-        return True
-    rows.pop(k, None)
-    return _save_scanned_pack_qr_keys_json(rows)
+    return RUNTIME_STORE.delete_scan_identity(k)
 
 
 def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
@@ -3461,6 +3446,7 @@ class ClientUI(QWidget):
     average_weight_received = pyqtSignal(float, str, str, str, str)
     server_average_weight_received = pyqtSignal(str, float, str, str, str, str, str)
     server_session_received = pyqtSignal(dict)
+    virtual_pack_reservation_received = pyqtSignal(dict)
 
     @staticmethod
     def _load_digital_font_family() -> str:
@@ -3478,6 +3464,7 @@ class ClientUI(QWidget):
         super().__init__()
         self.state = ClientState()
         self._crew_action_mode = ""
+        self._reliever_action_mode = False
         self.client_config = _load_client_config()
         self.job_api_config = _load_job_api_config()
         # The server remains authoritative. Successful lookups populate a
@@ -3537,6 +3524,8 @@ class ClientUI(QWidget):
         self._server_was_offline = False
         self._server_connection_ok = False
         self._server_sync_protocol = 0
+        self._server_batch_sync_supported: Optional[bool] = None
+        self._server_batch_acknowledged_ids: Set[str] = set()
         self._server_identity_conflict = False
         self._server_last_success_at = 0.0
         self._server_authoritative_reconcile_needed = True
@@ -5696,6 +5685,7 @@ QWidget#ClientUIRoot {{
         self._floating_pack_qr_recent_payloads: List[str] = []
         self._floating_pack_qr_scan_pending_payload = ""
         self._floating_pack_qr_render_size = 0
+        self._floating_pack_qr_reservations_inflight: Set[str] = set()
         self.floatingPackQrTimer = QTimer(self)
         self.floatingPackQrTimer.timeout.connect(self._refresh_floating_pack_qr_panel)
         self.floatingPackQrTimer.start(1000)
@@ -5783,7 +5773,7 @@ QWidget#ClientUIRoot {{
         self.finishStatus.setStyleSheet("color: #dbeafe; font-size: 12px; font-weight: 800; background: transparent; border: none;")
         self.finishStatus.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishReviewHint = QLabel(
-            'Scan "next" / "prev" QR to move the review, then scan Supervisor QR to approve this finished shift.'
+            'Scan "next" / "prev" QR to move the review, then scan Supervisor QR to approve.'
         )
         self.finishReviewHint.setStyleSheet(
             "color: #ffffff; font-size: 14px; font-weight: 900;"
@@ -5975,6 +5965,7 @@ QWidget#ClientUIRoot {{
         self._supervisor_validation_failed_value = ""
         self._fulfilled_notice_job_code = ""
         self._fulfilled_notice_active = False
+        self._remaining_packs_notice_key = ""
         self._fulfilled_notice_timer = QTimer(self)
         self._fulfilled_notice_timer.setSingleShot(True)
         self._fulfilled_notice_timer.timeout.connect(self._clear_fulfilled_notice)
@@ -6631,6 +6622,7 @@ QWidget#ClientUIRoot {{
         self.average_weight_received.connect(self._apply_external_average_weight)
         self.server_average_weight_received.connect(self._apply_server_average_weight)
         self.server_session_received.connect(self._apply_acknowledged_server_session)
+        self.virtual_pack_reservation_received.connect(self._apply_virtual_pack_reservation)
         self._ui_refresh_timer = QTimer(self)
         self._ui_refresh_timer.setSingleShot(True)
         self._ui_refresh_timer.timeout.connect(self._refresh_ui_now)
@@ -9379,9 +9371,9 @@ QWidget#ClientUIRoot {{
         self._position_finish_overlay()
         self._set_background_blur(True)
         self.finishTitle.setText("FINISH JOB SUMMARY")
-        self.finishStatus.setText("Review the summary. Scan NEXT / PREV to change page, then scan CONFIRM to finish.")
+        self.finishStatus.setText("Review the summary. Scan NEXT / PREV to change page, then scan Supervisor QR to finish.")
         self.finishReviewHint.setText(
-            'Scan "next" / "prev" to review, scan "confirm" to close, or scan Finish Job QR again to cancel.'
+            'Scan "next" / "prev" to review, scan Supervisor QR to approve, or scan Finish Job QR again to cancel.'
         )
         self.finishReviewHint.show()
         self.finishReviewPageInfo.show()
@@ -9469,13 +9461,36 @@ QWidget#ClientUIRoot {{
         self._save_active_session_snapshot()
         return True
 
-    def _confirm_pending_final_job_review(self):
+    def _approve_pending_final_job_review(self, reviewer: Dict[str, Any], reviewer_badge: str):
         if not self._pending_final_review_payload:
             return
         finished_payload = dict(self._pending_final_review_payload or {})
         linked_payloads = [
             dict(row) for row in (self._pending_final_review_linked_payloads or []) if isinstance(row, dict)
         ]
+        reviewer_name = self._safe_text(reviewer.get("name"), self._safe_text(reviewer_badge))
+        reviewer_code = self._safe_text(reviewer.get("code"), self._safe_text(reviewer_badge))
+        reviewer_role = self._safe_text(reviewer.get("role"), "SUPERVISOR")
+        approved_at_utc = datetime.now(timezone.utc).isoformat()
+        approval_remarks = f"Finish job approved on client by {reviewer_name}"
+        for row in [finished_payload] + linked_payloads:
+            row["approved_by"] = reviewer_name
+            row["approved_by_code"] = reviewer_code
+            row["approved_by_role"] = reviewer_role
+            row["approved_remarks"] = approval_remarks
+            row["approved_at_utc"] = approved_at_utc
+            row["supervisor_name"] = reviewer_name
+            row["review_status"] = REVIEW_STATUS_CLOSED
+            review_history = list(row.get("review_history") or [])
+            review_history.append({
+                "action": "APPROVE_FINISH_JOB",
+                "remarks": approval_remarks,
+                "actor_name": reviewer_name,
+                "actor_code": reviewer_code,
+                "actor_role": reviewer_role,
+                "timestamp_utc": approved_at_utc,
+            })
+            row["review_history"] = review_history
         self._show_bms_loading("Finishing Job...")
         try:
             saved_ok = self._save_finished_job_local(finished_payload)
@@ -9494,8 +9509,7 @@ QWidget#ClientUIRoot {{
                     f"FINISH LINKED JOB {row.get('job_name') or row.get('job_code') or ''}".strip(),
                     silent=True,
                 )
-            self._request_with_ui_events(time.sleep, 2.5)
-            self.status.setText("Job finished. Session cleared.")
+            self.status.setText(f"Job approved by {reviewer_name} and finished. Session cleared.")
             self._finish_job_cancel_snapshot = None
             self._finish_pending_clear = False
             # A final job close permanently invalidates every carryover balance
@@ -9533,12 +9547,11 @@ QWidget#ClientUIRoot {{
                 return
             approved_rows.append(row)
 
-        # The dedicated finish-shift file owns approved shifts until the server
-        # acknowledges them. While offline we do not add them to the general
-        # retry queue; a successful heartbeat will trigger a one-shot upload.
+        # Queue completion immediately even while offline. The SQLite outbox is
+        # the durable handoff, so the operator can begin the next job without
+        # waiting for the server to become reachable.
         self._last_finish_shift_sync_signature = ""
-        if bool(getattr(self, "_server_connection_ok", False)):
-            self.sync_local_finish_shifts_to_server(force=True)
+        self.sync_local_finish_shifts_to_server(force=True)
         self._finish_shift_cancel_snapshot = None
         self._hide_operator_shift_overlay()
         self._clear_shift_session_keep_machine()
@@ -11935,14 +11948,11 @@ QWidget#ClientUIRoot {{
         code = str(machine_code or "").strip()
         if not code:
             return None
-        for path in (
-            CLIENT_ACTIVE_MACHINE_SESSIONS_FILE,
-            _active_sessions_backup_path(CLIENT_ACTIVE_MACHINE_SESSIONS_FILE),
-        ):
-            rows = _read_active_sessions_json_file(path)
-            snap = rows.get(code)
-            if isinstance(snap, dict) and self._snapshot_is_recoverable(snap):
-                return snap
+        # SQLite is authoritative after migration. Reading the old JSON .bak
+        # here could resurrect a job that was intentionally finished/deleted.
+        snap = _load_active_sessions_json().get(code)
+        if isinstance(snap, dict) and self._snapshot_is_recoverable(snap):
+            return snap
         server_snap = self._fetch_active_session_snapshot_from_server(code)
         return server_snap if isinstance(server_snap, dict) and self._snapshot_is_recoverable(server_snap) else None
 
@@ -11951,10 +11961,9 @@ QWidget#ClientUIRoot {{
         code = str(machine_code or "").strip()
         if not code:
             return None
-        for path in (CLIENT_ACTIVE_MACHINE_SESSIONS_FILE, _active_sessions_backup_path(CLIENT_ACTIVE_MACHINE_SESSIONS_FILE)):
-            snap = _read_active_sessions_json_file(path).get(code)
-            if isinstance(snap, dict) and self._snapshot_is_recoverable(snap):
-                return snap
+        snap = _load_active_sessions_json().get(code)
+        if isinstance(snap, dict) and self._snapshot_is_recoverable(snap):
+            return snap
         return None
 
     def _merge_matching_recovery_snapshots(self, server_snap: Dict[str, Any], local_snap: Dict[str, Any]) -> Dict[str, Any]:
@@ -12594,6 +12603,7 @@ QWidget#ClientUIRoot {{
             if isinstance(row, dict)
         ]
         self._crew_action_mode = ""
+        self._reliever_action_mode = False
         s.active_scan_operator_id = snap.get("active_scan_operator_id") or s.operator_id
         s.active_scan_owner_type = str(snap.get("active_scan_owner_type") or ("RELIEVER" if snap.get("break_active") else "ORIGINAL")).strip().upper() or "ORIGINAL"
         s.reliever_id = snap.get("reliever_id")
@@ -12968,6 +12978,16 @@ QWidget#ClientUIRoot {{
             "raw_sacks_count": int(s.raw_sacks_count or 0),
             "raw_material_scans": list(s.raw_material_scans or []),
             "raw_material_logs": list(s.raw_material_logs or []),
+            "product_part_excess_logs": [
+                {
+                    **row,
+                    "source": "FINISH_JOB_PART_EXCESS",
+                    "excess_available_qty": row.get("carryover_available_qty", row.get("qty", 0)),
+                    "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+                for row in self._build_part_availability_carryover_logs()
+                if isinstance(row, dict)
+            ],
             "product_pack_history_logs": list(s.product_pack_history_logs or []),
             "butal_by_job": dict(s.butal_by_job or {}),
             "butal_scan_logs": list(s.butal_scan_logs or []),
@@ -13155,6 +13175,7 @@ QWidget#ClientUIRoot {{
         s.operator_pending_server_validation = False
         s.crew_members = []
         self._crew_action_mode = ""
+        self._reliever_action_mode = False
         s.active_scan_operator_id = None
         s.active_scan_owner_type = "ORIGINAL"
         s.reliever_id = None
@@ -14623,6 +14644,30 @@ QWidget#ClientUIRoot {{
             job = data_obj.get("job") if isinstance(data_obj.get("job"), dict) else {}
             if not job and isinstance(base_payload.get("job"), dict):
                 job = base_payload.get("job") or {}
+            approved_output_qty = (
+                job.get("approve_qty")
+                or job.get("approved_qty")
+                or ""
+            )
+            requested_output_qty = (
+                job.get("request_qty")
+                or job.get("requested_qty")
+                or job.get("qty")
+                or job.get("quantity")
+                or ""
+            )
+
+            def _annotated_rows(rows: Any) -> List[Dict[str, Any]]:
+                annotated: List[Dict[str, Any]] = []
+                for raw_part in rows if isinstance(rows, list) else []:
+                    if not self._job_part_is_active(raw_part):
+                        continue
+                    part = dict(raw_part)
+                    part["_job_approved_output_qty"] = approved_output_qty
+                    part["_job_requested_output_qty"] = requested_output_qty
+                    annotated.append(part)
+                return annotated
+
             job_details = {}
             if isinstance(job.get("job_details"), dict):
                 job_details = job.get("job_details") or {}
@@ -14631,18 +14676,18 @@ QWidget#ClientUIRoot {{
             elif isinstance(data_obj.get("job_details"), dict):
                 job_details = data_obj.get("job_details") or {}
             if isinstance(data_obj.get("parts"), list):
-                return [r for r in data_obj.get("parts") or [] if self._job_part_is_active(r)]
+                return _annotated_rows(data_obj.get("parts") or [])
             if isinstance(job_details.get("parts"), list):
-                return [r for r in job_details.get("parts") or [] if self._job_part_is_active(r)]
+                return _annotated_rows(job_details.get("parts") or [])
             if isinstance(job_details.get("part_ids"), list):
-                return [r for r in job_details.get("part_ids") or [] if self._job_part_is_active(r)]
+                return _annotated_rows(job_details.get("part_ids") or [])
             if isinstance(job_details.get("part_ids"), dict):
                 part = job_details.get("part_ids") or {}
-                return [part] if self._job_part_is_active(part) else []
+                return _annotated_rows([part])
             if isinstance(data_obj.get("part_ids"), list):
-                return [r for r in data_obj.get("part_ids") or [] if self._job_part_is_active(r)]
+                return _annotated_rows(data_obj.get("part_ids") or [])
             if isinstance(base_payload.get("part_ids"), list):
-                return [r for r in base_payload.get("part_ids") or [] if self._job_part_is_active(r)]
+                return _annotated_rows(base_payload.get("part_ids") or [])
             return []
 
         # An explicit payload lookup must stay isolated (used for linked-job
@@ -14762,6 +14807,7 @@ QWidget#ClientUIRoot {{
         s = self.state
         unit_kind = self._part_unit_kind(part)
         api_part_qty = 0.0
+        derived_api_part_qty = 0.0
         if isinstance(part, dict):
             for key in (
                 "part_qty_per_unit",
@@ -14773,6 +14819,24 @@ QWidget#ClientUIRoot {{
                 api_part_qty = self._parse_number(part.get(key))
                 if api_part_qty > 0:
                     break
+            approved_part_qty = self._parse_number(
+                part.get("approve_part_qty")
+                or part.get("approved_part_qty")
+                or part.get("approved_qty")
+            )
+            approved_output_qty = self._parse_number(part.get("_job_approved_output_qty"))
+            if approved_part_qty > 0 and approved_output_qty > 0:
+                derived_api_part_qty = approved_part_qty / approved_output_qty
+            else:
+                requested_part_qty = self._parse_number(
+                    part.get("request_part_qty")
+                    or part.get("required_qty")
+                    or part.get("qty")
+                    or part.get("quantity")
+                )
+                requested_output_qty = self._parse_number(part.get("_job_requested_output_qty"))
+                if requested_part_qty > 0 and requested_output_qty > 0:
+                    derived_api_part_qty = requested_part_qty / requested_output_qty
         if isinstance(part, dict) and unit_kind == "pc":
             if api_part_qty > 0:
                 return {
@@ -14797,6 +14861,13 @@ QWidget#ClientUIRoot {{
                 "source": "job_api_default_weight",
                 "unit": "kg",
                 "label": f"Job API default weight ({api_part_qty:.4f} kg)",
+            }
+        if unit_kind == "kg" and derived_api_part_qty > 0:
+            return {
+                "value": derived_api_part_qty,
+                "source": "job_api_derived_weight",
+                "unit": "kg",
+                "label": f"Job API approved allocation ({derived_api_part_qty:.4f} kg)",
             }
         if unit_kind == "kg":
             return {
@@ -17233,6 +17304,67 @@ QWidget#ClientUIRoot {{
         self.status.setText("Job quantity request fulfilled.")
         self._fulfilled_notice_timer.start(5000)
 
+    def _maybe_show_remaining_packs_notice(self, pack_qty: Any) -> None:
+        """Notify the operator when a whole-pack projection is near completion."""
+        metrics = self._compute_job_progress_metrics()
+        projection = _completion_pack_projection(
+            metrics.get("target_qty", 0),
+            metrics.get("produced_now", 0),
+            pack_qty,
+        )
+        job_code = str(self.state.job_code or "").strip()
+        packs_remaining = int(projection.get("packs_remaining", 0) or 0)
+        if (
+            not job_code
+            or int(projection.get("target_qty", 0) or 0) <= 0
+            or int(projection.get("pack_qty", 0) or 0) <= 0
+            or packs_remaining <= 0
+            or packs_remaining > JOB_COMPLETION_PACK_NOTICE_THRESHOLD
+        ):
+            self._remaining_packs_notice_key = ""
+            return
+
+        notice_key = "|".join(
+            str(value)
+            for value in (
+                job_code,
+                projection["target_qty"],
+                projection["produced_qty"],
+                projection["pack_qty"],
+                packs_remaining,
+            )
+        )
+        if notice_key == getattr(self, "_remaining_packs_notice_key", ""):
+            return
+        self._remaining_packs_notice_key = notice_key
+
+        pack_word = "PACK" if packs_remaining == 1 else "PACKS"
+        remaining_qty = int(projection["remaining_qty"])
+        projected_overrun = int(projection["projected_overrun"])
+        message_lines = [
+            f"{packs_remaining} {pack_word} remaining to complete Job {job_code}.",
+            (
+                f"Produced: {projection['produced_qty']:,} / {projection['target_qty']:,}"
+                f"   |   Pack quantity: {projection['pack_qty']:,}"
+                f"   |   Quantity remaining: {remaining_qty:,}"
+            ),
+        ]
+        if projected_overrun > 0:
+            message_lines.append(
+                f"The last full pack will finish at {projection['projected_total']:,} "
+                f"({projected_overrun:,} over target). This is allowed."
+            )
+        else:
+            message_lines.append(
+                f"The projected completed quantity is {projection['projected_total']:,}."
+            )
+        message = "\n".join(message_lines)
+        self.status.setText(
+            f"{packs_remaining} {pack_word.lower()} remaining to complete the job."
+        )
+        self._show_info_overlay("JOB ALMOST COMPLETE", message, hide_ms=7000)
+        self._append_app_log("STATUS", message.replace("\n", " "))
+
     def _clear_fulfilled_notice(self):
         self._fulfilled_notice_active = False
         if str(self.state.job_code or "").strip() != self._fulfilled_notice_job_code:
@@ -18287,8 +18419,13 @@ QWidget#ClientUIRoot {{
         self._last_job_payload_source = ""
         if not raw_job_id:
             return None
+        cached_before_request = self._cached_job_payload(raw_job_id)
+        if not bool(getattr(self, "_server_connection_ok", False)) and isinstance(cached_before_request, dict):
+            self._last_job_payload_source = "OFFLINE_CACHE"
+            self._append_job_api_log(f"OFFLINE CACHE HIT {raw_job_id} (network request skipped)")
+            return cached_before_request
         if not server_url:
-            return None
+            return cached_before_request
         try:
             url = f"{server_url}/api/jobs/lookup"
             self._append_job_api_log(f"SERVER JOB LOOKUP {raw_job_id}")
@@ -18297,21 +18434,20 @@ QWidget#ClientUIRoot {{
                 url,
                 headers={"Content-Type": "application/json", "Accept": "application/json"},
                 json={"job_identifier": raw_job_id},
-                # The server may need to wait for BMS. Keep this at least as
-                # long as the Job API Test timeout so a successful test also
-                # succeeds during a real job/linkage scan.
-                timeout=6.0,
+                # Fail over to the local cache quickly when the LAN/server is
+                # down. Pending-job retry continues in the background.
+                timeout=(0.75, 3.0),
             )
             if resp.status_code != 200:
                 self._append_job_api_log(f"SERVER JOB LOOKUP unavailable HTTP {resp.status_code}")
-                return self._cached_job_payload(raw_job_id)
+                return cached_before_request or self._cached_job_payload(raw_job_id)
             out = resp.json()
             payload = out.get("payload") if isinstance(out, dict) else None
             if isinstance(payload, dict):
                 self._last_job_payload_source = "SERVER"
                 self._cache_job_payload(payload, raw_job_id)
                 return payload
-            return self._cached_job_payload(raw_job_id)
+            return cached_before_request or self._cached_job_payload(raw_job_id)
         except Exception as e:
             self._append_job_api_log(f"SERVER JOB LOOKUP unavailable: {e}")
             cached = self._cached_job_payload(raw_job_id)
@@ -18898,6 +19034,7 @@ QWidget#ClientUIRoot {{
             self.status.setText(f"{requested.title()} manpower cancelled.")
             return
         self._crew_action_mode = requested
+        self._reliever_action_mode = False
         action_text = "ADD MANPOWER" if requested == "ADD" else "REMOVE MANPOWER"
         self.status.setText(f"{action_text}: scan the Operator QR.")
         self._show_info_overlay(
@@ -18910,6 +19047,27 @@ QWidget#ClientUIRoot {{
     def _handle_crew_control_scan(self, raw_scan: str) -> bool:
         raw_text = str(raw_scan or "").strip()
         command = raw_text.lower()
+        if command in ("reliever~1", "relief~1", "relieveradd~1"):
+            if not (self.state.machine_code and self.state.job_code and self.state.operator_id):
+                self._reliever_action_mode = False
+                self.status.setText("Complete MACHINE, JOB, and primary OPERATOR before adding a reliever.")
+                self._show_invalid_overlay("Set the primary operator before adding a reliever.")
+                return True
+            self._crew_action_mode = ""
+            self._reliever_action_mode = not bool(self._reliever_action_mode)
+            if not self._reliever_action_mode:
+                self._hide_invalid_overlay()
+                self.status.setText("Reliever scan cancelled.")
+                return True
+            action_text = "CHANGE RELIEVER" if self.state.break_active else "ADD RELIEVER"
+            self.status.setText(f"{action_text}: scan the reliever Operator QR.")
+            self._show_info_overlay(
+                action_text,
+                "SCAN THE RELIEVER OPERATOR QR NOW\n\n"
+                "Scan the RELIEVER control QR again to cancel.",
+                hide_ms=0,
+            )
+            return True
         if command == "crewlist~1":
             self._show_crew_list()
             return True
@@ -19006,6 +19164,7 @@ QWidget#ClientUIRoot {{
 
     def _reset_relief_state(self, keep_history: bool = True) -> None:
         s = self.state
+        self._reliever_action_mode = False
         s.active_scan_operator_id = s.operator_id
         s.active_scan_owner_type = "ORIGINAL"
         s.reliever_id = None
@@ -19867,6 +20026,64 @@ QWidget#ClientUIRoot {{
             self._append_app_log("VIRTUAL PACK", f"Server reservation unavailable; using offline identity: {exc}")
         return fallback
 
+    def _request_virtual_pack_reservation_async(
+        self,
+        context_key: str,
+        requested_index: int,
+        lot_second: str,
+        fallback_payload: str,
+    ) -> None:
+        key = str(context_key or "").strip()
+        if not key or key in self._floating_pack_qr_reservations_inflight:
+            return
+        self._floating_pack_qr_reservations_inflight.add(key)
+
+        def _worker():
+            reservation = self._reserve_virtual_pack_identity(requested_index)
+            self.virtual_pack_reservation_received.emit(
+                {
+                    "context_key": key,
+                    "lot_second": lot_second,
+                    "fallback_payload": fallback_payload,
+                    "reservation": reservation,
+                }
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_virtual_pack_reservation(self, result: Dict[str, Any]) -> None:
+        context_key = str((result or {}).get("context_key") or "").strip()
+        self._floating_pack_qr_reservations_inflight.discard(context_key)
+        if not context_key or context_key != str(self._floating_pack_qr_context_key or ""):
+            return
+        reservation = result.get("reservation") if isinstance(result.get("reservation"), dict) else {}
+        if not bool(reservation.get("server_issued")):
+            return
+        reserved_index = max(1, int(reservation.get("index") or 1))
+        payload = self._build_generated_pack_qr_payload(
+            str(result.get("lot_second") or "") or None,
+            index_value=reserved_index,
+            virtual_scan_id=str(reservation.get("virtual_scan_id") or ""),
+        )
+        if not payload:
+            return
+        previous_payload = str(self._floating_pack_qr_payload or "").strip()
+        recent = [
+            str(value).strip()
+            for value in (self._floating_pack_qr_recent_payloads or [])
+            if str(value).strip()
+        ]
+        if previous_payload and previous_payload not in recent:
+            recent.append(previous_payload)
+        if payload not in recent:
+            recent.append(payload)
+        self._floating_pack_qr_payload = payload
+        self._floating_pack_qr_recent_payloads = recent[-3:]
+        self._floating_pack_qr_render_size = 0
+        self._fit_floating_pack_qr_image()
+        total_qty = self._generated_pack_total_qty_from_job_payload()
+        self.floatingPackQrMeta.setText(f"INDEX {reserved_index}  |  TOTAL {total_qty}")
+
     def _build_generated_pack_qr_payload(
         self,
         lot_stamp: Optional[str] = None,
@@ -19960,8 +20177,15 @@ QWidget#ClientUIRoot {{
         context_key = f"{job_code}|{product_id}|{qty}|{next_index}|{total_qty}"
         if context_key != self._floating_pack_qr_context_key:
             lot_second = datetime.now().strftime("%Y%m%d%H%M%S")
-            reservation = self._reserve_virtual_pack_identity(next_index)
-            reserved_index = max(1, int(reservation.get("index") or next_index))
+            # Render an offline-safe QR immediately. The optional server
+            # reservation happens on a worker so a slow/unreachable LAN can
+            # never pause the scanner or Qt display thread.
+            reservation = {
+                "index": next_index,
+                "virtual_scan_id": uuid.uuid4().hex.upper(),
+                "server_issued": False,
+            }
+            reserved_index = next_index
             payload = self._build_generated_pack_qr_payload(
                 lot_second,
                 index_value=reserved_index,
@@ -19981,6 +20205,12 @@ QWidget#ClientUIRoot {{
                 self.floatingPackQrImage.setText("QR renderer missing")
             self.floatingPackQrTitle.setText(f"AUTO PACK QR  |  QTY {qty}")
             self.floatingPackQrMeta.setText(f"INDEX {reserved_index}  |  TOTAL {total_qty}")
+            self._request_virtual_pack_reservation_async(
+                context_key,
+                next_index,
+                lot_second,
+                payload,
+            )
         self._show_floating_pack_qr_panel()
 
     def _handle_pack_scan_floating_qr_state(self, raw_scan: str):
@@ -21242,7 +21472,22 @@ QWidget#ClientUIRoot {{
         signature = self._offline_qr_signature(raw_scan)
         if not signature:
             return ""
-        return str((self.state.offline_qr_type_rules or {}).get(signature) or "").strip().upper()
+        remembered = str((self.state.offline_qr_type_rules or {}).get(signature) or "").strip().upper()
+        if remembered:
+            return remembered
+        product_id = signature.split("|PRODUCT:", 1)[1] if "|PRODUCT:" in signature else ""
+        if not product_id:
+            return ""
+        try:
+            stored = RUNTIME_STORE.load_qr_classifications(
+                self.state.production_session_id,
+                self._normalize_job_code(self.state.job_code),
+            ).get(product_id.upper(), "")
+        except Exception:
+            stored = ""
+        if stored:
+            self.state.offline_qr_type_rules[signature] = str(stored).upper()
+        return str(stored or "").strip().upper()
 
     def _remember_offline_qr_rule(self, raw_scan: str, qr_type: str) -> bool:
         signature = self._offline_qr_signature(raw_scan)
@@ -21250,6 +21495,16 @@ QWidget#ClientUIRoot {{
         if not signature or kind not in ("PACK", "PRODUCT_PART"):
             return False
         self.state.offline_qr_type_rules[signature] = kind
+        product_id = signature.split("|PRODUCT:", 1)[1] if "|PRODUCT:" in signature else ""
+        try:
+            RUNTIME_STORE.remember_qr_classification(
+                self.state.production_session_id,
+                self._normalize_job_code(self.state.job_code),
+                product_id,
+                kind,
+            )
+        except Exception:
+            pass
         return True
 
     def _show_offline_qr_prompt(self, phase: str):
@@ -21757,6 +22012,8 @@ QWidget#ClientUIRoot {{
         crew_mode = str(getattr(self, "_crew_action_mode", "") or "").strip().upper()
         if crew_mode in ("ADD", "REMOVE"):
             return f"Scan an Operator QR to {crew_mode.lower()} manpower."
+        if bool(getattr(self, "_reliever_action_mode", False)):
+            return "Scan the reliever Operator QR."
         prereq = self._missing_session_prereq_message()
         if prereq:
             return prereq
@@ -22146,11 +22403,13 @@ QWidget#ClientUIRoot {{
             if raw_l in ("next", "prev", "previous", "preview"):
                 self._change_finish_review_page(1 if raw_l == "next" else -1)
                 return
-            if raw_l == "confirm":
-                self._confirm_pending_final_job_review()
+            reviewer = self._reviewer_from_scan(raw_s)
+            if reviewer is not None and str(reviewer.get("can_supervisor", "0")) == "1":
+                self.status.setText("Supervisor QR accepted. Approving finished job...")
+                self._approve_pending_final_job_review(reviewer, raw_s)
                 return
-            self.status.setText('Finish job summary is open. Scan "next", "prev", or "confirm".')
-            self._show_invalid_overlay('Scan "next" / "prev" to review pages, then scan "confirm" to close the finished job.')
+            self.status.setText("Finished job review is open. Scan Supervisor QR to approve.")
+            self._show_invalid_overlay("Supervisor QR is required to approve this finished job.")
             return
         if self._operator_shift_flash_active:
             pending_shift = dict(self._pending_shift_review_payload or {})
@@ -23464,9 +23723,14 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay("Operator badge is not registered on server.")
                 return
         elif res is not None and res.kind == "OPERATOR":
-            # During an active shift, retain an unknown operator badge as a
-            # reliever ID. The server can resolve its profile later; the raw QR
-            # remains attached for audit and retry.
+            # A second operator is accepted only after the explicit RELIEVER
+            # control QR. During an active relief the original operator may
+            # still scan directly to end the break.
+            relief_scan_allowed = bool(getattr(self, "_reliever_action_mode", False) or s.break_active)
+            if s.operator_id and not relief_scan_allowed:
+                self.status.setText("Primary operator remains active. Scan the RELIEVER control QR before a reliever badge.")
+                self._show_invalid_overlay("Scan RELIEVER QR first, then scan the reliever Operator QR.")
+                return
             known_auth = self._authorized_person_from_scan(raw_s)
             if known_auth is not None and str(known_auth.get("can_operator", "0")) != "1":
                 self.status.setText("Invalid reliever QR: badge is not an Operator role.")
@@ -24037,7 +24301,7 @@ QWidget#ClientUIRoot {{
                         f"Main job (1 of {total_jobs_in_group}) with {len(self.state.linkage_jobs or [])} linked job(s)."
                     )
             linked_finished_payloads = self._build_linked_finished_job_payloads(finished_payload)
-            self.status.setText('Finish job summary opened. Scan "next" / "prev" / "confirm", or Finish Job QR to cancel.')
+            self.status.setText('Finish job summary opened. Scan "next" / "prev", then scan Supervisor QR to approve; scan Finish Job QR to cancel.')
             self._finish_pending_clear = False
             self._show_final_job_review_overlay(finished_payload, linked_finished_payloads)
             return
@@ -24954,12 +25218,21 @@ QWidget#ClientUIRoot {{
                 self._end_operator_relief(raw_operator_payload)
                 return
             if current_operator_code and new_operator_code != current_operator_code:
+                if not bool(getattr(self, "_reliever_action_mode", False)):
+                    self.status.setText("Primary operator remains active. Scan the RELIEVER control QR first.")
+                    self._show_invalid_overlay("Scan RELIEVER QR first, then scan the reliever Operator QR.")
+                    return
+                # Clear the armed state before refreshing the UI inside the
+                # relief helpers so the prompt disappears immediately.
+                self._reliever_action_mode = False
                 if s.break_active:
                     changed = self._switch_active_break_cover(res.value, raw_operator_payload)
                 else:
                     changed = self._start_operator_relief(res.value, raw_operator_payload)
                 if changed:
+                    self._hide_invalid_overlay()
                     return
+                self._reliever_action_mode = True
                 self.status.setText("Reliever scan could not be applied right now.")
                 return
             if current_operator_code and new_operator_code == current_operator_code:
@@ -24968,6 +25241,7 @@ QWidget#ClientUIRoot {{
             s.operator_id = res.value
             s.crew_members = []
             self._crew_action_mode = ""
+            self._reliever_action_mode = False
             s.active_scan_operator_id = res.value
             s.active_scan_owner_type = "ORIGINAL"
             s.reliever_id = None
@@ -25423,6 +25697,7 @@ QWidget#ClientUIRoot {{
                         self.lblGood.add_points(main_new_good_qty)
                         self.lblTotalGood.add_points(main_new_good_qty)
                         self._refresh_ui()
+                        self._maybe_show_remaining_packs_notice(qty)
                         self._pulse_card(self.cardStatPack)
                         self._pulse_card(self.cardStatGood)
                         self._pulse_card(self.cardStatTotalGood)
@@ -25497,6 +25772,7 @@ QWidget#ClientUIRoot {{
                     self.lblGood.add_points(main_new_good_qty)
                     self.lblTotalGood.add_points(main_new_good_qty)
                     self._refresh_ui()
+                    self._maybe_show_remaining_packs_notice(qty)
                     self._pulse_card(self.cardStatPack)
                     self._pulse_card(self.cardStatGood)
                     self._pulse_card(self.cardStatTotalGood)
@@ -25559,6 +25835,7 @@ QWidget#ClientUIRoot {{
                 self.lblGood.add_points(main_pack_qty)
                 self.lblTotalGood.add_points(main_pack_qty)
                 self._refresh_ui()
+                self._maybe_show_remaining_packs_notice(main_pack_qty)
                 self._pulse_card(self.cardStatPack)
                 self._pulse_card(self.cardStatGood)
                 self._pulse_card(self.cardStatTotalGood)
@@ -25730,7 +26007,23 @@ QWidget#ClientUIRoot {{
         if not isinstance(payload, dict):
             return False
         event_type = self._server_event_type_from_item(item)
-        if event_type in {"FINISH_SHIFT", "FINISH_JOB", "SESSION_SYNC"}:
+        # A recovery snapshot may replace only idempotent configuration/status
+        # mutations.  Production/audit deltas (PACK, product part, reject,
+        # butal, void and finish events) must retain their own event IDs so the
+        # server can record every scan exactly once after an offline period.
+        compactable_types = {
+            "MACHINE_SET",
+            "JOB_SET",
+            "JOB_STUB_SET",
+            "OPERATOR_SET",
+            "SESSION_RESUME",
+            "REJECT_MODE",
+            "PRODUCTION_DAILY_REPORT_MODE",
+            "REJECT_SUMMARY_VIEW",
+            "BUTAL_COMPLETION_MODE",
+            "AVERAGE_WEIGHT_RECEIVED",
+        }
+        if event_type not in compactable_types:
             return False
         session_id = str(payload.get("production_session_id") or "").strip()
         cutoff_raw = str(self._server_recovery_cutoff_by_session.get(session_id) or "").strip()
@@ -25761,8 +26054,6 @@ QWidget#ClientUIRoot {{
                 _save_server_event_queue_json(kept)
 
     def sync_local_finish_shifts_to_server(self, force: bool = False):
-        if not bool(getattr(self, "_server_connection_ok", False)):
-            return
         rows = [row for row in _load_finish_shift_json() if isinstance(row, dict)]
         if not rows:
             self._last_finish_shift_sync_signature = ""
@@ -25790,6 +26081,28 @@ QWidget#ClientUIRoot {{
         if not force and signature == str(getattr(self, "_last_finish_shift_sync_signature", "")):
             return
         self._last_finish_shift_sync_signature = signature
+        with self._server_event_queue_lock:
+            pending_keys = {
+                key
+                for key in (
+                    _server_event_queue_finish_shift_key(item)
+                    for item in _load_server_event_queue_json()
+                )
+                if key
+            }
+        try:
+            with self._event_queue.mutex:
+                queued_items = list(self._event_queue.queue)
+            pending_keys.update(
+                key
+                for key in (
+                    _server_event_queue_finish_shift_key(item)
+                    for item in queued_items
+                )
+                if key
+            )
+        except Exception:
+            pass
         client_id = self._current_client_id()
         for row in rows:
             if str(row.get("review_status") or "").strip().upper() != REVIEW_STATUS_APPROVED:
@@ -25798,6 +26111,9 @@ QWidget#ClientUIRoot {{
                 continue
             machine_code = str(row.get("machine_code") or "").strip()
             if not machine_code:
+                continue
+            shift_key = self._finish_shift_row_key(row)
+            if shift_key and shift_key in pending_keys:
                 continue
             payload = {
                 "client_id": client_id,
@@ -25814,7 +26130,8 @@ QWidget#ClientUIRoot {{
                 },
                 "last_event": f"FINISH SHIFT SYNC {row.get('job_name') or row.get('job_code') or ''}".strip(),
             }
-            self._enqueue_server_event(payload, silent=True)
+            if self._enqueue_server_event(payload, silent=True) and shift_key:
+                pending_keys.add(shift_key)
 
     def sync_local_finished_jobs_to_server(self):
         """Offer locally owned finished jobs only after a heartbeat succeeds."""
@@ -25959,36 +26276,25 @@ QWidget#ClientUIRoot {{
         if not event_id:
             return False
         with self._server_event_queue_lock:
-            rows = _load_server_event_queue_json()
-            if any(str(existing.get("id") or "") == event_id for existing in rows):
-                return True
-            rows.append(row)
-            return _save_server_event_queue_json(rows)
+            saved = RUNTIME_STORE.enqueue_outbox(row)
+            if saved:
+                item.clear()
+                item.update(row)
+            return saved
 
     def _remove_persisted_server_event(self, event_id: str) -> None:
         eid = str(event_id or "").strip()
         if not eid:
             return
         with self._server_event_queue_lock:
-            rows = _load_server_event_queue_json()
-            kept = [row for row in rows if str(row.get("id") or "") != eid]
-            if len(kept) != len(rows):
-                _save_server_event_queue_json(kept)
+            RUNTIME_STORE.delete_outbox(eid)
 
     def _mark_persisted_server_event_failed(self, item: Dict[str, Any], error: Any) -> None:
         event_id = str((item or {}).get("id") or "").strip()
         if not event_id or not self._should_persist_server_event(item):
             return
         with self._server_event_queue_lock:
-            rows = _load_server_event_queue_json()
-            for row in rows:
-                if str(row.get("id") or "") != event_id:
-                    continue
-                row["attempts"] = int(row.get("attempts") or 0) + 1
-                row["last_error"] = str(error or "")[:240]
-                row["last_attempt_utc"] = datetime.now(timezone.utc).isoformat()
-                break
-            _save_server_event_queue_json(rows)
+            RUNTIME_STORE.mark_outbox_failed(event_id, error)
 
     def _load_persisted_server_events(self):
         try:
@@ -26031,6 +26337,136 @@ QWidget#ClientUIRoot {{
             self._persist_server_event_item(dropped)
         return True
 
+    def _event_is_batchable_production_delta(self, item: Dict[str, Any]) -> bool:
+        return self._server_event_type_from_item(item) in {
+            "PACK",
+            "RAW_MATERIAL",
+            "BUTAL",
+            "REJECT",
+            "STARTUP_REJECT",
+            "LAST_SHIFT_BUTAL_PACK",
+            "BUTAL_COMPLETION_PACK",
+        }
+
+    def _try_dispatch_server_event_batch(self, server_url: str, current_item: Dict[str, Any]) -> bool:
+        """Send consecutive durable production deltas using one LAN request.
+
+        Returns True only when the current item received an exact durable ACK.
+        Unsupported/transient paths fall back to the existing single-event
+        sender without removing anything from SQLite.
+        """
+        if self._server_batch_sync_supported is False:
+            return False
+        if not bool(getattr(self, "_server_connection_ok", False)):
+            return False
+        if not self._event_is_batchable_production_delta(current_item):
+            return False
+        current_id = str(current_item.get("id") or "").strip()
+        if not current_id:
+            return False
+        with self._server_event_queue_lock:
+            persisted = RUNTIME_STORE.load_outbox(limit=SERVER_SYNC_BATCH_SIZE)
+        if not persisted or str(persisted[0].get("id") or "").strip() != current_id:
+            return False
+        first_payload = persisted[0].get("payload") if isinstance(persisted[0].get("payload"), dict) else {}
+        first_identity = (
+            str(first_payload.get("client_id") or "").strip(),
+            str(first_payload.get("machine_code") or "").strip(),
+            str(first_payload.get("production_session_id") or "").strip(),
+        )
+        candidates: List[Dict[str, Any]] = []
+        for row in persisted:
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            identity = (
+                str(payload.get("client_id") or "").strip(),
+                str(payload.get("machine_code") or "").strip(),
+                str(payload.get("production_session_id") or "").strip(),
+            )
+            if identity != first_identity or not self._event_is_batchable_production_delta(row):
+                break
+            candidates.append(row)
+        if len(candidates) < 2:
+            return False
+
+        outbound_rows: List[Dict[str, Any]] = []
+        for row in candidates:
+            payload = dict(row.get("payload") or {})
+            payload["event_id"] = str(row.get("id") or "")
+            payload["event_created_at_utc"] = str(row.get("created_at_utc") or "")
+            outbound_rows.append(
+                {
+                    "id": str(row.get("id") or ""),
+                    "created_at_utc": str(row.get("created_at_utc") or ""),
+                    "session_sequence": payload.get("session_sequence"),
+                    "payload": payload,
+                }
+            )
+        try:
+            response = requests.post(
+                f"{server_url}/api/sync/batch",
+                json={
+                    "sync_protocol_requested": SERVER_SYNC_PROTOCOL_VERSION,
+                    "client_id": first_identity[0],
+                    "machine_code": first_identity[1],
+                    "events": outbound_rows,
+                },
+                timeout=15,
+            )
+            if int(response.status_code or 0) in {404, 405}:
+                self._server_batch_sync_supported = False
+                return False
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, dict) or not isinstance(body.get("results"), list):
+                return False
+        except Exception:
+            return False
+
+        self._server_batch_sync_supported = True
+        self._server_sync_protocol = int(body.get("sync_protocol") or self._server_sync_protocol or 0)
+        by_id = {
+            str(row.get("event_id") or "").strip(): row
+            for row in body.get("results") or []
+            if isinstance(row, dict) and str(row.get("event_id") or "").strip()
+        }
+        current_acknowledged = False
+        accepted_count = 0
+        for row in candidates:
+            row_id = str(row.get("id") or "").strip()
+            result = by_id.get(row_id) or {}
+            status = str(result.get("status") or "").strip().lower()
+            if status not in {"applied", "duplicate", "audit_only"}:
+                continue
+            if str(result.get("ack_event_id") or "").strip() != row_id:
+                continue
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            self._remove_persisted_server_event(row_id)
+            try:
+                RUNTIME_STORE.acknowledge_sequence(
+                    payload.get("client_id"),
+                    payload.get("machine_code"),
+                    payload.get("production_session_id"),
+                    payload.get("session_sequence"),
+                )
+            except Exception:
+                pass
+            pending_pack_key = _server_event_queue_pack_key(row)
+            if pending_pack_key:
+                self._mark_pack_qr_used_permanently(
+                    pending_pack_key,
+                    _server_event_queue_pack_record(row),
+                )
+            accepted_count += 1
+            if row_id == current_id:
+                current_acknowledged = True
+            else:
+                self._server_batch_acknowledged_ids.add(row_id)
+        if accepted_count:
+            self._server_connection_ok = True
+            self._server_was_offline = False
+            self._server_last_success_at = time.time()
+        return current_acknowledged
+
     def _event_dispatch_loop(self):
         priority_retry_item: Optional[Dict[str, Any]] = None
         while not self._event_worker_stop.is_set():
@@ -26045,6 +26481,12 @@ QWidget#ClientUIRoot {{
                 except queue.Empty:
                     continue
             item = self._normalize_server_event_item(item, silent=bool(item.get("silent")))
+            item_id = str(item.get("id") or "").strip()
+            if item_id and item_id in self._server_batch_acknowledged_ids:
+                self._server_batch_acknowledged_ids.discard(item_id)
+                if item_from_queue:
+                    self._event_queue.task_done()
+                continue
             if self._event_superseded_by_recovery_snapshot(item):
                 self._remove_persisted_server_event(str(item.get("id") or ""))
                 if item_from_queue:
@@ -26061,24 +26503,6 @@ QWidget#ClientUIRoot {{
                     self._event_queue.task_done()
                 continue
             item_payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-            item_session_id = str(item_payload.get("production_session_id") or "").strip()
-            current_session_id = str(self.state.production_session_id or "").strip()
-            same_machine = (
-                str(item_payload.get("machine_code") or "").strip()
-                == str(self.state.machine_code or "").strip()
-            )
-            if (
-                same_machine
-                and item_session_id
-                and current_session_id
-                and item_session_id != current_session_id
-                and self._server_event_type_from_item(item) not in ("FINISH_SHIFT", "FINISH_JOB")
-            ):
-                self._remove_persisted_server_event(str(item.get("id") or ""))
-                self._append_app_log("SESSION FENCE", f"Discarded queued event for closed session {item_session_id}")
-                if item_from_queue:
-                    self._event_queue.task_done()
-                continue
             if not self._persist_server_event_item(item):
                 retry_item = self._should_persist_server_event(item)
                 last_error = "could not durably save event to the local outbox"
@@ -26091,12 +26515,22 @@ QWidget#ClientUIRoot {{
                     time.sleep(0.5)
                 continue
             event_type = self._server_event_type_from_item(item)
+            batch_server_url = str(self.client_config.get("server_url", SERVER_URL)).strip().rstrip("/")
+            if batch_server_url and self._try_dispatch_server_event_batch(batch_server_url, item):
+                if item_from_queue:
+                    self._event_queue.task_done()
+                continue
             retry_item = False
             discard_item = False
             request_reached_server = False
             identity_conflict = False
             session_conflict = False
+            session_conflict_code = ""
             last_error: Any = ""
+            connection_was_unavailable = bool(
+                getattr(self, "_server_was_offline", False)
+                or not getattr(self, "_server_connection_ok", False)
+            )
             try:
                 server_url = str(self.client_config.get("server_url", SERVER_URL)).strip().rstrip("/")
                 if server_url:
@@ -26104,7 +26538,12 @@ QWidget#ClientUIRoot {{
                     outbound_payload["event_id"] = str(item.get("id") or "")
                     outbound_payload["event_created_at_utc"] = str(item.get("created_at_utc") or "")
                     endpoint = "/api/heartbeat" if event_type == "HEARTBEAT" else "/api/event"
-                    resp = requests.post(f"{server_url}{endpoint}", json=outbound_payload, timeout=3)
+                    request_timeout = 15 if event_type in {"SESSION_SYNC", "FINISH_SHIFT", "FINISH_JOB"} else 3
+                    resp = requests.post(
+                        f"{server_url}{endpoint}",
+                        json=outbound_payload,
+                        timeout=request_timeout,
+                    )
                     status_code = int(resp.status_code or 0)
                     response_body: Dict[str, Any] = {}
                     try:
@@ -26127,6 +26566,9 @@ QWidget#ClientUIRoot {{
                         in {"STALE_PRODUCTION_SESSION", "MISSING_PRODUCTION_SESSION"}
                     )
                     if session_conflict:
+                        session_conflict_code = str(
+                            response_body.get("error_code") or ""
+                        ).strip().upper()
                         last_error = str(response_body.get("error") or "Production session conflict")
                         raise RuntimeError(last_error)
                     # Permanent client errors cannot be fixed by retrying the
@@ -26176,6 +26618,15 @@ QWidget#ClientUIRoot {{
                 self._server_connection_ok = True
                 self._server_last_success_at = time.time()
                 self._remove_persisted_server_event(str(item.get("id") or ""))
+                try:
+                    RUNTIME_STORE.acknowledge_sequence(
+                        item_payload.get("client_id"),
+                        item_payload.get("machine_code"),
+                        item_payload.get("production_session_id"),
+                        item_payload.get("session_sequence"),
+                    )
+                except Exception:
+                    pass
                 successful_event_body = item_payload.get("event") if isinstance(item_payload.get("event"), dict) else {}
                 if event_type == "SESSION_SYNC" and bool(successful_event_body.get("session_recovery")):
                     recovery_session_id = str(item_payload.get("production_session_id") or "").strip()
@@ -26207,14 +26658,32 @@ QWidget#ClientUIRoot {{
                     )
                     if not bool(item.get("silent")):
                         self.scanner_status.emit(f"Invalid server event removed: {event_type}")
-                if bool(getattr(self, "_server_was_offline", False)):
+                recovery_prioritized = False
+                successful_event_body = item_payload.get("event") if isinstance(item_payload.get("event"), dict) else {}
+                successful_recovery = bool(
+                    event_type == "SESSION_SYNC"
+                    and successful_event_body.get("session_recovery")
+                )
+                if connection_was_unavailable:
                     self._server_was_offline = False
                     if int(getattr(self, "_server_sync_protocol", 0) or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
-                        self._server_recovery_snapshot_queued = False
+                        if successful_recovery:
+                            self._server_recovery_snapshot_queued = False
+                        else:
+                            recovery_item = self._build_session_recovery_event_item(
+                                "SESSION SNAPSHOT SYNC (RECONNECT COMPACTION)"
+                            )
+                            if isinstance(recovery_item, dict) and self._persist_server_event_item(recovery_item):
+                                self._server_recovery_snapshot_queued = True
+                                priority_retry_item = recovery_item
+                                recovery_prioritized = True
                     else:
                         self._enqueue_reconnect_session_snapshot_sync()
                         self._load_persisted_server_events()
-                if int(getattr(self, "_server_sync_protocol", 0) or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
+                if (
+                    int(getattr(self, "_server_sync_protocol", 0) or 0) >= SERVER_SYNC_PROTOCOL_VERSION
+                    and not recovery_prioritized
+                ):
                     self._load_persisted_server_events()
                 event_payload = item.get("payload") if isinstance(item, dict) else {}
                 event_body = event_payload.get("event") if isinstance(event_payload, dict) else {}
@@ -26276,7 +26745,21 @@ QWidget#ClientUIRoot {{
                 if event_type == "SESSION_SYNC" and isinstance(event_body, dict) and isinstance(event_body.get("session_snapshot"), dict):
                     self._server_recovery_snapshot_queued = False
             else:
-                self._mark_persisted_server_event_failed(item, last_error)
+                if session_conflict_code == "MISSING_PRODUCTION_SESSION":
+                    # This is a legacy/outbox payload created without the session
+                    # fence required by the server's current active job. Retrying
+                    # the exact payload can never succeed and previously caused an
+                    # endless 409 -> recovery snapshot -> retry loop. The local
+                    # state already includes the mutation, and the recovery snapshot
+                    # queued below transfers that authoritative aggregate instead.
+                    self._remove_persisted_server_event(str(item.get("id") or ""))
+                    retry_item = False
+                    self._append_app_log(
+                        "SESSION FENCE",
+                        f"Retired legacy {event_type or 'UNKNOWN'} event without a production session ID",
+                    )
+                else:
+                    self._mark_persisted_server_event_failed(item, last_error)
                 if event_type in ("FINISH_SHIFT", "FINISH_JOB"):
                     self._last_finish_shift_sync_signature = ""
             if session_conflict and not self._event_worker_stop.is_set():
@@ -26315,13 +26798,13 @@ QWidget#ClientUIRoot {{
         persistent = self._should_persist_server_event(item)
         if persistent and not self._persist_server_event_item(item):
             event_type = self._server_event_type_from_item(item) or "UNKNOWN"
-            self._append_app_log("SERVER QUEUE", f"Could not durably save {event_type} before queueing")
+            self._append_app_log("SERVER QUEUE", f"Could not save {event_type} in the local SQLite outbox")
             if not silent:
                 self.scanner_status.emit(f"Could not save {event_type} to the local retry queue.")
             return False
         if bool(getattr(self, "_server_identity_conflict", False)) and self._server_event_type_from_item(item) != "HEARTBEAT":
-            # Preserve valid production data on disk, but only heartbeat probes
-            # are allowed to test whether the identity conflict has cleared.
+            # The event is durable in SQLite; heartbeat probes alone test
+            # whether the identity conflict has cleared.
             return bool(persistent)
         while not self._event_worker_stop.is_set():
             try:
@@ -26329,9 +26812,8 @@ QWidget#ClientUIRoot {{
                 return True
             except queue.Full:
                 if persistent:
-                    # It is already durable on disk. Do not evict an older
-                    # mutation; the dispatcher refills this item after earlier
-                    # event IDs have been acknowledged.
+                    # The exact event is already durable in SQLite. The worker
+                    # refills it after older items have been acknowledged.
                     return True
                 if self._server_event_type_from_item(item) == "HEARTBEAT":
                     return False
@@ -26459,13 +26941,23 @@ QWidget#ClientUIRoot {{
         if not s.machine_code:
             return False
         event_payload = dict(event or {})
-        # Piggyback a small rolling audit batch on the existing event/heartbeat.
-        # The server deduplicates these rows, so no additional API requests are
-        # created for scan/status/UI/error logging.
-        event_payload.setdefault(
-            "client_activity_logs",
-            [dict(row) for row in list(getattr(self, "_app_logs", []) or [])[-80:] if isinstance(row, dict)],
-        )
+        event_type = str(event_payload.get("type") or "").strip().upper()
+        # Audit rows are transported by the regular heartbeat. Copying and
+        # encoding the same batch on every production scan adds latency without
+        # improving delivery because the server already deduplicates the rows.
+        if event_type == "HEARTBEAT":
+            event_payload.setdefault(
+                "request_session",
+                bool(getattr(self, "_server_authoritative_reconcile_needed", True)),
+            )
+            event_payload.setdefault(
+                "known_production_session_id",
+                str(s.production_session_id or "").strip(),
+            )
+            event_payload.setdefault(
+                "client_activity_logs",
+                [dict(row) for row in list(getattr(self, "_app_logs", []) or [])[-80:] if isinstance(row, dict)],
+            )
         session_id = str(s.production_session_id or "").strip()
         if s.job_code and not session_id:
             session_id = self._legacy_production_session_id(
