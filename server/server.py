@@ -7104,7 +7104,7 @@ async def _state_tick_loop():
         await asyncio.sleep(STATE_TICK_SECONDS)
 
 
-DASHBOARD_HTML = """
+DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html>
 <head>
