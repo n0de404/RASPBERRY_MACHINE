@@ -221,6 +221,12 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
             raw=raw,
             value="Supervisor machine counter overwrite",
         )
+    if s_l == "svisorreview~1":
+        return ScanResult(
+            kind="SUPERVISOR_REVIEW_TRIGGER",
+            raw=raw,
+            value="Open Supervisor Review",
+        )
 
     # Production daily report trigger
     if s_l in ("productiondailyreport~1", "pdr_start", "pdrstart"):

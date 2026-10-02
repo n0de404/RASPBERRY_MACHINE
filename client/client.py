@@ -3588,6 +3588,10 @@ class ClientUI(QWidget):
         self._action_logs: List[str] = []
         self._app_logs: List[Dict[str, Any]] = _load_app_logs_json()
         self._app_logs_dirty = True
+        # Activity acknowledgements are intentionally runtime-only. After a
+        # restart the latest rows are offered once again and the server's
+        # deterministic IDs safely deduplicate them.
+        self._server_acknowledged_activity_ids: Set[str] = set()
         self._avg_weight_server: Optional[ThreadingHTTPServer] = None
         self._avg_weight_server_thread: Optional[threading.Thread] = None
         self._avg_weight_server_error: Optional[str] = None
@@ -5366,7 +5370,7 @@ QWidget#ClientUIRoot {{
         self.rejectSummaryCycleCard.layout().setSpacing(10)
         self.rejectSummaryCycleTitle = QLabel("CYCLE TIME REVIEW")
         self.rejectSummaryCycleTitle.setStyleSheet("color: #f8fafc; font-size: 18px; font-weight: 900;")
-        self.rejectSummaryCycleHint = QLabel("Supervisor can keep the active cycle time or scan a new one, then scan confirm and Supervisor QR.")
+        self.rejectSummaryCycleHint = QLabel("Keep the active cycle time or scan a new one, then scan confirm and a Supervisor badge.")
         self.rejectSummaryCycleHint.setWordWrap(True)
         self.rejectSummaryCycleHint.setStyleSheet("color: #cbd5e1; font-size: 13px; font-weight: 700;")
         self.rejectSummaryCycleStd = QLabel("Std Cycle Time: -")
@@ -8225,7 +8229,7 @@ QWidget#ClientUIRoot {{
                     "Review production, downtime, product parts, rejects, and enter the current cycle time."
                 )
             elif s.cycle_time_pending_supervisor:
-                self.rejectSummaryHint.setText("Review reject details and cycle time. Scan confirm, then scan Supervisor QR to save.")
+                self.rejectSummaryHint.setText("Review reject details and cycle time. Scan confirm, then scan a Supervisor badge to save.")
             else:
                 self.rejectSummaryHint.setText("Review production, downtime, product parts, rejects, and cycle-time history.")
         else:
@@ -8242,9 +8246,9 @@ QWidget#ClientUIRoot {{
         self.rejectSummaryStamp.setText(f"Scanned at: {stamp_text or '-'}")
         pending_name = ""
         if s.waiting_cycle_time_confirm_popup and int(s.cycle_time_confirm_phase or 0) == 2:
-            pending_name = str(s.cycle_time_confirm_actor_name or "").strip()
+            pending_name = str(s.cycle_time_confirm_actor_name or "").strip() or "Pending Supervisor"
         elif s.supervisor_review_open:
-            pending_name = str(s.supervisor_review_actor_name or "").strip()
+            pending_name = str(s.supervisor_review_actor_name or "").strip() or "Pending Supervisor"
         confirmed_name = pending_name or str(s.cycle_time_confirmed_by or "").strip() or "-"
         self.rejectSummaryConfirmedBy.setText(f"Confirmed by: {confirmed_name}")
         self.rejectSummaryTotals.setText(
@@ -8323,16 +8327,19 @@ QWidget#ClientUIRoot {{
         self.rejectSummaryCycleStd.setText(f"Std Cycle Time: {std_cycle}")
         self.rejectSummaryCycleCurrent.setText(f"Current Cycle Time: {active_cycle}")
         self.rejectSummaryCycleInput.setText(self._format_supervisor_cycle_input_text())
+        cycle_reviewer = s.supervisor_review_actor_name or (
+            "Pending Supervisor" if s.supervisor_review_open else s.cycle_time_confirmed_by
+        )
         self.rejectSummaryCycleConfirmed.setText(
-            f"Confirmed by: {self._safe_text(s.cycle_time_confirmed_by or s.supervisor_review_actor_name, '-')}"
+            f"Confirmed by: {self._safe_text(cycle_reviewer, '-')}"
         )
         if s.waiting_cycle_time_confirm_popup:
             self.rejectSummaryCycleHint.setText(
-                "Scan num_0..num_9 or backspace to update cycle time. Scan confirm, then scan the same Supervisor QR to save."
+                "Scan num_0..num_9 or backspace to update cycle time. Scan confirm, then scan a Supervisor badge to save."
             )
         elif s.supervisor_review_open and s.cycle_time_pending_supervisor:
             self.rejectSummaryCycleHint.setText(
-                "Supervisor review is open. Keep the current cycle time by scanning confirm, then Supervisor QR."
+                "Supervisor review is open. Keep the current cycle time by scanning confirm, then scan a Supervisor badge."
             )
         else:
             self.rejectSummaryCycleHint.setText(
@@ -10263,7 +10270,7 @@ QWidget#ClientUIRoot {{
         elif s.waiting_shift_end_machine_counter_input:
             self._set_banner_text("Shift end: Input cycle time")
         elif s.waiting_cycle_time_confirm_popup:
-            self._set_banner_text("Supervisor cycle review: scan confirm, then Supervisor QR")
+            self._set_banner_text("Supervisor Review: update cycle time, confirm, then scan Supervisor badge")
         elif s.waiting_initial_cycle_qc_confirm:
             self._set_banner_text("Initial setup: Scan QC badge to confirm cycle time")
         elif s.pending_offline_qr_raw:
@@ -12865,7 +12872,7 @@ QWidget#ClientUIRoot {{
         elif s.waiting_cycle_time_confirm_popup:
             self.resolveTitle.setText("SUPERVISOR CYCLE TIME REVIEW")
             if int(s.cycle_time_confirm_phase or 0) == 2:
-                self.resolveHint.setText("Cycle time updated. Reject summary is open. Scan the same Supervisor badge again to confirm all.")
+                self.resolveHint.setText("Cycle time updated. Reject summary is open. Scan a valid Supervisor badge to confirm all.")
                 self.resolveOldCycleTitle.setText("STD CYCLE TIME")
                 self.resolveNewCycleTitle.setText("CURRENT CYCLE TIME")
                 self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_current or '-'}")
@@ -13687,7 +13694,7 @@ QWidget#ClientUIRoot {{
         self.resolveTitle.setText("SUPERVISOR CYCLE TIME REVIEW")
         self.resolveHint.setText(
             f"Active Cycle Time: {active_cycle}\n"
-            "Use numpad to update cycle time, then confirm. Scan the same Supervisor badge to save."
+            "Use numpad to update cycle time, then confirm. Scan a valid Supervisor badge to save."
         )
         self.resolveOldCycleTitle.setText("STD CYCLE TIME")
         self.resolveNewCycleTitle.setText("NEW CYCLE TIME INPUT")
@@ -21890,6 +21897,8 @@ QWidget#ClientUIRoot {{
             return "Production daily report mode enabled"
         if res.kind == "MACHINE_COUNTER_OVERWRITE_TRIGGER":
             return "Machine counter overwrite requested"
+        if res.kind == "SUPERVISOR_REVIEW_TRIGGER":
+            return "Supervisor Review requested"
         if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
             return "Production daily report resolve"
         if res.kind == "PRODUCTION_DAILY_REPORT_REASON":
@@ -21935,6 +21944,7 @@ QWidget#ClientUIRoot {{
         if not msg:
             return
         row = {
+            "activity_id": f"ACT-{uuid.uuid4().hex.upper()}",
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "source": src,
             "actor": actor_text,
@@ -21949,6 +21959,35 @@ QWidget#ClientUIRoot {{
         self._enqueue_app_log_persist(row, list(self._app_logs))
         if self._is_logs_section_active():
             self._refresh_app_logs_table(force=True)
+
+    @staticmethod
+    def _app_log_activity_id(row: Any) -> str:
+        if not isinstance(row, dict):
+            return ""
+        existing = str(row.get("activity_id") or "").strip()
+        if existing:
+            return existing
+        canonical = json.dumps(
+            {key: value for key, value in row.items() if key != "activity_id"},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        return f"ACT-{uuid.uuid5(uuid.NAMESPACE_URL, canonical).hex.upper()}"
+
+    def _pending_server_activity_logs(self, limit: int = 80) -> List[Dict[str, Any]]:
+        acknowledged = set(getattr(self, "_server_acknowledged_activity_ids", set()) or set())
+        rows: List[Dict[str, Any]] = []
+        for raw in list(getattr(self, "_app_logs", []) or []):
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            activity_id = self._app_log_activity_id(row)
+            if not activity_id or activity_id in acknowledged:
+                continue
+            row["activity_id"] = activity_id
+            rows.append(row)
+        return rows[-max(1, int(limit or 80)):]
 
     def _remove_server_acknowledged_app_logs(self, uploaded_rows: Any):
         """Remove only audit rows included in a server-confirmed shift."""
@@ -22033,7 +22072,7 @@ QWidget#ClientUIRoot {{
             return 'Scan num_0 to num_9 for the ending cycle time, then scan "confirm".'
         if s.waiting_cycle_time_confirm_popup:
             if int(s.cycle_time_confirm_phase or 0) == 2:
-                return "Scan the same Supervisor badge."
+                return "Scan a valid Supervisor badge."
             return 'Scan num_0 to num_9 for cycle time, then scan "confirm".'
         if s.waiting_initial_cycle_qc_confirm:
             return "Scan a QC badge."
@@ -22698,7 +22737,7 @@ QWidget#ClientUIRoot {{
                 "role": s.supervisor_review_actor_role or "SUPERVISOR",
             }
             review = self._start_or_update_supervisor_review(reviewer, action="SUMMARY_CONFIRMED_PENDING_QR")
-            self.status.setText("Supervisor summary confirmed. Scan the same Supervisor QR to close.")
+            self.status.setText("Supervisor summary confirmed. Scan a valid Supervisor badge to close.")
             self._refresh_reject_summary_overlay()
             self._save_active_session_snapshot()
             if review:
@@ -22804,23 +22843,22 @@ QWidget#ClientUIRoot {{
                     s.reject_summary_last_scanned_at = datetime.now(timezone.utc).isoformat()
                     s.showing_reject_summary = True
                     self._show_reject_summary_overlay()
-                    self.status.setText("Cycle time updated. Scan the same Supervisor badge again to confirm all.")
+                    self.status.setText("Cycle time updated. Scan a valid Supervisor badge to confirm all.")
                     self._refresh_ui()
                     self._save_active_session_snapshot()
                     return
                 self.status.setText("Supervisor cycle review: scan num_0..num_9, backspace, confirm.")
                 return
 
-            same_cycle_confirm_actor = (
-                raw_s == (s.cycle_time_confirm_actor_code or "")
-                or self._clean_badge_scan_code(raw_s) == self._clean_badge_scan_code(s.cycle_time_confirm_actor_code or "")
-            )
-            if not same_cycle_confirm_actor:
-                self.status.setText("Confirmation active: scan the same Supervisor badge again.")
+            supervisor = self._authorized_person_from_scan(raw_s)
+            if supervisor is None or str(supervisor.get("can_supervisor", "0")) != "1":
+                self.status.setText("Confirmation active: scan a valid Supervisor badge.")
+                self._show_invalid_overlay("Only a registered Supervisor badge can complete Supervisor Review.")
                 return
-            actor_name = s.cycle_time_confirm_actor_name or raw_s
-            actor_role = s.cycle_time_confirm_actor_role or "SUPERVISOR"
-            self._finalize_supervisor_cycle_review(raw_s, actor_name, actor_role)
+            actor_code = str(supervisor.get("code") or raw_s).strip()
+            actor_name = str(supervisor.get("name") or actor_code).strip()
+            actor_role = str(supervisor.get("role") or "SUPERVISOR").strip()
+            self._finalize_supervisor_cycle_review(actor_code, actor_name, actor_role)
             stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             self.push_event(
                 {
@@ -22837,6 +22875,40 @@ QWidget#ClientUIRoot {{
             return
 
         res_pre = parse_scan(raw_s)
+        if res_pre is not None and res_pre.kind == "SUPERVISOR_REVIEW_TRIGGER":
+            in_downtime_flow = (
+                s.waiting_production_report_reason
+                or s.waiting_downtime_start_maintenance
+                or s.waiting_pdr_maintenance_reason
+                or s.waiting_downtime_end_maintenance
+                or s.waiting_cycle_time_input
+                or s.waiting_maintenance_qr
+                or s.waiting_supervisor_qr
+                or s.waiting_operator_downtime_confirm
+                or s.downtime_active
+            )
+            if in_downtime_flow:
+                self.status.setText("Complete the active downtime flow before opening Supervisor Review.")
+                self._show_invalid_overlay("Supervisor Review is unavailable while downtime confirmation is active.")
+                return
+            if not self.can_accept_production_scans():
+                message = self._missing_session_prereq_message() or "Complete the active production prompt first."
+                self.status.setText(message)
+                self._show_invalid_overlay(message)
+                return
+            if not str(s.cycle_time_current or "").strip():
+                self.status.setText("Set the current cycle time before opening Supervisor Review.")
+                self._show_invalid_overlay("Supervisor Review requires an active cycle time.")
+                return
+            self._show_cycle_time_confirm_popup({"code": "", "name": "", "role": "SUPERVISOR"})
+            self.status.setText(
+                "Supervisor Review opened. Input or keep the current cycle time, "
+                "scan confirm, then scan a valid Supervisor badge."
+            )
+            self.log_last("Supervisor Review opened by svisorreview~1")
+            self._refresh_ui()
+            self._save_active_session_snapshot()
+            return
         if s.waiting_butal_job_assignment:
             if raw_l in ("cancel", "cancel~1", "void", "clear"):
                 self._clear_pending_butal_assignment()
@@ -22874,26 +22946,20 @@ QWidget#ClientUIRoot {{
                 if not self.can_accept_production_scans():
                     self.status.setText("Complete session first: MACHINE -> JOB -> OPERATOR.")
                     return
-                if reviewer_can_supervisor and s.cycle_time_current:
-                    if s.supervisor_review_open and not s.waiting_cycle_time_confirm_popup:
-                        self._close_supervisor_review_snapshot(
-                            s.supervisor_review_actor_code or reviewer.get("code") or raw_s,
-                            s.supervisor_review_actor_name or reviewer.get("name") or raw_s,
-                            s.supervisor_review_actor_role or reviewer.get("role") or "SUPERVISOR",
-                            action="CYCLE_REVIEW_REOPENED",
-                            resolved=False,
-                        )
-                        self._hide_supervisor_review()
-                    # Every new Supervisor review captures a fresh cycle-time
-                    # reading. The current value changes, while
-                    # cycle_time_change_logs preserves each old -> new row.
-                    self._show_cycle_time_confirm_popup(reviewer)
-                    self.status.setText(
-                        "Supervisor cycle review opened. Input the current cycle time, "
-                        "scan confirm, then scan the same Supervisor badge."
+                if reviewer_can_supervisor:
+                    checked_at_utc = datetime.now(timezone.utc).isoformat()
+                    self.push_event(
+                        {
+                            "type": "SUPERVISOR_ROTATION_CHECK",
+                            "checked_at_utc": checked_at_utc,
+                            "supervisor_code": reviewer.get("code"),
+                            "supervisor_name": reviewer.get("name"),
+                            "supervisor_role": reviewer.get("role"),
+                        },
+                        f"SUPERVISOR ROTATION CHECK {reviewer.get('name') or reviewer.get('code') or ''}".strip(),
+                        silent=True,
+                        defer_snapshot=True,
                     )
-                    self._refresh_ui()
-                    self._save_active_session_snapshot()
                     return
                 if not reviewer_can_supervisor:
                     self.status.setText("Authorized badge scanned. No supervisor action pending.")
@@ -26731,6 +26797,26 @@ QWidget#ClientUIRoot {{
                     if authoritative_replace_queued:
                         self._server_authoritative_reconcile_needed = False
                 if event_type == "HEARTBEAT":
+                    acknowledged_activity_ids = {
+                        str(value or "").strip()
+                        for value in (response_body.get("client_activity_ack_ids") or [])
+                        if str(value or "").strip()
+                    }
+                    if acknowledged_activity_ids:
+                        current_activity_ids = set(
+                            getattr(self, "_server_acknowledged_activity_ids", set()) or set()
+                        )
+                        current_activity_ids.update(acknowledged_activity_ids)
+                        # Keep only acknowledgements that can still correspond
+                        # to the bounded local audit history.
+                        live_activity_ids = {
+                            self._app_log_activity_id(row)
+                            for row in list(getattr(self, "_app_logs", []) or [])
+                            if isinstance(row, dict)
+                        }
+                        self._server_acknowledged_activity_ids = (
+                            current_activity_ids.intersection(live_activity_ids)
+                        )
                     self.sync_local_finish_shifts_to_server(force=False)
                     self.sync_local_finished_jobs_to_server()
                 if event_type == "FINISH_SHIFT" and not discard_item and isinstance(event_body, dict):
@@ -26956,7 +27042,7 @@ QWidget#ClientUIRoot {{
             )
             event_payload.setdefault(
                 "client_activity_logs",
-                [dict(row) for row in list(getattr(self, "_app_logs", []) or [])[-80:] if isinstance(row, dict)],
+                self._pending_server_activity_logs(80),
             )
         session_id = str(s.production_session_id or "").strip()
         if s.job_code and not session_id:

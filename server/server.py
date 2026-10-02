@@ -2,6 +2,8 @@
 from __future__ import annotations
 import asyncio
 import base64
+import contextvars
+import hashlib
 import io
 import json
 import math
@@ -11,9 +13,10 @@ import re
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -42,6 +45,7 @@ except Exception:
 @asynccontextmanager
 async def _app_lifespan(app: FastAPI):
     global STATE_TICK_TASK
+    await asyncio.to_thread(_migrate_active_session_activity_logs)
     if STATE_TICK_TASK is None or STATE_TICK_TASK.done():
         STATE_TICK_TASK = asyncio.create_task(_state_tick_loop())
     try:
@@ -64,6 +68,9 @@ APP = FastAPI(title="Machine Dashboard Server", lifespan=_app_lifespan)
 APP.mount("/Images", StaticFiles(directory=str(Path(__file__).resolve().parent / "Images")), name="images")
 APP.mount("/PERSON", StaticFiles(directory=str(Path(__file__).resolve().parent / "PERSON")), name="person")
 MACHINE_EVENT_LOCKS: Dict[str, asyncio.Lock] = {}
+BATCH_BROADCAST_DEFERRED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "batch_broadcast_deferred", default=False
+)
 
 
 @APP.middleware("http")
@@ -232,6 +239,8 @@ def _load_sql_config() -> Dict[str, Any]:
         "user": "rpimachine_user",
         "password": "0t1docmtl$tm",
         "connect_timeout": 5,
+        "read_timeout": 8,
+        "write_timeout": 8,
     }
     try:
         if SQL_CONFIG_FILE.exists():
@@ -277,6 +286,8 @@ class _SqlConnectionPool:
             cursorclass=DictCursor,
             autocommit=False,
             connect_timeout=int(cfg.get("connect_timeout", 5) or 5),
+            read_timeout=int(cfg.get("read_timeout", 8) or 8),
+            write_timeout=int(cfg.get("write_timeout", 8) or 8),
         )
 
     def acquire(self):
@@ -549,6 +560,18 @@ def _ensure_sql_schema() -> bool:
                   `saved_at_utc` VARCHAR(50) NULL,
                   `raw_json` JSON NOT NULL,
                   PRIMARY KEY (`machine_code`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS `machine_activity_logs` (
+                  `machine_code` VARCHAR(50) NOT NULL,
+                  `activity_id` VARCHAR(64) NOT NULL,
+                  `timestamp_utc` VARCHAR(50) NULL,
+                  `raw_json` JSON NOT NULL,
+                  PRIMARY KEY (`machine_code`, `activity_id`),
+                  KEY `idx_machine_activity_time` (`machine_code`, `timestamp_utc`)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """
             )
@@ -1027,7 +1050,131 @@ def _load_daily_role_assignments_sql() -> Optional[Dict[str, Any]]:
         conn.close()
 
 
+_HISTORY_HEAVY_COLUMNS = {
+    "raw_json", "raw_material_scans", "raw_material_logs",
+    "part_availability_carryover_logs", "product_part_excess_logs",
+    "product_pack_history_logs", "butal_scan_logs", "reject_review_logs",
+    "job_payload", "linkage_job_payload", "linkage_jobs", "linkage_mirror",
+    "operator_shift_logs", "review_history", "print_request_payload",
+}
+_HISTORY_JSON_TEXT_FIELDS = (
+    "production_session_id", "product_id", "product_sku", "product_name",
+    "job_started_at", "mold", "mold_no", "custom_05",
+)
+_HISTORY_JSON_COUNT_FIELDS = {
+    "_raw_material_log_count": "raw_material_logs",
+    "_pack_history_log_count": "product_pack_history_logs",
+    "_butal_scan_log_count": "butal_scan_logs",
+    "_reject_review_log_count": "reject_review_logs",
+    "_pdr_downtime_log_count": "pdr_downtime_logs",
+}
+_HISTORY_DETAIL_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_HISTORY_DETAIL_CACHE_LOCK = threading.Lock()
+_HISTORY_DETAIL_CACHE_MAX = 24
+
+
+def _load_history_summaries_sql(table_name: str) -> Optional[List[Dict[str, Any]]]:
+    """Load compact history rows without transferring or decoding large raw JSON."""
+    safe_table = str(table_name or "").strip()
+    if safe_table not in {"finished_jobs", "finish_shift", "archived_jobs_server"}:
+        return None
+    conn = _sql_conn()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT `COLUMN_NAME`,`DATA_TYPE` FROM `INFORMATION_SCHEMA`.`COLUMNS` "
+                "WHERE `TABLE_SCHEMA`=DATABASE() AND `TABLE_NAME`=%s ORDER BY `ORDINAL_POSITION`",
+                (safe_table,),
+            )
+            column_rows = cur.fetchall() or []
+            columns = [str((row or {}).get("COLUMN_NAME") or "") for row in column_rows]
+            if "id" not in columns or "raw_json" not in columns:
+                return []
+            data_types = {
+                str((row or {}).get("COLUMN_NAME") or ""): str((row or {}).get("DATA_TYPE") or "").lower()
+                for row in column_rows
+            }
+            selected = [name for name in columns if name and name not in _HISTORY_HEAVY_COLUMNS]
+            select_parts = [f"`{name}`" for name in selected]
+            for field_name in _HISTORY_JSON_TEXT_FIELDS:
+                if field_name not in columns:
+                    select_parts.append(
+                        f"JSON_UNQUOTE(JSON_EXTRACT(`raw_json`, '$.{field_name}')) AS `{field_name}`"
+                    )
+            for alias, json_field in _HISTORY_JSON_COUNT_FIELDS.items():
+                select_parts.append(
+                    f"COALESCE(JSON_LENGTH(JSON_EXTRACT(`raw_json`, '$.{json_field}')), 0) AS `{alias}`"
+                )
+            cur.execute(f"SELECT {','.join(select_parts)} FROM `{safe_table}` ORDER BY `id` ASC")
+            items: List[Dict[str, Any]] = []
+            for raw_row in cur.fetchall() or []:
+                row = dict(raw_row or {})
+                source_id = row.pop("id", None)
+                for name, data_type in data_types.items():
+                    if data_type == "json" and name in row:
+                        row[name] = _sql_decode_json(row.get(name), {} if name == "reject_breakdown" else None)
+                row["_history_summary_only"] = True
+                row["_history_source_table"] = safe_table
+                row["_history_source_id"] = source_id
+                items.append(row)
+            return items
+    except Exception as exc:
+        print(f"[SQL] Failed to load compact history from {safe_table}: {exc}")
+        return None
+    finally:
+        conn.close()
+
+
+def _history_detail_cache_key(row: Dict[str, Any]) -> str:
+    return f"{row.get('_history_source_table') or ''}:{row.get('_history_source_id') or ''}"
+
+
+def _load_history_detail_sql(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Hydrate one compact history row on demand and keep a small bounded cache."""
+    if not isinstance(row, dict) or not row.get("_history_summary_only"):
+        return dict(row or {})
+    table_name = str(row.get("_history_source_table") or "").strip()
+    source_id = row.get("_history_source_id")
+    if table_name not in {"finished_jobs", "finish_shift", "archived_jobs_server"} or source_id in (None, ""):
+        return dict(row)
+    cache_key = _history_detail_cache_key(row)
+    with _HISTORY_DETAIL_CACHE_LOCK:
+        cached = _HISTORY_DETAIL_CACHE.get(cache_key)
+        if cached is not None:
+            _HISTORY_DETAIL_CACHE.move_to_end(cache_key)
+            return dict(cached)
+    conn = _sql_conn()
+    if conn is None:
+        return dict(row)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT `raw_json` FROM `{table_name}` WHERE `id`=%s LIMIT 1", (source_id,))
+            sql_row = cur.fetchone()
+        detail = _sql_decode_json((sql_row or {}).get("raw_json"), {})
+        if not isinstance(detail, dict) or not detail:
+            return dict(row)
+        detail["_history_source_table"] = table_name
+        detail["_history_source_id"] = source_id
+        with _HISTORY_DETAIL_CACHE_LOCK:
+            _HISTORY_DETAIL_CACHE[cache_key] = dict(detail)
+            _HISTORY_DETAIL_CACHE.move_to_end(cache_key)
+            while len(_HISTORY_DETAIL_CACHE) > _HISTORY_DETAIL_CACHE_MAX:
+                _HISTORY_DETAIL_CACHE.popitem(last=False)
+        return detail
+    except Exception as exc:
+        print(f"[SQL] Failed to load history detail from {table_name} id={source_id}: {exc}")
+        return dict(row)
+    finally:
+        conn.close()
+
+
 def _load_archived_jobs_sql() -> Optional[List[Dict[str, Any]]]:
+    return _load_history_summaries_sql("archived_jobs_server")
+
+
+def _load_archived_jobs_sql_legacy() -> Optional[List[Dict[str, Any]]]:
     conn = _sql_conn()
     if conn is None:
         return None
@@ -1374,26 +1521,15 @@ def _save_server_document_sql(document_key: str, payload: Dict[str, Any]) -> boo
 
 
 def _load_finished_jobs_sql() -> Optional[List[Dict[str, Any]]]:
-    conn = _sql_conn()
-    if conn is None:
-        return None
-    try:
-        items: List[Dict[str, Any]] = []
-        with conn.cursor() as cur:
-            for table_name in ("finished_jobs", "finish_shift"):
-                try:
-                    cur.execute(f"SELECT `raw_json` FROM `{table_name}` ORDER BY `id` ASC")
-                except Exception:
-                    continue
-                for row in cur.fetchall() or []:
-                    item = _sql_decode_json((row or {}).get("raw_json"), {})
-                    if isinstance(item, dict):
-                        items.append(item)
-        return items
-    except Exception:
-        return None
-    finally:
-        conn.close()
+    items: List[Dict[str, Any]] = []
+    storage_available = False
+    for table_name in ("finished_jobs", "finish_shift"):
+        rows = _load_history_summaries_sql(table_name)
+        if rows is None:
+            continue
+        storage_available = True
+        items.extend(row for row in rows if isinstance(row, dict))
+    return items if storage_available else None
 
 
 def _load_machine_status_archive_sql() -> Optional[List[Dict[str, Any]]]:
@@ -1796,6 +1932,23 @@ def _clean_dashboard_last_event(value: Any) -> str:
     return text
 
 
+DASHBOARD_HEAVY_SESSION_FIELDS = {
+    "product_pack_history_logs",
+    "raw_material_logs",
+    "raw_material_scans",
+    "reject_review_logs",
+    "operator_shift_logs",
+    "break_sessions",
+    "pdr_downtime_logs",
+    "cycle_time_change_logs",
+    "machine_counter_overwrite_logs",
+    "supervisor_review_logs",
+    "supervisor_rotation_logs",
+    "butal_scan_logs",
+    "client_app_logs",
+}
+
+
 @dataclass
 class MachineSession:
     client_id: str
@@ -1873,6 +2026,8 @@ class MachineSession:
     last_supervisor_check_at_utc: Optional[str] = None
     last_supervisor_check_name: Optional[str] = None
     last_supervisor_check_code: Optional[str] = None
+    supervisor_rotation_count: int = 0
+    supervisor_rotation_logs: List[Dict[str, Any]] = None
     current_supervisor_review: Dict[str, Any] = None
     supervisor_review_logs: List[Dict[str, Any]] = None
     job_payload: Dict[str, Any] = None
@@ -1920,6 +2075,11 @@ class MachineSession:
         d["manpower_count"] = (1 if d.get("operator_id") else 0) + len(d["crew_members"])
         d["current_supervisor_review"] = d["current_supervisor_review"] or {}
         d["supervisor_review_logs"] = d["supervisor_review_logs"] or []
+        d["supervisor_rotation_count"] = max(0, int(d.get("supervisor_rotation_count") or 0))
+        d["supervisor_rotation_logs"] = [
+            dict(row) for row in (d.get("supervisor_rotation_logs") or [])[-100:]
+            if isinstance(row, dict)
+        ]
         d["pdr_downtime_logs"] = d["pdr_downtime_logs"] or []
         d["machine_counter_overwrite_logs"] = d["machine_counter_overwrite_logs"] or []
         d["cycle_time_change_logs"] = d["cycle_time_change_logs"] or []
@@ -1937,6 +2097,26 @@ class MachineSession:
         d["break_sessions"] = d["break_sessions"] or []
         d["butal_by_job"] = d["butal_by_job"] or {}
         d["last_shift_butal_by_job"] = d["last_shift_butal_by_job"] or {}
+        return d
+
+    def to_dashboard_dict(self) -> Dict[str, Any]:
+        """Return a lightweight card/list payload without copying audit ledgers."""
+        d = {
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+            if field.name not in DASHBOARD_HEAVY_SESSION_FIELDS
+        }
+        d["reject_breakdown"] = _canonical_reject_breakdown(d.get("reject_breakdown"))
+        d["job_payload"] = d.get("job_payload") or {}
+        d["linkage_job_payload"] = d.get("linkage_job_payload") or {}
+        d["linkage_jobs"] = d.get("linkage_jobs") or []
+        d["crew_members"] = d.get("crew_members") or []
+        d["manpower_count"] = (1 if d.get("operator_id") else 0) + len(d["crew_members"])
+        d["current_supervisor_review"] = d.get("current_supervisor_review") or {}
+        d["supervisor_rotation_count"] = max(0, int(d.get("supervisor_rotation_count") or 0))
+        d["butal_by_job"] = d.get("butal_by_job") or {}
+        d["last_shift_butal_by_job"] = d.get("last_shift_butal_by_job") or {}
+        d["summary_only"] = True
         return d
 
 
@@ -1986,6 +2166,8 @@ def _reset_active_session_for_new_job_segment(sess: MachineSession, preserve_ope
     sess.last_supervisor_check_at_utc = None
     sess.last_supervisor_check_name = None
     sess.last_supervisor_check_code = None
+    sess.supervisor_rotation_count = 0
+    sess.supervisor_rotation_logs = []
     sess.current_supervisor_review = {}
     sess.supervisor_review_logs = []
     sess.external_average_weight_grams = None
@@ -2302,6 +2484,11 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         last_supervisor_check_at_utc=raw.get("last_supervisor_check_at_utc"),
         last_supervisor_check_name=raw.get("last_supervisor_check_name"),
         last_supervisor_check_code=raw.get("last_supervisor_check_code"),
+        supervisor_rotation_count=max(0, int(raw.get("supervisor_rotation_count", 0) or 0)),
+        supervisor_rotation_logs=[
+            dict(row) for row in (raw.get("supervisor_rotation_logs") or [])[-100:]
+            if isinstance(row, dict)
+        ],
         current_supervisor_review=dict(raw.get("current_supervisor_review") or {}),
         supervisor_review_logs=list(raw.get("supervisor_review_logs") or []),
         job_payload=dict(raw.get("job_payload") or {}),
@@ -2383,6 +2570,7 @@ def load_active_sessions_seed() -> Dict[str, MachineSession]:
 
 
 def _save_active_sessions_json(rows: Dict[str, MachineSession]) -> bool:
+    global ACTIVE_SESSIONS_FILE_MTIME
     try:
         payload: Dict[str, Any] = {}
         for machine_code, sess in (rows or {}).items():
@@ -2396,6 +2584,7 @@ def _save_active_sessions_json(rows: Dict[str, MachineSession]) -> bool:
             os.fsync(f.fileno())
         _backup_active_sessions_file()
         tmp.replace(ACTIVE_MACHINE_SESSIONS_FILE)
+        ACTIVE_SESSIONS_FILE_MTIME = float(ACTIVE_MACHINE_SESSIONS_FILE.stat().st_mtime or 0)
         return True
     except Exception:
         return False
@@ -2418,13 +2607,85 @@ def _upsert_active_session_sql(row: Dict[str, Any]) -> bool:
                 (
                     str(row.get("machine_code") or "").strip(),
                     row.get("saved_at_utc") or datetime.now(timezone.utc).isoformat(),
-                    json.dumps(row, ensure_ascii=False),
+                    json.dumps({key: value for key, value in row.items() if key != "client_app_logs"}, ensure_ascii=False),
                 ),
             )
         conn.commit()
         return True
     except Exception:
         return False
+    finally:
+        conn.close()
+
+
+def _upsert_machine_activity_logs_sql(machine_code: str, rows: Any) -> bool:
+    code = str(machine_code or "").strip()
+    normalized = _normalize_client_activity_rows(rows)
+    if not code or not normalized:
+        return bool(code)
+    conn = _sql_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO `machine_activity_logs`
+                  (`machine_code`, `activity_id`, `timestamp_utc`, `raw_json`)
+                VALUES (%s, %s, %s, CAST(%s AS JSON))
+                ON DUPLICATE KEY UPDATE
+                  `timestamp_utc`=VALUES(`timestamp_utc`),
+                  `raw_json`=VALUES(`raw_json`)
+                """,
+                [(
+                    code,
+                    str(row.get("activity_id") or ""),
+                    str(row.get("timestamp_utc") or ""),
+                    json.dumps(row, ensure_ascii=False, default=str),
+                ) for row in normalized],
+            )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _load_machine_activity_logs_sql(machine_code: str, limit: int = 400) -> Optional[Dict[str, Any]]:
+    code = str(machine_code or "").strip()
+    if not code:
+        return {"items": [], "total": 0}
+    conn = _sql_conn()
+    if conn is None:
+        return None
+    safe_limit = max(1, min(1000, int(limit or 400)))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS total FROM `machine_activity_logs` WHERE `machine_code`=%s",
+                (code,),
+            )
+            count_row = cur.fetchone() or {}
+            cur.execute(
+                """
+                SELECT `raw_json` FROM `machine_activity_logs`
+                WHERE `machine_code`=%s
+                ORDER BY `timestamp_utc` DESC, `activity_id` DESC
+                LIMIT %s
+                """,
+                (code, safe_limit),
+            )
+            fetched = cur.fetchall() or []
+        return {
+            "items": [
+                decoded for decoded in (_sql_decode_json(row.get("raw_json"), {}) for row in fetched)
+                if isinstance(decoded, dict)
+            ],
+            "total": int(count_row.get("total") or 0),
+        }
+    except Exception:
+        return None
     finally:
         conn.close()
 
@@ -2501,7 +2762,10 @@ STATE_TICK_TASK: Optional[asyncio.Task] = None
 MACHINE_STATUS_OVERRIDES: Dict[str, Dict[str, Any]] = {}
 MACHINE_STATUS_ARCHIVE: List[Dict[str, Any]] = []
 CLIENT_STATUSES: Dict[str, Dict[str, Any]] = {}
-ACTIVE_SESSIONS_FILE_MTIME: Optional[float] = None
+try:
+    ACTIVE_SESSIONS_FILE_MTIME: Optional[float] = float(ACTIVE_MACHINE_SESSIONS_FILE.stat().st_mtime or 0)
+except Exception:
+    ACTIVE_SESSIONS_FILE_MTIME = None
 
 
 def _preserve_fresher_session_presence(
@@ -3138,8 +3402,8 @@ def _combine_privileges(base_privilege: str, extra_privilege: str) -> str:
 
 def load_finished_jobs() -> List[Dict[str, Any]]:
     current_rows = _load_finished_jobs_sql()
-    fallback_rows = _load_json_list(FINISHED_JOBS_FALLBACK_FILE)
     if current_rows is None:
+        fallback_rows = _load_json_list(FINISHED_JOBS_FALLBACK_FILE)
         if fallback_rows:
             current_rows = fallback_rows
         else:
@@ -3176,28 +3440,16 @@ def save_finished_job(row: Dict[str, Any]) -> None:
 
 def load_archived_jobs() -> List[Dict[str, Any]]:
     rows = _load_archived_jobs_sql()
+    if isinstance(rows, list):
+        return rows
     fallback_rows = _load_json_list(ARCHIVED_JOBS_FALLBACK_FILE)
-    if not isinstance(rows, list):
-        rows = []
-    if fallback_rows:
-        merged: List[Dict[str, Any]] = []
-        index_by_key: Dict[str, int] = {}
-        for row in list(rows) + fallback_rows:
-            if not isinstance(row, dict):
-                continue
-            key = _finished_job_key(row)
-            if key in index_by_key:
-                merged[index_by_key[key]] = _prefer_finished_job_row(merged[index_by_key[key]], row)
-                continue
-            index_by_key[key] = len(merged)
-            merged.append(row)
-        return merged
-    return rows
+    return [row for row in fallback_rows if isinstance(row, dict)]
 
 
 def save_archived_jobs(rows: List[Dict[str, Any]]):
-    json_ok = _save_json_list(ARCHIVED_JOBS_FALLBACK_FILE, rows)
-    sql_ok = _save_archived_jobs_sql(rows)
+    materialized = [_load_history_detail_sql(row) for row in rows if isinstance(row, dict)]
+    json_ok = _save_json_list(ARCHIVED_JOBS_FALLBACK_FILE, materialized)
+    sql_ok = _save_archived_jobs_sql(materialized)
     if not sql_ok and not json_ok:
         raise RuntimeError("archived_jobs_server SQL storage is unavailable")
 
@@ -3472,6 +3724,8 @@ def _count_voided(rows: Any) -> int:
 
 def _reject_scan_count(row: Dict[str, Any]) -> int:
     logs = row.get("reject_review_logs") if isinstance(row.get("reject_review_logs"), list) else []
+    if not logs and row.get("_history_summary_only"):
+        return max(0, int(row.get("_reject_review_log_count", 0) or 0))
     count = 0
     for item in logs:
         if not isinstance(item, dict):
@@ -3520,10 +3774,12 @@ def _kpi_job_summary(row: Dict[str, Any], issues: List[Dict[str, Any]], active: 
     issue_count = len(issues or [])
     success_rate = 100 if issue_count <= 0 else max(0, round((1 - (issue_count / max(1, issue_count + 1))) * 100))
     notable: List[str] = []
-    if raw_logs:
-        notable.append(f"{len(raw_logs)} raw material scan(s) recorded")
-    if pack_logs:
-        notable.append(f"{len(pack_logs)} pack QR scan(s) recorded")
+    raw_log_count = len(raw_logs) if raw_logs else max(0, int(row.get("_raw_material_log_count", 0) or 0))
+    pack_log_count = len(pack_logs) if pack_logs else max(0, int(row.get("_pack_history_log_count", 0) or 0))
+    if raw_log_count:
+        notable.append(f"{raw_log_count} raw material scan(s) recorded")
+    if pack_log_count:
+        notable.append(f"{pack_log_count} pack QR scan(s) recorded")
     if _reject_scan_count(row) > 0:
         notable.append(f"{_reject_scan_count(row)} reject scan/review log(s)")
     review_status = str(row.get("review_status") or "").strip()
@@ -3549,8 +3805,8 @@ def _kpi_job_summary(row: Dict[str, Any], issues: List[Dict[str, Any]], active: 
         "pack_count": pack_count,
         "good_total": good_total,
         "reject_total": reject_total,
-        "raw_material_scans": len(raw_logs),
-        "pack_qr_scans": len(pack_logs),
+        "raw_material_scans": raw_log_count,
+        "pack_qr_scans": pack_log_count,
         "reject_scans": _reject_scan_count(row),
         "wrong_or_voided_scans": _count_voided(pack_logs) + _count_voided(butal_logs),
         "issue_count": issue_count,
@@ -6235,6 +6491,7 @@ def _dashboard_finished_summary(row: Dict[str, Any]) -> Dict[str, Any]:
         "product_id", "product_sku", "product_name", "operator_id", "operator_name",
         "pack_count", "good_total", "butal_total", "reject_total", "total_good", "partial_qty",
         "startup_reject_total", "no_shot_total", "raw_sacks_count", "downtime_last_seconds",
+        "machine_counter_difference",
         "downtime_reason_code", "downtime_reason_text", "cycle_time_current",
         "maintenance_name", "supervisor_name", "review_status", "approved_by", "approved_by_code",
         "approved_by_role", "approved_remarks", "approved_at_utc", "changed_by", "changed_by_code",
@@ -6463,6 +6720,8 @@ def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, 
         seen_partials.add(partial_key)
         unique_partials.append(row)
 
+    unique_partials = [_load_history_detail_sql(row) for row in unique_partials]
+
     consumed_units = 0.0
     material_groups: Dict[str, Dict[str, Any]] = {}
     seen_scans: set = set()
@@ -6546,30 +6805,199 @@ def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, 
     }
 
 
-def _state_payload(*, include_history: bool = False) -> Dict[str, Any]:
-    refresh_active_sessions_from_file()
-    sessions = [s.to_dict() for s in SESSIONS.values()]
-    for row in sessions:
-        row["prior_partial_raw_material_totals"] = _same_job_partial_raw_material_totals(row)
-    if not include_history:
-        heavy_session_fields = {
-            "product_pack_history_logs",
-            "raw_material_logs",
-            "raw_material_scans",
-            "reject_review_logs",
-            "operator_shift_logs",
-            "break_sessions",
-            "pdr_downtime_logs",
-            "cycle_time_change_logs",
-            "machine_counter_overwrite_logs",
-            "supervisor_review_logs",
-            "butal_scan_logs",
-            "client_app_logs",
+DASHBOARD_SHORTAGE_TOLERANCE_KG = 0.000001
+_DASHBOARD_PART_SHORTAGE_CACHE: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
+_DASHBOARD_RECENT_PARTIALS_CACHE: tuple = (0.0, (), {})
+
+
+def _dashboard_job_payload_parts(payload: Any) -> List[Dict[str, Any]]:
+    src = payload if isinstance(payload, dict) else {}
+    data = src.get("data") if isinstance(src.get("data"), dict) else src
+    details = data.get("job_details") if isinstance(data.get("job_details"), dict) else {}
+    raw = data.get("parts") if isinstance(data.get("parts"), list) else details.get("parts")
+    return [dict(part) for part in (raw or []) if _job_part_is_active(part)]
+
+
+def _dashboard_part_standard_rate(part: Any, payload: Any) -> float:
+    if not isinstance(part, dict):
+        return 0.0
+    data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else (payload or {})
+    job = data.get("job") if isinstance(data, dict) and isinstance(data.get("job"), dict) else {}
+    target = max(0.0, _parse_number_like(job.get("approve_qty") or job.get("request_qty")))
+    approved = max(0.0, _parse_number_like(
+        part.get("approve_part_qty") or part.get("approved_part_qty") or part.get("approved_qty")
+    ))
+    if approved <= 0 and not any(key in part for key in ("approve_part_qty", "approved_part_qty", "approved_qty")):
+        approved = max(0.0, _parse_number_like(part.get("request_part_qty") or part.get("request_qty")))
+    return approved / target if target > 0 else 0.0
+
+
+def _dashboard_standard_product_weight(row: Any) -> Dict[str, Any]:
+    item = row if isinstance(row, dict) else {}
+    payload = item.get("job_payload") if isinstance(item.get("job_payload"), dict) else {}
+    components: List[Dict[str, Any]] = []
+    total = 0.0
+    for part in _dashboard_job_payload_parts(payload):
+        rate = _dashboard_part_standard_rate(part, payload)
+        if rate <= 0:
+            continue
+        component = {
+            "product_id": str(part.get("part_product_id") or part.get("product_id") or "").strip(),
+            "sku": str(part.get("sku") or part.get("part_sku") or part.get("product_code") or "").strip(),
+            "name": str(part.get("name") or part.get("part_name") or part.get("product_name") or "").strip(),
+            "weight_kg": rate,
         }
-        for row in sessions:
-            for field in heavy_session_fields:
-                row.pop(field, None)
-            row["summary_only"] = True
+        components.append(component)
+        total += rate
+    return {"weight_kg": total, "source": "JOB_API" if components else "", "components": components}
+
+
+def _dashboard_material_identity_keys(row: Any) -> set[str]:
+    item = row if isinstance(row, dict) else {}
+    keys = {
+        _material_usage_identity(item.get("part_product_id") or item.get("material_product_id") or item.get("product_id")),
+        _material_usage_identity(item.get("part_sku") or item.get("material_sku") or item.get("sku") or item.get("product_code")),
+        _material_usage_identity(item.get("part_name") or item.get("material_name") or item.get("name") or item.get("product_name")),
+    }
+    keys.discard("")
+    return keys
+
+
+def _dashboard_product_part_shortages(row: Dict[str, Any]) -> Dict[str, Any]:
+    item = row if isinstance(row, dict) else {}
+    cache_key = (
+        str(item.get("production_session_id") or item.get("machine_code") or ""),
+        hashlib.sha256(json.dumps({
+            "job_payload": item.get("job_payload"),
+            "raw_material_logs": item.get("raw_material_logs"),
+            "product_pack_history_logs": item.get("product_pack_history_logs"),
+            "prior": item.get("prior_partial_raw_material_totals"),
+        }, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
+    )
+    cached = _DASHBOARD_PART_SHORTAGE_CACHE.get(cache_key)
+    if cached:
+        return dict(cached[1])
+
+    payload = item.get("job_payload") if isinstance(item.get("job_payload"), dict) else {}
+    parts = _dashboard_job_payload_parts(payload)
+    prior = item.get("prior_partial_raw_material_totals") if isinstance(item.get("prior_partial_raw_material_totals"), dict) else {}
+    prior_rows = [r for r in (prior.get("rows") or []) if isinstance(r, dict)]
+    scans = [r for r in (item.get("raw_material_logs") or []) if isinstance(r, dict)]
+    packs = [r for r in (item.get("product_pack_history_logs") or []) if isinstance(r, dict) and not bool(r.get("voided"))]
+    details: List[Dict[str, Any]] = []
+
+    for part in parts:
+        part_keys = _dashboard_material_identity_keys(part)
+        if not part_keys:
+            continue
+        scanned = 0.0
+        used = 0.0
+        for raw in prior_rows:
+            if part_keys.intersection(_dashboard_material_identity_keys(raw)):
+                scanned += max(0.0, _parse_number_like(raw.get("qty") or raw.get("quantity")))
+                used += max(0.0, _parse_number_like(raw.get("used_qty")))
+        for raw in scans:
+            if "CARRYOVER" in str(raw.get("source") or "").upper():
+                continue
+            if part_keys.intersection(_dashboard_material_identity_keys(raw)):
+                scanned += max(0.0, _parse_number_like(raw.get("qty") or raw.get("quantity")))
+        for pack in packs:
+            consumption = pack.get("raw_part_consumption")
+            if not isinstance(consumption, list):
+                continue
+            for usage in consumption:
+                if isinstance(usage, dict) and part_keys.intersection(_dashboard_material_identity_keys(usage)):
+                    used += max(0.0, _parse_number_like(usage.get("used_qty_kg") if usage.get("used_qty_kg") not in (None, "") else usage.get("used_qty")))
+        if used <= 0 or scanned + DASHBOARD_SHORTAGE_TOLERANCE_KG >= used:
+            continue
+        sku = str(part.get("sku") or part.get("part_sku") or part.get("product_code") or "").strip()
+        name = sku or str(part.get("name") or part.get("part_name") or "Material").strip()
+        details.append({
+            "name": name,
+            "sku": sku,
+            "scanned_qty": round(scanned, 6),
+            "used_qty": round(used, 6),
+            "shortage_qty": round(max(0.0, used - scanned), 6),
+        })
+    result = {"count": len(details), "names": [row["name"] for row in details], "details": details}
+    _DASHBOARD_PART_SHORTAGE_CACHE[cache_key] = (time.monotonic(), result)
+    if len(_DASHBOARD_PART_SHORTAGE_CACHE) > 256:
+        oldest = sorted(_DASHBOARD_PART_SHORTAGE_CACHE.items(), key=lambda pair: pair[1][0])[:64]
+        for key, _value in oldest:
+            _DASHBOARD_PART_SHORTAGE_CACHE.pop(key, None)
+    return dict(result)
+
+
+def _dashboard_recent_partials_by_machine(sessions: Any, limit: int = 4) -> Dict[str, List[Dict[str, Any]]]:
+    safe_limit = max(1, min(20, int(limit or 4)))
+    targets: Dict[str, set[str]] = {}
+    for row in sessions or []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("machine_code") or "").strip().upper()
+        job_keys = {
+            str(row.get("job_code") or "").strip().upper(),
+            str(row.get("job_name") or "").strip().upper(),
+        }
+        job_keys.discard("")
+        if code and job_keys:
+            targets[code] = job_keys
+    grouped: Dict[str, List[Dict[str, Any]]] = {code: [] for code in targets}
+    ordered = sorted(
+        (row for row in FINISHED_JOBS if isinstance(row, dict)),
+        key=lambda row: str(row.get("finished_at_utc") or row.get("ended_at_utc") or ""),
+        reverse=True,
+    )
+    for row in ordered:
+        if str(row.get("record_type") or "").strip().upper() != "SHIFT_PARTIAL":
+            continue
+        code = str(row.get("machine_code") or "").strip().upper()
+        if code not in targets or len(grouped[code]) >= safe_limit:
+            continue
+        row_keys = {
+            str(row.get("job_code") or "").strip().upper(),
+            str(row.get("job_name") or "").strip().upper(),
+        }
+        row_keys.discard("")
+        if not row_keys.intersection(targets[code]):
+            continue
+        summary = _dashboard_finished_summary(row)
+        summary["job_key"] = _finished_job_key(row)
+        grouped[code].append(summary)
+    return grouped
+
+
+def _state_payload(
+    *,
+    include_history: bool = False,
+    include_session_details: bool = False,
+    machine_codes: Optional[set[str]] = None,
+) -> Dict[str, Any]:
+    refresh_active_sessions_from_file()
+    selected = [
+        session for session in SESSIONS.values()
+        if not machine_codes or str(session.machine_code or "").strip() in machine_codes
+    ]
+    detailed = bool(include_session_details)
+    sessions = [session.to_dict() if detailed else session.to_dashboard_dict() for session in selected]
+    for session, row in zip(selected, sessions):
+        calculation_row = {
+            field.name: getattr(session, field.name)
+            for field in fields(session)
+        }
+        prior = _same_job_partial_raw_material_totals(calculation_row)
+        calculation_row["prior_partial_raw_material_totals"] = prior
+        if detailed:
+            row["prior_partial_raw_material_totals"] = prior
+        standard = _dashboard_standard_product_weight(calculation_row)
+        row["standard_product_weight_kg"] = float(standard.get("weight_kg") or 0)
+        row["standard_product_weight_source"] = str(standard.get("source") or "")
+        row["standard_product_weight_components"] = list(standard.get("components") or [])
+        shortages = _dashboard_product_part_shortages(calculation_row)
+        row["product_part_shortage_count"] = int(shortages.get("count") or 0)
+        row["product_part_shortage_names"] = list(shortages.get("names") or [])
+        row["product_part_shortage_details"] = list(shortages.get("details") or [])
+        row["product_part_shortage_since_utc"] = str(shortages.get("since_utc") or "")
     payload = {
         "type": "STATE",
         "active_ttl_seconds": ACTIVE_TTL_SECONDS,
@@ -6583,6 +7011,7 @@ def _state_payload(*, include_history: bool = False) -> Dict[str, Any]:
         "machine_status_overrides": MACHINE_STATUS_OVERRIDES,
         "machine_status_archive": MACHINE_STATUS_ARCHIVE,
         "machine_tonnage": _load_machine_tonnage_map(),
+        "recent_partial_shifts_by_machine": _dashboard_recent_partials_by_machine(sessions),
         "client_statuses": _client_status_rows(),
         "visible_machine_codes": SERVER_SETTINGS.get("visible_machine_codes", []),
         "planning_board": PLANNING_BOARD,
@@ -6601,22 +7030,71 @@ def _state_payload(*, include_history: bool = False) -> Dict[str, Any]:
     return payload
 
 
-async def broadcast_state():
-    payload = _state_payload(include_history=False)
-    living = []
-    for ws in WS_CLIENTS:
+_LAST_BROADCAST_PAYLOAD: Optional[Dict[str, Any]] = None
+
+
+def _payload_signature(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+async def broadcast_state(only_if_dirty: bool = False):
+    global _LAST_BROADCAST_PAYLOAD
+    current = await asyncio.to_thread(_state_payload, include_history=False)
+    previous = _LAST_BROADCAST_PAYLOAD
+    payload: Dict[str, Any] = current
+    changed = True
+    if previous is not None:
+        previous_sessions = {
+            str(row.get("machine_code") or "").strip(): row
+            for row in (previous.get("sessions") or []) if isinstance(row, dict)
+        }
+        current_session_codes = {
+            str(row.get("machine_code") or "").strip()
+            for row in (current.get("sessions") or []) if isinstance(row, dict)
+        }
+        changed_sessions = []
+        for row in current.get("sessions") or []:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("machine_code") or "").strip()
+            if _payload_signature(row) != _payload_signature(previous_sessions.get(code)):
+                changed_sessions.append(row)
+        patch: Dict[str, Any] = {
+            "type": "STATE_PATCH",
+            "sessions": changed_sessions,
+            "server_time_utc": current.get("server_time_utc"),
+        }
+        for key, value in current.items():
+            if key in {"type", "sessions", "server_time_utc"}:
+                continue
+            if _payload_signature(value) != _payload_signature(previous.get(key)):
+                patch[key] = value
+        changed = bool(changed_sessions or len(patch) > 3 or current_session_codes != set(previous_sessions))
+        payload = current if current_session_codes != set(previous_sessions) else patch
+    _LAST_BROADCAST_PAYLOAD = current
+    if only_if_dirty and not changed:
+        return
+    if not WS_CLIENTS:
+        return
+    message = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    async def send_one(ws: WebSocket) -> Optional[WebSocket]:
         try:
-            await ws.send_json(payload)
-            living.append(ws)
+            await asyncio.wait_for(ws.send_text(message), timeout=3.0)
+            return ws
         except Exception:
-            pass
-    WS_CLIENTS[:] = living
+            return None
+
+    results = await asyncio.gather(*(send_one(ws) for ws in list(WS_CLIENTS)))
+    WS_CLIENTS[:] = [ws for ws in results if ws is not None]
 
 
 async def _state_tick_loop():
     while True:
         try:
-            await broadcast_state()
+            await broadcast_state(only_if_dirty=True)
         except Exception:
             pass
         try:
@@ -6672,6 +7150,9 @@ DASHBOARD_HTML = """
     .machine-filter-btn:hover { color:#0f64bd; border-color:#93b8df; background:#f8fbff; }
     .machine-filter-btn.active { color:#fff; border-color:#0f64bd; background:#0f64bd; }
     .machine-filter-btn svg { width:18px; height:18px; display:block; }
+    .machine-todo-btn { position:relative; color:#0f64bd; }
+    .machine-todo-count { position:absolute; right:-5px; top:-6px; min-width:18px; height:18px; display:inline-flex; align-items:center; justify-content:center; padding:0 5px; border:2px solid #eef4fb; border-radius:999px; background:#dc2626; color:#fff; font-size:.58rem; line-height:1; font-weight:950; box-shadow:0 3px 8px rgba(220,38,38,.28); }
+    .machine-todo-count[hidden] { display:none; }
     .planning-overview-btn { color:#0f64bd; }
     .planning-overview-btn svg { width:20px; height:20px; }
     .trial-board-btn { color:#0f64bd; }
@@ -6682,6 +7163,148 @@ DASHBOARD_HTML = """
     .machine-filter-option { display:flex; align-items:center; gap:9px; padding:9px 10px; border-radius:8px; color:#0f172a; font-size:.84rem; font-weight:850; cursor:pointer; }
     .machine-filter-option:hover { background:#f1f5f9; }
     .machine-filter-option input { width:16px; height:16px; accent-color:#0f64bd; }
+    #machineTodoOverlay { background:rgba(177,190,208,.66); backdrop-filter:blur(10px); }
+    .overlay-card.machine-todo-card { width:min(1728px,93vw); height:min(1110px,88vh); max-height:calc(100vh - 52px); border:0; border-radius:34px; background:#f0f4fa; box-shadow:0 28px 64px rgba(55,72,97,.24); color:#172338; }
+    .machine-todo-card > .overlay-head { flex:0 0 auto; min-height:150px; padding:40px 42px 32px; border-bottom:1px solid #d1dbe8; background:transparent; gap:28px; }
+    .machine-todo-head-copy { min-width:300px; margin-right:auto; }
+    .machine-todo-head-copy .overlay-title { color:#172338; font-size:2rem; line-height:1.12; font-weight:700; letter-spacing:-.035em; }
+    .machine-todo-head-copy .sub { margin-top:9px; color:#6e7f98; font-size:1rem; line-height:1.3; font-weight:500; }
+    .machine-todo-head-tools { display:flex; align-items:center; justify-content:flex-end; gap:16px; min-width:0; }
+    .machine-todo-search { width:282px; height:64px; padding:0 25px; border:0; outline:0; border-radius:22px; background:#edf2f8; color:#172338; font:500 1.20rem/1 "Poppins",sans-serif; box-shadow:inset 0 7px 14px rgba(72,91,119,.14),0 8px 18px rgba(72,91,119,.06); }
+    .machine-todo-search::placeholder { color:#74849c; opacity:1; }
+    .machine-todo-tool-btn { height:64px; padding:0 27px; border:0; border-radius:22px; background:#edf2f8; color:#172338; font:700 1.16rem/1 "Poppins",sans-serif; white-space:nowrap; cursor:pointer; box-shadow:0 11px 20px rgba(69,87,113,.18),inset 0 1px 0 rgba(255,255,255,.7); transition:transform .15s ease,background-color .15s ease,color .15s ease; }
+    .machine-todo-tool-btn:hover { transform:translateY(-1px); background:#f7f9fc; }
+    .machine-todo-tool-btn.active { background:#dbe8f8; color:#1f67cb; box-shadow:inset 0 3px 8px rgba(51,83,126,.15); }
+    .machine-todo-card .overlay-close { flex:0 0 auto; width:64px; height:64px; border:0; border-radius:20px; background:#edf2f8; color:#657791; box-shadow:0 11px 20px rgba(69,87,113,.18); }
+    .machine-todo-card .overlay-close::before { font-size:32px; font-weight:400; }
+    .machine-todo-body { min-height:0; flex:1 1 auto; display:flex; flex-direction:column; overflow:hidden; padding:32px 40px 42px; }
+    .machine-todo-summary { flex:0 0 auto; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:30px; margin-bottom:36px; }
+    .machine-todo-summary-item { display:flex; align-items:center; justify-content:space-between; gap:18px; min-height:118px; padding:25px 32px; border:0; border-radius:30px; background:#e7edf5; box-shadow:0 16px 25px rgba(63,81,108,.18),inset 0 1px 0 rgba(255,255,255,.72); }
+    .machine-todo-summary-item .copy { display:block; min-width:0; }
+    .machine-todo-summary-item .label { display:block; color:#66768e; font-size:1.34rem; line-height:1.22; font-weight:700; letter-spacing:0; text-transform:none; }
+    .machine-todo-summary-item .note { display:block; min-height:1.25em; margin-top:9px; color:#eb4654; font-size:1rem; line-height:1.25; font-weight:700; }
+    .machine-todo-summary-item .count { flex:0 0 auto; min-width:54px; text-align:center; color:#172338; font-size:2.35rem; line-height:1; font-weight:700; }
+    .machine-todo-columns { min-height:0; flex:1 1 auto; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:30px; align-items:stretch; }
+    .machine-todo-section { min-width:0; min-height:0; display:flex; flex-direction:column; overflow:hidden; border:0; border-radius:30px; background:#e7edf5; box-shadow:0 18px 30px rgba(63,81,108,.18),inset 0 1px 0 rgba(255,255,255,.68); }
+    .machine-todo-section-head { flex:0 0 auto; display:block; padding:32px 33px 40px; border:0; background:transparent !important; }
+    .machine-todo-section-head .title { color:#172338; font-size:1.38rem; line-height:1.2; font-weight:700; }
+    .machine-todo-section-head .role { margin-top:5px; color:#718198; font-size:1.05rem; line-height:1.25; font-weight:500; }
+    .machine-todo-section-head .badge { display:none; }
+    .machine-todo-list { min-height:0; flex:1 1 auto; display:grid; align-content:start; gap:24px; overflow:auto; padding:10px 27px 30px; scrollbar-width:thin; scrollbar-color:#bdc9d9 transparent; }
+    .machine-todo-item { width:100%; display:block; padding:22px 24px 20px; border:0; border-radius:22px; background:#edf2f8; color:#172338; text-align:left; cursor:pointer; box-shadow:inset 0 7px 14px rgba(72,91,119,.13),0 8px 14px rgba(90,105,128,.08); transition:transform .15s ease,box-shadow .15s ease,background-color .15s ease; }
+    .machine-todo-item:hover { transform:translateY(-2px); background:#f3f6fa; box-shadow:inset 0 5px 12px rgba(72,91,119,.1),0 13px 22px rgba(72,91,119,.13); }
+    .machine-todo-item:focus-visible { outline:3px solid rgba(55,116,216,.34); outline-offset:2px; }
+    .machine-todo-item-top { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .machine-todo-machine { min-width:0; color:#172338; font-size:1.34rem; line-height:1.2; font-weight:700; }
+    .machine-todo-status { flex:0 0 auto; display:inline-flex; align-items:center; gap:8px; max-width:62%; padding:6px 12px; border-radius:999px; color:#2aaa77; background:#edf3f8; font-size:.94rem; line-height:1; font-weight:700; white-space:nowrap; box-shadow:inset 0 4px 10px rgba(72,91,119,.13); }
+    .machine-todo-status::before { content:""; width:10px; height:10px; border-radius:50%; background:currentColor; }
+    .machine-todo-status.late { color:#d99500; }
+    .machine-todo-status.urgent { color:#eb4654; }
+    .machine-todo-message { display:block; margin-top:17px; color:#172338; font-size:1.28rem; line-height:1.35; font-weight:700; overflow-wrap:anywhere; }
+    .machine-todo-description,.machine-todo-material,.machine-todo-time { display:block; margin-top:12px; color:#718198; font-size:1.04rem; line-height:1.38; font-weight:500; overflow-wrap:anywhere; }
+    .machine-todo-material { margin-top:13px; }
+    .machine-todo-footer { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:17px; }
+    .machine-todo-job { min-width:0; overflow:hidden; color:#3274db; font-size:1.05rem; line-height:1.2; font-weight:700; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-todo-action { flex:0 0 auto; min-height:48px; padding:0 20px; border:0; border-radius:18px; background:#edf2f8; color:#3274db; font:700 1.02rem/1 "Poppins",sans-serif; cursor:pointer; box-shadow:0 9px 17px rgba(69,87,113,.16); }
+    .machine-todo-empty { padding:38px 18px; border-radius:22px; background:#edf2f8; color:#718198; font-size:.92rem; font-weight:600; text-align:center; box-shadow:inset 0 5px 12px rgba(72,91,119,.1); }
+    @media (max-height:1000px) and (min-width:1041px) {
+      .overlay-card.machine-todo-card { height:calc(100vh - 50px); max-height:calc(100vh - 50px); border-radius:24px; }
+      .machine-todo-card > .overlay-head { min-height:88px; padding:16px 32px 14px; gap:16px; }
+      .machine-todo-head-copy { min-width:250px; }
+      .machine-todo-head-copy .overlay-title { font-size:1.28rem; }
+      .machine-todo-head-copy .sub { margin-top:4px; font-size:.66rem; }
+      .machine-todo-head-tools { gap:9px; }
+      .machine-todo-search { width:240px; height:42px; padding:0 17px; border-radius:14px; font-size:.78rem; }
+      .machine-todo-tool-btn { height:42px; padding:0 18px; border-radius:14px; font-size:.72rem; }
+      .machine-todo-card .overlay-close { width:42px; height:42px; border-radius:14px; }
+      .machine-todo-card .overlay-close::before { font-size:22px; }
+      .machine-todo-body { padding:14px 28px 18px; }
+      .machine-todo-summary { gap:18px; margin-bottom:14px; }
+      .machine-todo-summary-item { min-height:58px; padding:10px 18px; border-radius:18px; }
+      .machine-todo-summary-item .label { font-size:.78rem; }
+      .machine-todo-summary-item .note { margin-top:3px; font-size:.58rem; }
+      .machine-todo-summary-item .count { min-width:34px; font-size:1.35rem; }
+      .machine-todo-columns { gap:18px; }
+      .machine-todo-section { border-radius:18px; }
+      .machine-todo-section-head { padding:14px 18px 14px; }
+      .machine-todo-section-head .title { font-size:.82rem; }
+      .machine-todo-section-head .role { margin-top:2px; font-size:.62rem; }
+      .machine-todo-list { gap:10px; padding:6px 14px 16px; }
+      .machine-todo-item { padding:10px 13px; border-radius:14px; }
+      .machine-todo-machine { font-size:.80rem; }
+      .machine-todo-status { gap:5px; padding:4px 8px; font-size:.58rem; }
+      .machine-todo-status::before { width:7px; height:7px; }
+      .machine-todo-message { margin-top:8px; font-size:.76rem; line-height:1.24; }
+      .machine-todo-description,.machine-todo-material,.machine-todo-time { margin-top:6px; font-size:.62rem; line-height:1.28; }
+      .machine-todo-material { margin-top:7px; }
+      .machine-todo-footer { margin-top:8px; }
+      .machine-todo-job { font-size:.64rem; }
+      .machine-todo-action { min-height:30px; padding:0 12px; border-radius:11px; font-size:.62rem; }
+      .machine-todo-empty { padding:22px 12px; font-size:.66rem; }
+    }
+    @media (max-width:1320px) {
+      .machine-todo-card > .overlay-head { padding:28px 30px 24px; min-height:126px; }
+      .machine-todo-head-tools { gap:10px; }
+      .machine-todo-search { width:230px; }
+      .machine-todo-tool-btn { padding:0 18px; }
+      .machine-todo-body { padding:24px 28px 30px; }
+      .machine-todo-summary,.machine-todo-columns { gap:20px; }
+      .machine-todo-summary { margin-bottom:24px; }
+    }
+    @media (max-width:1040px) {
+      .overlay-card.machine-todo-card { width:calc(100vw - 24px); height:calc(100vh - 24px); max-height:none; border-radius:24px; }
+      .machine-todo-card > .overlay-head { align-items:flex-start; flex-wrap:wrap; }
+      .machine-todo-head-tools { width:100%; justify-content:flex-start; flex-wrap:wrap; }
+      .machine-todo-search { flex:1 1 260px; }
+      .machine-todo-summary { grid-template-columns:1fr; }
+      .machine-todo-summary-item { min-height:86px; }
+      .machine-todo-columns { grid-template-columns:1fr; overflow:auto; }
+      .machine-todo-section { min-height:420px; }
+      .machine-todo-body { overflow:auto; }
+    }
+    @media (max-width:620px) {
+      .machine-todo-card > .overlay-head { padding:22px 20px; gap:16px; }
+      .machine-todo-head-copy { min-width:0; }
+      .machine-todo-head-copy .overlay-title { font-size:1.55rem; }
+      .machine-todo-head-tools { display:grid; grid-template-columns:1fr 1fr; }
+      .machine-todo-search { grid-column:1/-1; width:100%; }
+      .machine-todo-tool-btn { padding:0 12px; font-size:.86rem; }
+      .machine-todo-card .overlay-close { position:absolute; top:18px; right:18px; width:48px; height:48px; }
+      .machine-todo-body { padding:20px 16px 24px; }
+      .machine-todo-summary-item { padding:20px 24px; }
+      .machine-todo-summary-item .count { font-size:2rem; }
+    }
+    .overlay-card.machine-partial-card { width:min(980px,calc(100vw - 40px)); max-height:calc(100vh - 48px); border:0; border-radius:22px; background:#f4f7fb; box-shadow:0 24px 60px rgba(15,23,42,.24); }
+    .machine-partial-card > .overlay-head { min-height:78px; padding:16px 20px; background:#fff; border-bottom:1px solid #dce5f0; }
+    .machine-partial-head-copy { min-width:0; }
+    .machine-partial-head-copy .overlay-title { color:#172338; font-size:1.18rem; font-weight:800; }
+    .machine-partial-head-copy .sub { margin-top:3px; color:#64748b; font-size:.72rem; font-weight:650; }
+    .machine-partial-body { min-height:180px; overflow:auto; display:grid; align-content:start; gap:10px; padding:16px 18px 20px; }
+    .machine-partial-row { display:grid; grid-template-columns:minmax(170px,1.1fr) minmax(230px,1.5fr) auto; gap:14px; align-items:center; padding:13px 14px; border:1px solid #dce5f0; border-left:4px solid #22c55e; border-radius:13px; background:#fff; box-shadow:0 5px 14px rgba(15,23,42,.055); }
+    .machine-partial-row.warning { border-left-color:#f59e0b; background:#fffdf7; }
+    .machine-partial-row.issue { border-left-color:#ef4444; background:#fffafa; }
+    .machine-partial-primary { min-width:0; }
+    .machine-partial-job { overflow:hidden; color:#172338; font-size:.84rem; font-weight:900; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-partial-meta { margin-top:3px; color:#64748b; font-size:.66rem; font-weight:700; }
+    .machine-partial-metrics { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:6px; }
+    .machine-partial-metric { min-width:0; padding:6px 7px; border-radius:8px; background:#f1f5f9; text-align:center; }
+    .machine-partial-metric .k { display:block; color:#94a3b8; font-size:.49rem; font-weight:900; text-transform:uppercase; }
+    .machine-partial-metric .v { display:block; margin-top:2px; overflow:hidden; color:#26364d; font-size:.74rem; font-weight:900; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-partial-review { display:flex; flex-direction:column; align-items:flex-end; gap:7px; }
+    .machine-partial-flags { display:flex; justify-content:flex-end; flex-wrap:wrap; gap:4px; }
+    .machine-partial-flag { padding:4px 7px; border-radius:999px; background:#dcfce7; color:#047857; font-size:.54rem; font-weight:900; white-space:nowrap; }
+    .machine-partial-flag.warning { background:#fef3c7; color:#92400e; }
+    .machine-partial-flag.issue { background:#fee2e2; color:#b91c1c; }
+    .machine-partial-open { min-height:34px; padding:0 12px; border:1px solid #bfdbfe; border-radius:9px; background:#eff6ff; color:#1d4ed8; font-size:.66rem; font-weight:900; cursor:pointer; }
+    .machine-partial-open:hover { border-color:#60a5fa; background:#dbeafe; }
+    .machine-partial-empty { padding:42px 18px; border:1px dashed #cbd5e1; border-radius:14px; background:#fff; color:#64748b; text-align:center; font-size:.80rem; font-weight:750; }
+    @media (max-width:760px) {
+      .overlay-card.machine-partial-card { width:calc(100vw - 20px); max-height:calc(100vh - 20px); }
+      .machine-partial-row { grid-template-columns:1fr; gap:10px; }
+      .machine-partial-review { align-items:stretch; }
+      .machine-partial-flags { justify-content:flex-start; }
+      .machine-partial-open { width:100%; }
+    }
     .main-tab-content { display: none; padding: 0 clamp(10px, 1.6vw, 20px) clamp(12px, 1.6vw, 20px); min-width:0; }
     .main-tab-content.active { display: block; }
     .kpi-filter-row { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
@@ -6860,12 +7483,12 @@ DASHBOARD_HTML = """
     .sub-tab-content.active { display:block; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(clamp(150px, 11vw, 190px), 1fr)); gap: clamp(10px, 1.2vw, 18px); }
     #machineGrid, #additionalMachineGrid { grid-template-columns:repeat(6, minmax(0, 1fr)); justify-content:stretch; align-items:stretch; gap:10px; perspective:1200px; }
-    #additionalMachineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); align-content:start; gap:8px; min-height:176px; padding:13px 14px; border:1px solid #e2e8f0; border-radius:11px; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); box-shadow:0 4px 14px rgba(15,23,42,.07); overflow:hidden; }
+    #additionalMachineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); align-content:start; gap:8px; min-height:176px; padding:13px 14px; border:1px solid #e2e8f0; border-radius:11px; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); box-shadow:0 4px 14px rgba(15,23,42,.07); overflow:hidden; cursor:pointer; }
     #additionalMachineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
     #additionalMachineGrid .card.inactive { border-color:#d8e2ef; border-top-color:#94a3b8; background:#f8fafc; }
     #additionalMachineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; background:#fffafa; }
-    #additionalMachineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; background:#fffdf8; }
-    #additionalMachineGrid .card.status-alert { border-color:#fed7aa; background:#fffdf8; animation:none; }
+    #additionalMachineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); }
+    #additionalMachineGrid .card.status-alert { border-color:#fed7aa; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); animation:none; }
     #additionalMachineGrid .card .machine-card-title h3 { margin:0; color:#1e293b; font-size:.90rem; }
     .additional-machines-section { margin-top:24px; padding-top:18px; border-top:2px solid #dbe4f0; }
     .additional-machines-title { margin:0 0 12px; color:#334155; font-size:1rem; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
@@ -6878,13 +7501,25 @@ DASHBOARD_HTML = """
     .card.maintenance { border-color: #FF9800; animation: cardPulseOrange 1.5s ease-in-out infinite; }
     .card h3 { margin: 0 0 10px; font-size: clamp(.9rem, .9vw, 1.05rem); border-bottom: 1px solid #eee; padding-bottom: 8px; overflow-wrap:anywhere; }
     .card p { margin: 6px 0; font-size: 0.9rem; overflow-wrap:break-word; word-break:normal; }
-    #machineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); align-content:start; gap:8px; min-height:176px; padding:13px 14px; border:1px solid #e2e8f0; border-radius:11px; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); box-shadow:0 4px 14px rgba(15,23,42,.07); overflow:hidden; transform-style:preserve-3d; backface-visibility:hidden; will-change:transform, box-shadow; }
+    #machineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); align-content:start; gap:8px; min-height:176px; padding:13px 14px; border:1px solid #e2e8f0; border-radius:11px; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); box-shadow:0 4px 14px rgba(15,23,42,.07); overflow:hidden; cursor:pointer; transform-style:preserve-3d; backface-visibility:hidden; will-change:transform, box-shadow; }
     #machineGrid .card:hover, #additionalMachineGrid .card:hover { transform:translateY(-1px); box-shadow:0 8px 20px rgba(15,23,42,.10); }
+    #machineGrid .card:focus-visible, #additionalMachineGrid .card:focus-visible { outline:3px solid #2563eb; outline-offset:3px; }
     #machineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
     #machineGrid .card.inactive { border-color:#d8e2ef; border-top-color:#94a3b8; animation:none; background:#f8fafc; }
     #machineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; animation:none; background:#fffafa; }
-    #machineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; animation:none; background:#fffdf8; }
-    #machineGrid .card.status-alert { border-color:#fed7aa; background:#fffdf8; animation:none; }
+    #machineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; animation:none; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); }
+    #machineGrid .card.status-alert { border-color:#fed7aa; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); animation:none; }
+    @property --maintenance-stripe-turn { syntax:"<angle>"; inherits:false; initial-value:0deg; }
+    #machineGrid .card.machine-alert-status,
+    #additionalMachineGrid .card.machine-alert-status { isolation:isolate; overflow:visible; border-color:#111827; animation:none; }
+    #machineGrid .card.machine-alert-status::before,
+    #additionalMachineGrid .card.machine-alert-status::before { content:""; position:absolute; inset:-3px; z-index:6; padding:2px; border-radius:14px; pointer-events:none; background:repeating-conic-gradient(from var(--maintenance-stripe-turn),#facc15 0deg 8deg,#111827 8deg 16deg); -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0); -webkit-mask-composite:xor; mask-composite:exclude; animation:machineMaintenanceStripeRotate 7s linear var(--machine-alert-delay,0s) infinite; }
+    #machineGrid .card.machine-alert-status > *,
+    #additionalMachineGrid .card.machine-alert-status > * { z-index:1; }
+    #machineGrid .card.machine-alert-supervisor,
+    #additionalMachineGrid .card.machine-alert-supervisor { border-color:#fdba74; border-top-color:#f97316; animation:machineSupervisorCardBlink 1.7s ease-in-out var(--machine-alert-delay,0s) infinite; }
+    #machineGrid .card.machine-alert-parts,
+    #additionalMachineGrid .card.machine-alert-parts { border-color:#dc2626; border-top-color:#dc2626; animation:machinePartShortageCardBlink var(--part-alert-speed,.75s) steps(2,end) var(--machine-alert-delay,0s) infinite; }
     .machine-card-face { min-width:0; height:100%; transition:opacity .24s ease, transform .28s cubic-bezier(.2,.72,.25,1); }
     .machine-card-face-normal { display:grid; grid-template-rows:auto 1fr auto; gap:8px; opacity:1; transform:translateY(0) scale(1); }
     .machine-card-face-hover { position:absolute; inset:0; z-index:4; display:grid; grid-template-rows:auto auto auto 1fr; gap:5px; padding:9px 10px; background:linear-gradient(145deg,rgba(255,255,255,.99),rgba(244,249,255,.99)); opacity:0; transform:translateY(10px) scale(.97); pointer-events:none; }
@@ -6929,8 +7564,17 @@ DASHBOARD_HTML = """
     .machine-card-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px; align-items:center; }
     .machine-card-title { min-width:0; display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
     #machineGrid .card .machine-card-title h3 { margin:0; padding:0; border:0; color:#1e293b; font-size:.90rem; line-height:1.15; letter-spacing:.01em; }
+    .machine-supervisor-rotation { display:inline-flex; align-items:center; gap:4px; border:1px solid #86efac; border-radius:999px; padding:2px 6px; background:#ecfdf5; color:#047857; font-size:.52rem; line-height:1; font-weight:950; white-space:nowrap; box-shadow:0 2px 7px rgba(22,163,74,.12); }
+    .machine-supervisor-rotation-dot { width:7px; height:7px; border-radius:999px; background:#22c55e; box-shadow:0 0 0 2px rgba(34,197,94,.14); }
+    .machine-card-alert-pill { display:inline-flex; width:max-content; max-width:100%; border:1px solid transparent; border-radius:999px; padding:3px 6px; font-size:.48rem; line-height:1; font-weight:950; letter-spacing:.035em; text-transform:uppercase; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .machine-card-alert-pill.secondary { padding:2px 5px; opacity:.72; filter:saturate(.72); }
+    .machine-card-alert-pill.primary { box-shadow:0 2px 7px rgba(15,23,42,.10); }
+    .machine-card-alert-pill.maintenance { border-color:#fb923c; background:#ffedd5; color:#9a3412; }
+    .machine-card-alert-pill.supervisor { border-color:#f97316; background:linear-gradient(90deg,#fee2e2,#ffedd5); color:#991b1b; }
+    .machine-card-alert-pill.parts { border-color:#b91c1c; background:#dc2626; color:#fff; }
     .machine-card-code { display:none; }
     .machine-card-status-stack { display:flex; flex-direction:column; align-items:flex-end; justify-content:center; gap:3px; }
+    .machine-hover-head-actions { flex:0 0 auto; display:flex; align-items:center; gap:5px; }
     .machine-tonnage { color:#64748b; font-size:.62rem; line-height:1; font-weight:850; letter-spacing:.015em; white-space:nowrap; }
     .machine-status-badge { flex:0 0 auto; display:inline-flex; align-items:center; gap:5px; border-radius:6px; padding:5px 7px; font-size:.56rem; line-height:1; font-weight:950; letter-spacing:.04em; text-transform:uppercase; background:#f1f5f9; color:#475569; border:1px solid #e2e8f0; box-shadow:0 3px 10px rgba(15,23,42,.06); }
     .machine-status-badge::before { content:""; flex:0 0 auto; width:6px; height:6px; border-radius:999px; background:#94a3b8; box-shadow:none; }
@@ -7397,7 +8041,7 @@ DASHBOARD_HTML = """
     .jq-cycle-icon { color:#7c3aed; }
     .jq-queue-footer { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 12px; border-top:1px solid #e8eef5; color:#64748b; font-size:.65rem; }
     .jq-auto-refresh { color:#475569; }
-    .jq-auto-refresh::before { content:"↻"; margin-right:5px; color:#2563eb; font-size:.9rem; }
+    .jq-auto-refresh::before { content:"Γå╗"; margin-right:5px; color:#2563eb; font-size:.9rem; }
     #planningTab { font-family:"Poppins",sans-serif; }
     #planningTab .planning-shell { background:#eef3f8; border:1px solid rgba(255,255,255,.82); box-shadow:12px 12px 28px #d6dee8,-10px -10px 24px rgba(255,255,255,.92),inset 0 1px 0 #fff; }
     #planningTab .planning-ops-metric { border:1px solid rgba(255,255,255,.78); background:#eef3f8; color:#0f172a; box-shadow:7px 7px 15px #d4dde7,-7px -7px 15px #fff; }
@@ -7574,7 +8218,7 @@ DASHBOARD_HTML = """
     .overlay-head { padding: 18px 24px 14px; border-bottom: 1px solid #d7dbe1; display: flex; align-items: center; justify-content: space-between; }
     .overlay-title { font-weight: 800; font-size: 1.08rem; color: #1d273c; letter-spacing: .01em; }
     .overlay-close { border: 1px solid #cfd4dc; background: #dde1e7; color: #2d3342; border-radius: 14px; width: 44px; height: 44px; padding: 0; cursor: pointer; font-size: 0; position: relative; }
-    .overlay-close::before { content: "\\00D7"; font-size: 22px; line-height: 1; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+    .overlay-close::before { content: "\00D7"; font-size: 22px; line-height: 1; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
     .overlay-body { padding: 10px 18px 8px; display: grid; gap: 6px; min-height: 0; overflow: hidden; flex: 1 1 auto; }
     .overlay-row { display: grid; grid-template-columns: 180px 1fr; gap: 12px; align-items: center; }
     .overlay-row > * { min-width: 0; }
@@ -7992,6 +8636,15 @@ DASHBOARD_HTML = """
       0%, 100% { border-color:#fdba74; border-top-color:#f97316; box-shadow:0 8px 20px rgba(15,23,42,.06), 0 0 0 0 rgba(249,115,22,.34); }
       50% { border-color:#f97316; border-top-color:#ea580c; box-shadow:0 8px 20px rgba(15,23,42,.06), 0 0 0 8px rgba(249,115,22,.14); }
     }
+    @keyframes machineMaintenanceStripeRotate { to { --maintenance-stripe-turn:360deg; } }
+    @keyframes machineSupervisorCardBlink {
+      0%,100% { border-color:#fed7aa; border-top-color:#f97316; box-shadow:0 4px 14px rgba(15,23,42,.07); }
+      50% { border-color:#f97316; border-top-color:#dc2626; box-shadow:0 5px 17px rgba(249,115,22,.18),0 0 0 2px rgba(220,38,38,.08); }
+    }
+    @keyframes machinePartShortageCardBlink {
+      0%,49% { border-color:#dc2626; border-top-color:#b91c1c; box-shadow:0 4px 14px rgba(15,23,42,.07),0 0 0 3px rgba(220,38,38,.34); }
+      50%,100% { border-color:#fecaca; border-top-color:#fecaca; box-shadow:0 4px 14px rgba(15,23,42,.07),0 0 0 0 rgba(220,38,38,0); }
+    }
     @keyframes statusBeatGreen {
       0%, 100% { transform:scale(1); box-shadow:0 0 0 3px rgba(34,197,94,.18), 0 0 8px rgba(34,197,94,.28); }
       50% { transform:scale(1.18); box-shadow:0 0 0 6px rgba(34,197,94,.10), 0 0 14px rgba(34,197,94,.48); }
@@ -8013,6 +8666,43 @@ DASHBOARD_HTML = """
       100% { transform:translateX(0); opacity:1; }
     }
     .overlay-head-actions { display:flex; align-items:center; gap:8px; }
+    .machine-detail-finish-shifts-btn { width:auto; min-width:0; height:38px; display:inline-flex; align-items:center; justify-content:center; gap:5px; padding:0 11px; border:1px solid #bfd3ee; border-radius:12px; background:#f4f8fd; color:#1559a6; font:inherit; font-size:.68rem; line-height:1; font-weight:900; white-space:nowrap; cursor:pointer; box-shadow:0 3px 10px rgba(15,23,42,.05); }
+    .machine-detail-finish-shifts-btn:hover { border-color:#7fb0e8; background:#eaf3ff; box-shadow:0 6px 14px rgba(15,23,42,.08); }
+    .machine-detail-finish-shifts-btn.attention { border-color:#f4c96b; background:#fffbeb; color:#a65508; }
+    .machine-detail-finish-shifts-btn[hidden] { display:none; }
+    .machine-detail-finish-shifts-btn .partial-clock { font-size:.78rem; }
+    .machine-detail-finish-shifts-btn .finish-shifts-caret { margin-left:1px; font-size:.66rem; transition:transform .15s ease; }
+    .machine-detail-finish-shifts-btn[aria-expanded="true"] .finish-shifts-caret { transform:rotate(180deg); }
+    .machine-detail-finish-shifts-menu { position:fixed; z-index:1120; width:min(390px,calc(100vw - 24px)); max-height:min(430px,calc(100vh - 90px)); overflow:auto; padding:7px; border:1px solid #cbd9ea; border-radius:14px; background:#fff; box-shadow:0 20px 46px rgba(15,23,42,.24); }
+    .machine-detail-finish-shifts-menu[hidden] { display:none; }
+    .machine-detail-supervisor-btn { width:auto; min-width:0; height:38px; display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:0 11px; border:1px solid #86efac; border-radius:12px; background:#ecfdf5; color:#047857; font:inherit; font-size:.68rem; line-height:1; font-weight:900; white-space:nowrap; cursor:pointer; box-shadow:0 3px 10px rgba(22,163,74,.08); }
+    .machine-detail-supervisor-btn:hover { border-color:#4ade80; background:#dcfce7; box-shadow:0 6px 14px rgba(22,163,74,.12); }
+    .machine-detail-supervisor-btn[hidden] { display:none; }
+    .machine-detail-supervisor-btn .supervisor-check-dot { width:8px; height:8px; border-radius:999px; background:#22c55e; box-shadow:0 0 0 3px rgba(34,197,94,.13); }
+    .machine-detail-supervisor-btn .supervisor-caret { margin-left:1px; font-size:.66rem; transition:transform .15s ease; }
+    .machine-detail-supervisor-btn[aria-expanded="true"] .supervisor-caret { transform:rotate(180deg); }
+    .machine-detail-supervisor-menu { position:fixed; z-index:1121; width:min(460px,calc(100vw - 24px)); max-height:min(520px,calc(100vh - 90px)); overflow:auto; padding:10px; border:1px solid #bbf7d0; border-radius:16px; background:#fff; box-shadow:0 20px 46px rgba(15,23,42,.24); }
+    .machine-detail-supervisor-menu[hidden] { display:none; }
+    .supervisor-activity-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; margin-bottom:9px; }
+    .supervisor-activity-stat { min-width:0; padding:9px; border:1px solid #d1fae5; border-radius:11px; background:#f0fdf4; }
+    .supervisor-activity-stat .k { color:#64748b; font-size:.52rem; line-height:1; font-weight:900; text-transform:uppercase; letter-spacing:.035em; }
+    .supervisor-activity-stat .v { margin-top:5px; color:#065f46; font-size:.78rem; line-height:1.15; font-weight:950; overflow-wrap:anywhere; }
+    .supervisor-activity-log { display:grid; gap:6px; }
+    .supervisor-activity-row { display:grid; grid-template-columns:10px minmax(0,1fr) auto; gap:8px; align-items:start; padding:9px 8px; border:1px solid #e2e8f0; border-radius:11px; background:#f8fafc; }
+    .supervisor-activity-row-dot { width:8px; height:8px; margin-top:4px; border-radius:999px; background:#22c55e; }
+    .supervisor-activity-row.review .supervisor-activity-row-dot { background:#2563eb; }
+    .supervisor-activity-row-main { min-width:0; }
+    .supervisor-activity-row-title { color:#172338; font-size:.70rem; line-height:1.2; font-weight:950; }
+    .supervisor-activity-row-meta { margin-top:3px; color:#64748b; font-size:.59rem; line-height:1.35; font-weight:750; overflow-wrap:anywhere; }
+    .supervisor-activity-row-time { color:#475569; font-size:.57rem; line-height:1.25; font-weight:850; text-align:right; white-space:nowrap; }
+    .supervisor-activity-empty { padding:14px 10px; color:#64748b; font-size:.70rem; font-weight:800; text-align:center; }
+    .machine-finish-shift-option { width:100%; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:5px 10px; align-items:center; padding:10px 11px; border:0; border-radius:10px; background:transparent; color:#172338; font:inherit; text-align:left; cursor:pointer; }
+    .machine-finish-shift-option + .machine-finish-shift-option { margin-top:3px; }
+    .machine-finish-shift-option:hover,.machine-finish-shift-option:focus-visible { outline:none; background:#edf5ff; }
+    .machine-finish-shift-option .shift-main { min-width:0; overflow:hidden; font-size:.74rem; font-weight:900; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-finish-shift-option .shift-status { justify-self:end; padding:3px 6px; border-radius:999px; background:#dcfce7; color:#047857; font-size:.52rem; line-height:1; font-weight:950; text-transform:uppercase; }
+    .machine-finish-shift-option .shift-status.pending { background:#fef3c7; color:#92400e; }
+    .machine-finish-shift-option .shift-meta { grid-column:1/-1; min-width:0; overflow:hidden; color:#64748b; font-size:.61rem; line-height:1.35; font-weight:750; white-space:nowrap; text-overflow:ellipsis; }
     .icon-btn {
       width: 38px; height: 38px; border-radius: 12px; border: 1px solid #c7d0dd; background: #f8fafc;
       color: #334155; cursor: pointer; font-size: 18px; font-weight: 700;
@@ -8123,19 +8813,25 @@ DASHBOARD_HTML = """
     .machine-detail-info-panel { min-width:0; overflow:hidden; border:1px solid #e8edf5; border-radius:16px; background:rgba(255,255,255,.98); box-shadow:0 9px 24px rgba(30,64,175,.06); }
     .machine-detail-info-title { padding:15px 18px 12px; color:#17306d; font-size:.68rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; border-bottom:1px solid #edf1f7; }
     .machine-detail-info-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); }
-    .product-weight-info-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
+    .product-weight-info-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
     .downtime-summary-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
-    .product-weight-info-grid .machine-detail-info-item:nth-child(3n) { border-right:1px solid #edf1f7; }
+    .product-weight-info-grid .machine-detail-info-item:nth-child(3n) { border-right:0; }
     .downtime-summary-grid .machine-detail-info-item:nth-child(3n) { border-right:1px solid #edf1f7; }
-    .product-weight-info-grid .machine-detail-info-item:nth-child(4n) { border-right:0; }
     .downtime-summary-grid .machine-detail-info-item:nth-child(4n) { border-right:0; }
-    .product-weight-info-grid .machine-detail-info-item { border-bottom:0; }
+    .product-weight-info-grid .machine-detail-info-item { border-bottom:1px solid #edf1f7; }
+    .product-weight-info-grid .machine-detail-info-item:nth-last-child(-n+3) { border-bottom:0; }
     .downtime-summary-grid .machine-detail-info-item { border-bottom:0; }
     .machine-detail-info-item { min-width:0; min-height:70px; padding:13px 18px; border-right:1px solid #edf1f7; border-bottom:1px solid #edf1f7; }
     .machine-detail-info-item:nth-child(3n) { border-right:0; }
     .machine-detail-info-item:nth-last-child(-n+3) { border-bottom:0; }
     .machine-detail-info-item .k { color:#7890bd; font-size:.58rem; font-weight:900; letter-spacing:.035em; text-transform:uppercase; }
     .machine-detail-info-item .v { margin-top:8px; color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; overflow-wrap:anywhere; }
+    .machine-detail-info-item.weight-good { background:#f0fdf4; box-shadow:inset 0 0 0 1px #86efac; }
+    .machine-detail-info-item.weight-good .k,.machine-detail-info-item.weight-good .v { color:#15803d; }
+    .machine-detail-info-item.weight-warning { background:#fff7ed; box-shadow:inset 0 0 0 1px #fdba74; }
+    .machine-detail-info-item.weight-warning .k,.machine-detail-info-item.weight-warning .v { color:#c2410c; }
+    .machine-detail-info-item.weight-danger { background:#fef2f2; box-shadow:inset 0 0 0 1px #fca5a5; }
+    .machine-detail-info-item.weight-danger .k,.machine-detail-info-item.weight-danger .v { color:#b91c1c; }
     .machine-detail-records-title { margin-top:4px; padding:3px 2px; color:#17306d; font-size:.75rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
     .machine-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
     .machine-detail-item { min-width: 0; background: #f8fbff; border: 1px solid #d9e6f6; border-radius: 10px; padding: 9px 10px; }
@@ -8681,6 +9377,10 @@ DASHBOARD_HTML = """
     <button class="main-tab-button" data-target="userKpiTab">User KPIs</button>
     <button class="main-tab-button" data-target="pdrTab">PDR Reports</button>
     <div class="machine-filter-wrap" id="machineFilterWrap">
+      <button class="machine-filter-btn machine-todo-btn" id="machineTodoBtn" type="button" aria-label="Open production to-do list" aria-expanded="false" title="Production To-Do List">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4h11a2 2 0 0 1 2 2v14H6V5a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 3h5v3H9zM9 11l1.5 1.5L14 9M9 16h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="machine-todo-count" id="machineTodoCount" hidden>0</span>
+      </button>
       <button class="machine-filter-btn" id="machineFilterBtn" type="button" aria-label="Filter machines" aria-expanded="false" title="Filter machines">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18l-7 8v5l-4 2v-7L3 5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
       </button>
@@ -9123,6 +9823,39 @@ DASHBOARD_HTML = """
     </div>
   </div>
 
+  <div id="machineTodoOverlay" class="overlay-backdrop" role="dialog" aria-modal="true" aria-labelledby="machineTodoTitle">
+    <div class="overlay-card machine-todo-card">
+      <div class="overlay-head machine-todo-head">
+        <div class="machine-todo-head-copy">
+          <div class="overlay-title" id="machineTodoTitle">Production To-Do List</div>
+          <div class="sub" id="machineTodoUpdated">Live tasks sorted by the time they became needed.</div>
+        </div>
+        <div class="machine-todo-head-tools">
+          <input id="machineTodoSearch" class="machine-todo-search" type="search" autocomplete="off" placeholder="Find a machine, e.g. 310" aria-label="Find a machine or job">
+          <button id="machineTodoWaitFilter" class="machine-todo-tool-btn" type="button" aria-pressed="false">Waiting over 1 hour</button>
+        </div>
+        <button id="machineTodoCloseBtn" class="overlay-close" type="button" aria-label="Close production to-do list">Close</button>
+      </div>
+      <div class="machine-todo-body">
+        <div class="machine-todo-summary" id="machineTodoSummary"></div>
+        <div class="machine-todo-columns" id="machineTodoColumns"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="machinePartialOverlay" class="overlay-backdrop" role="dialog" aria-modal="true" aria-labelledby="machinePartialTitle">
+    <div class="overlay-card machine-partial-card">
+      <div class="overlay-head">
+        <div class="machine-partial-head-copy">
+          <div class="overlay-title" id="machinePartialTitle">Recent Partial Shifts</div>
+          <div class="sub" id="machinePartialSubtitle">Newest partial shifts first.</div>
+        </div>
+        <button id="machinePartialCloseBtn" class="overlay-close" type="button" aria-label="Close recent partial shifts">Close</button>
+      </div>
+      <div id="machinePartialBody" class="machine-partial-body"></div>
+    </div>
+  </div>
+
   <div id="machineDetailOverlay" class="overlay-backdrop">
     <div class="overlay-card machine-detail-card">
       <div class="overlay-head">
@@ -9131,6 +9864,8 @@ DASHBOARD_HTML = """
           <div class="overlay-title" id="machineDetailTitle">Machine Details</div>
         </div>
         <div class="overlay-head-actions">
+          <button id="machineDetailSupervisorBtn" class="machine-detail-supervisor-btn" type="button" title="Supervisor checks and reviews" aria-haspopup="menu" aria-expanded="false" aria-controls="machineDetailSupervisorMenu"><span class="supervisor-check-dot" aria-hidden="true"></span><span>Supervisor 0</span><span class="supervisor-caret" aria-hidden="true">&#9662;</span></button>
+          <button id="machineDetailFinishShiftsBtn" class="machine-detail-finish-shifts-btn" type="button" title="Choose a same-job shift to review" aria-haspopup="menu" aria-expanded="false" aria-controls="machineDetailFinishShiftsMenu" hidden><span class="partial-clock" aria-hidden="true">&#9687;</span><span>Finish shifts</span><span class="finish-shifts-caret" aria-hidden="true">&#9662;</span></button>
           <button id="machineDetailHistoryBtn" class="icon-btn" type="button" title="Machine history" aria-label="Machine history">&#128337;</button>
           <button id="machineDetailSettingsBtn" class="icon-btn" type="button" title="Machine status settings" aria-label="Machine status settings">&#9881;</button>
           <button id="machineDetailCloseBtn" class="icon-btn" type="button" title="Close" aria-label="Close">&times;</button>
@@ -9168,6 +9903,8 @@ DASHBOARD_HTML = """
       </div>
       <div class="machine-detail-body" id="machineDetailBody"></div>
     </div>
+    <div id="machineDetailSupervisorMenu" class="machine-detail-supervisor-menu" role="menu" aria-label="Supervisor checks and reviews" hidden></div>
+    <div id="machineDetailFinishShiftsMenu" class="machine-detail-finish-shifts-menu" role="menu" aria-label="Finished shifts for the current job" hidden></div>
   </div>
 
   <div id="machineHistoryOverlay" class="overlay-backdrop machine-history-overlay">
@@ -9238,6 +9975,7 @@ DASHBOARD_HTML = """
           <button id="settingsNavTheme" class="settings-nav-btn" type="button">Theme</button>
           <button id="settingsNavMachines" class="settings-nav-btn" type="button">Machines</button>
           <button id="settingsNavClients" class="settings-nav-btn" type="button">Clients &amp; IP</button>
+          <button id="settingsNavInventory" class="settings-nav-btn" type="button">Inventory</button>
           <button id="settingsNavApi" class="settings-nav-btn" type="button">API Configuration</button>
           <button id="settingsNavProfile" class="settings-nav-btn" type="button">Profile</button>
         </div>
@@ -9304,6 +10042,25 @@ DASHBOARD_HTML = """
                 <table class="settings-table">
                   <thead><tr><th>Client</th><th>IP Address</th><th>Machine</th><th>Last Seen</th><th>Status</th></tr></thead>
                   <tbody id="settingsClientsTableBody"><tr><td colspan="5">Loading...</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+          <div id="settingsPageInventory" class="settings-page">
+            <div class="settings-form">
+              <div class="settings-note">Positive product-part balances are moved here when a supervisor closes a finished job. Each row keeps the source job, machine, operator, and transfer time.</div>
+              <div class="settings-row">
+                <label>Search Inventory</label>
+                <input id="settingsInventorySearch" type="text" placeholder="Part name, SKU, job, machine, or operator..." />
+              </div>
+              <div class="settings-actions">
+                <button id="settingsInventoryRefreshBtn" class="btn-secondary" type="button">Refresh Inventory</button>
+              </div>
+              <div id="settingsInventorySummary" class="settings-note">Loading inventory...</div>
+              <div class="settings-table-wrap">
+                <table class="settings-table">
+                  <thead><tr><th>Added</th><th>Part Name</th><th>SKU</th><th>Qty</th><th>Unit</th><th>Source Job</th><th>Machine</th><th>Operator</th></tr></thead>
+                  <tbody id="settingsInventoryTableBody"><tr><td colspan="8">Loading...</td></tr></tbody>
                 </table>
               </div>
             </div>
@@ -9428,12 +10185,14 @@ DASHBOARD_HTML = """
   const settingsNavTheme = document.getElementById("settingsNavTheme");
   const settingsNavMachines = document.getElementById("settingsNavMachines");
   const settingsNavClients = document.getElementById("settingsNavClients");
+  const settingsNavInventory = document.getElementById("settingsNavInventory");
   const settingsNavApi = document.getElementById("settingsNavApi");
   const settingsNavProfile = document.getElementById("settingsNavProfile");
   const settingsPageGeneral = document.getElementById("settingsPageGeneral");
   const settingsPageTheme = document.getElementById("settingsPageTheme");
   const settingsPageMachines = document.getElementById("settingsPageMachines");
   const settingsPageClients = document.getElementById("settingsPageClients");
+  const settingsPageInventory = document.getElementById("settingsPageInventory");
   const settingsPageApi = document.getElementById("settingsPageApi");
   const settingsPageProfile = document.getElementById("settingsPageProfile");
   const settingsServerHost = document.getElementById("settingsServerHost");
@@ -9454,6 +10213,10 @@ DASHBOARD_HTML = """
   const settingsMachineClearStatus = document.getElementById("settingsMachineClearStatus");
   const settingsClientsTableBody = document.getElementById("settingsClientsTableBody");
   const settingsClientsRefreshBtn = document.getElementById("settingsClientsRefreshBtn");
+  const settingsInventorySearch = document.getElementById("settingsInventorySearch");
+  const settingsInventoryRefreshBtn = document.getElementById("settingsInventoryRefreshBtn");
+  const settingsInventorySummary = document.getElementById("settingsInventorySummary");
+  const settingsInventoryTableBody = document.getElementById("settingsInventoryTableBody");
   const settingsProfilesTableBody = document.getElementById("settingsProfilesTableBody");
   const settingsProfilesCount = document.getElementById("settingsProfilesCount");
   const settingsProfilesRefreshBtn = document.getElementById("settingsProfilesRefreshBtn");
@@ -9473,6 +10236,22 @@ DASHBOARD_HTML = """
   const machineGrid = document.getElementById("machineGrid");
   const additionalMachineGrid = document.getElementById("additionalMachineGrid");
   const machineFilterWrap = document.getElementById("machineFilterWrap");
+  const machineTodoBtn = document.getElementById("machineTodoBtn");
+  const machineTodoCount = document.getElementById("machineTodoCount");
+  const machineTodoOverlay = document.getElementById("machineTodoOverlay");
+  const machineTodoCloseBtn = document.getElementById("machineTodoCloseBtn");
+  const machineTodoUpdated = document.getElementById("machineTodoUpdated");
+  const machineTodoSummary = document.getElementById("machineTodoSummary");
+  const machineTodoColumns = document.getElementById("machineTodoColumns");
+  const machineTodoSearch = document.getElementById("machineTodoSearch");
+  const machineTodoWaitFilter = document.getElementById("machineTodoWaitFilter");
+  const machinePartialOverlay = document.getElementById("machinePartialOverlay");
+  const machinePartialTitle = document.getElementById("machinePartialTitle");
+  const machinePartialSubtitle = document.getElementById("machinePartialSubtitle");
+  const machinePartialBody = document.getElementById("machinePartialBody");
+  const machinePartialCloseBtn = document.getElementById("machinePartialCloseBtn");
+  let machineTodoQuery = "";
+  let machineTodoWaitingOverHour = false;
   const machineFilterBtn = document.getElementById("machineFilterBtn");
   const machineFilterMenu = document.getElementById("machineFilterMenu");
   const hideInactiveMachinesFilter = document.getElementById("hideInactiveMachinesFilter");
@@ -9604,6 +10383,10 @@ DASHBOARD_HTML = """
   const overlayLotNumber = document.getElementById("overlayLotNumber");
   const overlayPoNumberRow = overlayPoNumber ? overlayPoNumber.closest(".overlay-row") : null;
   const machineDetailOverlay = document.getElementById("machineDetailOverlay");
+  const machineDetailSupervisorBtn = document.getElementById("machineDetailSupervisorBtn");
+  const machineDetailSupervisorMenu = document.getElementById("machineDetailSupervisorMenu");
+  const machineDetailFinishShiftsBtn = document.getElementById("machineDetailFinishShiftsBtn");
+  const machineDetailFinishShiftsMenu = document.getElementById("machineDetailFinishShiftsMenu");
   const machineDetailHistoryBtn = document.getElementById("machineDetailHistoryBtn");
   const machineDetailSettingsBtn = document.getElementById("machineDetailSettingsBtn");
   const machineDetailCloseBtn = document.getElementById("machineDetailCloseBtn");
@@ -9677,13 +10460,13 @@ DASHBOARD_HTML = """
     const machineCode = String(code || "").trim().toUpperCase();
     if(ADDITIONAL_MACHINE_CODES.has(machineCode)) return true;
     const displayName = String(session?.machine_name || MACHINE_NAME_MAP[machineCode] || "").trim().toUpperCase();
-    if(/^IMM\\s*4\\d{2}\\b/.test(displayName)) return true;
-    return /^M0*4\\d{2}$/.test(machineCode);
+    if(/^IMM\s*4\d{2}\b/.test(displayName)) return true;
+    return /^M0*4\d{2}$/.test(machineCode);
   }
   const DEFAULT_MACHINE_CODES = Object.keys(MACHINE_NAME_MAP);
   function planningLaneMachineCode(code){
     const machineCode = String(code || "").trim().toUpperCase();
-    const factory4Match = machineCode.match(/^M004(\\d{2})$/);
+    const factory4Match = machineCode.match(/^M004(\d{2})$/);
     if(factory4Match){
       const laneCode = `M001${factory4Match[1]}`;
       if(ADDITIONAL_MACHINE_CODES.has(laneCode)) return laneCode;
@@ -9794,6 +10577,7 @@ DASHBOARD_HTML = """
   let serverSettingsState = { theme: "Default", qrgen_base_url: "" };
   let dailyRolesState = {};
   let settingsProfilesState = [];
+  let settingsInventoryState = [];
   let machineStatusOverridesState = {};
   let visibleMachineCodesState = [];
   let hideInactiveMachines = (() => {
@@ -9807,6 +10591,16 @@ DASHBOARD_HTML = """
   let userKpiRoleState = "operator";
   let userKpiLoading = false;
   let userKpiItemsState = [];
+  const dashboardSectionSignatures = new Map();
+
+  function renderDashboardSectionIfChanged(key, value, renderFn){
+    let signature = "";
+    try { signature = JSON.stringify(value ?? null); }
+    catch(_err) { signature = String(Date.now()); }
+    if(dashboardSectionSignatures.get(key) === signature) return;
+    dashboardSectionSignatures.set(key, signature);
+    renderFn();
+  }
 
   function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;"); }
   function escAttr(s){ return esc(s).replaceAll('"', "&quot;"); }
@@ -10232,8 +11026,11 @@ DASHBOARD_HTML = """
     return `<div class="machine-detail-item"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
   }
 
-  function machineDetailInfoItem(label, value){
-    return `<div class="machine-detail-info-item"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
+  function machineDetailInfoItem(label, value, tone = ""){
+    const safeTone = ["weight-good", "weight-warning", "weight-danger"].includes(String(tone || ""))
+      ? String(tone)
+      : "";
+    return `<div class="machine-detail-info-item${safeTone ? ` ${safeTone}` : ""}"><div class="k">${esc(label)}</div><div class="v">${esc(value ?? "-")}</div></div>`;
   }
 
   function machineDetailSideRow(label, value){
@@ -10382,7 +11179,7 @@ DASHBOARD_HTML = """
 
   function parsedRawMaterialScan(payload){
     const raw = String(payload || "").trim();
-    const match = raw.match(/V2P(\\d{11})Q(\\d{11})I(\\d{11})T(\\d{11})L([^-]+)/);
+    const match = raw.match(/V2P(\d{11})Q(\d{11})I(\d{11})T(\d{11})L([^-]+)/);
     if(!match) return {};
     const numeric = value => String(Number(value || 0));
     return {
@@ -10663,7 +11460,7 @@ DASHBOARD_HTML = """
       if(!Object.prototype.hasOwnProperty.call(part, key)) continue;
       const raw = part[key];
       if(raw === null || raw === undefined || String(raw).trim() === "") continue;
-      const match = String(raw).replaceAll(",", "").match(/-?\\d+(?:\\.\\d+)?/);
+      const match = String(raw).replaceAll(",", "").match(/-?\d+(?:\.\d+)?/);
       return !match || Number(match[0]) > 0;
     }
     return true;
@@ -10673,6 +11470,9 @@ DASHBOARD_HTML = """
     const item = (row && typeof row === "object") ? row : {};
     const payload = (item.job_payload && typeof item.job_payload === "object") ? item.job_payload : {};
     const data = (payload.data && typeof payload.data === "object") ? payload.data : {};
+    const job = (data.job && typeof data.job === "object")
+      ? data.job
+      : ((payload.job && typeof payload.job === "object") ? payload.job : {});
     const details = (data.job_details && typeof data.job_details === "object") ? data.job_details : {};
     const candidates = [
       Array.isArray(data.parts) ? data.parts : null,
@@ -10683,9 +11483,32 @@ DASHBOARD_HTML = """
       Array.isArray(payload.part_ids) ? payload.part_ids : null,
     ].filter(Boolean);
     for(const rows of candidates){
-      if(rows.length) return rows.filter(jobPartIsActive);
+      if(rows.length) return rows.filter(jobPartIsActive).map(part => ({
+        ...part,
+        _job_approved_output_qty:firstValue(job.approve_qty, job.approved_qty, ""),
+        _job_requested_output_qty:firstValue(job.request_qty, job.requested_qty, job.qty, job.quantity, ""),
+      }));
     }
     return [];
+  }
+
+  function derivedJobApiPartRate(part){
+    const row = (part && typeof part === "object") ? part : {};
+    const approvedPartQty = Math.max(0, Number(firstValue(row.approve_part_qty, row.approved_part_qty, row.approved_qty, 0)) || 0);
+    const approvedOutputQty = Math.max(0, Number(row._job_approved_output_qty || 0));
+    if(approvedPartQty > 0 && approvedOutputQty > 0) return approvedPartQty / approvedOutputQty;
+    const requestedPartQty = Math.max(0, Number(firstValue(row.request_part_qty, row.required_qty, row.qty, row.quantity, 0)) || 0);
+    const requestedOutputQty = Math.max(0, Number(row._job_requested_output_qty || 0));
+    return requestedPartQty > 0 && requestedOutputQty > 0 ? requestedPartQty / requestedOutputQty : 0;
+  }
+
+  function standardJobApiPartRate(part){
+    const row = (part && typeof part === "object") ? part : {};
+    const explicitRate = Math.max(0, Number(firstValue(
+      row.part_qty_per_unit, row.qty_per_unit, row.quantity_per_unit,
+      row.part_quantity_per_unit, row.component_qty_per_unit, 0
+    )) || 0);
+    return explicitRate || derivedJobApiPartRate(row);
   }
 
   function allJobPartRows(row){
@@ -10752,7 +11575,7 @@ DASHBOARD_HTML = """
           product_id: productId,
           sku,
           name: materialLabel(part),
-          per_unit: firstValue(part.part_qty_per_unit, part.qty_per_unit, "-"),
+          per_unit: standardJobApiPartRate(part) || "-",
           requested: firstValue(part.request_part_qty, part.required_qty, part.qty, part.quantity, "-"),
           approved: firstValue(part.approve_part_qty, part.approved_qty, "-"),
           completed: firstValue(part.complete_part_qty, part.completed_qty, "-"),
@@ -10860,7 +11683,7 @@ DASHBOARD_HTML = """
     const rows = rawLogsForPart(materialRows, part, totalPartCount);
     const sku = String(part?.sku || part?.part_sku || part?.product_sku || "").trim().toUpperCase();
     const name = String(part?.name || part?.part_name || part?.material_name || "").trim().toUpperCase();
-    const isMaterial = sku.startsWith("Z-RM") || /\bKGS?\b/.test(name);
+    const isMaterial = sku.startsWith("Z-RM") || /KGS?/.test(name);
     const fallbackPerUnit = isMaterial
       ? Math.max(0, Number(appPartQtyKg || 0))
       : Number(part?.part_qty_per_unit || part?.qty_per_unit || 0);
@@ -10910,9 +11733,9 @@ DASHBOARD_HTML = """
         .forEach(entry => entries.push(entry)));
     const sku = String(firstValue(part?.sku, part?.part_sku, part?.product_sku, "")).toUpperCase();
     const name = String(materialLabel(part)).toUpperCase();
-    const isRawMaterial = sku.startsWith("Z-RM") || /\bKGS?\b/.test(name);
+    const isRawMaterial = sku.startsWith("Z-RM") || /KGS?/.test(name);
     const shiftWeight = isRawMaterial ? Math.max(0, Number(row.external_average_weight_grams || 0) / 1000) : 0;
-    const partRate = Math.max(0, Number(part?.part_qty_per_unit || part?.qty_per_unit || 0));
+    const partRate = standardJobApiPartRate(part);
     const positiveRates = entries.map(entry => Math.max(0, Number(
       entry.part_qty_per_unit_kg ?? entry.part_qty_per_unit ?? 0
     ))).filter(rate => rate > 0);
@@ -10968,12 +11791,12 @@ DASHBOARD_HTML = """
       const scanCount = matchedRows.reduce((sum, materialRow) => sum + Math.max(1, Number(materialRow.scan_count || 1)), 0);
       const sku = String(firstValue(part.sku, part.part_sku, part.product_sku, part.part_code, part.product_code, part.code, "")).trim().toUpperCase();
       const name = String(materialLabel(part)).trim().toUpperCase();
-      const isRawMaterial = sku.startsWith("Z-RM") || /\bKGS?\b/.test(name);
+      const isRawMaterial = sku.startsWith("Z-RM") || /KGS?/.test(name);
       const loggedPerUnit = matchedRows.map(materialRow => Number(
         isRawMaterial ? materialRow.part_qty_per_unit_kg : materialRow.part_qty_per_unit
       )).find(value => Number.isFinite(value) && value > 0) || 0;
       const perUnit = isRawMaterial
-        ? (appPartQtyKg || loggedPerUnit)
+        ? (appPartQtyKg || loggedPerUnit || standardJobApiPartRate(part))
         : (Number(part.part_qty_per_unit || part.qty_per_unit || 0) || loggedPerUnit || 1);
       const currentUsage = actualPackMaterialUsage(item, part);
       const priorUsed = matchedRows.reduce((sum, materialRow) => sum + Math.max(0, Number(materialRow.used_qty || 0)), 0);
@@ -11008,7 +11831,7 @@ DASHBOARD_HTML = """
       unmatchedGroups.set(key, group);
     });
     unmatchedGroups.forEach(group => {
-      const rawUnit = String(group.sku || "").toUpperCase().startsWith("Z-RM") || /\bKGS?\b/i.test(group.material || "");
+      const rawUnit = String(group.sku || "").toUpperCase().startsWith("Z-RM") || /KGS?/i.test(group.material || "");
       statisticsRows.push({...group, unit:rawUnit ? "kg" : "pcs", currentUsed:null, totalUsed:null, balance:null, status:"info", statusText:"Unmatched"});
     });
     if(!statisticsRows.length) return '<div class="machine-detail-empty">No material requirements or scans recorded for this job.</div>';
@@ -11080,6 +11903,10 @@ DASHBOARD_HTML = """
     const reviewLogs = Array.isArray(row.reject_review_logs) ? row.reject_review_logs : [];
     const approvedBy = row.supervisor_name || row.qc_name || (reviewLogs.find(x => x?.actor_name)?.actor_name) || "-";
     machineDetailTitle.textContent = `${session.machine_name || session.machine_code || "Archived Job"} Archive`;
+    setMachineDetailSupervisorMenuOpen(false);
+    if(machineDetailSupervisorBtn) machineDetailSupervisorBtn.hidden = true;
+    setMachineDetailFinishShiftsMenuOpen(false);
+    if(machineDetailFinishShiftsBtn) machineDetailFinishShiftsBtn.hidden = true;
     if(machineDetailHistoryBtn) machineDetailHistoryBtn.style.display = "none";
     if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "none";
     if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
@@ -11453,7 +12280,10 @@ DASHBOARD_HTML = """
       renderArchivedMachineDetail(session);
       return;
     }
+    const supervisorMenuWasOpen = machineDetailSupervisorMenu?.hidden === false;
     activeMachineDetailCode = String(session.machine_code || "").trim();
+    syncMachineDetailSupervisorActivity(session);
+    syncMachineDetailFinishShifts(activeMachineDetailCode);
     if(machineDetailHistoryBtn) machineDetailHistoryBtn.style.display = "";
     if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "";
     const activeTtlSeconds = Number((latestState && latestState.active_ttl_seconds) || 30);
@@ -11500,7 +12330,7 @@ DASHBOARD_HTML = """
         duration: fmtDowntimeSeconds(row.duration_seconds || 0),
         maintenance: row.maintenance || "-",
         confirmed_by: row.confirmed_by || "-",
-        period: `${fmtTimeOnly(row.started_at_utc || "")} → ${fmtTimeOnly(row.finished_at_utc || "")}`,
+        period: `${fmtTimeOnly(row.started_at_utc || "")} ΓåÆ ${fmtTimeOnly(row.finished_at_utc || "")}`,
       };
     });
     const counterOverwriteRows = (Array.isArray(session.machine_counter_overwrite_logs)
@@ -11553,6 +12383,29 @@ DASHBOARD_HTML = """
     const averageWeight = Number(session.external_average_weight_grams || 0) > 0
       ? `${(Number(session.external_average_weight_grams) / 1000).toFixed(4)} kg`
       : "-";
+    const apiStandardWeightKg = Math.max(0, Number(session.standard_product_weight_kg || 0))
+      || rawPartRows(session)
+        .filter(isRawMaterialPart)
+        .reduce((sum, part) => sum + Math.max(0, standardJobApiPartRate(part)), 0);
+    const measuredWeightKg = Math.max(0, Number(session.external_average_weight_grams || 0) / 1000);
+    const standardWeight = apiStandardWeightKg > 0 ? `${apiStandardWeightKg.toFixed(4)} kg` : "-";
+    const weightDifference = apiStandardWeightKg > 0 && measuredWeightKg > 0
+      ? measuredWeightKg - apiStandardWeightKg
+      : null;
+    const weightDifferencePct = weightDifference !== null && apiStandardWeightKg > 0
+      ? (weightDifference / apiStandardWeightKg) * 100
+      : null;
+    const absoluteWeightDifferencePct = weightDifferencePct === null ? null : Math.abs(weightDifferencePct);
+    const weightDeviationTone = absoluteWeightDifferencePct === null
+      ? ""
+      : absoluteWeightDifferencePct >= 5
+        ? "weight-danger"
+        : absoluteWeightDifferencePct > 2.5
+          ? "weight-warning"
+          : "weight-good";
+    const weightDifferenceLabel = weightDifference === null
+      ? "-"
+      : `${weightDifference >= 0 ? "+" : ""}${weightDifference.toFixed(4)} kg (${weightDifferencePct >= 0 ? "+" : ""}${weightDifferencePct.toFixed(1)}%)`;
     const operatorName = displayNameForId(session.operator_id || "-");
     const productName = firstValue(session.product_name, jobDetails.product_name, job.product_name, "-");
     const lastMeaningfulAction = meaningfulMachineAction(session) || "-";
@@ -11623,8 +12476,10 @@ DASHBOARD_HTML = """
           <section class="machine-detail-info-panel">
             <div class="machine-detail-info-title">Product Weight Information</div>
             <div class="machine-detail-info-grid product-weight-info-grid">
+              ${machineDetailInfoItem("Standard Weight (SKU API)", standardWeight)}
+              ${machineDetailInfoItem("Average Weight", averageWeight, weightDeviationTone)}
+              ${machineDetailInfoItem("Difference vs Standard", weightDifferenceLabel)}
               ${machineDetailInfoItem("Weight Sender", session.external_average_weight_sender || "-")}
-              ${machineDetailInfoItem("Average Weight", averageWeight)}
               ${machineDetailInfoItem("Weight Source", session.external_average_weight_source || "-")}
               ${machineDetailInfoItem("Weight Received At", fmtDateLocal(session.external_average_weight_received_at || ""))}
             </div>
@@ -11700,16 +12555,21 @@ DASHBOARD_HTML = """
       goodMetric.addEventListener("pointerenter", () => positionMachineGoodBubble(goodMetric));
       goodMetric.addEventListener("focus", () => positionMachineGoodBubble(goodMetric));
     }
+    if(supervisorMenuWasOpen) setMachineDetailSupervisorMenuOpen(true);
   }
 
   function closeMachineDetail(){
     closeMachineHistory();
+    setMachineDetailSupervisorMenuOpen(false);
+    setMachineDetailFinishShiftsMenuOpen(false);
     machineDetailOverlay.classList.remove("active");
     activeMachineDetailCode = "";
     if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
     if(machineStatusSaveFeedback) machineStatusSaveFeedback.classList.remove("active");
     if(machineStatusSaveBar) machineStatusSaveBar.style.width = "0%";
     if(machineStatusSaveCheck) machineStatusSaveCheck.classList.remove("done");
+    if(machineDetailSupervisorBtn) machineDetailSupervisorBtn.hidden = true;
+    if(machineDetailFinishShiftsBtn) machineDetailFinishShiftsBtn.hidden = true;
     if(machineDetailHistoryBtn) machineDetailHistoryBtn.style.display = "";
     if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "";
   }
@@ -11767,6 +12627,7 @@ DASHBOARD_HTML = """
       theme: [settingsNavTheme, settingsPageTheme],
       machines: [settingsNavMachines, settingsPageMachines],
       clients: [settingsNavClients, settingsPageClients],
+      inventory: [settingsNavInventory, settingsPageInventory],
       api: [settingsNavApi, settingsPageApi],
       profile: [settingsNavProfile, settingsPageProfile],
     };
@@ -11798,7 +12659,7 @@ DASHBOARD_HTML = """
       `;
     }).join("");
     settingsMachinePickerGrid.innerHTML = `
-      <div style="grid-column:1/-1;font-weight:900;color:#334155;">IMM 301–321</div>
+      <div style="grid-column:1/-1;font-weight:900;color:#334155;">IMM 301ΓÇô321</div>
       ${renderItems(standardCodes)}
       <div style="grid-column:1/-1;margin-top:8px;padding-top:10px;border-top:1px solid #dbe4f0;font-weight:900;color:#334155;">Factory 4 Machines</div>
       ${renderItems(additionalCodes)}
@@ -11910,7 +12771,7 @@ DASHBOARD_HTML = """
       const option = document.createElement("option");
       option.value = code;
       option.dataset.clientId = String(s.client_id || "").trim();
-      option.textContent = `${name} (${code})${job ? ` — Job ${job}` : " — No job"}`;
+      option.textContent = `${name} (${code})${job ? ` ΓÇö Job ${job}` : " ΓÇö No job"}`;
       settingsMachineClearSelect.appendChild(option);
     });
     if(previous && rows.some(s => String(s.machine_code || "").trim() === previous)){
@@ -11929,7 +12790,9 @@ DASHBOARD_HTML = """
       if(settingsMachineClearStatus) settingsMachineClearStatus.textContent = "This active session has no client ID and cannot be cleared safely.";
       return;
     }
-    if(!window.confirm(`Clear all current active data for ${label}?\n\nFinished-job history will remain saved. This action cannot be undone.`)) return;
+    if(!window.confirm(`Clear all current active data for ${label}?
+
+Finished-job history will remain saved. This action cannot be undone.`)) return;
     if(settingsMachineClearBtn){
       settingsMachineClearBtn.disabled = true;
       settingsMachineClearBtn.textContent = "Clearing...";
@@ -11972,8 +12835,8 @@ DASHBOARD_HTML = """
         let statusLabel = "Offline";
         if(online && job) statusLabel = `Running Job ${job}`;
         else if(online) statusLabel = "Active";
-        else if(row.active_session && job) statusLabel = `Offline — Job ${job} saved`;
-        else if(row.active_session) statusLabel = "Offline — Data saved";
+        else if(row.active_session && job) statusLabel = `Offline ΓÇö Job ${job} saved`;
+        else if(row.active_session) statusLabel = "Offline ΓÇö Data saved";
         return `<tr>
           <td>${esc(row.client_id || "UNKNOWN")}</td>
           <td>${esc(row.remote_host || "-")}</td>
@@ -11984,6 +12847,54 @@ DASHBOARD_HTML = """
       }).join("") : `<tr><td colspan="5">No clients have contacted the server yet.</td></tr>`;
     } catch {
       if(settingsClientsTableBody) settingsClientsTableBody.innerHTML = `<tr><td colspan="5">Unable to load clients.</td></tr>`;
+    }
+  }
+
+  function renderSettingsInventoryUi(){
+    if(!settingsInventoryTableBody) return;
+    const needle = String(settingsInventorySearch?.value || "").trim().toLowerCase();
+    const rows = settingsInventoryState.filter(row => !needle || [
+      row.part_name, row.sku, row.product_id, row.job_code, row.job_name,
+      row.machine_code, row.machine_name, row.operator_id, row.operator_name,
+    ].some(value => String(value || "").toLowerCase().includes(needle)));
+    if(settingsInventorySummary){
+      settingsInventorySummary.textContent = needle
+        ? `${rows.length} matching item${rows.length === 1 ? "" : "s"} (${settingsInventoryState.length} total)`
+        : `${rows.length} inventory item${rows.length === 1 ? "" : "s"} from finished jobs`;
+    }
+    settingsInventoryTableBody.innerHTML = rows.length ? rows.map(row => {
+      const qty = Number(row.qty || 0);
+      const qtyLabel = Number.isFinite(qty)
+        ? qty.toLocaleString(undefined, {maximumFractionDigits: 6})
+        : String(row.qty || "0");
+      const job = [row.job_code, row.job_name].filter(Boolean).join(" ΓÇö ") || "-";
+      const machine = [row.machine_code, row.machine_name].filter(Boolean).join(" ΓÇö ") || "-";
+      const operator = [row.operator_name, row.operator_id].filter(Boolean).join(" ΓÇö ") || "-";
+      return `<tr>
+        <td>${esc(fmtDateLocal(row.transferred_at_utc || ""))}</td>
+        <td>${esc(row.part_name || "-")}</td>
+        <td>${esc(row.sku || row.product_id || "-")}</td>
+        <td>${esc(qtyLabel)}</td>
+        <td>${esc(row.unit || "-")}</td>
+        <td>${esc(job)}</td>
+        <td>${esc(machine)}</td>
+        <td>${esc(operator)}</td>
+      </tr>`;
+    }).join("") : `<tr><td colspan="8">${needle ? "No inventory matches this search." : "No finished-job part balances yet."}</td></tr>`;
+  }
+
+  async function loadSettingsInventoryUi(){
+    if(settingsInventoryTableBody) settingsInventoryTableBody.innerHTML = `<tr><td colspan="8">Loading inventory...</td></tr>`;
+    if(settingsInventorySummary) settingsInventorySummary.textContent = "Loading inventory...";
+    try {
+      const resp = await fetch("/api/part-inventory");
+      const out = await resp.json().catch(() => ({}));
+      if(!resp.ok || !out.ok) throw new Error(out.error || `Server returned ${resp.status}`);
+      settingsInventoryState = Array.isArray(out.items) ? out.items : [];
+      renderSettingsInventoryUi();
+    } catch(err) {
+      if(settingsInventorySummary) settingsInventorySummary.textContent = `Unable to load inventory: ${err?.message || err}`;
+      if(settingsInventoryTableBody) settingsInventoryTableBody.innerHTML = `<tr><td colspan="8">Unable to load inventory.</td></tr>`;
     }
   }
 
@@ -12077,7 +12988,7 @@ DASHBOARD_HTML = """
   function displayNameForId(idValue){
     const raw = String(idValue || "").trim();
     if(!raw) return "-";
-    const combinedMatch = raw.match(/^\\s*[\\w-]+\\s*-\\s*(.+)\\s*$/);
+    const combinedMatch = raw.match(/^\s*[\w-]+\s*-\s*(.+)\s*$/);
     if(combinedMatch && String(combinedMatch[1] || "").trim()){
       return String(combinedMatch[1] || "").trim();
     }
@@ -12171,9 +13082,9 @@ DASHBOARD_HTML = """
     const body = filtered.map((x, index) => {
       const originalIndex = rows.indexOf(x);
       const status = String(x.operator_status || "OFFLINE").toUpperCase();
-      const statusClass = status.toLowerCase().replace(/\\s+/g, "-");
+      const statusClass = status.toLowerCase().replace(/\s+/g, "-");
       const currentPair = compactPair(x.current_machine_name || x.current_machine_code, x.current_job_name || x.current_job_code);
-      const initials = String(x.name || x.id_number || "?").trim().split(/\\s+/).slice(0,2).map(v => v[0] || "").join("").toUpperCase() || "?";
+      const initials = String(x.name || x.id_number || "?").trim().split(/\s+/).slice(0,2).map(v => v[0] || "").join("").toUpperCase() || "?";
       const photo = String(x.photo_data_url || "").trim();
       const avatar = photo ? `<img src="${escAttr(photo)}" alt="${escAttr(x.name || 'Operator photo')}" />` : esc(initials);
       return `<div class="operator-status-card" data-operator-index="${esc(originalIndex)}">
@@ -12412,12 +13323,12 @@ DASHBOARD_HTML = """
     } else if(toolbar){
       toolbar.style.display = "";
       if(overlayReviewPrevBtn){
-        overlayReviewPrevBtn.textContent = "\\u2039";
+        overlayReviewPrevBtn.textContent = "\u2039";
         toolbar.appendChild(overlayReviewPrevBtn);
       }
       if(overlayReviewSlideStatus) toolbar.appendChild(overlayReviewSlideStatus);
       if(overlayReviewNextBtn){
-        overlayReviewNextBtn.textContent = "\\u203A";
+        overlayReviewNextBtn.textContent = "\u203A";
         toolbar.appendChild(overlayReviewNextBtn);
       }
     }
@@ -12433,14 +13344,14 @@ DASHBOARD_HTML = """
       `Reject: ${row.reject_total ?? 0}`,
       `No Shot: ${row.no_shot_total ?? 0}`,
       `Total Good: ${row.total_good ?? ((Number(row.good_total||0)+Number(row.butal_total||0)))}`,
-    ].join("\\n");
+    ].join("\n");
   }
 
   function reviewRejectsText(row){
     const rb = (row && typeof row.reject_breakdown === "object" && row.reject_breakdown) || {};
     const keys = Object.keys(rb);
     if(!keys.length) return "No reject details recorded.";
-    return keys.sort().map(k => `${k}: ${rb[k]}`).join("\\n");
+    return keys.sort().map(k => `${k}: ${rb[k]}`).join("\n");
   }
 
   function fillDisapproveFields(row){
@@ -12460,7 +13371,7 @@ DASHBOARD_HTML = """
   }
 
   function renderBulletListHtml(text, emptyLabel = "No data."){
-    const lines = String(text || "").split(/\\r?\\n/).map(x => x.trim()).filter(Boolean);
+    const lines = String(text || "").split(/\r?\n/).map(x => x.trim()).filter(Boolean);
     if(!lines.length) return `<div class="machine-detail-empty">${esc(emptyLabel)}</div>`;
     return `<ul class="review-line-list">${lines.map(x => `<li>${esc(x)}</li>`).join("")}</ul>`;
   }
@@ -13243,7 +14154,7 @@ DASHBOARD_HTML = """
       const recordedRows = Array.from(actualConsumptionMap.values()).filter(consumption => matchesConsumptionPart(part, consumption));
       const unitText = String(firstValue(part.unit, part.uom, part.part_unit, part.qty_unit, "")).toLowerCase();
       const sku = String(firstValue(part.sku, part.part_sku, part.product_sku, "")).toUpperCase();
-      const unit = sku.startsWith("Z-RM") || /\bkg(s)?\b/.test(unitText) ? "kg" : "pc";
+      const unit = sku.startsWith("Z-RM") || /kg(s)?/.test(unitText) ? "kg" : "pc";
       const partRate = Math.max(0, Number(part.part_qty_per_unit || part.qty_per_unit || part.quantity_per_unit || 0));
       if(recordedRows.length){
         const recordedUnits = recordedRows.reduce((sum, consumption) => sum + Math.max(0, Number(consumption.packed_qty || 0)), 0);
@@ -13310,7 +14221,7 @@ DASHBOARD_HTML = """
             <details class="scan-history-item">
               <summary class="scan-history-summary">
                 <span>${esc(item.index)}</span>
-                <span class="material">${esc(item.material)}<br><span class="scan-history-count">${esc(item.scans.length)} scan${item.scans.length === 1 ? "" : "s"} — click to view</span></span>
+                <span class="material">${esc(item.material)}<br><span class="scan-history-count">${esc(item.scans.length)} scan${item.scans.length === 1 ? "" : "s"} ΓÇö click to view</span></span>
                 <span>${esc(item.scanned_qty)}</span>
                 <span>${esc(item.lots)}</span>
                 <span>${esc(fmtDateLocal(item.last_scanned_at || "") || "-")}</span>
@@ -13862,7 +14773,7 @@ DASHBOARD_HTML = """
       const machineName = r.machine_name || MACHINE_NAME_MAP[machineCode] || machineCode || "-";
       const rawLogs = Array.isArray(r.raw_material_logs) ? r.raw_material_logs : [];
       const rawText = rawLogs.length
-        ? rawLogs.map((x, rowIdx) => `${rowIdx+1}. ${x.material_name || x.material || "-"} | qty=${x.qty || 0}`).join("\\n")
+        ? rawLogs.map((x, rowIdx) => `${rowIdx+1}. ${x.material_name || x.material || "-"} | qty=${x.qty || 0}`).join("\n")
         : "No raw materials scanned.";
       return `
         <div class="finished-item">
@@ -13941,7 +14852,7 @@ DASHBOARD_HTML = """
             <div class="job-progress-fill" style="width:${Math.min(100, progressPercent).toFixed(2)}%;"></div>
           </div>
           <div class="job-progress-caption"><span>${esc(producedQty)} produced</span><span>${esc(targetQty || 0)} target${producedQty > targetQty && targetQty > 0 ? ` | ${esc(producedQty - targetQty)} over` : ""}</span></div>
-          <div class="raw-list">${esc(lines.join("\\n"))}</div>
+          <div class="raw-list">${esc(lines.join("\n"))}</div>
         </div>
       `};
     }).sort((a, b) => String(b.latestTime).localeCompare(String(a.latestTime)));
@@ -14080,10 +14991,10 @@ DASHBOARD_HTML = """
       const rawLogs = Array.isArray(r.raw_material_logs) ? r.raw_material_logs : [];
       const relatedApprovedShifts = shiftItems.filter(x => isApprovedShiftRecord(x) && String(x.job_code || "") === String(r.job_code || ""));
       const rawText = rawLogs.length
-        ? rawLogs.map((x, idx) => `${idx+1}. ${x.material || "-"} | qty=${x.qty || 0}`).join("\\n")
+        ? rawLogs.map((x, idx) => `${idx+1}. ${x.material || "-"} | qty=${x.qty || 0}`).join("\n")
         : "No raw materials scanned.";
       const partialSummaryText = relatedApprovedShifts.length
-        ? relatedApprovedShifts.map((x, rowIdx) => `${rowIdx + 1}. ${fmtDateLocal(x.finished_at_utc || x.ended_at_utc || "")} | Qty ${x.partial_qty || x.total_good || 0} | Reject ${x.reject_total || 0} | No Shot ${x.no_shot_total || 0} | Downtime ${fmtDowntimeSeconds(x.downtime_last_seconds)} | Approved by ${x.approved_by || "-"} ${x.approved_at_utc ? `at ${fmtDateLocal(x.approved_at_utc)}` : ""}`).join("\\n")
+        ? relatedApprovedShifts.map((x, rowIdx) => `${rowIdx + 1}. ${fmtDateLocal(x.finished_at_utc || x.ended_at_utc || "")} | Qty ${x.partial_qty || x.total_good || 0} | Reject ${x.reject_total || 0} | No Shot ${x.no_shot_total || 0} | Downtime ${fmtDowntimeSeconds(x.downtime_last_seconds)} | Approved by ${x.approved_by || "-"} ${x.approved_at_utc ? `at ${fmtDateLocal(x.approved_at_utc)}` : ""}`).join("\n")
         : "No approved shift partials linked to this job yet.";
       const linkageRole = String(r.linkage_role || "").toUpperCase();
       const linkageTotal = Number(r.linkage_group_total_jobs || 0);
@@ -14837,16 +15748,16 @@ DASHBOARD_HTML = """
             const jobName = firstValue(row?.job_name, row?.job_code, "-");
             const jobSub = jobSecondaryLabel(row);
             const targetWarning = targetReached
-              ? `<span class="queue-target-warning ${excessQty > 0 ? "excess" : ""}">${esc(excessQty > 0 ? `TARGET REACHED • EXCESS +${excessQty}` : "TARGET REACHED")}</span>`
+              ? `<span class="queue-target-warning ${excessQty > 0 ? "excess" : ""}">${esc(excessQty > 0 ? `TARGET REACHED ΓÇó EXCESS +${excessQty}` : "TARGET REACHED")}</span>`
               : "";
             return `
               <tr>
-                <td><div class="jq-machine-cell"><div class="jq-machine-icon">M</div><div><div class="jq-primary">${esc(machineName)} · ${esc(row?.machine_code || "-")}</div><div class="jq-secondary">Job ${esc(jobName)}</div><div class="jq-secondary">${esc(jobSub)}</div></div></div></td>
+                <td><div class="jq-machine-cell"><div class="jq-machine-icon">M</div><div><div class="jq-primary">${esc(machineName)} ┬╖ ${esc(row?.machine_code || "-")}</div><div class="jq-secondary">Job ${esc(jobName)}</div><div class="jq-secondary">${esc(jobSub)}</div></div></div></td>
                 <td><div class="jq-primary">${esc(startText)}</div></td>
-                <td><div class="jq-progress-head"><span>${esc(produced.toLocaleString())} / ${esc(target.toLocaleString())}</span><span>${esc(progressPct.toFixed(1))}%</span></div><div class="jq-progress-track"><span class="jq-progress-fill ${isDisconnected ? "offline" : ""}" style="width:${esc(progressPct.toFixed(2))}%"></span></div><div class="jq-secondary">Pack ${esc(row?.pack_count ?? 0)} &nbsp;·&nbsp; Cavity ${esc(cavity)}</div>${targetWarning}</td>
-                <td><span class="jq-inline-icon">◉</span><span class="jq-primary">${esc(remainingText)}</span></td>
-                <td><span class="jq-inline-icon">▣</span><span class="jq-primary">${esc(endText)}</span></td>
-                <td><span class="jq-inline-icon jq-cycle-icon">◷</span><span class="jq-primary">${esc(cycleText)}</span>${hourlyRate ? `<div class="jq-secondary">${esc(hourlyRate.toLocaleString())} / hr</div>` : '<div class="jq-secondary">-</div>'}</td>
+                <td><div class="jq-progress-head"><span>${esc(produced.toLocaleString())} / ${esc(target.toLocaleString())}</span><span>${esc(progressPct.toFixed(1))}%</span></div><div class="jq-progress-track"><span class="jq-progress-fill ${isDisconnected ? "offline" : ""}" style="width:${esc(progressPct.toFixed(2))}%"></span></div><div class="jq-secondary">Pack ${esc(row?.pack_count ?? 0)} &nbsp;┬╖&nbsp; Cavity ${esc(cavity)}</div>${targetWarning}</td>
+                <td><span class="jq-inline-icon">Γùë</span><span class="jq-primary">${esc(remainingText)}</span></td>
+                <td><span class="jq-inline-icon">Γûú</span><span class="jq-primary">${esc(endText)}</span></td>
+                <td><span class="jq-inline-icon jq-cycle-icon">Γù╖</span><span class="jq-primary">${esc(cycleText)}</span>${hourlyRate ? `<div class="jq-secondary">${esc(hourlyRate.toLocaleString())} / hr</div>` : '<div class="jq-secondary">-</div>'}</td>
               </tr>
             `;
           }).join("")}
@@ -14900,7 +15811,7 @@ DASHBOARD_HTML = """
   function kpiInitials(name, fallback){
     const raw = String(name || fallback || "").trim();
     if(!raw) return "--";
-    const parts = raw.split(/\\s+/).filter(Boolean);
+    const parts = raw.split(/\s+/).filter(Boolean);
     if(parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
     return `${parts[0][0] || ""}${parts[parts.length - 1][0] || ""}`.toUpperCase();
   }
@@ -15256,7 +16167,7 @@ DASHBOARD_HTML = """
   }
 
   function planningTonnageNumber(value){
-    const match = String(value || "").replace(/,/g, "").match(/\\d+(?:\\.\\d+)?/);
+    const match = String(value || "").replace(/,/g, "").match(/\d+(?:\.\d+)?/);
     const parsed = match ? Number(match[0]) : 0;
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
   }
@@ -15271,7 +16182,7 @@ DASHBOARD_HTML = """
     const abcClass = String(job.abc_class || "").trim().toUpperCase();
     const abcBadge = ["A", "B", "C"].includes(abcClass) ? `<span class="abc-class-badge class-${abcClass.toLowerCase()}" title="ABC class ${esc(abcClass)}">${esc(abcClass)}</span>` : "";
     const relationBadge = Number(job.related_child_count || 0) > 0
-      ? `<span class="product-relation-badge parent">PARENT · ${esc(job.related_child_count)}</span>`
+      ? `<span class="product-relation-badge parent">PARENT ┬╖ ${esc(job.related_child_count)}</span>`
       : (planningItemIsChild(job) ? '<span class="product-relation-badge child">CHILD</span>' : "");
     const product = [job.product_sku, job.product_name].filter(Boolean).join(" - ") || job.product_id || "-";
     const productLine = `<span class="planning-product-line"><span>Product:</span> <span class="planning-product-name">${esc(product)}</span></span>`;
@@ -15286,7 +16197,7 @@ DASHBOARD_HTML = """
       job.std_cycle_time ? `Cycle: ${job.std_cycle_time}` : "",
       job.request_qty ? `Qty: ${job.request_qty}` : "",
     ]).filter(Boolean).join("<br>");
-    const tonnageTitle = job.tonnage_source ? `Required machine tonnage · ${job.tonnage_source}` : "Required machine tonnage";
+    const tonnageTitle = job.tonnage_source ? `Required machine tonnage ┬╖ ${job.tonnage_source}` : "Required machine tonnage";
     return `<div class="planning-card${cardClass}" draggable="true" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><div class="planning-card-top-actions">${relationBadge}${abcBadge}${itemTonnage ? `<span class="planning-item-tonnage" title="${esc(tonnageTitle)}">${esc(itemTonnage)} T</span>` : ""}<span class="planning-chip ${esc(roleClass)}">${esc(roleLabel)}</span><button class="planning-remove" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}" title="Remove ${esc(title)}" aria-label="Remove ${esc(title)}">&times;</button></div></div><div class="planning-meta">${details || "No BMS details available."}</div></div>`;
   }
 
@@ -15305,7 +16216,7 @@ DASHBOARD_HTML = """
     const finishUtc = preferredQueueFinish(queueRow);
     const remaining = preferredQueueRemaining(queueRow);
     const finishText = finishUtc ? fmtDateLocal(finishUtc) : "Estimate unavailable";
-    const progressCaption = `${finishText}${remaining != null && Number(remaining) > 0 ? ` · ${fmtDowntimeSeconds(remaining)} left` : ""}`;
+    const progressCaption = `${finishText}${remaining != null && Number(remaining) > 0 ? ` ┬╖ ${fmtDowntimeSeconds(remaining)} left` : ""}`;
     const operator = displayNameForId(session?.operator_id || "-");
     return `
       <div class="planning-card live">
@@ -15365,7 +16276,7 @@ DASHBOARD_HTML = """
   }
 
   function planningItemIsChild(item){
-    if(/^WIP(?:\b|-)/i.test(String(item?.category_name || "").trim())) return true;
+    if(/^WIP(?:|-)/i.test(String(item?.category_name || "").trim())) return true;
     const relation = planningRelationParts(item);
     return relation.hasWMarker && relation.components.length > 0;
   }
@@ -15490,14 +16401,14 @@ DASHBOARD_HTML = """
         .join(" | ") || "No warehouse qty";
       const title = item.sku || item.product_id || "Product";
       const abcClass = String(item.abc_class || "").trim().toUpperCase();
-      const abcTitle = [`ABC class ${abcClass}`, item.serving_category ? `Category: ${item.serving_category}` : "", item.serving_rate !== "" && item.serving_rate != null ? `Serving rate: ${item.serving_rate}` : ""].filter(Boolean).join(" · ");
+      const abcTitle = [`ABC class ${abcClass}`, item.serving_category ? `Category: ${item.serving_category}` : "", item.serving_rate !== "" && item.serving_rate != null ? `Serving rate: ${item.serving_rate}` : ""].filter(Boolean).join(" ┬╖ ");
       const isChild = planningItemIsChild(item);
       const childCount = relatedChildren(item);
       const canExpand = !options.nested && childCount > 0;
       const accordionKey = canExpand ? familyAccordionKey(item) : "";
       const expanded = canExpand && planningExpandedProductFamilies.has(accordionKey);
       const relationBadge = childCount
-        ? `<span class="product-relation-badge parent">PARENT · ${childCount}</span>`
+        ? `<span class="product-relation-badge parent">PARENT ┬╖ ${childCount}</span>`
         : (isChild ? '<span class="product-relation-badge child">CHILD</span>' : "");
       return `
         <div class="stock-rec-card${canExpand ? " has-children" : ""}" draggable="true" data-product-key="${esc(itemDragKey(item, options.index))}"${canExpand ? ` data-family-toggle="${esc(accordionKey)}" aria-expanded="${expanded ? "true" : "false"}"` : ""}>
@@ -15802,7 +16713,7 @@ DASHBOARD_HTML = """
       renderPlanningOpsSummary(latestState || {}, latestState?.job_queue || []);
       const suffix = out.from_cache ? " from cache" : "";
       const counts = out.abc_counts || {};
-      const classSummary = `A ${Number(counts.A || 0)} · B ${Number(counts.B || 0)} · C ${Number(counts.C || 0)}`;
+      const classSummary = `A ${Number(counts.A || 0)} ┬╖ B ${Number(counts.B || 0)} ┬╖ C ${Number(counts.C || 0)}`;
       planningSetStatus(`Loaded ${(out.items || []).length} product item(s) with IMS stock; classifications: ${classSummary}${suffix}.`);
     } catch(e){
       renderLowStockRecommendations([], { error: `Product item lookup failed: ${e}` });
@@ -15956,7 +16867,7 @@ DASHBOARD_HTML = """
         const actionText = String(entry?.action || "MOVED").toUpperCase();
         const fromPosition = Number(entry?.from_position || 0);
         const toPosition = Number(entry?.to_position || 0);
-        const positionText = fromPosition && toPosition ? `${fromPosition} → ${toPosition}` : (toPosition ? `Position ${toPosition}` : (fromPosition ? `Was ${fromPosition}` : "-"));
+        const positionText = fromPosition && toPosition ? `${fromPosition} ΓåÆ ${toPosition}` : (toPosition ? `Position ${toPosition}` : (fromPosition ? `Was ${fromPosition}` : "-"));
         return `<tr>
           <td><span class="planning-activity-item">${esc(fmtDateLocal(entry?.timestamp_utc))}</span><div class="planning-activity-sub">${esc(entry?.source_ip || "Server")}</div></td>
           <td><span class="planning-action-chip ${esc(actionText.toLowerCase())}">${esc(actionText)}</span></td>
@@ -16058,9 +16969,9 @@ DASHBOARD_HTML = """
       const finish = preferredQueueFinish(queueRow);
       const reason = firstValue(session?.downtime_reason_text, session?.downtime_reason_code, "");
       const more = cards.length > 2 ? `+${cards.length - 2} more queued` : "";
-      const remarks = [reason, more].filter(Boolean).join(" · ") || "-";
+      const remarks = [reason, more].filter(Boolean).join(" ┬╖ ") || "-";
       return `<tr>
-        <td class="plan-overview-machine">${esc((MACHINE_NAME_MAP[code] || code).replace(/^IMM\\s*/i,""))}<small>${esc(tonnageMap[code] || "-")}</small></td>
+        <td class="plan-overview-machine">${esc((MACHINE_NAME_MAP[code] || code).replace(/^IMM\s*/i,""))}<small>${esc(tonnageMap[code] || "-")}</small></td>
         <td>${currentHtml}</td>
         <td class="plan-overview-center">${session?.operator_id ? "1" : "-"}</td>
         <td class="plan-overview-center"><span class="plan-overview-status ${esc(status.css)}">${esc(status.label)}</span></td>
@@ -16237,7 +17148,9 @@ DASHBOARD_HTML = """
     const jobLabel = String(card.job_ref || card.job_name || card.job_id || card.product_sku || "This item").trim();
     const machineLabel = MACHINE_NAME_MAP[targetLane] || targetLane;
     return window.confirm(
-      `${jobLabel} requires ${requiredText} tons, but ${machineLabel} is ${machineText}.\n\n` +
+      `${jobLabel} requires ${requiredText} tons, but ${machineLabel} is ${machineText}.
+
+` +
       `The item may not fit this machine. Place it here anyway?`
     );
   }
@@ -16533,7 +17446,7 @@ DASHBOARD_HTML = """
     if(overlayRawConsumption) overlayRawConsumption.value = shiftPanels
       ? shiftPanels.rawConsumption
       : (rawLogs.length
-        ? rawLogs.map((x, i) => `${i + 1}. ${(x?.material || x?.code || x?.value || "-")} | qty=${x?.qty ?? 0}`).join("\\n")
+        ? rawLogs.map((x, i) => `${i + 1}. ${(x?.material || x?.code || x?.value || "-")} | qty=${x?.qty ?? 0}`).join("\n")
         : "No raw material consumption records.");
     if(overlayRawConsumptionDisplay) overlayRawConsumptionDisplay.innerHTML = approvedShiftView
       ? shiftProductConsumptionComparisonHtml(activeJobRow)
@@ -16545,7 +17458,7 @@ DASHBOARD_HTML = """
         `Raw Materials / Sacks Count: ${activeJobRow?.raw_sacks_count ?? 0}`,
         `Cycle Count (Pack): ${activeJobRow?.pack_count ?? 0}`,
         `Cycle Time: ${activeJobRow?.cycle_time_current || "-"}`,
-      ].join("\\n");
+      ].join("\n");
     if(overlayRawCycleSummaryDisplay) overlayRawCycleSummaryDisplay.innerHTML = shiftPanels
       ? renderShiftGroupedPanelHtml(shiftPanels.rawCycle, "No raw/cycle data.")
       : renderBulletListHtml(overlayRawCycleSummary?.value || "");
@@ -16554,7 +17467,7 @@ DASHBOARD_HTML = """
       : [
         `Reason: ${activeJobRow?.downtime_reason_code || "-"} ${activeJobRow?.downtime_reason_text || ""}`.trim(),
         `Downtime: ${fmtDowntimeSeconds(activeJobRow?.downtime_last_seconds)}`,
-      ].join("\\n");
+      ].join("\n");
     if(overlayDowntimeSummaryDisplay) overlayDowntimeSummaryDisplay.innerHTML = shiftPanels
       ? renderShiftGroupedPanelHtml(shiftPanels.downtime, "No downtime data.")
       : renderBulletListHtml(overlayDowntimeSummary?.value || "");
@@ -16566,7 +17479,7 @@ DASHBOARD_HTML = """
         `QC: ${qcFromFinishedJob(activeJobRow)}`,
         `Start Up Reject: ${activeJobRow?.startup_reject_total ?? 0}`,
         `No Shot: ${activeJobRow?.no_shot_total ?? 0}`,
-      ].join("\\n");
+      ].join("\n");
     if(overlayPeopleSummaryDisplay) overlayPeopleSummaryDisplay.innerHTML = shiftPanels
       ? renderShiftGroupedPanelHtml(shiftPanels.people, "No team data.")
       : renderBulletListHtml(overlayPeopleSummary?.value || "");
@@ -16684,10 +17597,13 @@ DASHBOARD_HTML = """
     const css = statusClass(s.last_seen_utc, activeTtlSeconds, manualStatus, s) || "inactive";
     const statusLabel = manualStatus || css.toUpperCase();
     const hasStatusAlert = Boolean(manualStatus);
+    const alertMeta = machineCardAlertMeta(s, code, css);
     const baseClassName = `card ${css}${hasStatusAlert ? " status-alert" : ""}`;
-    const nextClassName = `${baseClassName}${flipLinkage ? " linkage-flip" : ""}`;
+    const alertClassName = alertMeta.className ? ` ${alertMeta.className}` : "";
+    const nextClassName = `${baseClassName}${alertClassName}${flipLinkage ? " linkage-flip" : ""}`;
     const nextHtml = machineCardHtml(s, code, css, statusLabel, flipLinkage);
-    card.className = baseClassName;
+    card.className = `${baseClassName}${alertClassName}`;
+    applyMachineCardAlertStyle(card, code, alertMeta);
     card.innerHTML = nextHtml;
     if(flipLinkage){
       void card.offsetWidth;
@@ -16820,7 +17736,7 @@ DASHBOARD_HTML = """
   }
 
   function isNoScheduleStatus(value){
-    return String(value || "").trim().replace(/[_-]+/g, " ").replace(/\\s+/g, " ").toUpperCase() === "NO SCHEDULE";
+    return String(value || "").trim().replace(/[_-]+/g, " ").replace(/\s+/g, " ").toUpperCase() === "NO SCHEDULE";
   }
 
   function stopMachineNoScheduleAnimation(code){
@@ -16973,7 +17889,7 @@ DASHBOARD_HTML = """
 
   function positiveDashboardNumber(value){
     if(value === null || value === undefined || value === "") return 0;
-    const match = String(value).replace(/,/g, "").match(/-?\\d+(?:\\.\\d+)?/);
+    const match = String(value).replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
     const parsed = match ? Number(match[0]) : 0;
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
   }
@@ -16982,9 +17898,9 @@ DASHBOARD_HTML = """
     const machineCode = String(code || session?.machine_code || "").trim();
     const sessionKey = String(session?.production_session_id || session?.job_code || "").trim();
     const description = String(session?.last_event || "");
-    const eventQtyMatch = description.match(/\\bQTY\\s*[:=]?\\s*(\\d+(?:\\.\\d+)?)/i);
+    const eventQtyMatch = description.match(/\bQTY\s*[:=]?\s*(\d+(?:\.\d+)?)/i);
     const eventQty = eventQtyMatch ? positiveDashboardNumber(eventQtyMatch[1]) : 0;
-    if(/^PACK\\s+SCANNED\\b/i.test(description.trim()) && eventQty > 0){
+    if(/^PACK\s+SCANNED\b/i.test(description.trim()) && eventQty > 0){
       machinePackQtyBySession.set(machineCode, { sessionKey, qty:eventQty });
       return eventQty;
     }
@@ -17035,6 +17951,617 @@ DASHBOARD_HTML = """
     ];
     if(transportPrefixes.some(prefix => upper === prefix || upper.startsWith(`${prefix} `))) return "";
     return text;
+  }
+
+  function machineCardAlertMeta(s, code, css){
+    const session = (s && typeof s === "object") ? s : {};
+    if(css === "inactive") return {className:"", pills:[], speed:0, duration:0, primaryKind:"", supervisorMissing:false, supervisorDueAt:"", supervisorReason:""};
+    const shortageCount = Math.max(0, Number(session.product_part_shortage_count || 0));
+    const shortageNames = Array.isArray(session.product_part_shortage_names)
+      ? session.product_part_shortage_names.map(value => String(value || "").trim()).filter(Boolean)
+      : [];
+    const jobStartedMs = Date.parse(String(session.job_started_at || ""));
+    const lastSupervisorMs = Date.parse(String(session.last_supervisor_check_at_utc || ""));
+    const hasRunningJob = Boolean(String(session.job_code || session.job_name || "").trim() && String(session.operator_id || "").trim());
+    const now = new Date();
+    const scheduledChecks = [11, 15]
+      .map(hour => {
+        const checkpoint = new Date(now);
+        checkpoint.setHours(hour, 0, 0, 0);
+        return checkpoint.getTime();
+      })
+      .filter(checkpointMs => checkpointMs <= now.getTime());
+    const latestScheduledCheckMs = scheduledChecks.length ? Math.max(...scheduledChecks) : NaN;
+    const missedScheduledCheck = Boolean(
+      hasRunningJob
+      && Number.isFinite(latestScheduledCheckMs)
+      && (!Number.isFinite(jobStartedMs) || jobStartedMs <= latestScheduledCheckMs)
+      && (!Number.isFinite(lastSupervisorMs) || lastSupervisorMs < latestScheduledCheckMs)
+    );
+    const supervisorMissing = Boolean(
+      session.waiting_supervisor_qr
+      || session.supervisor_review_open
+      || missedScheduledCheck
+      || (hasRunningJob && (!Number.isFinite(lastSupervisorMs) || (Number.isFinite(jobStartedMs) && lastSupervisorMs < jobStartedMs)))
+    );
+    const reviewOpenedMs = Date.parse(String(
+      session.current_supervisor_review?.opened_at_utc
+      || session.supervisor_downtime_confirmation_started_at
+      || ""
+    ));
+    const supervisorDueMs = Number.isFinite(reviewOpenedMs)
+      ? reviewOpenedMs
+      : missedScheduledCheck
+        ? latestScheduledCheckMs
+        : jobStartedMs;
+    const supervisorReason = session.waiting_supervisor_qr
+      ? "Supervisor QR is required."
+      : session.supervisor_review_open
+        ? "Supervisor review is still open."
+        : missedScheduledCheck
+          ? "Scheduled supervisor check is overdue."
+          : "This job has not been checked by a supervisor.";
+    const manualStatus = String(machineStatusOverrideFor(code)?.status || "").trim();
+    const maintenanceActive = Boolean(
+      isMaintenanceSession(session)
+      || /maintenance|repair/i.test(manualStatus)
+    );
+    const statusActive = Boolean(manualStatus || maintenanceActive || css === "maintenance");
+    const primaryKind = statusActive
+      ? "status"
+      : shortageCount > 0
+        ? "parts"
+        : supervisorMissing
+          ? "supervisor"
+          : "";
+    const className = primaryKind ? `machine-alert-${primaryKind}` : "";
+    const pills = [];
+    const speed = shortageCount > 0
+      ? Math.max(.24, .92 - Math.min(shortageCount, 6) * .11)
+      : 0;
+    if(shortageCount > 0){
+      pills.push({
+        kind:"parts",
+        prominence:primaryKind === "parts" ? "primary" : "secondary",
+        label:`${shortageCount} PART${shortageCount === 1 ? "" : "S"} SHORT`,
+        title:`Product-part shortage: ${shortageNames.join(", ") || shortageCount}`,
+      });
+    }
+    if(supervisorMissing){
+      pills.push({
+        kind:"supervisor",
+        prominence:primaryKind === "supervisor" ? "primary" : "secondary",
+        label:"SUPERVISOR CHECK",
+        title:session.waiting_supervisor_qr
+          ? "Supervisor QR is required to continue."
+          : missedScheduledCheck
+            ? "This machine has not completed the latest scheduled supervisor check."
+            : "This machine has not completed a supervisor check for the current job.",
+      });
+    }
+    const duration = primaryKind === "status"
+      ? 7
+      : primaryKind === "parts"
+        ? speed
+        : primaryKind === "supervisor"
+          ? 1.7
+          : 0;
+    return {
+      className, pills, speed, duration, primaryKind,
+      supervisorMissing,
+      supervisorDueAt:Number.isFinite(supervisorDueMs) ? new Date(supervisorDueMs).toISOString() : "",
+      supervisorReason,
+    };
+  }
+
+  function machineAlertPhaseDelay(code, alertMeta){
+    const duration = Math.max(0, Number(alertMeta?.duration || 0));
+    const primaryKind = String(alertMeta?.primaryKind || "");
+    if(!primaryKind || duration <= 0) return 0;
+    const seed = `${String(code || "")}|${primaryKind}`;
+    let hash = 2166136261;
+    for(let index = 0; index < seed.length; index += 1){
+      hash ^= seed.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    const phaseRatio = ((hash >>> 0) % 997) / 997;
+    return -(phaseRatio * duration);
+  }
+
+  function applyMachineCardAlertStyle(card, code, alertMeta){
+    if(!card) return;
+    if(alertMeta?.speed) card.style.setProperty("--part-alert-speed", `${Number(alertMeta.speed).toFixed(2)}s`);
+    else card.style.removeProperty("--part-alert-speed");
+    if(alertMeta?.primaryKind){
+      const phaseDelay = machineAlertPhaseDelay(code, alertMeta);
+      card.style.setProperty("--machine-alert-delay", `${phaseDelay.toFixed(3)}s`);
+      card.dataset.machineAlertKind = String(alertMeta.primaryKind);
+    } else {
+      card.style.removeProperty("--machine-alert-delay");
+      delete card.dataset.machineAlertKind;
+    }
+  }
+
+  function machineTodoSortValue(value){
+    const parsed = Date.parse(String(value || ""));
+    return Number.isFinite(parsed) ? parsed : Number.MAX_SAFE_INTEGER;
+  }
+
+  function machineTodoNeededLabel(value){
+    const parsed = Date.parse(String(value || ""));
+    if(!Number.isFinite(parsed)) return "Needed time unavailable";
+    const date = new Date(parsed);
+    const formatted = date.toLocaleString(undefined, {
+      month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hour12:false,
+    });
+    return `Needed ${formatted}`;
+  }
+
+  function machineTodoWaitingSeconds(value){
+    const parsed = Date.parse(String(value || ""));
+    return Number.isFinite(parsed) ? Math.max(0, Math.floor((Date.now() - parsed) / 1000)) : 0;
+  }
+
+  function machineTodoCompactDuration(seconds){
+    const totalMinutes = Math.max(0, Math.floor(Number(seconds || 0) / 60));
+    const days = Math.floor(totalMinutes / 1440);
+    const hours = Math.floor((totalMinutes % 1440) / 60);
+    const minutes = totalMinutes % 60;
+    if(days > 0) return `${days}d ${hours}h`;
+    if(hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+  }
+
+  function machineTodoUrgency(item){
+    const seconds = machineTodoWaitingSeconds(item?.neededAt);
+    const duration = machineTodoCompactDuration(seconds);
+    if(seconds >= 86400) return {kind:"urgent", label:`Urgent ┬╖ ${duration}`};
+    if(seconds >= 3600) return {kind:"late", label:`Late ┬╖ ${duration}`};
+    return {kind:"on-time", label:`On time ┬╖ ${duration}`};
+  }
+
+  function buildMachineTodoLists(state){
+    const dashboardState = (state && typeof state === "object") ? state : {};
+    const sessions = Array.isArray(dashboardState.sessions) ? dashboardState.sessions : [];
+    const activeTtlSeconds = Number(dashboardState.active_ttl_seconds || 30);
+    const lists = {qc:[], supervisor:[], loader:[]};
+    sessions.forEach(session => {
+      if(!session || typeof session !== "object") return;
+      const code = String(session.machine_code || "").trim();
+      const machine = String(session.machine_name || MACHINE_NAME_MAP[code] || code || "Machine").trim();
+      const job = firstValue(session.job_name, session.job_code, "No Job");
+      const manualStatus = String(machineStatusOverrideFor(code)?.status || "").trim();
+      const css = statusClass(session.last_seen_utc, activeTtlSeconds, manualStatus, session) || "inactive";
+      const hasJob = Boolean(String(session.job_code || session.job_name || "").trim());
+      if(!hasJob || css === "inactive") return;
+
+      const rawParts = allJobPartRows(session).filter(isRawMaterialPart);
+      const hasActualWeight = Number(session.external_average_weight_grams || 0) > 0;
+      if(rawParts.length && !hasActualWeight){
+        const partNames = rawParts
+          .map(part => firstValue(part.sku, part.name, part.part_name, "Raw material"))
+          .filter(Boolean);
+        const runningProduct = firstValue(session.product_sku, session.product_name, "the running product");
+        lists.qc.push({
+          code, machine, job,
+          neededAt:String(session.job_started_at || ""),
+          message:`Weigh ${runningProduct}`,
+          description:"Standard rate is used until QC sends the actual weight.",
+          material:partNames.length ? partNames.join(", ") : "",
+        });
+      }
+
+      const alertMeta = machineCardAlertMeta(session, code, css);
+      if(alertMeta.supervisorMissing){
+        lists.supervisor.push({
+          code, machine, job,
+          neededAt:alertMeta.supervisorDueAt || String(session.job_started_at || ""),
+          message:alertMeta.supervisorReason || "Supervisor check is needed.",
+          description:"",
+          material:"",
+        });
+      }
+
+      const shortageDetails = Array.isArray(session.product_part_shortage_details)
+        ? session.product_part_shortage_details
+        : [];
+      if(shortageDetails.length){
+        shortageDetails.forEach(detail => {
+          const sku = String(firstValue(detail?.sku, "")).trim();
+          const name = String(firstValue(detail?.name, detail?.sku, "required material")).trim();
+          lists.loader.push({
+            code, machine, job,
+            neededAt:String(detail?.needed_since_utc || session.product_part_shortage_since_utc || session.job_started_at || ""),
+            message:`Load ${name}`,
+            description:"",
+            material:sku,
+          });
+        });
+      } else {
+        const shortageNames = Array.isArray(session.product_part_shortage_names) ? session.product_part_shortage_names : [];
+        shortageNames.forEach(name => lists.loader.push({
+          code, machine, job,
+          neededAt:String(session.product_part_shortage_since_utc || session.job_started_at || ""),
+          message:`Load ${String(name || "required material")}`,
+          description:"",
+          material:String(name || ""),
+        }));
+      }
+    });
+    Object.values(lists).forEach(items => items.sort((a,b) => (
+      machineTodoSortValue(a.neededAt) - machineTodoSortValue(b.neededAt)
+      || String(a.machine).localeCompare(String(b.machine))
+    )));
+    return lists;
+  }
+
+  function machineTodoSectionHtml(kind, title, role, items){
+    const actionLabel = kind === "qc" ? "Mark weighed" : kind === "supervisor" ? "Mark checked" : "Mark loaded";
+    const body = items.length ? items.map(item => {
+      const urgency = machineTodoUrgency(item);
+      return `
+        <article class="machine-todo-item" role="button" tabindex="0" data-todo-machine="${escAttr(item.code)}" aria-label="Open ${escAttr(item.machine)} details">
+          <span class="machine-todo-item-top">
+            <span class="machine-todo-machine">${esc(item.machine)}</span>
+            <span class="machine-todo-status ${escAttr(urgency.kind)}">${esc(urgency.label)}</span>
+          </span>
+          <span class="machine-todo-message">${esc(item.message)}</span>
+          ${item.description ? `<span class="machine-todo-description">${esc(item.description)}</span>` : ""}
+          ${item.material ? `<span class="machine-todo-material">Material: ${esc(item.material)}</span>` : ""}
+          <span class="machine-todo-time">${esc(machineTodoNeededLabel(item.neededAt))}</span>
+          <span class="machine-todo-footer">
+            <span class="machine-todo-job">${esc(item.job)}</span>
+            <button class="machine-todo-action" type="button" data-todo-machine="${escAttr(item.code)}" title="Open machine details">${esc(actionLabel)}</button>
+          </span>
+        </article>
+      `;
+    }).join("") : '<div class="machine-todo-empty">Nothing waiting right now.</div>';
+    return `
+      <section class="machine-todo-section ${esc(kind)}">
+        <div class="machine-todo-section-head">
+          <div><div class="title">${esc(title)}</div><div class="role">${esc(role)}</div></div>
+          <span class="badge">${items.length}</span>
+        </div>
+        <div class="machine-todo-list">${body}</div>
+      </section>
+    `;
+  }
+
+  function filteredMachineTodoLists(lists){
+    const query = machineTodoQuery.trim().toLowerCase();
+    const filtered = {qc:[], supervisor:[], loader:[]};
+    Object.keys(filtered).forEach(kind => {
+      filtered[kind] = (lists[kind] || []).filter(item => {
+        if(machineTodoWaitingOverHour && machineTodoWaitingSeconds(item.neededAt) < 3600) return false;
+        if(!query) return true;
+        return [item.machine,item.code,item.job,item.message,item.description,item.material]
+          .some(value => String(value || "").toLowerCase().includes(query));
+      });
+    });
+    return filtered;
+  }
+
+  function machineTodoSummaryItemHtml(label, items){
+    const overDay = items.filter(item => machineTodoWaitingSeconds(item.neededAt) >= 86400).length;
+    const note = overDay > 0 ? `${overDay} waiting over a day` : "";
+    return `<div class="machine-todo-summary-item">
+      <span class="copy"><span class="label">${esc(label)}</span><span class="note">${esc(note)}</span></span>
+      <span class="count">${items.length}</span>
+    </div>`;
+  }
+
+  function renderMachineTodo(state){
+    const allLists = buildMachineTodoLists(state);
+    const total = allLists.qc.length + allLists.supervisor.length + allLists.loader.length;
+    if(machineTodoCount){
+      machineTodoCount.textContent = total > 99 ? "99+" : String(total);
+      machineTodoCount.hidden = total <= 0;
+    }
+    if(!machineTodoOverlay?.classList.contains("active")) return;
+    const lists = filteredMachineTodoLists(allLists);
+    if(machineTodoUpdated) machineTodoUpdated.textContent = `Longest waiting first ┬╖ Updated ${new Date().toLocaleTimeString([], {hour12:false})}`;
+    if(machineTodoSummary) machineTodoSummary.innerHTML = `
+      ${machineTodoSummaryItemHtml("Machines without weight", lists.qc)}
+      ${machineTodoSummaryItemHtml("Checks still needed", lists.supervisor)}
+      ${machineTodoSummaryItemHtml("Short materials", lists.loader)}
+    `;
+    if(machineTodoColumns) machineTodoColumns.innerHTML = [
+      machineTodoSectionHtml("qc", "Machines Without Weight", "QC", lists.qc),
+      machineTodoSectionHtml("supervisor", "Checks Still Needed", "Supervisor", lists.supervisor),
+      machineTodoSectionHtml("loader", "Short Materials", "Material Loader", lists.loader),
+    ].join("");
+  }
+
+  function syncMachineTodoControls(){
+    if(machineTodoWaitFilter){
+      machineTodoWaitFilter.classList.toggle("active", machineTodoWaitingOverHour);
+      machineTodoWaitFilter.setAttribute("aria-pressed", machineTodoWaitingOverHour ? "true" : "false");
+    }
+  }
+
+  function setMachineTodoOpen(open){
+    const shouldOpen = Boolean(open);
+    machineTodoOverlay?.classList.toggle("active", shouldOpen);
+    machineTodoBtn?.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+    if(shouldOpen){
+      syncMachineTodoControls();
+      renderMachineTodo(latestState);
+      machineTodoSearch?.focus();
+    }
+  }
+
+  function recentMachinePartials(code){
+    const grouped = (latestState?.recent_partial_shifts_by_machine && typeof latestState.recent_partial_shifts_by_machine === "object")
+      ? latestState.recent_partial_shifts_by_machine
+      : {};
+    const rows = grouped[String(code || "").trim()] || [];
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  function machinePartialFlags(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const flags = [];
+    const reviewStatus = String(item.review_status || "PENDING").trim().toUpperCase();
+    const rejects = Math.max(0, Number(item.reject_total || 0));
+    const noShots = Math.max(0, Number(item.no_shot_total || 0));
+    const counterDiff = Number(item.machine_counter_difference || 0);
+    const downtime = Math.max(0, Number(item.downtime_last_seconds || 0));
+    if(reviewStatus !== "APPROVED") flags.push({label:"Needs review", level:"warning"});
+    if(rejects > 0) flags.push({label:`${rejects} reject`, level:"issue"});
+    if(noShots > 0) flags.push({label:`${noShots} no shot`, level:"issue"});
+    if(Number.isFinite(counterDiff) && Math.abs(counterDiff) > 0) flags.push({label:`Counter diff ${counterDiff}`, level:"issue"});
+    if(downtime > 0) flags.push({label:`Downtime ${fmtDowntimeSeconds(downtime)}`, level:"warning"});
+    if(!flags.length) flags.push({label:"Looks okay", level:"ok"});
+    return flags;
+  }
+
+  function machineSupervisorActivityRows(session){
+    const source = session && typeof session === "object" ? session : {};
+    const rotationRows = (Array.isArray(source.supervisor_rotation_logs) ? source.supervisor_rotation_logs : [])
+      .filter(row => row && typeof row === "object")
+      .map(row => ({
+        kind: "rotation",
+        title: "Rotation check",
+        person: firstValue(row.supervisor_name, row.supervisor_code, "Supervisor"),
+        role: firstValue(row.supervisor_role, "SUPERVISOR"),
+        status: "Checked",
+        at: firstValue(row.checked_at_utc, row.created_at_utc, ""),
+        duration: "",
+      }));
+    const reviewRows = (Array.isArray(source.supervisor_review_logs) ? source.supervisor_review_logs : [])
+      .filter(row => row && typeof row === "object")
+      .map(row => ({
+        kind: "review",
+        title: "Supervisor review",
+        person: firstValue(row.actor_name, row.actor_code, "Supervisor"),
+        role: firstValue(row.actor_role, "SUPERVISOR"),
+        status: firstValue(row.action, row.status, "Reviewed"),
+        at: firstValue(row.closed_at_utc, row.last_updated_at_utc, row.opened_at_utc, ""),
+        duration: row.duration_seconds == null ? "" : fmtDowntimeSeconds(row.duration_seconds),
+      }));
+    return rotationRows.concat(reviewRows).sort((a, b) => {
+      const aTime = Date.parse(String(a.at || ""));
+      const bTime = Date.parse(String(b.at || ""));
+      return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+    });
+  }
+
+  function positionMachineDetailSupervisorMenu(){
+    if(!machineDetailSupervisorBtn || !machineDetailSupervisorMenu || machineDetailSupervisorMenu.hidden) return;
+    const rect = machineDetailSupervisorBtn.getBoundingClientRect();
+    const menuWidth = Math.min(460, Math.max(290, window.innerWidth - 24));
+    const left = Math.max(12, Math.min(window.innerWidth - menuWidth - 12, rect.right - menuWidth));
+    machineDetailSupervisorMenu.style.width = `${menuWidth}px`;
+    machineDetailSupervisorMenu.style.left = `${left}px`;
+    machineDetailSupervisorMenu.style.top = `${Math.min(window.innerHeight - 70, rect.bottom + 7)}px`;
+  }
+
+  function setMachineDetailSupervisorMenuOpen(open){
+    if(!machineDetailSupervisorBtn || !machineDetailSupervisorMenu) return;
+    const shouldOpen = Boolean(open && !machineDetailSupervisorBtn.hidden && machineDetailSupervisorMenu.children.length);
+    machineDetailSupervisorMenu.hidden = !shouldOpen;
+    machineDetailSupervisorBtn.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+    if(shouldOpen) requestAnimationFrame(positionMachineDetailSupervisorMenu);
+  }
+
+  function renderMachineDetailSupervisorMenu(session){
+    if(!machineDetailSupervisorMenu) return;
+    const source = session && typeof session === "object" ? session : {};
+    const rotations = (Array.isArray(source.supervisor_rotation_logs) ? source.supervisor_rotation_logs : [])
+      .filter(row => row && typeof row === "object");
+    const reviews = (Array.isArray(source.supervisor_review_logs) ? source.supervisor_review_logs : [])
+      .filter(row => row && typeof row === "object");
+    const rows = machineSupervisorActivityRows(source);
+    const rotationCount = Math.max(rotations.length, Number(source.supervisor_rotation_count || 0));
+    const latest = rows[0] || null;
+    const timeline = rows.length ? rows.map(row => {
+      const detail = [row.role, row.status, row.duration ? `Duration ${row.duration}` : ""].filter(Boolean).join(" ┬╖ ");
+      return `<div class="supervisor-activity-row ${row.kind === "review" ? "review" : "rotation"}">
+        <span class="supervisor-activity-row-dot" aria-hidden="true"></span>
+        <div class="supervisor-activity-row-main">
+          <div class="supervisor-activity-row-title">${esc(row.title)} ┬╖ ${esc(row.person)}</div>
+          <div class="supervisor-activity-row-meta">${esc(detail)}</div>
+        </div>
+        <div class="supervisor-activity-row-time">${esc(fmtDateLocal(row.at))}</div>
+      </div>`;
+    }).join("") : `<div class="supervisor-activity-empty">No supervisor activity recorded for this job yet.</div>`;
+    machineDetailSupervisorMenu.innerHTML = `
+      <div class="supervisor-activity-summary">
+        <div class="supervisor-activity-stat"><div class="k">Rotation checks</div><div class="v">${esc(rotationCount)}</div></div>
+        <div class="supervisor-activity-stat"><div class="k">Reviews</div><div class="v">${esc(reviews.length)}</div></div>
+        <div class="supervisor-activity-stat"><div class="k">Last check</div><div class="v">${esc(latest ? latest.person : "-")}</div></div>
+      </div>
+      <div class="supervisor-activity-log">${timeline}</div>
+    `;
+  }
+
+  function syncMachineDetailSupervisorActivity(session){
+    if(!machineDetailSupervisorBtn) return;
+    const source = session && typeof session === "object" ? session : {};
+    const rotations = (Array.isArray(source.supervisor_rotation_logs) ? source.supervisor_rotation_logs : [])
+      .filter(row => row && typeof row === "object");
+    const reviews = (Array.isArray(source.supervisor_review_logs) ? source.supervisor_review_logs : [])
+      .filter(row => row && typeof row === "object");
+    const rotationCount = Math.max(rotations.length, Number(source.supervisor_rotation_count || 0));
+    const total = rotationCount + reviews.length;
+    setMachineDetailSupervisorMenuOpen(false);
+    machineDetailSupervisorBtn.hidden = false;
+    machineDetailSupervisorBtn.innerHTML = `<span class="supervisor-check-dot" aria-hidden="true"></span><span>Supervisor ${esc(total)}</span><span class="supervisor-caret" aria-hidden="true">&#9662;</span>`;
+    machineDetailSupervisorBtn.title = `${rotationCount} rotation check${rotationCount === 1 ? "" : "s"} ┬╖ ${reviews.length} review${reviews.length === 1 ? "" : "s"}`;
+    renderMachineDetailSupervisorMenu(source);
+  }
+
+  function positionMachineDetailFinishShiftsMenu(){
+    if(!machineDetailFinishShiftsBtn || !machineDetailFinishShiftsMenu || machineDetailFinishShiftsMenu.hidden) return;
+    const rect = machineDetailFinishShiftsBtn.getBoundingClientRect();
+    const menuWidth = Math.min(390, Math.max(260, window.innerWidth - 24));
+    const left = Math.max(12, Math.min(window.innerWidth - menuWidth - 12, rect.right - menuWidth));
+    machineDetailFinishShiftsMenu.style.width = `${menuWidth}px`;
+    machineDetailFinishShiftsMenu.style.left = `${left}px`;
+    machineDetailFinishShiftsMenu.style.top = `${Math.min(window.innerHeight - 70, rect.bottom + 7)}px`;
+  }
+
+  function setMachineDetailFinishShiftsMenuOpen(open){
+    if(!machineDetailFinishShiftsBtn || !machineDetailFinishShiftsMenu) return;
+    const shouldOpen = Boolean(open && !machineDetailFinishShiftsBtn.hidden && machineDetailFinishShiftsMenu.children.length);
+    machineDetailFinishShiftsMenu.hidden = !shouldOpen;
+    machineDetailFinishShiftsBtn.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+    if(shouldOpen) requestAnimationFrame(positionMachineDetailFinishShiftsMenu);
+  }
+
+  function renderMachineDetailFinishShiftsMenu(code){
+    if(!machineDetailFinishShiftsMenu) return;
+    const rows = recentMachinePartials(code);
+    machineDetailFinishShiftsMenu.innerHTML = rows.map((row, index) => {
+      const jobKey = firstValue(row.job_key, jobKeyOf(row), "");
+      const endedAt = row.finished_at_utc || row.ended_at_utc || "";
+      const operator = firstValue(row.operator_name, displayNameForId(row.operator_id || "-"), "-");
+      const reviewStatus = String(row.review_status || "PENDING").trim().toUpperCase();
+      const statusClass = reviewStatus === "APPROVED" ? "" : "pending";
+      const shiftLabel = row.shift_index !== undefined && row.shift_index !== null
+        ? `Shift ${row.shift_index}`
+        : `Saved shift ${index + 1}`;
+      const totalGood = row.total_good ?? row.partial_qty ?? row.good_total ?? 0;
+      return `<button class="machine-finish-shift-option" type="button" role="menuitem" data-machine-code="${escAttr(code)}" data-finish-shift-key="${escAttr(jobKey)}">
+        <span class="shift-main">${esc(shiftLabel)} ┬╖ ${esc(fmtDateLocal(endedAt))}</span>
+        <span class="shift-status ${escAttr(statusClass)}">${esc(reviewStatus)}</span>
+        <span class="shift-meta">${esc(operator)} ┬╖ Good ${esc(totalGood)} ┬╖ Packs ${esc(row.pack_count ?? 0)}</span>
+      </button>`;
+    }).join("");
+  }
+
+  function syncMachineDetailFinishShifts(code){
+    if(!machineDetailFinishShiftsBtn) return;
+    const wanted = String(code || "").trim();
+    const rows = wanted ? recentMachinePartials(wanted) : [];
+    if(!rows.length){
+      setMachineDetailFinishShiftsMenuOpen(false);
+      machineDetailFinishShiftsBtn.hidden = true;
+      machineDetailFinishShiftsBtn.classList.remove("attention");
+      machineDetailFinishShiftsBtn.removeAttribute("data-machine-partials");
+      machineDetailFinishShiftsBtn.removeAttribute("data-partial-job-key");
+      if(machineDetailFinishShiftsMenu) machineDetailFinishShiftsMenu.innerHTML = "";
+      return;
+    }
+    const needsCheck = rows.some(row => machinePartialFlags(row).some(flag => flag.level !== "ok"));
+    setMachineDetailFinishShiftsMenuOpen(false);
+    machineDetailFinishShiftsBtn.hidden = false;
+    machineDetailFinishShiftsBtn.classList.toggle("attention", needsCheck);
+    machineDetailFinishShiftsBtn.setAttribute("data-machine-partials", wanted);
+    machineDetailFinishShiftsBtn.removeAttribute("data-partial-job-key");
+    machineDetailFinishShiftsBtn.innerHTML = `<span class="partial-clock" aria-hidden="true">&#9687;</span><span>Finish shifts ${esc(rows.length)}</span><span class="finish-shifts-caret" aria-hidden="true">&#9662;</span>`;
+    renderMachineDetailFinishShiftsMenu(wanted);
+  }
+
+  async function openMachineLatestPartialReview(code, sourceButton, selectedJobKey = ""){
+    const rows = recentMachinePartials(code);
+    const latest = rows[0] || {};
+    const jobKey = firstValue(
+      selectedJobKey,
+      sourceButton?.getAttribute?.("data-finish-shift-key"),
+      sourceButton?.getAttribute?.("data-partial-job-key"),
+      latest.job_key,
+      jobKeyOf(latest),
+      ""
+    );
+    if(!jobKey){
+      alert("No saved Finish Shift record was found for this current job.");
+      return;
+    }
+    const originalHtml = sourceButton?.innerHTML || "";
+    try {
+      if(sourceButton){
+        sourceButton.disabled = true;
+        sourceButton.setAttribute("aria-busy", "true");
+        sourceButton.textContent = "Loading...";
+      }
+      const response = await fetch(`/api/finished-jobs/detail?job_key=${encodeURIComponent(jobKey)}`, {cache:"no-store"});
+      const body = await response.json();
+      if(!response.ok || !body?.ok || !body.item) throw new Error(body?.error || `HTTP ${response.status}`);
+      if(machineDetailOverlay?.classList.contains("active")) closeMachineDetail();
+      const finishTabButton = document.querySelector('.main-tab-button[data-target="finishShiftTab"]');
+      if(finishTabButton && !finishTabButton.classList.contains("active")) finishTabButton.click();
+      if(finishShiftViewSelect){
+        finishShiftViewSelect.value = "finishShiftQueuePane";
+        finishShiftViewSelect.dispatchEvent(new Event("change"));
+      }
+      openApprovePrintOverlay(body.item);
+      setOverlayStep("review");
+      if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = "none";
+      if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = isApprovedShiftRecord(body.item) ? "Save Changes" : "Approve & Continue";
+    } catch(error) {
+      alert(`Unable to load finished shift: ${error?.message || error}`);
+      if(sourceButton?.isConnected){
+        sourceButton.disabled = false;
+        sourceButton.removeAttribute("aria-busy");
+        sourceButton.innerHTML = originalHtml;
+      }
+    }
+  }
+
+  function closeMachinePartials(){
+    machinePartialOverlay?.classList.remove("active");
+  }
+
+  function openMachinePartials(code){
+    const wanted = String(code || "").trim();
+    if(!wanted || !machinePartialOverlay || !machinePartialBody) return;
+    const rows = recentMachinePartials(wanted);
+    const session = (latestState?.sessions || []).find(row => String(row?.machine_code || "").trim() === wanted) || {};
+    const machineName = session.machine_name || MACHINE_NAME_MAP[wanted] || wanted;
+    const currentJob = firstValue(session.job_name, session.job_code, "Current job");
+    if(machinePartialTitle) machinePartialTitle.textContent = `${machineName} ┬╖ ${currentJob}`;
+    if(machinePartialSubtitle) machinePartialSubtitle.textContent = rows.length
+      ? `${rows.length} saved Finish Shift partial${rows.length === 1 ? "" : "s"} for this same job ┬╖ newest first`
+      : "No saved Finish Shift partials were found for this current job.";
+    machinePartialBody.innerHTML = rows.length ? rows.map(row => {
+      const flags = machinePartialFlags(row);
+      const rowClass = flags.some(flag => flag.level === "issue") ? "issue" : flags.some(flag => flag.level === "warning") ? "warning" : "";
+      const reviewStatus = String(row.review_status || "PENDING").trim().toUpperCase();
+      const operator = firstValue(row.operator_name, displayNameForId(row.operator_id || "-"), "-");
+      const endedAt = row.finished_at_utc || row.ended_at_utc || "";
+      const jobKey = firstValue(row.job_key, jobKeyOf(row), "");
+      return `
+        <article class="machine-partial-row ${escAttr(rowClass)}">
+          <div class="machine-partial-primary">
+            <div class="machine-partial-job" title="${esc(finishedShiftJobName(row))}">${esc(finishedShiftJobName(row))}</div>
+            <div class="machine-partial-meta">${esc(fmtDateLocal(endedAt))} ┬╖ Shift ${esc(row.shift_index ?? "-")} ┬╖ ${esc(operator)}</div>
+          </div>
+          <div class="machine-partial-metrics">
+            <div class="machine-partial-metric"><span class="k">Good</span><span class="v">${esc(row.total_good ?? row.partial_qty ?? row.good_total ?? 0)}</span></div>
+            <div class="machine-partial-metric"><span class="k">Butal</span><span class="v">${esc(row.butal_total ?? 0)}</span></div>
+            <div class="machine-partial-metric"><span class="k">Reject</span><span class="v">${esc(row.reject_total ?? 0)}</span></div>
+            <div class="machine-partial-metric"><span class="k">Packs</span><span class="v">${esc(row.pack_count ?? 0)}</span></div>
+            <div class="machine-partial-metric"><span class="k">Downtime</span><span class="v">${esc(fmtDowntimeSeconds(row.downtime_last_seconds))}</span></div>
+          </div>
+          <div class="machine-partial-review">
+            <div class="machine-partial-flags">${flags.map(flag => `<span class="machine-partial-flag ${escAttr(flag.level)}">${esc(flag.label)}</span>`).join("")}</div>
+            <button class="machine-partial-open" type="button" data-partial-job-key="${escAttr(jobKey)}">${reviewStatus === "APPROVED" ? "View shift" : "Review shift"}</button>
+          </div>
+        </article>`;
+    }).join("") : '<div class="machine-partial-empty">No partial shifts have been saved for this machine yet.</div>';
+    machinePartialOverlay.classList.add("active");
+    machinePartialCloseBtn?.focus();
   }
 
   function machineCardHtml(s, code, css, statusLabel, flipLinkage = false){
@@ -17095,22 +18622,38 @@ DASHBOARD_HTML = """
     const totalGoodNow = Math.max(0, Number(s.good_total || 0) + Number(s.butal_total || 0));
     const machineCounterNow = firstValue(s.machine_counter_current, s.machine_counter_shift_end, "-");
     const skuName = firstValue(jobSku(displayedJob), linkageDisplay.index === 0 ? s.product_sku : "", "-");
+    const supervisorRotationCount = Math.max(0, Number(s.supervisor_rotation_count || 0));
+    const supervisorRotationLast = String(s.last_supervisor_check_at_utc || "").trim();
+    const supervisorRotationName = String(s.last_supervisor_check_name || "Supervisor").trim();
+    const supervisorRotationTitle = [
+      `${supervisorRotationCount} supervisor rotation check${supervisorRotationCount === 1 ? "" : "s"}`,
+      supervisorRotationName ? `Last: ${supervisorRotationName}` : "",
+      supervisorRotationLast ? fmtDateLocal(supervisorRotationLast) : "",
+    ].filter(Boolean).join(" | ");
+    const supervisorRotationBadge = supervisorRotationCount > 0 ? `
+      <span class="machine-supervisor-rotation" title="${esc(supervisorRotationTitle)}" aria-label="${esc(supervisorRotationTitle)}">
+        <span class="machine-supervisor-rotation-dot" aria-hidden="true"></span>${esc(supervisorRotationCount)}
+      </span>
+    ` : "";
     const supervisorTooltip = [
       "Supervisor QR pending",
       "Scan Supervisor QR on the client to continue downtime resolution.",
       s.cycle_time_new_input ? `New cycle: ${s.cycle_time_new_input}` : "",
-    ].filter(Boolean).join("\\n");
+    ].filter(Boolean).join("\n");
     const supervisorNotif = s.waiting_supervisor_qr ? `
       <div class="machine-notif-wrap">
         <div class="machine-notif-badge" tabindex="0" title="${esc(supervisorTooltip)}">!</div>
       </div>
     ` : "";
+    const alertMeta = machineCardAlertMeta(s, code, css);
     return `
       ${supervisorNotif}
       <div class="machine-card-face machine-card-face-normal">
         <div class="machine-card-head">
           <div class="machine-card-title">
             <h3>${esc(machineName)}</h3>
+            ${supervisorRotationBadge}
+            ${alertMeta.pills.map(alert => `<span class="machine-card-alert-pill ${esc(alert.kind)} ${esc(alert.prominence)}" title="${esc(alert.title)}">${esc(alert.label)}</span>`).join("")}
           </div>
           <div class="machine-card-status-stack">
             <span class="machine-status-badge ${esc(css)}">${esc(statusText)}</span>
@@ -17131,12 +18674,12 @@ DASHBOARD_HTML = """
         <div class="machine-compact-bottom">
           ${manualStatus ? `
             <div class="machine-compact-duration">
-              <span class="clock">◷</span>
+              <span class="clock">Γù╖</span>
               <span class="machine-status-live-duration" data-status-started="${esc(statusStartedAt)}">${esc(statusDuration)}</span>
             </div>
           ` : css === "disconnected" ? `
             <div class="machine-offline-note">
-              <span class="offline-icon" aria-hidden="true">⊘</span>
+              <span class="offline-icon" aria-hidden="true">Γèÿ</span>
               <strong>No internet</strong>
             </div>
           ` : `
@@ -17153,7 +18696,9 @@ DASHBOARD_HTML = """
       <div class="machine-card-face machine-card-face-hover">
         <div class="machine-hover-head">
           <strong>${esc(machineName)}</strong>
-          <span>${esc(tonnage || statusText)}</span>
+          <div class="machine-hover-head-actions">
+            <span>${esc(tonnage || statusText)}</span>
+          </div>
         </div>
         <div class="machine-hover-counters">
           <div class="machine-hover-counter good"><span class="k">Good</span><span class="v">${esc(s.good_total || 0)}</span></div>
@@ -17178,7 +18723,7 @@ DASHBOARD_HTML = """
         <div class="machine-job-estimate">
           <div class="machine-job-estimate-head"><span>Estimated finish</span><strong>${esc(jobProgressPct.toFixed(1))}%</strong></div>
           <div class="machine-job-estimate-track"><span class="machine-job-estimate-fill" style="width:${esc(jobProgressPct.toFixed(2))}%"></span></div>
-          <div class="machine-job-estimate-caption" title="${esc(`${estimatedFinish} | ${estimateCaption}`)}">${esc(estimatedFinish)} · ${esc(estimateCaption)}</div>
+          <div class="machine-job-estimate-caption" title="${esc(`${estimatedFinish} | ${estimateCaption}`)}">${esc(estimatedFinish)} ┬╖ ${esc(estimateCaption)}</div>
         </div>
       </div>
     `;
@@ -17198,11 +18743,14 @@ DASHBOARD_HTML = """
     if(!card){
       card = document.createElement("div");
       card.dataset.machineCode = code;
+      card.setAttribute("role", "button");
+      card.setAttribute("tabindex", "0");
       machineCardEls.set(code, card);
     }
     const manual = machineStatusOverrideFor(code);
     const hasStatusAlert = Boolean(String((manual && manual.status) || "").trim());
-    const nextClassName = `card ${css}${hasStatusAlert ? " status-alert" : ""}`;
+    const alertMeta = machineCardAlertMeta(s, code, css);
+    const nextClassName = `card ${css}${hasStatusAlert ? " status-alert" : ""}${alertMeta.className ? ` ${alertMeta.className}` : ""}`;
     const nextHtml = machineCardHtml(s, code, css, statusLabel);
     const nextRenderSig = `${nextClassName}|${nextHtml}`;
     if(card.dataset.renderSig !== nextRenderSig){
@@ -17210,6 +18758,8 @@ DASHBOARD_HTML = """
       card.innerHTML = nextHtml;
       card.dataset.renderSig = nextRenderSig;
     }
+    card.setAttribute("aria-label", `Open details for ${s.machine_name || MACHINE_NAME_MAP[code] || code}`);
+    applyMachineCardAlertStyle(card, code, alertMeta);
     syncMachineNoScheduleAnimation(code, statusLabel, s.machine_name || MACHINE_NAME_MAP[code] || code);
     return card;
   }
@@ -17219,10 +18769,23 @@ DASHBOARD_HTML = """
       planningDeferredState = state || null;
       return;
     }
+    const isStatePatch = state?.type === "STATE_PATCH";
     const previousSessions = new Map(
       (latestState?.sessions || []).map(row => [String(row?.machine_code || "").trim(), row])
     );
-    const incomingSessions = Array.isArray(state?.sessions) ? state.sessions : (latestState?.sessions || []);
+    let incomingSessions = Array.isArray(state?.sessions) ? state.sessions : (latestState?.sessions || []);
+    if(isStatePatch){
+      const patchedRows = new Map(
+        incomingSessions.map(row => [String(row?.machine_code || "").trim(), row])
+      );
+      incomingSessions = (latestState?.sessions || []).map(row => {
+        const code = String(row?.machine_code || "").trim();
+        return patchedRows.has(code) ? {...row, ...patchedRows.get(code)} : row;
+      });
+      for(const [code, row] of patchedRows.entries()){
+        if(code && !previousSessions.has(code)) incomingSessions.push(row);
+      }
+    }
     const packAnimationCodes = incomingSessions
       .filter(row => {
         const code = String(row?.machine_code || "").trim();
@@ -17300,16 +18863,21 @@ DASHBOARD_HTML = """
       machinePackQtyBySession.delete(code);
       stopMachineNoScheduleAnimation(code);
     }
-    renderJobQueue(state.job_queue || []);
-    renderFinishedJobs(state.finished_jobs || []);
-    renderArchivedJobs(state.archived_jobs || []);
-    renderMachineStatusArchive(machineStatusArchiveState);
-    renderDowntimeArchive(state.finished_jobs || [], state.archived_jobs || []);
-    renderMaintenanceTab(state || {});
-    renderPlanningOpsSummary(state || {}, state.job_queue || []);
-    renderPlanningQueue(state.job_queue || []);
-    renderPlanningBoard(state || {});
-    renderPlanningQueueMismatchAlerts(state.planning_queue_alerts || []);
+    if(isStatePatch){
+      renderMachineTodo(state || {});
+      return;
+    }
+    renderDashboardSectionIfChanged("job-queue", state.job_queue || [], () => renderJobQueue(state.job_queue || []));
+    renderDashboardSectionIfChanged("finished-jobs", state.finished_jobs || [], () => renderFinishedJobs(state.finished_jobs || []));
+    renderDashboardSectionIfChanged("archived-jobs", state.archived_jobs || [], () => renderArchivedJobs(state.archived_jobs || []));
+    renderDashboardSectionIfChanged("machine-status-archive", machineStatusArchiveState, () => renderMachineStatusArchive(machineStatusArchiveState));
+    renderDashboardSectionIfChanged("downtime-archive", [state.finished_jobs || [], state.archived_jobs || []], () => renderDowntimeArchive(state.finished_jobs || [], state.archived_jobs || []));
+    renderDashboardSectionIfChanged("maintenance", [state.sessions || [], state.daily_roles || [], state.maintenance_profiles || []], () => renderMaintenanceTab(state || {}));
+    renderDashboardSectionIfChanged("planning-summary", [state.planning_board || {}, state.job_queue || []], () => renderPlanningOpsSummary(state || {}, state.job_queue || []));
+    renderDashboardSectionIfChanged("planning-queue", state.job_queue || [], () => renderPlanningQueue(state.job_queue || []));
+    renderDashboardSectionIfChanged("planning-board", state.planning_board || {}, () => renderPlanningBoard(state || {}));
+    renderDashboardSectionIfChanged("planning-alerts", state.planning_queue_alerts || [], () => renderPlanningQueueMismatchAlerts(state.planning_queue_alerts || []));
+    renderMachineTodo(state || {});
     if(!trialBoardDirty) trialBoardState = normalizeTrialBoard(state.trial_board || trialBoardState);
     if(planningBoardView?.classList.contains("trial-active")) renderTrialBoard(trialBoardState);
   }
@@ -17393,8 +18961,11 @@ DASHBOARD_HTML = """
       btn.classList.add("active");
       document.getElementById(target)?.classList.add("active");
       const planningActive = target === "planningTab";
+      const machinesActive = target === "machinesTab";
       document.body.classList.toggle("planning-tab-active", planningActive);
       if(machineFilterBtn) machineFilterBtn.hidden = planningActive;
+      if(machineTodoBtn) machineTodoBtn.hidden = !machinesActive;
+      if(!machinesActive) setMachineTodoOpen(false);
       if(planningOverviewBtn) planningOverviewBtn.hidden = !planningActive;
       if(trialBoardBtn) trialBoardBtn.hidden = !planningActive;
       if(planningActivityBtn) planningActivityBtn.hidden = !planningActive;
@@ -17430,6 +19001,82 @@ DASHBOARD_HTML = """
   });
   if(hideInactiveMachinesFilter) hideInactiveMachinesFilter.checked = hideInactiveMachines;
   if(machineFilterBtn) machineFilterBtn.classList.toggle("active", hideInactiveMachines);
+  machineTodoBtn?.addEventListener("click", ev => {
+    ev.stopPropagation();
+    if(machineFilterMenu) machineFilterMenu.hidden = true;
+    machineFilterBtn?.setAttribute("aria-expanded", "false");
+    setMachineTodoOpen(true);
+  });
+  machineTodoCloseBtn?.addEventListener("click", () => {
+    setMachineTodoOpen(false);
+    machineTodoBtn?.focus();
+  });
+  machineTodoOverlay?.addEventListener("click", ev => {
+    if(ev.target !== machineTodoOverlay) return;
+    setMachineTodoOpen(false);
+    machineTodoBtn?.focus();
+  });
+  machineTodoSearch?.addEventListener("input", () => {
+    machineTodoQuery = String(machineTodoSearch.value || "");
+    renderMachineTodo(latestState);
+  });
+  machineTodoWaitFilter?.addEventListener("click", () => {
+    machineTodoWaitingOverHour = !machineTodoWaitingOverHour;
+    syncMachineTodoControls();
+    renderMachineTodo(latestState);
+  });
+  try {
+    if(new URLSearchParams(window.location.search).get("todo") === "1"){
+      window.setTimeout(() => setMachineTodoOpen(true), 0);
+    }
+  } catch(_err) {}
+  function openMachineTodoTask(code){
+    const wanted = String(code || "").trim();
+    const fresh = (latestState.sessions || []).find(row => String(row?.machine_code || "").trim() === wanted);
+    if(!fresh) return;
+    setMachineTodoOpen(false);
+    openMachineDetail(machineDetailSessionForDisplayedJob(fresh, wanted));
+  }
+  machineTodoColumns?.addEventListener("click", ev => {
+    const task = ev.target?.closest?.("[data-todo-machine]");
+    if(!task) return;
+    openMachineTodoTask(task.getAttribute("data-todo-machine"));
+  });
+  machineTodoColumns?.addEventListener("keydown", ev => {
+    if(ev.key !== "Enter" && ev.key !== " ") return;
+    if(ev.target?.closest?.("button")) return;
+    const task = ev.target?.closest?.("[data-todo-machine]");
+    if(!task) return;
+    ev.preventDefault();
+    openMachineTodoTask(task.getAttribute("data-todo-machine"));
+  });
+  machinePartialCloseBtn?.addEventListener("click", closeMachinePartials);
+  machinePartialOverlay?.addEventListener("click", ev => {
+    if(ev.target === machinePartialOverlay) closeMachinePartials();
+  });
+  machinePartialBody?.addEventListener("click", async ev => {
+    const button = ev.target?.closest?.("[data-partial-job-key]");
+    if(!button) return;
+    const jobKey = String(button.getAttribute("data-partial-job-key") || "").trim();
+    if(!jobKey) return;
+    const originalText = button.textContent;
+    try {
+      button.disabled = true;
+      button.textContent = "Loading...";
+      const response = await fetch(`/api/finished-jobs/detail?job_key=${encodeURIComponent(jobKey)}`, {cache:"no-store"});
+      const body = await response.json();
+      if(!response.ok || !body?.ok || !body.item) throw new Error(body?.error || `HTTP ${response.status}`);
+      closeMachinePartials();
+      openApprovePrintOverlay(body.item);
+      setOverlayStep("review");
+      if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = "none";
+      if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = isApprovedShiftRecord(body.item) ? "Save Changes" : "Approve & Continue";
+    } catch(error) {
+      alert(`Unable to load partial shift: ${error?.message || error}`);
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  });
   machineFilterBtn?.addEventListener("click", (ev) => {
     ev.stopPropagation();
     const opening = Boolean(machineFilterMenu?.hidden);
@@ -17449,6 +19096,24 @@ DASHBOARD_HTML = """
   });
   document.addEventListener("keydown", (ev) => {
     if(ev.key !== "Escape") return;
+    if(machineDetailSupervisorMenu?.hidden === false){
+      setMachineDetailSupervisorMenuOpen(false);
+      machineDetailSupervisorBtn?.focus();
+      return;
+    }
+    if(machineDetailFinishShiftsMenu?.hidden === false){
+      setMachineDetailFinishShiftsMenuOpen(false);
+      machineDetailFinishShiftsBtn?.focus();
+      return;
+    }
+    if(machinePartialOverlay?.classList.contains("active")){
+      closeMachinePartials();
+      return;
+    }
+    if(machineTodoOverlay?.classList.contains("active")){
+      setMachineTodoOpen(false);
+      machineTodoBtn?.focus();
+    }
     if(machineFilterMenu) machineFilterMenu.hidden = true;
     machineFilterBtn?.setAttribute("aria-expanded", "false");
   });
@@ -17463,30 +19128,80 @@ DASHBOARD_HTML = """
   if(userKpiRefreshBtn){
     userKpiRefreshBtn.addEventListener("click", () => loadUserKpis(userKpiRoleState));
   }
+  async function openMachineCard(code){
+    const machineCode = String(code || "").trim();
+    if(!machineCode) return;
+    let fresh = (latestState.sessions || []).find(x => String(x.machine_code || "").trim() === machineCode) || {
+      machine_code: machineCode,
+      machine_name: MACHINE_NAME_MAP[machineCode] || machineCode,
+    };
+    // Give immediate visual feedback. Detailed session logs are loaded in the
+    // background so a slow request can never make the card feel unclickable.
+    openMachineDetail(machineDetailSessionForDisplayedJob(fresh, machineCode));
+    if(!fresh.summary_only) return;
+
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timeoutId = window.setTimeout(() => controller?.abort(), 8000);
+    try{
+      const response = await fetch(`/api/sessions/${encodeURIComponent(machineCode)}`, {
+        cache:"no-store",
+        signal:controller?.signal,
+      });
+      const body = await response.json();
+      if(response.ok && body?.ok && body.session){
+        fresh = {...fresh, ...body.session, summary_only: false};
+        if(Array.isArray(latestState?.sessions)){
+          latestState.sessions = latestState.sessions.map(row =>
+            String(row?.machine_code || "").trim() === machineCode ? fresh : row
+          );
+        }
+        if(
+          machineDetailOverlay?.classList.contains("active")
+          && String(activeMachineDetailCode || "").trim() === machineCode
+        ){
+          openMachineDetail(machineDetailSessionForDisplayedJob(fresh, machineCode));
+        }
+      }
+    }catch(error){
+      if(error?.name !== "AbortError") console.error("Unable to load machine details", error);
+    }finally{
+      window.clearTimeout(timeoutId);
+    }
+  }
+
   // Use the stable grid for pointer handling. Active cards can refresh their
   // inner HTML between mouse-down and mouse-up, which cancels a normal click.
-  const handleMachineGridPointerDown = (ev) => {
+  const handleMachineGridPointerDown = ev => {
     if(ev.button !== undefined && ev.button !== 0) return;
     const target = ev.target instanceof Element ? ev.target : null;
-    const card = target?.closest("[data-machine-code]");
+    const eventPath = typeof ev.composedPath === "function" ? ev.composedPath() : [];
+    const card = eventPath.find(node => node instanceof Element && node.matches?.("[data-machine-code]"))
+      || target?.closest("[data-machine-code]");
     if(!card) return;
     const code = String(card.getAttribute("data-machine-code") || "").trim();
     if(!code) return;
     ev.preventDefault();
-    const switchBtn = target?.closest(".machine-linkage-switch");
+    const switchBtn = eventPath.find(node => node instanceof Element && node.matches?.(".machine-linkage-switch"))
+      || target?.closest(".machine-linkage-switch");
     if(switchBtn){
       ev.stopPropagation();
       cycleMachineLinkageCard(code);
       return;
     }
-    const fresh = (latestState.sessions || []).find(x => String(x.machine_code || "").trim() === code) || {
-      machine_code: code,
-      machine_name: MACHINE_NAME_MAP[code] || code,
-    };
-    openMachineDetail(machineDetailSessionForDisplayedJob(fresh, code));
+    void openMachineCard(code);
+  };
+  const handleMachineGridKeyDown = ev => {
+    if(ev.key !== "Enter" && ev.key !== " ") return;
+    if(ev.target?.closest?.(".machine-linkage-switch")) return;
+    const card = ev.target?.closest?.("[data-machine-code]");
+    if(!card) return;
+    ev.preventDefault();
+    void openMachineCard(card.getAttribute("data-machine-code"));
   };
   machineGrid?.addEventListener("pointerdown", handleMachineGridPointerDown);
   additionalMachineGrid?.addEventListener("pointerdown", handleMachineGridPointerDown);
+  machineGrid?.addEventListener("keydown", handleMachineGridKeyDown);
+  additionalMachineGrid?.addEventListener("keydown", handleMachineGridKeyDown);
   if(userKpiTableWrap){
     userKpiTableWrap.addEventListener("click", (ev) => {
       const card = ev.target && ev.target.closest ? ev.target.closest("[data-user-kpi-index]") : null;
@@ -17688,12 +19403,15 @@ DASHBOARD_HTML = """
   settingsNavTheme?.addEventListener("click", () => showServerSettingsPage("theme"));
   settingsNavMachines?.addEventListener("click", () => { renderMachinePicker(); renderMachineDataClearer(); showServerSettingsPage("machines"); });
   settingsNavClients?.addEventListener("click", async () => { await loadSettingsClientsUi(); showServerSettingsPage("clients"); });
+  settingsNavInventory?.addEventListener("click", async () => { showServerSettingsPage("inventory"); await loadSettingsInventoryUi(); });
   settingsNavApi?.addEventListener("click", () => showServerSettingsPage("api"));
   settingsNavProfile?.addEventListener("click", async () => { await loadSettingsProfilesUi(); showServerSettingsPage("profile"); });
   settingsProfilesRefreshBtn?.addEventListener("click", async () => {
     if(settingsProfilesCount) settingsProfilesCount.value = "Refreshing...";
     await loadSettingsProfilesUi();
   });
+  settingsInventoryRefreshBtn?.addEventListener("click", loadSettingsInventoryUi);
+  settingsInventorySearch?.addEventListener("input", renderSettingsInventoryUi);
   settingsThemeSelect?.addEventListener("change", () => applyDashboardTheme(settingsThemeSelect.value));
   serverSettingsSaveBtn?.addEventListener("click", saveServerSettingsUi);
   settingsMachinesSaveBtn?.addEventListener("click", saveServerSettingsUi);
@@ -17814,14 +19532,21 @@ DASHBOARD_HTML = """
   finishedJobsList.addEventListener("mousedown", (ev) => {
     if(ev.target.closest(".approve-print-btn")) setFinishedJobsInteractionLock(true);
   });
-  archivedJobsTableWrap?.addEventListener("click", (ev) => {
+  archivedJobsTableWrap?.addEventListener("click", async (ev) => {
     const btn = ev.target.closest(".archived-view-btn");
     if(!btn) return;
     const idx = Number(btn.getAttribute("data-row-index"));
     if(Number.isNaN(idx) || idx < 0) return;
     const sorted = [...(archivedJobsState || [])].reverse();
-    const row = sorted[idx];
+    let row = sorted[idx];
     if(!row) return;
+    try{
+      const response = await fetch(`/api/archived-jobs/detail?job_key=${encodeURIComponent(jobKeyOf(row))}`, {cache:"no-store"});
+      const output = await response.json();
+      if(response.ok && output?.ok && output?.item) row = output.item;
+    }catch(_err){
+      // Keep the compact row usable if detail storage is temporarily offline.
+    }
     openMachineDetail(archivedRowToMachineSessionLike(row));
   });
 
@@ -17859,6 +19584,42 @@ DASHBOARD_HTML = """
     syncReviewSubslides();
   });
   machineDetailCloseBtn.addEventListener("click", closeMachineDetail);
+  machineDetailSupervisorBtn?.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    setMachineDetailFinishShiftsMenuOpen(false);
+    setMachineDetailSupervisorMenuOpen(machineDetailSupervisorMenu?.hidden !== false);
+  });
+  machineDetailFinishShiftsBtn?.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    setMachineDetailSupervisorMenuOpen(false);
+    setMachineDetailFinishShiftsMenuOpen(machineDetailFinishShiftsMenu?.hidden !== false);
+  });
+  machineDetailFinishShiftsMenu?.addEventListener("click", async (ev) => {
+    const option = ev.target instanceof Element ? ev.target.closest("[data-finish-shift-key]") : null;
+    if(!option) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const code = String(option.getAttribute("data-machine-code") || activeMachineDetailCode || "").trim();
+    const jobKey = String(option.getAttribute("data-finish-shift-key") || "").trim();
+    if(!code || !jobKey) return;
+    await openMachineLatestPartialReview(code, option, jobKey);
+  });
+  document.addEventListener("pointerdown", ev => {
+    if(machineDetailSupervisorMenu?.hidden === false
+      && !machineDetailSupervisorBtn?.contains(ev.target)
+      && !machineDetailSupervisorMenu?.contains(ev.target)){
+      setMachineDetailSupervisorMenuOpen(false);
+    }
+    if(machineDetailFinishShiftsMenu?.hidden === false
+      && !machineDetailFinishShiftsBtn?.contains(ev.target)
+      && !machineDetailFinishShiftsMenu?.contains(ev.target)){
+      setMachineDetailFinishShiftsMenuOpen(false);
+    }
+  });
+  window.addEventListener("resize", () => {
+    if(machineDetailSupervisorMenu?.hidden === false) positionMachineDetailSupervisorMenu();
+    if(machineDetailFinishShiftsMenu?.hidden === false) positionMachineDetailFinishShiftsMenu();
+  });
   overlayShiftHistoryBtn?.addEventListener("click", openShiftActionHistory);
   shiftActionHistoryCloseBtn?.addEventListener("click", closeShiftActionHistory);
   shiftActionHistorySearch?.addEventListener("input", renderShiftActionHistory);
@@ -18078,11 +19839,15 @@ DASHBOARD_HTML = """
         if(generatedQrState.stageKind === "BUTAL"){
           overlayQrPayload.value = "Enter PO Number for Butal.";
         } else {
-          overlayQrPayload.value = `${overlayQrPayload.value}\n\nPrint request sent. Next QR stage loaded.`;
+          overlayQrPayload.value = `${overlayQrPayload.value}
+
+Print request sent. Next QR stage loaded.`;
         }
         return;
       }
-      overlayQrPayload.value = `${overlayQrPayload.value}\n\nPrint request sent. Shift finished.`;
+      overlayQrPayload.value = `${overlayQrPayload.value}
+
+Print request sent. Shift finished.`;
       try {
         const archiveResp = await fetch("/api/finished-jobs/archive", {
           method: "POST",
@@ -18097,15 +19862,18 @@ DASHBOARD_HTML = """
         const archiveOut = await archiveResp.json();
         if(archiveOut.ok){
           activeJobRow = archiveOut.item || activeJobRow;
-          overlayQrPayload.value = `${overlayQrPayload.value}\nArchived to Archived Jobs.`;
+          overlayQrPayload.value = `${overlayQrPayload.value}
+Archived to Archived Jobs.`;
           setTimeout(() => {
             closeApprovePrintOverlay();
           }, 450);
         } else {
-          overlayQrPayload.value = `${overlayQrPayload.value}\nArchive warning: ${archiveOut.error || "Failed to archive."}`;
+          overlayQrPayload.value = `${overlayQrPayload.value}
+Archive warning: ${archiveOut.error || "Failed to archive."}`;
         }
       } catch (e) {
-        overlayQrPayload.value = `${overlayQrPayload.value}\nArchive warning: ${e}`;
+        overlayQrPayload.value = `${overlayQrPayload.value}
+Archive warning: ${e}`;
       }
     } else {
       const apiMsg = out?.target_base_url
@@ -18168,7 +19936,7 @@ DASHBOARD_HTML = """
     if(overlayReviewJobInfoDisplay) overlayReviewJobInfoDisplay.textContent = overlayReviewJobInfo.value;
     const shiftPanels = overlayReviewMode === "shift" ? buildShiftPreviewPanels(activeJobRow) : null;
     const approvedShiftView = overlayReviewMode === "shift" && isApprovedShiftRecord(activeJobRow);
-    overlayReviewSummary.value = shiftPanels ? safeJsonPretty(shiftPanels.summary) : reviewSummaryText(activeJobRow) + `\\n\\nStatus: ${activeJobRow.review_status || "-"}`;
+    overlayReviewSummary.value = shiftPanels ? safeJsonPretty(shiftPanels.summary) : reviewSummaryText(activeJobRow) + `\n\nStatus: ${activeJobRow.review_status || "-"}`;
     overlayReviewRejects.value = shiftPanels ? safeJsonPretty(shiftPanels.rejects) : reviewRejectsText(activeJobRow);
     if(overlayReviewSummaryDisplay) overlayReviewSummaryDisplay.innerHTML = approvedShiftView
       ? shiftDailyReportHtml(activeJobRow)
@@ -18248,8 +20016,8 @@ DASHBOARD_HTML = """
 
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
-    lastMessageEl.textContent = "STATE";
-    if(msg.type === "STATE") render(msg);
+    lastMessageEl.textContent = msg.type === "STATE_PATCH" ? "LIVE" : "STATE";
+    if(msg.type === "STATE" || msg.type === "STATE_PATCH") render(msg);
   };
 
   // Apply saved dashboard theme/settings immediately on page load.
@@ -18266,9 +20034,45 @@ DASHBOARD_HTML = """
 """
 
 
+def _dashboard_delivery_assets(html: str) -> tuple[str, str, str, str]:
+    style_match = re.search(r"<style\b[^>]*>(.*?)</style>", html, flags=re.IGNORECASE | re.DOTALL)
+    script_match = re.search(r"<script\b[^>]*>(.*?)</script>", html, flags=re.IGNORECASE | re.DOTALL)
+    css = style_match.group(1).strip() if style_match else ""
+    javascript = script_match.group(1).strip() if script_match else ""
+    version = hashlib.sha256((css + "\n" + javascript).encode("utf-8")).hexdigest()[:12]
+    page = html
+    if style_match:
+        page = page[:style_match.start()] + f'<link rel="stylesheet" href="/assets/dashboard.css?v={version}">' + page[style_match.end():]
+    script_match = re.search(r"<script\b[^>]*>(.*?)</script>", page, flags=re.IGNORECASE | re.DOTALL)
+    if script_match:
+        page = page[:script_match.start()] + f'<script src="/assets/dashboard.js?v={version}" defer></script>' + page[script_match.end():]
+    return page, css, javascript, version
+
+
+DASHBOARD_PAGE_HTML, DASHBOARD_CSS, DASHBOARD_JAVASCRIPT, DASHBOARD_ASSET_VERSION = _dashboard_delivery_assets(DASHBOARD_HTML)
+
+
 @APP.get("/", response_class=HTMLResponse)
 def dashboard():
-    return HTMLResponse(DASHBOARD_HTML)
+    return HTMLResponse(DASHBOARD_PAGE_HTML)
+
+
+@APP.get("/assets/dashboard.css")
+def dashboard_css():
+    return Response(
+        DASHBOARD_CSS,
+        media_type="text/css",
+        headers={"Cache-Control": "public, max-age=31536000, immutable", "ETag": DASHBOARD_ASSET_VERSION},
+    )
+
+
+@APP.get("/assets/dashboard.js")
+def dashboard_javascript():
+    return Response(
+        DASHBOARD_JAVASCRIPT,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=31536000, immutable", "ETag": DASHBOARD_ASSET_VERSION},
+    )
 
 
 PROFILE_CREATOR_HTML = """
@@ -19058,18 +20862,42 @@ async def api_machine_status_set(req: Request):
     }
 
 
+def _machine_activity_id(row: Any) -> str:
+    item = dict(row) if isinstance(row, dict) else {"value": str(row or "")}
+    supplied = str(item.get("activity_id") or "").strip()
+    if supplied:
+        return supplied
+    item.pop("activity_id", None)
+    canonical = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def _client_activity_id(row: Any) -> str:
+    return _machine_activity_id(row)
+
+
+def _normalize_client_activity_rows(incoming: Any) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for raw in incoming or []:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        row["activity_id"] = _machine_activity_id(row)
+        normalized.append(row)
+    return normalized
+
+
 def _merge_client_app_logs(sess: MachineSession, incoming: Any) -> int:
-    rows = [dict(row) for row in (incoming or []) if isinstance(row, dict)]
+    rows = _normalize_client_activity_rows(incoming)
     if not rows:
         return 0
     merged = [dict(row) for row in (sess.client_app_logs or []) if isinstance(row, dict)]
-    seen = {
-        json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
-        for row in merged
-    }
+    for row in merged:
+        row["activity_id"] = _machine_activity_id(row)
+    seen = {str(row.get("activity_id") or "") for row in merged}
     added = 0
     for row in rows:
-        signature = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+        signature = str(row.get("activity_id") or "")
         if signature in seen:
             continue
         seen.add(signature)
@@ -19078,6 +20906,17 @@ def _merge_client_app_logs(sess: MachineSession, incoming: Any) -> int:
     merged.sort(key=lambda row: str(row.get("timestamp_utc") or ""))
     sess.client_app_logs = merged[-1000:]
     return added
+
+
+def _migrate_active_session_activity_logs() -> None:
+    """Move legacy embedded activity to its indexed table, then release memory."""
+    for machine_code, sess in list(SESSIONS.items()):
+        rows = [dict(row) for row in (sess.client_app_logs or []) if isinstance(row, dict)]
+        if not rows:
+            continue
+        if _upsert_machine_activity_logs_sql(machine_code, rows):
+            sess.client_app_logs = []
+            _upsert_active_session_sql(sess.to_dict())
 
 
 def _session_protocol_payload(sess: Optional[MachineSession]) -> Optional[Dict[str, Any]]:
@@ -19277,6 +21116,34 @@ SERVER_SYNC_PROTOCOL_VERSION = max(
 )
 
 
+def _apply_supervisor_rotation_check(
+    sess: MachineSession,
+    event: Dict[str, Any],
+    event_created_at_utc: Any = None,
+) -> Dict[str, Any]:
+    ev = event if isinstance(event, dict) else {}
+    checked_at = str(
+        ev.get("checked_at_utc") or event_created_at_utc or utc_now().isoformat()
+    ).strip()
+    row = {
+        "checked_at_utc": checked_at,
+        "supervisor_code": str(ev.get("supervisor_code") or ev.get("actor_code") or "").strip(),
+        "supervisor_name": str(ev.get("supervisor_name") or ev.get("actor_name") or "Supervisor").strip(),
+        "supervisor_role": str(ev.get("supervisor_role") or ev.get("actor_role") or "SUPERVISOR").strip(),
+        "job_code": str(sess.job_code or "").strip(),
+        "operator_id": str(sess.operator_id or "").strip(),
+    }
+    sess.supervisor_rotation_logs = [
+        *[dict(item) for item in (sess.supervisor_rotation_logs or []) if isinstance(item, dict)],
+        row,
+    ][-100:]
+    sess.supervisor_rotation_count = max(0, int(sess.supervisor_rotation_count or 0)) + 1
+    sess.last_supervisor_check_at_utc = checked_at
+    sess.last_supervisor_check_name = row["supervisor_name"] or None
+    sess.last_supervisor_check_code = row["supervisor_code"] or None
+    return row
+
+
 def _dashboard_event_description(
     sess: MachineSession,
     event_type: str,
@@ -19335,6 +21202,9 @@ def _dashboard_event_description(
         review = ev.get("review") if isinstance(ev.get("review"), dict) else {}
         actor = str(review.get("actor_name") or review.get("actor_code") or "Supervisor").strip()
         return f"SUPERVISOR CHECK | {actor}"
+    if ev_type == "SUPERVISOR_ROTATION_CHECK":
+        actor = str(ev.get("supervisor_name") or ev.get("supervisor_code") or "Supervisor").strip()
+        return f"SUPERVISOR ROTATION | {actor}"
     return str(fallback or ev_type.replace("_", " ")).strip()
 
 
@@ -19594,7 +21464,93 @@ async def api_sync_capabilities():
         "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
         "server_authoritative": True,
         "ordered_event_replay": True,
+        "batch_sync": True,
     }
+
+
+def _batch_response_payload(response: Any) -> tuple[int, Dict[str, Any]]:
+    if isinstance(response, JSONResponse):
+        try:
+            payload = json.loads(bytes(response.body).decode("utf-8"))
+        except Exception:
+            payload = {"ok": False, "error": "Invalid internal event response"}
+        return int(response.status_code or 500), payload if isinstance(payload, dict) else {}
+    return 200, response if isinstance(response, dict) else {}
+
+
+@APP.post("/api/sync/batch")
+async def api_sync_batch(req: Request):
+    try:
+        body = await req.json()
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"Invalid JSON body: {exc}"}, status_code=400)
+    if not isinstance(body, dict) or not isinstance(body.get("events"), list):
+        return JSONResponse({"ok": False, "error": "events must be a list"}, status_code=400)
+    rows = [row for row in body.get("events") or [] if isinstance(row, dict)][:50]
+    if not rows:
+        return {"ok": True, "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION, "results": []}
+    machine_code = str(body.get("machine_code") or "").strip()
+    remote = str(req.client.host if req.client else "")
+    results: List[Dict[str, Any]] = []
+    lock = MACHINE_EVENT_LOCKS.setdefault(machine_code or "BATCH", asyncio.Lock())
+    token = BATCH_BROADCAST_DEFERRED.set(True)
+    try:
+        async with lock:
+            failed = False
+            for envelope in rows:
+                event_id = str(envelope.get("id") or "").strip()
+                if failed:
+                    results.append({"event_id": event_id, "status": "deferred"})
+                    continue
+                payload = dict(envelope.get("payload") or {}) if isinstance(envelope.get("payload"), dict) else {}
+                payload["event_id"] = event_id or str(payload.get("event_id") or "").strip()
+                payload["event_created_at_utc"] = str(
+                    envelope.get("created_at_utc") or payload.get("event_created_at_utc") or ""
+                )
+                encoded = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+                sent = False
+
+                async def receive() -> Dict[str, Any]:
+                    nonlocal sent
+                    if sent:
+                        return {"type": "http.disconnect"}
+                    sent = True
+                    return {"type": "http.request", "body": encoded, "more_body": False}
+
+                internal = Request({
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/api/event",
+                    "headers": [(b"content-type", b"application/json")],
+                    "client": (remote, 0),
+                    "server": ("batch", 0),
+                    "scheme": "http",
+                    "query_string": b"",
+                }, receive)
+                response = await api_event(internal)
+                status_code, response_body = _batch_response_payload(response)
+                acknowledged = str(response_body.get("ack_event_id") or "").strip()
+                if status_code < 400 and bool(response_body.get("ok")):
+                    status = "duplicate" if response_body.get("duplicate") else (
+                        "audit_only" if response_body.get("ignored") else "applied"
+                    )
+                    results.append({
+                        "event_id": event_id,
+                        "ack_event_id": acknowledged or event_id,
+                        "status": status,
+                    })
+                else:
+                    failed = True
+                    results.append({
+                        "event_id": event_id,
+                        "status": "failed",
+                        "error": str(response_body.get("error") or f"HTTP {status_code}"),
+                    })
+    finally:
+        BATCH_BROADCAST_DEFERRED.reset(token)
+    if any(row.get("status") in {"applied", "duplicate", "audit_only"} for row in results):
+        await broadcast_state()
+    return {"ok": True, "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION, "results": results}
 
 
 @APP.get("/api/machines/{machine_code}/activity")
@@ -19607,6 +21563,14 @@ async def api_machine_client_activity(machine_code: str, limit: int = 400):
             None,
         )
     safe_limit = max(1, min(1000, int(limit or 400)))
+    stored = _load_machine_activity_logs_sql(code, safe_limit)
+    if stored is not None:
+        return {
+            "ok": True,
+            "machine_code": code,
+            "items": stored["items"],
+            "total": stored["total"],
+        }
     rows = [dict(row) for row in ((sess.client_app_logs if sess else None) or []) if isinstance(row, dict)]
     rows.sort(key=lambda row: str(row.get("timestamp_utc") or ""), reverse=True)
     return {
@@ -19645,19 +21609,27 @@ async def api_heartbeat(req: Request):
         last_event="HEARTBEAT",
         machine_scanned=bool(machine_code),
     )
+    heartbeat_event = data.get("event") if isinstance(data.get("event"), dict) else {}
     session = SESSIONS.get(machine_code) if machine_code else None
     activity_added = 0
+    client_activity_ack_ids: List[str] = []
     if session is not None:
         # Machine cards read the session timestamp, while the lightweight
         # heartbeat previously refreshed only CLIENT_STATUSES. Keep both
         # presence views aligned; the existing 3-second state tick broadcasts
         # this in-memory timestamp without adding a full broadcast per client.
         session.last_seen_utc = str(client_status.get("last_seen_utc") or utc_now().isoformat())
-        heartbeat_event = data.get("event") if isinstance(data.get("event"), dict) else {}
-        activity_added = _merge_client_app_logs(session, heartbeat_event.get("client_activity_logs"))
+        activity_rows = _normalize_client_activity_rows(heartbeat_event.get("client_activity_logs"))
+        client_activity_ack_ids = [str(row.get("activity_id") or "") for row in activity_rows]
+        activity_added = _merge_client_app_logs(session, activity_rows)
+        if activity_rows and await asyncio.to_thread(_upsert_machine_activity_logs_sql, machine_code, activity_rows):
+            session.client_app_logs = []
         if activity_added:
-            _persist_active_sessions_state(machine_code)
+            await asyncio.to_thread(_persist_active_sessions_state, machine_code)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
+    known_session_id = str(heartbeat_event.get("known_production_session_id") or "").strip()
+    server_session_id = str(session.production_session_id or "").strip() if session is not None else ""
+    return_session = bool(heartbeat_event.get("request_session")) or known_session_id != server_session_id
     return {
         "ok": True,
         "client_online": True,
@@ -19666,7 +21638,9 @@ async def api_heartbeat(req: Request):
         "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
         "server_authoritative": True,
         "client_activity_added": activity_added,
-        "session": _session_protocol_payload(session),
+        "client_activity_ack_ids": client_activity_ack_ids,
+        "production_session_id": server_session_id or None,
+        "session": _session_protocol_payload(session) if return_session else None,
     }
 
 
@@ -20134,7 +22108,11 @@ async def api_event(req: Request):
         # broadcast_state() reloads the active-session snapshot from disk.
     sess.last_seen_utc = utc_now().isoformat()
 
-    _merge_client_app_logs(sess, ev.get("client_activity_logs"))
+    event_activity_rows = _normalize_client_activity_rows(ev.get("client_activity_logs"))
+    client_activity_ack_ids = [str(row.get("activity_id") or "") for row in event_activity_rows]
+    _merge_client_app_logs(sess, event_activity_rows)
+    if event_activity_rows and await asyncio.to_thread(_upsert_machine_activity_logs_sql, machine_code, event_activity_rows):
+        sess.client_app_logs = []
 
     # apply event counters if provided
     _append_server_app_log(
@@ -20149,7 +22127,7 @@ async def api_event(req: Request):
     )
     pack_event_key = _pack_counter_event_key(ev) if ev_type in PACK_COUNTER_EVENT_TYPES else ""
     if pack_event_key and _session_has_pack_counter_event(sess, pack_event_key):
-        if not _persist_active_sessions_state(machine_code):
+        if not await asyncio.to_thread(_persist_active_sessions_state, machine_code):
             return JSONResponse(
                 {"ok": False, "error": "Could not durably save duplicate PACK acknowledgement; retry required"},
                 status_code=503,
@@ -20608,6 +22586,15 @@ async def api_event(req: Request):
                 sess.current_supervisor_review = dict(snap.get("current_supervisor_review") or {})
             if isinstance(snap.get("supervisor_review_logs"), list):
                 sess.supervisor_review_logs = list(snap.get("supervisor_review_logs") or [])
+            if isinstance(snap.get("supervisor_rotation_logs"), list):
+                sess.supervisor_rotation_logs = [
+                    dict(row) for row in (snap.get("supervisor_rotation_logs") or [])[-100:]
+                    if isinstance(row, dict)
+                ]
+                sess.supervisor_rotation_count = max(
+                    int(snap.get("supervisor_rotation_count", 0) or 0),
+                    len(sess.supervisor_rotation_logs),
+                )
             if isinstance(snap.get("job_payload"), dict):
                 sess.job_payload = dict(snap.get("job_payload") or {})
             _fill_session_product_identity(sess)
@@ -20639,6 +22626,8 @@ async def api_event(req: Request):
             sess.external_average_weight_sent_at = snap.get("external_average_weight_sent_at") or sess.external_average_weight_sent_at
             sess.external_average_weight_source = str(snap.get("external_average_weight_source") or sess.external_average_weight_source or "").strip() or None
             sess.external_average_weight_sender = str(snap.get("external_average_weight_sender") or sess.external_average_weight_sender or "").strip() or None
+    elif ev_type == "SUPERVISOR_ROTATION_CHECK":
+        _apply_supervisor_rotation_check(sess, ev, data.get("event_created_at_utc"))
     elif ev_type == "SUPERVISOR_REVIEW":
         review = ev.get("review")
         if isinstance(review, dict):
@@ -20753,7 +22742,7 @@ async def api_event(req: Request):
 
     state_persisted = True
     if ev_type not in ("HEARTBEAT", "FINISH_JOB"):
-        state_persisted = _persist_active_sessions_state(machine_code)
+        state_persisted = await asyncio.to_thread(_persist_active_sessions_state, machine_code)
     durable_production_events = PACK_COUNTER_EVENT_TYPES | {"REJECT", "STARTUP_REJECT", "REJECT_VOID"}
     if ev_type in durable_production_events and not state_persisted:
         # Do not acknowledge/remove a durable production event until both its
@@ -20763,7 +22752,7 @@ async def api_event(req: Request):
             status_code=503,
         )
 
-    if ev_type != "HEARTBEAT":
+    if ev_type != "HEARTBEAT" and not BATCH_BROADCAST_DEFERRED.get():
         await broadcast_state()
     _append_server_app_log(
         "api_event_ok",
@@ -20785,6 +22774,7 @@ async def api_event(req: Request):
         "session_recovered": session_recovered,
         "previous_production_session_id": previous_session_id or None,
         "session": _session_protocol_payload(resulting_session),
+        "client_activity_ack_ids": client_activity_ack_ids,
     }
 
 
@@ -20813,8 +22803,19 @@ def api_finished_job_detail(job_key: str = ""):
         return JSONResponse({"ok": False, "error": "job_key is required"}, status_code=400)
     for row in reversed(FINISHED_JOBS):
         if isinstance(row, dict) and _finished_job_key(row) == key:
-            return {"ok": True, "item": row}
+            return {"ok": True, "item": _load_history_detail_sql(row)}
     return JSONResponse({"ok": False, "error": "finished shift was not found"}, status_code=404)
+
+
+@APP.get("/api/archived-jobs/detail")
+def api_archived_job_detail(job_key: str = ""):
+    key = str(job_key or "").strip()
+    if not key:
+        return JSONResponse({"ok": False, "error": "job_key is required"}, status_code=400)
+    for row in reversed(ARCHIVED_JOBS):
+        if isinstance(row, dict) and _finished_job_key(row) == key:
+            return {"ok": True, "item": _load_history_detail_sql(row)}
+    return JSONResponse({"ok": False, "error": "archived job was not found"}, status_code=404)
 
 
 @APP.get("/api/active-sessions")
@@ -20856,9 +22857,19 @@ def api_active_sessions(client_id: str = "", machine_code: str = ""):
             continue
         if cid and str(sess.client_id or "").strip() != cid:
             continue
-        rows.append(sess.to_dict())
+        rows.append(sess.to_dict() if (cid or code_filter) else sess.to_dashboard_dict())
     rows.sort(key=lambda r: str(r.get("last_seen_utc") or r.get("saved_at_utc") or ""), reverse=True)
     return {"ok": True, "items": rows}
+
+
+@APP.get("/api/active-sessions/{machine_code}")
+def api_session_detail(machine_code: str):
+    refresh_active_sessions_from_file()
+    code = str(machine_code or "").strip()
+    sess = SESSIONS.get(code)
+    if sess is None:
+        return JSONResponse({"ok": False, "error": "Active session was not found"}, status_code=404)
+    return {"ok": True, "item": sess.to_dict()}
 
 
 @APP.get("/api/client-status")
@@ -21080,7 +23091,7 @@ async def api_raw_material_scanning_scan(req: Request):
     received_at = utc_now().isoformat()
     sess.last_seen_utc = received_at
     sess.last_event = f"RAW MATERIAL SCAN {row.get('material_name') or row.get('material') or ''}".strip()
-    _persist_active_sessions_state()
+    await asyncio.to_thread(_persist_active_sessions_state)
     await broadcast_state()
     return {
         "ok": True,
@@ -21162,7 +23173,7 @@ async def api_active_session_reset_fresh(req: Request):
     sess.live_cycle_avg_seconds = None
     sess.last_seen_utc = now
     sess.last_event = str(data.get("last_event") or "FRESH SHIFT RESET ON SERVER").strip()
-    _persist_active_sessions_state()
+    await asyncio.to_thread(_persist_active_sessions_state)
     await broadcast_state()
     return {"ok": True, "item": sess.to_dict()}
 
@@ -21283,7 +23294,7 @@ async def api_average_weight(req: Request):
     sess.external_average_weight_sender = sender or None
     sess.last_seen_utc = received_at
     sess.last_event = f"AVERAGE WEIGHT {average_grams:.4f} {normalized_unit} ({source})"
-    _persist_active_sessions_state()
+    await asyncio.to_thread(_persist_active_sessions_state)
     await broadcast_state()
     return {
         "ok": True,
@@ -21543,7 +23554,7 @@ async def api_finished_jobs_review(req: Request):
     if idx < 0:
         return JSONResponse({"ok": False, "error": "Finished job not found"}, status_code=404)
 
-    row = dict(FINISHED_JOBS[idx] or {})
+    row = _load_history_detail_sql(FINISHED_JOBS[idx])
     now_utc = utc_now().isoformat()
     row.setdefault("review_history", [])
     original_snapshot = {
@@ -21659,7 +23670,7 @@ async def api_finished_jobs_archive(req: Request):
     if idx < 0:
         return JSONResponse({"ok": False, "error": "Finished job not found"}, status_code=404)
 
-    row = dict(FINISHED_JOBS[idx] or {})
+    row = _load_history_detail_sql(FINISHED_JOBS[idx])
     now_utc = utc_now().isoformat()
     row["printed_at_utc"] = now_utc
     row["archived_at_utc"] = now_utc
@@ -21854,7 +23865,7 @@ async def api_qrgen_pending_request(req: Request):
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     WS_CLIENTS.append(ws)
-    await ws.send_json(_state_payload(include_history=True))
+    await ws.send_json(await asyncio.to_thread(_state_payload, include_history=True))
     try:
         while True:
             # keep alive; client doesn't need to send anything
