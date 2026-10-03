@@ -34,13 +34,5 @@ class TestMachineMappingTests(unittest.TestCase):
         self.assertEqual(result.meta.get("machine_code"), "TEST-MACHINE")
         self.assertTrue(result.meta.get("test_machine"))
 
-    def test_test_pack_qr_supports_configurable_quantity(self):
-        result = parse_scan("testpack~24")
-
-        self.assertIsNotNone(result)
-        self.assertEqual(result.kind, "PACK")
-        self.assertEqual(result.qty, 24.0)
-
-
 if __name__ == "__main__":
     unittest.main()

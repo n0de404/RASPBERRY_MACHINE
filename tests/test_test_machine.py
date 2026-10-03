@@ -38,6 +38,13 @@ class TestMachineSandboxTests(unittest.TestCase):
                 "reject_breakdown": {"DENT": 2},
                 "pack_logs": [{"pack_key": "TEST-PACK-1", "qty": 20}],
                 "reject_logs": [{"reject_scan_id": "TEST-REJECT-1", "reason_code": "DENT"}],
+                "session_snapshot": {
+                    "job_code": "34589",
+                    "job_name": "WO-34589",
+                    "operator_id": "26-00025",
+                    "production_session_id": "PS-REAL-FLOW-TEST",
+                    "job_payload": {"data": {"job": {"ref_no": "WO-34589"}}},
+                },
             }
         }
 
@@ -46,7 +53,9 @@ class TestMachineSandboxTests(unittest.TestCase):
         self.assertIsNotNone(session)
         self.assertTrue(session["is_test_machine"])
         self.assertEqual(session["machine_code"], dashboard_server.TEST_MACHINE_CODE)
-        self.assertEqual(session["production_session_id"], "TEST-SANDBOX-SESSION")
+        self.assertEqual(session["production_session_id"], "PS-REAL-FLOW-TEST")
+        self.assertEqual(session["job_code"], "34589")
+        self.assertEqual(session["operator_id"], "26-00025")
         self.assertEqual(session["test_target_packs"], 12)
         self.assertEqual(session["pack_total"], 3)
         self.assertEqual(session["good_total"], 60)
@@ -91,7 +100,12 @@ class TestMachineSandboxTests(unittest.TestCase):
         try:
             with patch.object(dashboard_server, "save_server_settings", return_value=None):
                 dashboard_server._apply_test_machine_client_event({
+                    "client_id": "RPI-TEST",
                     "machine_code": dashboard_server.TEST_MACHINE_CODE,
+                    "job_code": "34589",
+                    "job_name": "WO-34589",
+                    "operator_id": "26-00025",
+                    "production_session_id": "PS-REAL-FLOW-TEST",
                     "event": {
                         "type": "PACK",
                         "pack_qty": 1,
@@ -111,6 +125,8 @@ class TestMachineSandboxTests(unittest.TestCase):
             self.assertEqual(config["pack_count"], 1)
             self.assertEqual(config["good_total"], 8)
             self.assertEqual(config["reject_total"], 2)
+            self.assertEqual(config["session_snapshot"]["job_code"], "34589")
+            self.assertEqual(config["session_snapshot"]["operator_id"], "26-00025")
             self.assertEqual(set(dashboard_server.SESSIONS), original_session_keys)
             self.assertNotIn(dashboard_server.TEST_MACHINE_CODE, dashboard_server.SESSIONS)
         finally:

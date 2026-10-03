@@ -211,9 +211,6 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
             value="TEST MACHINE",
             meta={"machine_code": "TEST-MACHINE", "test_machine": True},
         )
-    test_pack = re.fullmatch(r"testpack~(\d+)", s_l)
-    if test_pack:
-        return ScanResult(kind="PACK", raw=raw, value="Test Pack", qty=float(test_pack.group(1)))
 
     # Operator handoff trigger
     if s_l in ("operatorshift~1", "operator_shift~1", "shiftchange~1"):

@@ -5014,6 +5014,10 @@ def _normalize_test_machine_settings(value: Any) -> Dict[str, Any]:
     breakdown = _canonical_reject_breakdown(raw.get("reject_breakdown"))
     pack_logs = [dict(row) for row in (raw.get("pack_logs") or []) if isinstance(row, dict)][-500:]
     reject_logs = [dict(row) for row in (raw.get("reject_logs") or []) if isinstance(row, dict)][-500:]
+    session_snapshot = dict(raw.get("session_snapshot") or {}) if isinstance(raw.get("session_snapshot"), dict) else {}
+    for key in ("product_pack_history_logs", "raw_material_logs", "butal_scan_logs", "reject_review_logs", "operator_shift_logs"):
+        if isinstance(session_snapshot.get(key), list):
+            session_snapshot[key] = list(session_snapshot.get(key) or [])[-500:]
     return {
         "enabled": bool(raw.get("enabled", False)),
         "target_packs": target_packs,
@@ -5024,6 +5028,7 @@ def _normalize_test_machine_settings(value: Any) -> Dict[str, Any]:
         "reject_breakdown": breakdown,
         "pack_logs": pack_logs,
         "reject_logs": reject_logs,
+        "session_snapshot": session_snapshot,
         "last_event": str(raw.get("last_event") or "Test machine ready").strip(),
         "started_at_utc": str(raw.get("started_at_utc") or "").strip(),
         "updated_at_utc": str(raw.get("updated_at_utc") or "").strip(),
@@ -5037,19 +5042,15 @@ def _test_machine_session_payload(settings: Optional[Dict[str, Any]] = None) -> 
     if not config["enabled"]:
         return None
     updated_at = config["updated_at_utc"] or utc_now().isoformat()
-    return {
+    payload = {
         "client_id": "SERVER-TEST-SANDBOX",
         "machine_code": TEST_MACHINE_CODE,
         "machine_name": "TEST MACHINE",
-        "job_code": "TEST-JOB",
-        "job_name": "Dashboard Test Job",
-        "job_started_at": config["started_at_utc"] or config["updated_at_utc"] or utc_now().isoformat(),
-        "product_sku": "TEST-SKU",
-        "product_name": "Test Product (Not Production)",
-        "operator_id": "TEST OPERATOR",
-        "active_scan_operator_id": "TEST OPERATOR",
-        "active_scan_owner_type": "ORIGINAL",
-        "production_session_id": "TEST-SANDBOX-SESSION",
+        "job_code": None,
+        "job_name": None,
+        "job_started_at": None,
+        "operator_id": None,
+        "production_session_id": None,
         "pack_total": config["pack_count"],
         "pack_count": config["pack_count"],
         "good_total": config["good_total"],
@@ -5070,24 +5071,9 @@ def _test_machine_session_payload(settings: Optional[Dict[str, Any]] = None) -> 
         "supervisor_rotation_count": 0,
         "pdr_downtime_logs": [],
         "operator_shift_logs": [],
-        "cycle_time_current": "60",
+        "cycle_time_current": None,
         "qty_per_packing": config["pack_qty"],
-        "job_payload": {
-            "data": {
-                "job": {
-                    "id": "TEST-JOB",
-                    "ref_no": "TEST-JOB",
-                    "status": "TEST ONLY",
-                    "product_sku": "TEST-SKU",
-                    "product_name": "Test Product (Not Production)",
-                },
-                "job_details": {
-                    "product_sku": "TEST-SKU",
-                    "product_name": "Test Product (Not Production)",
-                    "qty_per_packing": config["pack_qty"],
-                },
-            }
-        },
+        "job_payload": {},
         "test_target_packs": config["target_packs"],
         "is_test_machine": True,
         "last_event": config["last_event"],
@@ -5095,6 +5081,25 @@ def _test_machine_session_payload(settings: Optional[Dict[str, Any]] = None) -> 
         "last_seen_utc": updated_at,
         "summary_only": False,
     }
+    payload.update(dict(config.get("session_snapshot") or {}))
+    # These fields are hard fences: even a copied client snapshot cannot turn
+    # the sandbox into a production machine/session row.
+    payload["machine_code"] = TEST_MACHINE_CODE
+    payload["machine_name"] = "TEST MACHINE"
+    payload["is_test_machine"] = True
+    payload["test_target_packs"] = config["target_packs"]
+    payload["pack_total"] = config["pack_count"]
+    payload["pack_count"] = config["pack_count"]
+    payload["good_total"] = config["good_total"]
+    payload["reject_total"] = config["reject_total"]
+    payload["reject_breakdown"] = config["reject_breakdown"]
+    payload["product_pack_history_logs"] = config["pack_logs"]
+    payload["reject_review_logs"] = config["reject_logs"]
+    payload["last_event"] = config["last_event"]
+    payload["last_event_at_utc"] = updated_at
+    payload["last_seen_utc"] = updated_at
+    payload["summary_only"] = False
+    return payload
 
 
 def _apply_test_machine_client_event(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -5108,8 +5113,42 @@ def _apply_test_machine_client_event(data: Dict[str, Any]) -> Dict[str, Any]:
     config["enabled"] = True
     now = str(data.get("event_created_at_utc") or utc_now().isoformat())
     snapshot = event.get("session_snapshot") if isinstance(event.get("session_snapshot"), dict) else {}
+    session_snapshot = dict(config.get("session_snapshot") or {})
+    session_snapshot["machine_code"] = TEST_MACHINE_CODE
+    session_snapshot["machine_name"] = "TEST MACHINE"
+    session_snapshot["client_id"] = str(data.get("client_id") or session_snapshot.get("client_id") or "SERVER-TEST-SANDBOX")
+    incoming_session_id = str(data.get("production_session_id") or event.get("production_session_id") or "").strip()
+    current_session_id = str(session_snapshot.get("production_session_id") or "").strip()
+    if event_type in {"JOB_SET", "JOB_STUB_SET"} and incoming_session_id and incoming_session_id != current_session_id:
+        session_snapshot = {
+            "client_id": str(data.get("client_id") or "SERVER-TEST-SANDBOX"),
+            "machine_code": TEST_MACHINE_CODE,
+            "machine_name": "TEST MACHINE",
+        }
+        config["pack_count"] = 0
+        config["good_total"] = 0
+        config["reject_total"] = 0
+        config["reject_breakdown"] = {}
+        config["pack_logs"] = []
+        config["reject_logs"] = []
+    for key in ("job_code", "job_name", "operator_id", "production_session_id"):
+        value = data.get(key)
+        if value not in (None, ""):
+            session_snapshot[key] = value
 
-    if event_type == "PACK":
+    if event_type == "FINISH_JOB":
+        session_snapshot = {
+            "client_id": str(data.get("client_id") or "SERVER-TEST-SANDBOX"),
+            "machine_code": TEST_MACHINE_CODE,
+            "machine_name": "TEST MACHINE",
+        }
+        config["pack_count"] = 0
+        config["good_total"] = 0
+        config["reject_total"] = 0
+        config["reject_breakdown"] = {}
+        config["pack_logs"] = []
+        config["reject_logs"] = []
+    elif event_type == "PACK":
         pack_count = max(1, int(event.get("pack_qty", 1) or 1))
         good_qty = max(0, int(event.get("qty", config["pack_qty"] * pack_count) or 0))
         config["pack_count"] += pack_count
@@ -5129,7 +5168,11 @@ def _apply_test_machine_client_event(data: Dict[str, Any]) -> Dict[str, Any]:
     elif event_type == "REJECT":
         count = max(1, int(event.get("qty", 1) or 1))
         reason = str(event.get("reason") or "TEST_REJECT").strip().upper() or "TEST_REJECT"
-        config["reject_total"] += count
+        bucket = _canonical_reject_code(reason)
+        if bucket == "NO":
+            session_snapshot["no_shot_total"] = max(0, int(session_snapshot.get("no_shot_total", 0) or 0)) + count
+        else:
+            config["reject_total"] += count
         config["reject_breakdown"][reason] = int(config["reject_breakdown"].get(reason, 0) or 0) + count
         incoming = event.get("reject_records") if isinstance(event.get("reject_records"), list) else []
         for offset in range(count):
@@ -5146,8 +5189,13 @@ def _apply_test_machine_client_event(data: Dict[str, Any]) -> Dict[str, Any]:
             })
     elif event_type == "STARTUP_REJECT":
         count = max(1, int(event.get("qty", 1) or 1))
-        config["reject_total"] += count
+        session_snapshot["startup_reject_total"] = max(0, int(session_snapshot.get("startup_reject_total", 0) or 0)) + count
         config["reject_breakdown"]["SUR"] = int(config["reject_breakdown"].get("SUR", 0) or 0) + count
+    elif event_type == "BUTAL":
+        count = max(0, int(event.get("qty", 0) or 0))
+        session_snapshot["butal_total"] = max(0, int(session_snapshot.get("butal_total", 0) or 0)) + count
+    elif event_type == "RAW_MATERIAL":
+        session_snapshot["raw_sacks_count"] = max(0, int(session_snapshot.get("raw_sacks_count", 0) or 0)) + 1
     elif event_type == "PACK_VOID":
         record = event.get("void_record") if isinstance(event.get("void_record"), dict) else {}
         wanted_key = str(record.get("pack_key") or "").strip()
@@ -5173,9 +5221,26 @@ def _apply_test_machine_client_event(data: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             config["reject_logs"][idx] = {**row, **supplied, "voided": True, "voided_at": supplied.get("voided_at") or now}
             break
-        config["reject_total"] = max(0, config["reject_total"] - 1)
+        entry_type = str(supplied.get("entry_type") or "").strip().upper()
+        if entry_type == "STARTUP_REJECT_SCAN" or reason == "SUR":
+            session_snapshot["startup_reject_total"] = max(0, int(session_snapshot.get("startup_reject_total", 0) or 0) - 1)
+        elif _canonical_reject_code(reason) == "NO":
+            session_snapshot["no_shot_total"] = max(0, int(session_snapshot.get("no_shot_total", 0) or 0) - 1)
+        else:
+            config["reject_total"] = max(0, config["reject_total"] - 1)
         config["reject_breakdown"][reason] = max(0, int(config["reject_breakdown"].get(reason, 0) or 0) - 1)
+    elif event_type == "BUTAL_VOID":
+        session_snapshot["butal_total"] = max(0, int(event.get("post_butal_total", session_snapshot.get("butal_total", 0)) or 0))
+        if isinstance(event.get("post_butal_by_job"), dict):
+            session_snapshot["butal_by_job"] = dict(event.get("post_butal_by_job") or {})
+    elif event_type == "PRODUCT_PART_VOID":
+        session_snapshot["raw_sacks_count"] = max(0, int(event.get("post_raw_sacks_count", session_snapshot.get("raw_sacks_count", 0)) or 0))
+        if isinstance(event.get("post_raw_material_scans"), list):
+            session_snapshot["raw_material_scans"] = list(event.get("post_raw_material_scans") or [])
     elif event_type == "SESSION_SYNC" and snapshot:
+        session_snapshot = dict(snapshot)
+        session_snapshot["machine_code"] = TEST_MACHINE_CODE
+        session_snapshot["machine_name"] = "TEST MACHINE"
         config["pack_count"] = max(0, int(snapshot.get("pack_count", snapshot.get("pack_total", config["pack_count"])) or 0))
         config["good_total"] = max(0, int(snapshot.get("good_total", config["good_total"]) or 0))
         config["reject_total"] = max(0, int(snapshot.get("reject_total", config["reject_total"]) or 0))
@@ -5188,6 +5253,18 @@ def _apply_test_machine_client_event(data: Dict[str, Any]) -> Dict[str, Any]:
 
     config["pack_logs"] = config["pack_logs"][-500:]
     config["reject_logs"] = config["reject_logs"][-500:]
+    session_snapshot["machine_code"] = TEST_MACHINE_CODE
+    session_snapshot["machine_name"] = "TEST MACHINE"
+    session_snapshot["pack_count"] = config["pack_count"]
+    session_snapshot["pack_total"] = config["pack_count"]
+    session_snapshot["good_total"] = config["good_total"]
+    session_snapshot["reject_total"] = config["reject_total"]
+    session_snapshot["reject_breakdown"] = dict(config["reject_breakdown"])
+    session_snapshot["product_pack_history_logs"] = list(config["pack_logs"])
+    session_snapshot["reject_review_logs"] = list(config["reject_logs"])
+    session_snapshot["last_event"] = str(data.get("last_event") or event_type or "TEST CLIENT CONNECTED")
+    session_snapshot["last_seen_utc"] = now
+    config["session_snapshot"] = session_snapshot
     config["last_event"] = str(data.get("last_event") or event_type or "TEST CLIENT CONNECTED")
     config["updated_at_utc"] = now
     SERVER_SETTINGS = {**SERVER_SETTINGS, "test_machine": _normalize_test_machine_settings(config)}
@@ -10287,10 +10364,10 @@ DASHBOARD_HTML = r"""
               <div class="test-machine-warning"><strong>Isolated test sandbox.</strong> This machine never enters production sessions, finished-job history, client status, job planning, or production reports.</div>
               <div class="test-machine-action-card">
                 <h4>Client Test QR</h4>
-                <div class="settings-note">Scan this on any updated Raspberry Pi client to load the complete isolated test job.</div>
+                <div class="settings-note">Scan this on any updated Raspberry Pi client. It behaves like a normal machine scan, then you scan the normal Job and Operator QRs.</div>
                 <code style="font-size:1rem;font-weight:900;color:#5b21b6;">testmachine~1</code>
                 <button id="settingsTestMachineQrBtn" class="btn-primary" type="button">Show testmachine~1 QR</button>
-                <div class="settings-note">After it loads, use <strong>testpack~QTY</strong> (example: testpack~10) to test packing.</div>
+                <div class="settings-note">After it loads, use the same real Job, Operator, material, PACK, reject, void, shift, and finish QRs used on other machines.</div>
               </div>
               <div class="settings-row">
                 <label>Test Machine</label>
@@ -23397,6 +23474,12 @@ def api_active_sessions(client_id: str = "", machine_code: str = ""):
                 machine_scanned=True,
             )
     rows = []
+    if code_filter == TEST_MACHINE_CODE:
+        test_session = _test_machine_session_payload()
+        if isinstance(test_session, dict):
+            if not cid or str(test_session.get("client_id") or "").strip() == cid:
+                rows.append(test_session)
+        return {"ok": True, "items": rows}
     for sess in SESSIONS.values():
         if code_filter and str(sess.machine_code or "").strip() != code_filter:
             continue
@@ -24072,7 +24155,7 @@ async def api_server_settings_save(req: Request):
     # sandbox counters or audit rows already created by test actions.
     current_test = _normalize_test_machine_settings(SERVER_SETTINGS.get("test_machine"))
     if isinstance(incoming_test, dict):
-        for key in ("pack_count", "good_total", "reject_total", "reject_breakdown", "pack_logs", "reject_logs", "last_event", "started_at_utc", "updated_at_utc"):
+        for key in ("pack_count", "good_total", "reject_total", "reject_breakdown", "pack_logs", "reject_logs", "session_snapshot", "last_event", "started_at_utc", "updated_at_utc"):
             test_machine[key] = current_test[key]
     SERVER_SETTINGS = {
         "theme": theme,
@@ -24104,6 +24187,7 @@ async def api_test_machine_action(req: Request):
             "reject_breakdown": {},
             "pack_logs": [],
             "reject_logs": [],
+            "session_snapshot": {},
             "last_event": "TEST RESET",
             "started_at_utc": now,
             "updated_at_utc": now,
@@ -24164,31 +24248,6 @@ async def api_test_machine_action(req: Request):
     return {
         "ok": True,
         "test_machine": SERVER_SETTINGS["test_machine"],
-        "session": _test_machine_session_payload(),
-    }
-
-
-@APP.post("/api/test-machine/connect")
-async def api_test_machine_connect(req: Request):
-    """Activate and return the sandbox session for a real client terminal."""
-    global SERVER_SETTINGS
-    try:
-        data = await req.json()
-    except Exception:
-        data = {}
-    config = _normalize_test_machine_settings(SERVER_SETTINGS.get("test_machine"))
-    config["enabled"] = True
-    if not config["started_at_utc"]:
-        config["started_at_utc"] = utc_now().isoformat()
-    config["last_event"] = f"TEST CLIENT CONNECTED {str(data.get('client_id') or '').strip()}".strip()
-    config["updated_at_utc"] = utc_now().isoformat()
-    SERVER_SETTINGS = {**SERVER_SETTINGS, "test_machine": config}
-    save_server_settings(SERVER_SETTINGS)
-    await broadcast_state()
-    return {
-        "ok": True,
-        "test_only": True,
-        "test_machine": config,
         "session": _test_machine_session_payload(),
     }
 
