@@ -26855,23 +26855,40 @@ QWidget#ClientUIRoot {{
                 if event_type == "SESSION_SYNC" and isinstance(event_body, dict) and isinstance(event_body.get("session_snapshot"), dict):
                     self._server_recovery_snapshot_queued = False
             else:
+                item_session_id = str(item_payload.get("production_session_id") or "").strip()
+                current_local_session_id = str(self.state.production_session_id or "").strip()
                 retire_stale_job_start = (
                     session_conflict_code == "STALE_PRODUCTION_SESSION"
                     and event_type == "JOB_SET"
                 )
-                if session_conflict_code == "MISSING_PRODUCTION_SESSION" or retire_stale_job_start:
+                retire_completed_session_event = (
+                    session_conflict_code == "STALE_PRODUCTION_SESSION"
+                    and event_type not in {"FINISH_SHIFT", "FINISH_JOB"}
+                    and bool(item_session_id)
+                    and bool(current_local_session_id)
+                    and item_session_id != current_local_session_id
+                )
+                retire_session_fence_event = (
+                    session_conflict_code == "MISSING_PRODUCTION_SESSION"
+                    or retire_stale_job_start
+                    or retire_completed_session_event
+                )
+                if retire_session_fence_event:
                     # This is a legacy/outbox payload created without the session
-                    # fence required by the server's current active job. Retrying
-                    # the exact payload can never succeed and previously caused an
-                    # endless 409 -> recovery snapshot -> retry loop. The local
-                    # state already includes the mutation, and the recovery snapshot
-                    # queued below transfers that authoritative aggregate instead.
+                    # fence required by the server's current active job, or it
+                    # belongs to a production session already superseded locally.
+                    # Retrying it can never succeed and would block every newer
+                    # event behind it. FINISH_SHIFT and FINISH_JOB are deliberately
+                    # excluded because the server accepts historical completion
+                    # records through their dedicated path.
                     self._remove_persisted_server_event(str(item.get("id") or ""))
                     retry_item = False
                     self._append_app_log(
                         "SESSION FENCE",
                         (
-                            f"Retired stale {event_type} event superseded by the current production session"
+                            f"Retired stale {event_type} event from completed production session {item_session_id}"
+                            if retire_completed_session_event
+                            else f"Retired stale {event_type} event superseded by the current production session"
                             if retire_stale_job_start
                             else f"Retired legacy {event_type or 'UNKNOWN'} event without a production session ID"
                         ),
@@ -26880,7 +26897,7 @@ QWidget#ClientUIRoot {{
                     self._mark_persisted_server_event_failed(item, last_error)
                 if event_type in ("FINISH_SHIFT", "FINISH_JOB"):
                     self._last_finish_shift_sync_signature = ""
-            if session_conflict and not self._event_worker_stop.is_set():
+            if session_conflict and not retire_session_fence_event and not self._event_worker_stop.is_set():
                 recovery_item = self._build_session_recovery_event_item(
                     "SESSION SNAPSHOT SYNC (409 FENCE REPAIR)"
                 )
