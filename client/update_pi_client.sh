@@ -125,6 +125,11 @@ fi
 echo "Stopping running Raspberry Machine client..."
 pkill -f "$PROJECT_DIR/dist/RaspberryMachineClient" 2>/dev/null || true
 pkill -f "$PROJECT_DIR/client.py" 2>/dev/null || true
+# Older launchers started the source file from inside PROJECT_DIR, so the
+# process command line contains only `python client.py` and does not match the
+# absolute-path pattern above.  Stop that legacy form as well or two kiosk
+# windows compete for scanner input after an update.
+pkill -f '(^|[[:space:]])python(3)?[[:space:]]+(\./)?client\.py([[:space:]]|$)' 2>/dev/null || true
 sleep 1
 
 if [[ "$DO_PULL" -eq 1 ]]; then

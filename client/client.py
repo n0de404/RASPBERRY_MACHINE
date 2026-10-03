@@ -6705,6 +6705,11 @@ QWidget#ClientUIRoot {{
         self._refresh_ui(force=True)
         QTimer.singleShot(0, self._apply_adaptive_ui_scale)
         QTimer.singleShot(0, self._sync_right_panel_top_alignment)
+        # Updates and power interruptions must not leave a live production
+        # session looking like an idle, unassigned terminal.  Restore only a
+        # recoverable session owned by this configured client; an idle machine
+        # shell still requires an intentional MACHINE scan.
+        QTimer.singleShot(700, self._restore_owned_session_on_startup)
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -11969,6 +11974,47 @@ QWidget#ClientUIRoot {{
         except Exception as e:
             self._append_app_log("RECOVERY", f"Server active-session recovery failed: {e}")
             return None
+
+    def _restore_owned_session_on_startup(self) -> None:
+        """Resume this terminal's one active job after an app restart."""
+        if str(self.state.machine_code or "").strip():
+            return
+
+        local_rows = _load_active_sessions_json()
+        local_candidates = self._recoverable_snapshots_from_rows(
+            local_rows,
+            require_current_client=True,
+        )
+        local_snap = local_candidates[0] if len(local_candidates) == 1 else None
+        server_snap = self._fetch_active_session_snapshot_from_server()
+        server_ok = isinstance(server_snap, dict) and self._snapshot_is_recoverable(server_snap)
+        local_ok = isinstance(local_snap, dict) and self._snapshot_is_recoverable(local_snap)
+
+        if not (server_ok or local_ok):
+            if len(local_candidates) > 1:
+                self._append_app_log(
+                    "RECOVERY",
+                    "Startup recovery skipped because multiple local sessions belong to this client",
+                )
+            return
+
+        recovered = self._resolve_recovery_snapshot(
+            server_snap if server_ok else None,
+            local_snap if local_ok else None,
+        )
+        machine_code = str(recovered.get("machine_code") or "").strip()
+        if not machine_code:
+            return
+        source_label = "SERVER + LOCAL" if server_ok and local_ok else ("SERVER" if server_ok else "LOCAL")
+        self._append_app_log(
+            "RECOVERY",
+            f"Restoring {machine_code} automatically at startup from {source_label.lower()}",
+        )
+        self._resume_snapshot(
+            recovered,
+            _machine_display_name(machine_code, recovered.get("machine_name")),
+            f"SESSION SNAPSHOT SYNC (STARTUP AUTO RECOVERY: {source_label})",
+        )
 
     def _load_active_session_snapshot(self, machine_code: str) -> Optional[Dict[str, Any]]:
         code = str(machine_code or "").strip()
