@@ -18740,7 +18740,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
             </div>
           ` : css === "disconnected" ? `
             <div class="machine-offline-note">
-              <span class="offline-icon" aria-hidden="true">Γèÿ</span>
+              <span class="offline-icon" aria-hidden="true">&#x2298;</span>
               <strong>No internet</strong>
             </div>
           ` : `
@@ -21409,6 +21409,100 @@ def _apply_reject_void_event(sess: MachineSession, event: Dict[str, Any]) -> boo
     return True
 
 
+def _apply_pack_void_event(sess: MachineSession, event: Dict[str, Any]) -> bool:
+    """Apply one compact PACK void without requiring a full session snapshot."""
+    ev = event if isinstance(event, dict) else {}
+    record = ev.get("void_record") if isinstance(ev.get("void_record"), dict) else {}
+    wanted_key = str(record.get("pack_key") or "").strip()
+    wanted_raw = str(record.get("raw_scan") or "").strip()
+    wanted_index = str(record.get("index") or "").strip()
+    wanted_lot = str(record.get("lot_number") or "").strip()
+    rows = [dict(row) for row in (sess.product_pack_history_logs or []) if isinstance(row, dict)]
+    for idx in range(len(rows) - 1, -1, -1):
+        row = rows[idx]
+        same = bool(wanted_key and str(row.get("pack_key") or "").strip() == wanted_key)
+        if not same and wanted_raw:
+            same = str(row.get("raw_scan") or "").strip() == wanted_raw
+        if not same and wanted_index and wanted_lot:
+            same = (
+                str(row.get("index") or "").strip() == wanted_index
+                and str(row.get("lot_number") or "").strip() == wanted_lot
+            )
+        if same:
+            rows.pop(idx)
+            break
+    sess.product_pack_history_logs = rows
+    if "post_pack_total" in ev:
+        sess.pack_total = max(0, int(ev.get("post_pack_total") or 0))
+    else:
+        sess.pack_total = max(0, int(sess.pack_total or 0) - 1)
+    if "post_good_total" in ev:
+        sess.good_total = max(0, int(ev.get("post_good_total") or 0))
+    else:
+        qty = int(float(record.get("qty_q") or record.get("qty") or record.get("good_qty") or 0))
+        sess.good_total = max(0, int(sess.good_total or 0) - qty)
+    if isinstance(ev.get("post_linkage_jobs"), list):
+        sess.linkage_jobs = [dict(row) for row in ev.get("post_linkage_jobs") or [] if isinstance(row, dict)]
+    return True
+
+
+def _apply_product_part_void_event(sess: MachineSession, event: Dict[str, Any]) -> bool:
+    """Apply one compact product-part void and remove its matching ledger row."""
+    ev = event if isinstance(event, dict) else {}
+    record = ev.get("void_record") if isinstance(ev.get("void_record"), dict) else {}
+    wanted_key = str(record.get("unique_key") or "").strip()
+    wanted_raw = str(record.get("raw_scan") or "").strip()
+    rows = [dict(row) for row in (sess.raw_material_logs or []) if isinstance(row, dict)]
+    for idx in range(len(rows) - 1, -1, -1):
+        row = rows[idx]
+        same = bool(wanted_key and str(row.get("unique_key") or "").strip() == wanted_key)
+        if not same and wanted_raw:
+            same = str(row.get("raw_scan") or "").strip() == wanted_raw
+        if same:
+            rows.pop(idx)
+            break
+    sess.raw_material_logs = rows
+    if "post_raw_sacks_count" in ev:
+        sess.raw_sacks_count = max(0, int(ev.get("post_raw_sacks_count") or 0))
+    else:
+        sess.raw_sacks_count = max(0, int(sess.raw_sacks_count or 0) - 1)
+    if isinstance(ev.get("post_raw_material_scans"), list):
+        sess.raw_material_scans = list(ev.get("post_raw_material_scans") or [])
+    return True
+
+
+def _apply_butal_void_event(sess: MachineSession, event: Dict[str, Any]) -> bool:
+    """Apply one compact BUTAL void, preserving its audit row as voided."""
+    ev = event if isinstance(event, dict) else {}
+    record = ev.get("void_record") if isinstance(ev.get("void_record"), dict) else {}
+    wanted_raw = str(record.get("raw_scan") or "").strip()
+    wanted_time = str(record.get("scanned_at") or "").strip()
+    rows = [dict(row) for row in (sess.butal_scan_logs or []) if isinstance(row, dict)]
+    matched = False
+    for idx in range(len(rows) - 1, -1, -1):
+        row = rows[idx]
+        if wanted_raw and str(row.get("raw_scan") or "").strip() != wanted_raw:
+            continue
+        if wanted_time and str(row.get("scanned_at") or "").strip() != wanted_time:
+            continue
+        rows[idx] = {**row, **record, "voided": True}
+        matched = True
+        break
+    if not matched and record:
+        rows.append({**record, "voided": True})
+    sess.butal_scan_logs = rows
+    if "post_butal_total" in ev:
+        sess.butal_total = max(0, int(ev.get("post_butal_total") or 0))
+    else:
+        sess.butal_total = max(0, int(sess.butal_total or 0) - int(record.get("qty") or 0))
+    if isinstance(ev.get("post_butal_by_job"), dict):
+        sess.butal_by_job = {
+            str(key): max(0, int(value or 0))
+            for key, value in dict(ev.get("post_butal_by_job") or {}).items()
+        }
+    return True
+
+
 PACK_COUNTER_EVENT_TYPES = {"PACK", "LAST_SHIFT_BUTAL_PACK", "BUTAL_COMPLETION_PACK"}
 
 
@@ -22766,6 +22860,12 @@ async def api_event(req: Request):
             counter_event = dict(ev)
             counter_event["qty"] = appended_rejects
             _apply_reject_counter_event(sess, ev_type, counter_event)
+    elif ev_type == "PACK_VOID":
+        _apply_pack_void_event(sess, ev)
+    elif ev_type == "PRODUCT_PART_VOID":
+        _apply_product_part_void_event(sess, ev)
+    elif ev_type == "BUTAL_VOID":
+        _apply_butal_void_event(sess, ev)
     elif ev_type == "REJECT_VOID":
         if not _apply_reject_void_event(sess, ev):
             return JSONResponse(
@@ -22804,7 +22904,9 @@ async def api_event(req: Request):
     state_persisted = True
     if ev_type not in ("HEARTBEAT", "FINISH_JOB"):
         state_persisted = await asyncio.to_thread(_persist_active_sessions_state, machine_code)
-    durable_production_events = PACK_COUNTER_EVENT_TYPES | {"REJECT", "STARTUP_REJECT", "REJECT_VOID"}
+    durable_production_events = PACK_COUNTER_EVENT_TYPES | {
+        "REJECT", "STARTUP_REJECT", "PACK_VOID", "PRODUCT_PART_VOID", "BUTAL_VOID", "REJECT_VOID"
+    }
     if ev_type in durable_production_events and not state_persisted:
         # Do not acknowledge/remove a durable production event until both its
         # aggregate and exact ledger identity have reached server storage.

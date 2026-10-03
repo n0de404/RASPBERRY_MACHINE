@@ -21663,6 +21663,7 @@ QWidget#ClientUIRoot {{
 
     def _void_pack_scan(self, raw_scan: str) -> bool:
         s = self.state
+        self._last_voided_pack_record = None
         target_key = self._pack_history_key({"raw_scan": raw_scan})
         parsed = self._extract_pack_history_fields(raw_scan)
         fallback_key = self._pack_history_key(parsed or {})
@@ -21678,6 +21679,7 @@ QWidget#ClientUIRoot {{
             qty = int(float(row.get("qty_q") or row.get("qty") or 0))
             removed_row = dict(row)
             removed_row["voided_at"] = datetime.now(timezone.utc).isoformat()
+            removed_row["voided"] = True
             if row_key:
                 s.product_pack_history_keys.discard(row_key)
                 self._used_pack_qr_keys.discard(row_key)
@@ -21706,11 +21708,13 @@ QWidget#ClientUIRoot {{
             self.lblTotalGood.add_points(-qty)
             self.log_last(self._format_pack_history_action_text(removed_row, voided=True))
             self.status.setText(f"Pack voided: -1 pack, Good -{qty}")
+            self._last_voided_pack_record = dict(removed_row)
             return True
         return False
 
     def _void_product_part_scan(self, raw_scan: str) -> bool:
         s = self.state
+        self._last_voided_product_part_record = None
         wanted_raw = str(raw_scan or "").strip()
         for row_index in range(len(s.raw_material_logs or []) - 1, -1, -1):
             row = s.raw_material_logs[row_index]
@@ -21739,11 +21743,15 @@ QWidget#ClientUIRoot {{
             )
             self.log_last(f"{material_name} | VOID")
             self.status.setText(f"Product part voided and removed: {material_name}")
+            removed["voided"] = True
+            removed["voided_at"] = datetime.now(timezone.utc).isoformat()
+            self._last_voided_product_part_record = dict(removed)
             return True
         return False
 
     def _void_butal_scan(self, raw_scan: str, qty: int) -> bool:
         s = self.state
+        self._last_voided_butal_record = None
         for row in reversed(list(s.butal_scan_logs or [])):
             if not isinstance(row, dict):
                 continue
@@ -21768,6 +21776,7 @@ QWidget#ClientUIRoot {{
             self.lblTotalGood.add_points(-void_qty)
             self.log_last(self._format_butal_history_action_text(row, voided=True))
             self.status.setText(f"Butal voided: -{void_qty}")
+            self._last_voided_butal_record = dict(row)
             return True
         return False
 
@@ -23313,7 +23322,16 @@ QWidget#ClientUIRoot {{
                 self._clear_void_modes()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
-                self.push_event({"type": "PRODUCT_PART_VOID"}, "PRODUCT PART VOID", defer_snapshot=True)
+                self.push_event(
+                    {
+                        "type": "PRODUCT_PART_VOID",
+                        "void_record": dict(getattr(self, "_last_voided_product_part_record", {}) or {}),
+                        "post_raw_sacks_count": int(s.raw_sacks_count or 0),
+                        "post_raw_material_scans": list(s.raw_material_scans or []),
+                    },
+                    "PRODUCT PART VOID",
+                    defer_snapshot=True,
+                )
                 return
             meta = res_pre.meta if isinstance(res_pre.meta, dict) else {}
             material_code = str(meta.get("material_code") or "").strip() if isinstance(meta, dict) else ""
@@ -24079,7 +24097,22 @@ QWidget#ClientUIRoot {{
                 self._save_active_session_snapshot()
                 event_type = "PACK_VOID" if voided_kind == "PACK" else "PRODUCT_PART_VOID"
                 event_label = "PACK VOID" if voided_kind == "PACK" else "PRODUCT PART VOID"
-                self.push_event({"type": event_type}, event_label, defer_snapshot=True)
+                if voided_kind == "PACK":
+                    void_payload = {
+                        "type": event_type,
+                        "void_record": dict(getattr(self, "_last_voided_pack_record", {}) or {}),
+                        "post_pack_total": int(s.pack_count or 0),
+                        "post_good_total": int(s.good_total or 0),
+                        "post_linkage_jobs": [dict(row) for row in (s.linkage_jobs or []) if isinstance(row, dict)],
+                    }
+                else:
+                    void_payload = {
+                        "type": event_type,
+                        "void_record": dict(getattr(self, "_last_voided_product_part_record", {}) or {}),
+                        "post_raw_sacks_count": int(s.raw_sacks_count or 0),
+                        "post_raw_material_scans": list(s.raw_material_scans or []),
+                    }
+                self.push_event(void_payload, event_label, defer_snapshot=True)
                 return
             if res.kind == "BUTAL":
                 if s.supervisor_review_open and not s.cycle_time_pending_supervisor:
@@ -24092,7 +24125,16 @@ QWidget#ClientUIRoot {{
                 self._clear_void_modes()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
-                self.push_event({"type": "BUTAL_VOID"}, "BUTAL VOID", defer_snapshot=True)
+                self.push_event(
+                    {
+                        "type": "BUTAL_VOID",
+                        "void_record": dict(getattr(self, "_last_voided_butal_record", {}) or {}),
+                        "post_butal_total": int(s.butal_total or 0),
+                        "post_butal_by_job": dict(s.butal_by_job or {}),
+                    },
+                    "BUTAL VOID",
+                    defer_snapshot=True,
+                )
                 return
             if res.kind in ("REJECT_REASON", "STARTUP_REJECT"):
                 void_raw = "SUR" if res.kind == "STARTUP_REJECT" else str(raw_s).strip().upper()
