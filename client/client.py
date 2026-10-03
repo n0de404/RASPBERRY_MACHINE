@@ -58,6 +58,7 @@ except Exception:
 
 
 SERVER_URL = os.environ.get("MACHINE_SERVER_URL", "http://192.168.1.178:8000")
+TEST_MACHINE_CODE = "TEST-MACHINE"
 CLIENT_ID = os.environ.get("MACHINE_CLIENT_ID", socket.gethostname())
 SCANNER_MODE = os.environ.get("MACHINE_SCANNER_MODE", "auto").strip().lower()
 SCANNER_COM_PORT = os.environ.get("MACHINE_SCANNER_COM_PORT", "/dev`/ttyACM0").strip()
@@ -12628,6 +12629,39 @@ QWidget#ClientUIRoot {{
         )
         self._refresh_ui()
 
+    def _activate_test_machine(self) -> bool:
+        """Load the isolated server sandbox without any BMS/job lookup."""
+        server_url = str((self.client_config or {}).get("server_url", SERVER_URL) or SERVER_URL).strip().rstrip("/")
+        try:
+            response = requests.post(
+                f"{server_url}/api/test-machine/connect",
+                json={"client_id": self._current_client_id()},
+                timeout=5,
+            )
+            body = response.json() if response.content else {}
+            if response.status_code != 200 or not isinstance(body, dict) or not body.get("ok"):
+                raise RuntimeError(str((body or {}).get("error") or f"HTTP {response.status_code}"))
+            snapshot = body.get("session") if isinstance(body.get("session"), dict) else None
+            if not isinstance(snapshot, dict):
+                raise RuntimeError("Server did not return the test session")
+        except Exception as exc:
+            self.status.setText(f"Could not load TEST MACHINE: {exc}")
+            self._show_invalid_overlay("The isolated test machine could not be loaded from the server.")
+            return False
+
+        self._hide_invalid_overlay()
+        self._restore_state_from_snapshot(snapshot)
+        self.state.machine_code = TEST_MACHINE_CODE
+        self.state.machine_name = "TEST MACHINE"
+        self._save_active_session_snapshot(force=True)
+        self.status.setText(
+            "TEST MACHINE loaded. Scan testpack~QTY, reject~1 + a reason QR, void~1, or other client controls."
+        )
+        self._set_banner_text("TEST MODE - isolated from production | testpack~QTY")
+        self._refresh_ui()
+        self.push_event({"type": "MACHINE_SET", "test_only": True}, "TEST MACHINE CONNECTED")
+        return True
+
     def _discard_server_recovery(self, machine_code: str) -> bool:
         server_url = str((self.client_config or {}).get("server_url", SERVER_URL) or SERVER_URL).strip().rstrip("/")
         try:
@@ -21712,6 +21746,69 @@ QWidget#ClientUIRoot {{
             return True
         return False
 
+    def _record_test_machine_pack(self, raw_scan: str, qty_value: Any) -> bool:
+        """Record a synthetic pack through the normal durable event queue."""
+        s = self.state
+        try:
+            qty_float = float(qty_value or 0)
+        except (TypeError, ValueError):
+            qty_float = 0
+        if qty_float <= 0 or not qty_float.is_integer():
+            self.status.setText("Invalid test pack. Use testpack~QTY with a positive whole number.")
+            self._show_invalid_overlay("Example test pack QR: testpack~10")
+            return False
+        qty = int(qty_float)
+        next_index = int(s.pack_count or 0) + 1
+        now_utc = datetime.now(timezone.utc).isoformat()
+        pack_key = f"TEST:{s.production_session_id}:{next_index}:{uuid.uuid4().hex.upper()}"
+        row = {
+            "pack_key": pack_key,
+            "raw_scan": str(raw_scan or "").strip(),
+            "product_p": "TEST",
+            "product_id": "TEST",
+            "product_name": "Test Product (Not Production)",
+            "qty_q": str(qty),
+            "qty": qty,
+            "good_qty": qty,
+            "index": str(next_index),
+            "total_labels": "-",
+            "lot_number": "TEST-CLIENT",
+            "po_number": "TEST-JOB",
+            "operator": str(s.operator_id or "TEST OPERATOR"),
+            "operator_name": "TEST OPERATOR",
+            **self._scan_owner_context(),
+            "production_session_id": str(s.production_session_id or "TEST-SANDBOX-SESSION"),
+            "status": "TEST_ONLY",
+            "source": "TEST_CLIENT",
+            "voided": False,
+            "scanned_at": now_utc,
+        }
+        s.product_pack_history_logs.append(row)
+        s.product_pack_history_keys.add(pack_key)
+        s.pack_count += 1
+        s.good_total += qty
+        self._sync_machine_counter_current()
+        self.lblPack.add_points(1)
+        self.lblGood.add_points(qty)
+        self.lblTotalGood.add_points(qty)
+        self.log_last(self._format_pack_history_action_text(row))
+        self.status.setText(f"TEST PACK +1, Good +{qty}")
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        self.push_event(
+            {
+                "type": "PACK",
+                "pack_qty": 1,
+                "qty": qty,
+                "pack_key": pack_key,
+                "pack_record": dict(row),
+                "test_only": True,
+            },
+            f"TEST PACK +1 GOOD +{qty}",
+            defer_snapshot=True,
+        )
+        return True
+
     def _void_product_part_scan(self, raw_scan: str) -> bool:
         s = self.state
         self._last_voided_product_part_record = None
@@ -24694,20 +24791,36 @@ QWidget#ClientUIRoot {{
             return
 
         if res.kind == "MACHINE":
+            test_machine_scan = bool(isinstance(res.meta, dict) and res.meta.get("test_machine"))
+            if test_machine_scan:
+                if s.machine_code and s.machine_code != TEST_MACHINE_CODE:
+                    current_snapshot = self._state_to_active_snapshot()
+                    if self._snapshot_is_recoverable(current_snapshot):
+                        self.status.setText("Finish your current production job before entering TEST MACHINE.")
+                        self._show_invalid_overlay("Cannot leave an active production job for test mode.")
+                        return
+                    self._clear_active_session_snapshot(s.machine_code)
+                self._activate_test_machine()
+                return
             if s.machine_code:
-                current_snapshot = self._state_to_active_snapshot()
-                if self._snapshot_is_recoverable(current_snapshot):
-                    self.status.setText("Finish your current job first before changing machine.")
-                    self._show_invalid_overlay("Cannot change machine while current job is active.")
-                    return
-                # This client is an interchangeable terminal. A machine-only
-                # idle shell must not pin the Raspberry Pi to that machine.
-                # Remove only the old local shell; any real server session for
-                # the newly scanned machine is fetched and offered for recovery
-                # below.
-                self._clear_active_session_snapshot(s.machine_code)
-                s.machine_code = None
-                s.machine_name = None
+                if s.machine_code == TEST_MACHINE_CODE:
+                    self._clear_active_session_snapshot(TEST_MACHINE_CODE)
+                    s.machine_code = None
+                    s.machine_name = None
+                else:
+                    current_snapshot = self._state_to_active_snapshot()
+                    if self._snapshot_is_recoverable(current_snapshot):
+                        self.status.setText("Finish your current job first before changing machine.")
+                        self._show_invalid_overlay("Cannot change machine while current job is active.")
+                        return
+                    # This client is an interchangeable terminal. A machine-only
+                    # idle shell must not pin the Raspberry Pi to that machine.
+                    # Remove only the old local shell; any real server session for
+                    # the newly scanned machine is fetched and offered for recovery
+                    # below.
+                    self._clear_active_session_snapshot(s.machine_code)
+                    s.machine_code = None
+                    s.machine_name = None
             self.status.setText("Machine scanned. Checking saved session...")
             QApplication.processEvents()
             local_snap = self._load_local_active_session_snapshot(raw_s)
@@ -25547,6 +25660,9 @@ QWidget#ClientUIRoot {{
                 return
 
             if res.kind == "PACK":
+                if s.machine_code == TEST_MACHINE_CODE:
+                    self._record_test_machine_pack(raw_s, res.qty)
+                    return
                 qty = float(res.qty or 0.0)
                 pack_hist = self._extract_pack_history_fields(raw_s)
                 pack_key = ""

@@ -5025,6 +5025,7 @@ def _normalize_test_machine_settings(value: Any) -> Dict[str, Any]:
         "pack_logs": pack_logs,
         "reject_logs": reject_logs,
         "last_event": str(raw.get("last_event") or "Test machine ready").strip(),
+        "started_at_utc": str(raw.get("started_at_utc") or "").strip(),
         "updated_at_utc": str(raw.get("updated_at_utc") or "").strip(),
     }
 
@@ -5042,9 +5043,12 @@ def _test_machine_session_payload(settings: Optional[Dict[str, Any]] = None) -> 
         "machine_name": "TEST MACHINE",
         "job_code": "TEST-JOB",
         "job_name": "Dashboard Test Job",
+        "job_started_at": config["started_at_utc"] or config["updated_at_utc"] or utc_now().isoformat(),
         "product_sku": "TEST-SKU",
         "product_name": "Test Product (Not Production)",
         "operator_id": "TEST OPERATOR",
+        "active_scan_operator_id": "TEST OPERATOR",
+        "active_scan_owner_type": "ORIGINAL",
         "production_session_id": "TEST-SANDBOX-SESSION",
         "pack_total": config["pack_count"],
         "pack_count": config["pack_count"],
@@ -5068,6 +5072,22 @@ def _test_machine_session_payload(settings: Optional[Dict[str, Any]] = None) -> 
         "operator_shift_logs": [],
         "cycle_time_current": "60",
         "qty_per_packing": config["pack_qty"],
+        "job_payload": {
+            "data": {
+                "job": {
+                    "id": "TEST-JOB",
+                    "ref_no": "TEST-JOB",
+                    "status": "TEST ONLY",
+                    "product_sku": "TEST-SKU",
+                    "product_name": "Test Product (Not Production)",
+                },
+                "job_details": {
+                    "product_sku": "TEST-SKU",
+                    "product_name": "Test Product (Not Production)",
+                    "qty_per_packing": config["pack_qty"],
+                },
+            }
+        },
         "test_target_packs": config["target_packs"],
         "is_test_machine": True,
         "last_event": config["last_event"],
@@ -5075,6 +5095,104 @@ def _test_machine_session_payload(settings: Optional[Dict[str, Any]] = None) -> 
         "last_seen_utc": updated_at,
         "summary_only": False,
     }
+
+
+def _apply_test_machine_client_event(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply a real client event to the isolated dashboard sandbox only."""
+    global SERVER_SETTINGS
+    event = data.get("event") if isinstance(data.get("event"), dict) else {}
+    event_type = str(event.get("type") or "").strip().upper()
+    config = _normalize_test_machine_settings(SERVER_SETTINGS.get("test_machine"))
+    if event_type == "HEARTBEAT":
+        return config
+    config["enabled"] = True
+    now = str(data.get("event_created_at_utc") or utc_now().isoformat())
+    snapshot = event.get("session_snapshot") if isinstance(event.get("session_snapshot"), dict) else {}
+
+    if event_type == "PACK":
+        pack_count = max(1, int(event.get("pack_qty", 1) or 1))
+        good_qty = max(0, int(event.get("qty", config["pack_qty"] * pack_count) or 0))
+        config["pack_count"] += pack_count
+        config["good_total"] += good_qty
+        source = event.get("pack_record") if isinstance(event.get("pack_record"), dict) else {}
+        row = dict(source)
+        row.setdefault("pack_key", str(event.get("pack_key") or f"TEST-PACK-{uuid.uuid4().hex.upper()}"))
+        row.setdefault("raw_scan", str(row.get("pack_key") or "TEST PACK"))
+        row.setdefault("qty_q", str(good_qty))
+        row.setdefault("qty", good_qty)
+        row.setdefault("index", str(config["pack_count"]))
+        row.setdefault("lot_number", "TEST-CLIENT")
+        row.setdefault("scanned_at", now)
+        row["source"] = "TEST_CLIENT"
+        row["voided"] = False
+        config["pack_logs"].append(row)
+    elif event_type == "REJECT":
+        count = max(1, int(event.get("qty", 1) or 1))
+        reason = str(event.get("reason") or "TEST_REJECT").strip().upper() or "TEST_REJECT"
+        config["reject_total"] += count
+        config["reject_breakdown"][reason] = int(config["reject_breakdown"].get(reason, 0) or 0) + count
+        incoming = event.get("reject_records") if isinstance(event.get("reject_records"), list) else []
+        for offset in range(count):
+            source = incoming[offset] if offset < len(incoming) and isinstance(incoming[offset], dict) else {}
+            config["reject_logs"].append({
+                **source,
+                "reject_scan_id": str(source.get("reject_scan_id") or f"TEST-REJECT-{uuid.uuid4().hex.upper()}"),
+                "entry_type": "REJECT_SCAN",
+                "reason_code": reason,
+                "reason_text": str(source.get("reason_text") or reason),
+                "scanned_at": str(source.get("scanned_at") or now),
+                "voided": False,
+                "source": "TEST_CLIENT",
+            })
+    elif event_type == "STARTUP_REJECT":
+        count = max(1, int(event.get("qty", 1) or 1))
+        config["reject_total"] += count
+        config["reject_breakdown"]["SUR"] = int(config["reject_breakdown"].get("SUR", 0) or 0) + count
+    elif event_type == "PACK_VOID":
+        record = event.get("void_record") if isinstance(event.get("void_record"), dict) else {}
+        wanted_key = str(record.get("pack_key") or "").strip()
+        wanted_raw = str(record.get("raw_scan") or "").strip()
+        for idx in range(len(config["pack_logs"]) - 1, -1, -1):
+            row = config["pack_logs"][idx]
+            if (wanted_key and str(row.get("pack_key") or "") == wanted_key) or (
+                wanted_raw and str(row.get("raw_scan") or "") == wanted_raw
+            ):
+                config["pack_logs"].pop(idx)
+                break
+        config["pack_count"] = max(0, int(event.get("post_pack_total", config["pack_count"] - 1) or 0))
+        config["good_total"] = max(0, int(event.get("post_good_total", config["good_total"]) or 0))
+    elif event_type == "REJECT_VOID":
+        supplied = event.get("reject_record") if isinstance(event.get("reject_record"), dict) else {}
+        reject_id = str(event.get("reject_scan_id") or supplied.get("reject_scan_id") or "").strip()
+        reason = str(event.get("reason") or supplied.get("reason_code") or "TEST_REJECT").strip().upper()
+        for idx in range(len(config["reject_logs"]) - 1, -1, -1):
+            row = config["reject_logs"][idx]
+            if reject_id and str(row.get("reject_scan_id") or "") != reject_id:
+                continue
+            if not reject_id and str(row.get("reason_code") or "").strip().upper() != reason:
+                continue
+            config["reject_logs"][idx] = {**row, **supplied, "voided": True, "voided_at": supplied.get("voided_at") or now}
+            break
+        config["reject_total"] = max(0, config["reject_total"] - 1)
+        config["reject_breakdown"][reason] = max(0, int(config["reject_breakdown"].get(reason, 0) or 0) - 1)
+    elif event_type == "SESSION_SYNC" and snapshot:
+        config["pack_count"] = max(0, int(snapshot.get("pack_count", snapshot.get("pack_total", config["pack_count"])) or 0))
+        config["good_total"] = max(0, int(snapshot.get("good_total", config["good_total"]) or 0))
+        config["reject_total"] = max(0, int(snapshot.get("reject_total", config["reject_total"]) or 0))
+        if isinstance(snapshot.get("reject_breakdown"), dict):
+            config["reject_breakdown"] = _canonical_reject_breakdown(snapshot.get("reject_breakdown"))
+        if isinstance(snapshot.get("product_pack_history_logs"), list):
+            config["pack_logs"] = [dict(row) for row in snapshot.get("product_pack_history_logs") or [] if isinstance(row, dict)][-500:]
+        if isinstance(snapshot.get("reject_review_logs"), list):
+            config["reject_logs"] = [dict(row) for row in snapshot.get("reject_review_logs") or [] if isinstance(row, dict)][-500:]
+
+    config["pack_logs"] = config["pack_logs"][-500:]
+    config["reject_logs"] = config["reject_logs"][-500:]
+    config["last_event"] = str(data.get("last_event") or event_type or "TEST CLIENT CONNECTED")
+    config["updated_at_utc"] = now
+    SERVER_SETTINGS = {**SERVER_SETTINGS, "test_machine": _normalize_test_machine_settings(config)}
+    save_server_settings(SERVER_SETTINGS)
+    return SERVER_SETTINGS["test_machine"]
 
 
 def load_server_settings() -> Dict[str, Any]:
@@ -10167,6 +10285,13 @@ DASHBOARD_HTML = r"""
           <div id="settingsPageTestMachine" class="settings-page">
             <div class="settings-form">
               <div class="test-machine-warning"><strong>Isolated test sandbox.</strong> This machine never enters production sessions, finished-job history, client status, job planning, or production reports.</div>
+              <div class="test-machine-action-card">
+                <h4>Client Test QR</h4>
+                <div class="settings-note">Scan this on any updated Raspberry Pi client to load the complete isolated test job.</div>
+                <code style="font-size:1rem;font-weight:900;color:#5b21b6;">testmachine~1</code>
+                <button id="settingsTestMachineQrBtn" class="btn-primary" type="button">Show testmachine~1 QR</button>
+                <div class="settings-note">After it loads, use <strong>testpack~QTY</strong> (example: testpack~10) to test packing.</div>
+              </div>
               <div class="settings-row">
                 <label>Test Machine</label>
                 <select id="settingsTestMachineEnabled">
@@ -10386,6 +10511,7 @@ DASHBOARD_HTML = r"""
   const settingsMachineClearBtn = document.getElementById("settingsMachineClearBtn");
   const settingsMachineClearStatus = document.getElementById("settingsMachineClearStatus");
   const settingsTestMachineEnabled = document.getElementById("settingsTestMachineEnabled");
+  const settingsTestMachineQrBtn = document.getElementById("settingsTestMachineQrBtn");
   const settingsTestTargetPacks = document.getElementById("settingsTestTargetPacks");
   const settingsTestPackQty = document.getElementById("settingsTestPackQty");
   const settingsTestSaveBtn = document.getElementById("settingsTestSaveBtn");
@@ -19687,6 +19813,12 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   serverSettingsSaveBtn?.addEventListener("click", saveServerSettingsUi);
   settingsMachinesSaveBtn?.addEventListener("click", saveServerSettingsUi);
   settingsTestSaveBtn?.addEventListener("click", saveServerSettingsUi);
+  settingsTestMachineQrBtn?.addEventListener("click", () => openQrViewer({
+    title: "TEST MACHINE Client QR",
+    payload: "testmachine~1",
+    product: "Isolated client test sandbox",
+    code: "TEST-MACHINE",
+  }));
   settingsTestAddPackBtn?.addEventListener("click", () => runTestMachineAction("add_pack"));
   settingsTestAddRejectBtn?.addEventListener("click", () => runTestMachineAction("add_reject"));
   settingsTestResetBtn?.addEventListener("click", () => runTestMachineAction("reset"));
@@ -21963,6 +22095,20 @@ async def api_heartbeat(req: Request):
     remote_host = str(req.client.host if req.client else "")
     client_id = str(data.get("client_id") or "UNKNOWN").strip() or "UNKNOWN"
     machine_code = str(data.get("machine_code") or "").strip()
+    if machine_code == TEST_MACHINE_CODE:
+        _apply_test_machine_client_event(data)
+        session = _test_machine_session_payload()
+        return {
+            "ok": True,
+            "client_online": True,
+            "machine_scanned": True,
+            "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
+            "server_authoritative": True,
+            "test_only": True,
+            "production_session_id": str((session or {}).get("production_session_id") or "") or None,
+            "session": session,
+            "client_activity_ack_ids": [],
+        }
     identity_owner = _active_client_identity_conflict(client_id, remote_host)
     if identity_owner is not None:
         return JSONResponse(
@@ -22131,6 +22277,15 @@ async def api_event(req: Request):
                 {"remote_host": remote_host, "event_id": event_id},
             )
         duplicate_machine = str(data.get("machine_code") or "").strip()
+        if duplicate_machine == TEST_MACHINE_CODE:
+            return {
+                "ok": True,
+                "duplicate": True,
+                "ack_event_id": event_id,
+                "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
+                "server_authoritative": True,
+                "session": _test_machine_session_payload(),
+            }
         duplicate_session = SESSIONS.get(duplicate_machine)
         return {
             "ok": True,
@@ -22142,6 +22297,19 @@ async def api_event(req: Request):
         }
 
     client_id = str(data.get("client_id", "UNKNOWN")).strip() or "UNKNOWN"
+    requested_machine_code = str(data.get("machine_code") or "").strip()
+    if requested_machine_code == TEST_MACHINE_CODE:
+        _apply_test_machine_client_event(data)
+        _mark_event_id_processed(event_id)
+        await broadcast_state()
+        return {
+            "ok": True,
+            "ack_event_id": event_id,
+            "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
+            "server_authoritative": True,
+            "test_only": True,
+            "session": _test_machine_session_payload(),
+        }
     identity_owner = _active_client_identity_conflict(client_id, remote_host)
     if identity_owner is not None:
         conflict_payload = {
@@ -23904,7 +24072,7 @@ async def api_server_settings_save(req: Request):
     # sandbox counters or audit rows already created by test actions.
     current_test = _normalize_test_machine_settings(SERVER_SETTINGS.get("test_machine"))
     if isinstance(incoming_test, dict):
-        for key in ("pack_count", "good_total", "reject_total", "reject_breakdown", "pack_logs", "reject_logs", "last_event", "updated_at_utc"):
+        for key in ("pack_count", "good_total", "reject_total", "reject_breakdown", "pack_logs", "reject_logs", "last_event", "started_at_utc", "updated_at_utc"):
             test_machine[key] = current_test[key]
     SERVER_SETTINGS = {
         "theme": theme,
@@ -23937,6 +24105,7 @@ async def api_test_machine_action(req: Request):
             "pack_logs": [],
             "reject_logs": [],
             "last_event": "TEST RESET",
+            "started_at_utc": now,
             "updated_at_utc": now,
         })
     elif action == "add_pack":
@@ -23995,6 +24164,31 @@ async def api_test_machine_action(req: Request):
     return {
         "ok": True,
         "test_machine": SERVER_SETTINGS["test_machine"],
+        "session": _test_machine_session_payload(),
+    }
+
+
+@APP.post("/api/test-machine/connect")
+async def api_test_machine_connect(req: Request):
+    """Activate and return the sandbox session for a real client terminal."""
+    global SERVER_SETTINGS
+    try:
+        data = await req.json()
+    except Exception:
+        data = {}
+    config = _normalize_test_machine_settings(SERVER_SETTINGS.get("test_machine"))
+    config["enabled"] = True
+    if not config["started_at_utc"]:
+        config["started_at_utc"] = utc_now().isoformat()
+    config["last_event"] = f"TEST CLIENT CONNECTED {str(data.get('client_id') or '').strip()}".strip()
+    config["updated_at_utc"] = utc_now().isoformat()
+    SERVER_SETTINGS = {**SERVER_SETTINGS, "test_machine": config}
+    save_server_settings(SERVER_SETTINGS)
+    await broadcast_state()
+    return {
+        "ok": True,
+        "test_only": True,
+        "test_machine": config,
         "session": _test_machine_session_payload(),
     }
 

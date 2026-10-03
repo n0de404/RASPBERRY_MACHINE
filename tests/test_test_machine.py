@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -75,6 +76,45 @@ class TestMachineSandboxTests(unittest.TestCase):
         self.assertIn('id="settingsTestResetBtn"', html)
         self.assertIn("TEST ONLY", html)
         self.assertIn("/api/test-machine/action", html)
+
+    def test_real_client_pack_and_reject_events_stay_out_of_production_sessions(self):
+        original_settings = dashboard_server.SERVER_SETTINGS
+        original_session_keys = set(dashboard_server.SESSIONS)
+        dashboard_server.SERVER_SETTINGS = {
+            **original_settings,
+            "test_machine": dashboard_server._normalize_test_machine_settings({
+                "enabled": True,
+                "target_packs": 5,
+                "pack_qty": 8,
+            }),
+        }
+        try:
+            with patch.object(dashboard_server, "save_server_settings", return_value=None):
+                dashboard_server._apply_test_machine_client_event({
+                    "machine_code": dashboard_server.TEST_MACHINE_CODE,
+                    "event": {
+                        "type": "PACK",
+                        "pack_qty": 1,
+                        "qty": 8,
+                        "pack_key": "CLIENT-TEST-PACK-1",
+                        "pack_record": {"raw_scan": "testpack~8"},
+                    },
+                    "last_event": "TEST PACK +1 GOOD +8",
+                })
+                dashboard_server._apply_test_machine_client_event({
+                    "machine_code": dashboard_server.TEST_MACHINE_CODE,
+                    "event": {"type": "REJECT", "qty": 2, "reason": "BM01"},
+                    "last_event": "TEST REJECT +2",
+                })
+
+            config = dashboard_server.SERVER_SETTINGS["test_machine"]
+            self.assertEqual(config["pack_count"], 1)
+            self.assertEqual(config["good_total"], 8)
+            self.assertEqual(config["reject_total"], 2)
+            self.assertEqual(set(dashboard_server.SESSIONS), original_session_keys)
+            self.assertNotIn(dashboard_server.TEST_MACHINE_CODE, dashboard_server.SESSIONS)
+        finally:
+            dashboard_server.SERVER_SETTINGS = original_settings
 
 
 if __name__ == "__main__":

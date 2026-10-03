@@ -24,5 +24,23 @@ class SupervisorReviewMappingTests(unittest.TestCase):
         self.assertEqual(result.kind, "SUPERVISOR_REVIEW_TRIGGER")
 
 
+class TestMachineMappingTests(unittest.TestCase):
+    def test_test_machine_qr_uses_isolated_machine_identity(self):
+        result = parse_scan("testmachine~1")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "MACHINE")
+        self.assertEqual(result.value, "TEST MACHINE")
+        self.assertEqual(result.meta.get("machine_code"), "TEST-MACHINE")
+        self.assertTrue(result.meta.get("test_machine"))
+
+    def test_test_pack_qr_supports_configurable_quantity(self):
+        result = parse_scan("testpack~24")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "PACK")
+        self.assertEqual(result.qty, 24.0)
+
+
 if __name__ == "__main__":
     unittest.main()

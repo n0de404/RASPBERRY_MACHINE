@@ -202,6 +202,19 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
     s = raw.strip()
     s_l = s.lower()
 
+    # Isolated server/client sandbox controls. These never map to a physical
+    # IMM machine or production work order.
+    if s_l == "testmachine~1":
+        return ScanResult(
+            kind="MACHINE",
+            raw=raw,
+            value="TEST MACHINE",
+            meta={"machine_code": "TEST-MACHINE", "test_machine": True},
+        )
+    test_pack = re.fullmatch(r"testpack~(\d+)", s_l)
+    if test_pack:
+        return ScanResult(kind="PACK", raw=raw, value="Test Pack", qty=float(test_pack.group(1)))
+
     # Operator handoff trigger
     if s_l in ("operatorshift~1", "operator_shift~1", "shiftchange~1"):
         return ScanResult(kind="OPERATOR_SHIFT_TRIGGER", raw=raw, value="Finish shift")
