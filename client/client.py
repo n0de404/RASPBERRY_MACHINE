@@ -26645,15 +26645,20 @@ QWidget#ClientUIRoot {{
                     if 400 <= status_code < 500 and not retryable_http:
                         discard_item = True
                         last_error = f"HTTP {status_code}: {str(resp.text or '')[:200]}"
+                        # The server conclusively rejected this payload. Treat the
+                        # response as reached so the durable outbox row is retired
+                        # below instead of falling through the protocol-2 ACK check
+                        # and retrying a permanently invalid event forever.
+                        request_reached_server = True
                     else:
                         resp.raise_for_status()
-                    response_protocol = int(response_body.get("sync_protocol") or 0)
-                    if response_protocol >= SERVER_SYNC_PROTOCOL_VERSION and event_type != "HEARTBEAT":
-                        acknowledged_event_id = str(response_body.get("ack_event_id") or "").strip()
-                        if acknowledged_event_id != str(item.get("id") or "").strip():
-                            raise RuntimeError("Server response did not acknowledge this event ID")
-                    self._server_sync_protocol = response_protocol
-                    request_reached_server = True
+                        response_protocol = int(response_body.get("sync_protocol") or 0)
+                        if response_protocol >= SERVER_SYNC_PROTOCOL_VERSION and event_type != "HEARTBEAT":
+                            acknowledged_event_id = str(response_body.get("ack_event_id") or "").strip()
+                            if acknowledged_event_id != str(item.get("id") or "").strip():
+                                raise RuntimeError("Server response did not acknowledge this event ID")
+                        self._server_sync_protocol = response_protocol
+                        request_reached_server = True
                 else:
                     retry_item = self._should_persist_server_event(item)
                     last_error = "server_url is empty"
@@ -26831,7 +26836,11 @@ QWidget#ClientUIRoot {{
                 if event_type == "SESSION_SYNC" and isinstance(event_body, dict) and isinstance(event_body.get("session_snapshot"), dict):
                     self._server_recovery_snapshot_queued = False
             else:
-                if session_conflict_code == "MISSING_PRODUCTION_SESSION":
+                retire_stale_job_start = (
+                    session_conflict_code == "STALE_PRODUCTION_SESSION"
+                    and event_type == "JOB_SET"
+                )
+                if session_conflict_code == "MISSING_PRODUCTION_SESSION" or retire_stale_job_start:
                     # This is a legacy/outbox payload created without the session
                     # fence required by the server's current active job. Retrying
                     # the exact payload can never succeed and previously caused an
@@ -26842,7 +26851,11 @@ QWidget#ClientUIRoot {{
                     retry_item = False
                     self._append_app_log(
                         "SESSION FENCE",
-                        f"Retired legacy {event_type or 'UNKNOWN'} event without a production session ID",
+                        (
+                            f"Retired stale {event_type} event superseded by the current production session"
+                            if retire_stale_job_start
+                            else f"Retired legacy {event_type or 'UNKNOWN'} event without a production session ID"
+                        ),
                     )
                 else:
                     self._mark_persisted_server_event_failed(item, last_error)
