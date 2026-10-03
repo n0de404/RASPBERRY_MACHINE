@@ -73,6 +73,8 @@ class SupervisorRotationTests(unittest.TestCase):
         self.assertIn('id="machineDetailSupervisorMenu"', dashboard_server.DASHBOARD_HTML)
         self.assertIn("machineSupervisorActivityRows", dashboard_server.DASHBOARD_HTML)
         self.assertIn("Rotation checks", dashboard_server.DASHBOARD_HTML)
+        self.assertNotIn("┬╖", dashboard_server.DASHBOARD_HTML)
+        self.assertNotIn("ΓÇó", dashboard_server.DASHBOARD_HTML)
 
     def test_dashboard_summary_includes_compact_rotation_identity_and_time(self):
         session = self._session()

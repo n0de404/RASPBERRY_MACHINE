@@ -15782,13 +15782,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
             const jobName = firstValue(row?.job_name, row?.job_code, "-");
             const jobSub = jobSecondaryLabel(row);
             const targetWarning = targetReached
-              ? `<span class="queue-target-warning ${excessQty > 0 ? "excess" : ""}">${esc(excessQty > 0 ? `TARGET REACHED ΓÇó EXCESS +${excessQty}` : "TARGET REACHED")}</span>`
+              ? `<span class="queue-target-warning ${excessQty > 0 ? "excess" : ""}">${esc(excessQty > 0 ? `TARGET REACHED | EXCESS +${excessQty}` : "TARGET REACHED")}</span>`
               : "";
             return `
               <tr>
-                <td><div class="jq-machine-cell"><div class="jq-machine-icon">M</div><div><div class="jq-primary">${esc(machineName)} ┬╖ ${esc(row?.machine_code || "-")}</div><div class="jq-secondary">Job ${esc(jobName)}</div><div class="jq-secondary">${esc(jobSub)}</div></div></div></td>
+                <td><div class="jq-machine-cell"><div class="jq-machine-icon">M</div><div><div class="jq-primary">${esc(machineName)} | ${esc(row?.machine_code || "-")}</div><div class="jq-secondary">Job ${esc(jobName)}</div><div class="jq-secondary">${esc(jobSub)}</div></div></div></td>
                 <td><div class="jq-primary">${esc(startText)}</div></td>
-                <td><div class="jq-progress-head"><span>${esc(produced.toLocaleString())} / ${esc(target.toLocaleString())}</span><span>${esc(progressPct.toFixed(1))}%</span></div><div class="jq-progress-track"><span class="jq-progress-fill ${isDisconnected ? "offline" : ""}" style="width:${esc(progressPct.toFixed(2))}%"></span></div><div class="jq-secondary">Pack ${esc(row?.pack_count ?? 0)} &nbsp;┬╖&nbsp; Cavity ${esc(cavity)}</div>${targetWarning}</td>
+                <td><div class="jq-progress-head"><span>${esc(produced.toLocaleString())} / ${esc(target.toLocaleString())}</span><span>${esc(progressPct.toFixed(1))}%</span></div><div class="jq-progress-track"><span class="jq-progress-fill ${isDisconnected ? "offline" : ""}" style="width:${esc(progressPct.toFixed(2))}%"></span></div><div class="jq-secondary">Pack ${esc(row?.pack_count ?? 0)} &nbsp;|&nbsp; Cavity ${esc(cavity)}</div>${targetWarning}</td>
                 <td><span class="jq-inline-icon">Γùë</span><span class="jq-primary">${esc(remainingText)}</span></td>
                 <td><span class="jq-inline-icon">Γûú</span><span class="jq-primary">${esc(endText)}</span></td>
                 <td><span class="jq-inline-icon jq-cycle-icon">Γù╖</span><span class="jq-primary">${esc(cycleText)}</span>${hourlyRate ? `<div class="jq-secondary">${esc(hourlyRate.toLocaleString())} / hr</div>` : '<div class="jq-secondary">-</div>'}</td>
@@ -16216,7 +16216,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const abcClass = String(job.abc_class || "").trim().toUpperCase();
     const abcBadge = ["A", "B", "C"].includes(abcClass) ? `<span class="abc-class-badge class-${abcClass.toLowerCase()}" title="ABC class ${esc(abcClass)}">${esc(abcClass)}</span>` : "";
     const relationBadge = Number(job.related_child_count || 0) > 0
-      ? `<span class="product-relation-badge parent">PARENT ┬╖ ${esc(job.related_child_count)}</span>`
+      ? `<span class="product-relation-badge parent">PARENT | ${esc(job.related_child_count)}</span>`
       : (planningItemIsChild(job) ? '<span class="product-relation-badge child">CHILD</span>' : "");
     const product = [job.product_sku, job.product_name].filter(Boolean).join(" - ") || job.product_id || "-";
     const productLine = `<span class="planning-product-line"><span>Product:</span> <span class="planning-product-name">${esc(product)}</span></span>`;
@@ -16231,7 +16231,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       job.std_cycle_time ? `Cycle: ${job.std_cycle_time}` : "",
       job.request_qty ? `Qty: ${job.request_qty}` : "",
     ]).filter(Boolean).join("<br>");
-    const tonnageTitle = job.tonnage_source ? `Required machine tonnage ┬╖ ${job.tonnage_source}` : "Required machine tonnage";
+    const tonnageTitle = job.tonnage_source ? `Required machine tonnage | ${job.tonnage_source}` : "Required machine tonnage";
     return `<div class="planning-card${cardClass}" draggable="true" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><div class="planning-card-top-actions">${relationBadge}${abcBadge}${itemTonnage ? `<span class="planning-item-tonnage" title="${esc(tonnageTitle)}">${esc(itemTonnage)} T</span>` : ""}<span class="planning-chip ${esc(roleClass)}">${esc(roleLabel)}</span><button class="planning-remove" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}" title="Remove ${esc(title)}" aria-label="Remove ${esc(title)}">&times;</button></div></div><div class="planning-meta">${details || "No BMS details available."}</div></div>`;
   }
 
@@ -16250,7 +16250,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const finishUtc = preferredQueueFinish(queueRow);
     const remaining = preferredQueueRemaining(queueRow);
     const finishText = finishUtc ? fmtDateLocal(finishUtc) : "Estimate unavailable";
-    const progressCaption = `${finishText}${remaining != null && Number(remaining) > 0 ? ` ┬╖ ${fmtDowntimeSeconds(remaining)} left` : ""}`;
+    const progressCaption = `${finishText}${remaining != null && Number(remaining) > 0 ? ` | ${fmtDowntimeSeconds(remaining)} left` : ""}`;
     const operator = displayNameForId(session?.operator_id || "-");
     return `
       <div class="planning-card live">
@@ -16435,14 +16435,14 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         .join(" | ") || "No warehouse qty";
       const title = item.sku || item.product_id || "Product";
       const abcClass = String(item.abc_class || "").trim().toUpperCase();
-      const abcTitle = [`ABC class ${abcClass}`, item.serving_category ? `Category: ${item.serving_category}` : "", item.serving_rate !== "" && item.serving_rate != null ? `Serving rate: ${item.serving_rate}` : ""].filter(Boolean).join(" ┬╖ ");
+      const abcTitle = [`ABC class ${abcClass}`, item.serving_category ? `Category: ${item.serving_category}` : "", item.serving_rate !== "" && item.serving_rate != null ? `Serving rate: ${item.serving_rate}` : ""].filter(Boolean).join(" | ");
       const isChild = planningItemIsChild(item);
       const childCount = relatedChildren(item);
       const canExpand = !options.nested && childCount > 0;
       const accordionKey = canExpand ? familyAccordionKey(item) : "";
       const expanded = canExpand && planningExpandedProductFamilies.has(accordionKey);
       const relationBadge = childCount
-        ? `<span class="product-relation-badge parent">PARENT ┬╖ ${childCount}</span>`
+        ? `<span class="product-relation-badge parent">PARENT | ${childCount}</span>`
         : (isChild ? '<span class="product-relation-badge child">CHILD</span>' : "");
       return `
         <div class="stock-rec-card${canExpand ? " has-children" : ""}" draggable="true" data-product-key="${esc(itemDragKey(item, options.index))}"${canExpand ? ` data-family-toggle="${esc(accordionKey)}" aria-expanded="${expanded ? "true" : "false"}"` : ""}>
@@ -16747,7 +16747,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       renderPlanningOpsSummary(latestState || {}, latestState?.job_queue || []);
       const suffix = out.from_cache ? " from cache" : "";
       const counts = out.abc_counts || {};
-      const classSummary = `A ${Number(counts.A || 0)} ┬╖ B ${Number(counts.B || 0)} ┬╖ C ${Number(counts.C || 0)}`;
+      const classSummary = `A ${Number(counts.A || 0)} | B ${Number(counts.B || 0)} | C ${Number(counts.C || 0)}`;
       planningSetStatus(`Loaded ${(out.items || []).length} product item(s) with IMS stock; classifications: ${classSummary}${suffix}.`);
     } catch(e){
       renderLowStockRecommendations([], { error: `Product item lookup failed: ${e}` });
@@ -17003,7 +17003,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       const finish = preferredQueueFinish(queueRow);
       const reason = firstValue(session?.downtime_reason_text, session?.downtime_reason_code, "");
       const more = cards.length > 2 ? `+${cards.length - 2} more queued` : "";
-      const remarks = [reason, more].filter(Boolean).join(" ┬╖ ") || "-";
+      const remarks = [reason, more].filter(Boolean).join(" | ") || "-";
       return `<tr>
         <td class="plan-overview-machine">${esc((MACHINE_NAME_MAP[code] || code).replace(/^IMM\s*/i,""))}<small>${esc(tonnageMap[code] || "-")}</small></td>
         <td>${currentHtml}</td>
@@ -18149,9 +18149,9 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   function machineTodoUrgency(item){
     const seconds = machineTodoWaitingSeconds(item?.neededAt);
     const duration = machineTodoCompactDuration(seconds);
-    if(seconds >= 86400) return {kind:"urgent", label:`Urgent ┬╖ ${duration}`};
-    if(seconds >= 3600) return {kind:"late", label:`Late ┬╖ ${duration}`};
-    return {kind:"on-time", label:`On time ┬╖ ${duration}`};
+    if(seconds >= 86400) return {kind:"urgent", label:`Urgent | ${duration}`};
+    if(seconds >= 3600) return {kind:"late", label:`Late | ${duration}`};
+    return {kind:"on-time", label:`On time | ${duration}`};
   }
 
   function buildMachineTodoLists(state){
@@ -18293,7 +18293,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     }
     if(!machineTodoOverlay?.classList.contains("active")) return;
     const lists = filteredMachineTodoLists(allLists);
-    if(machineTodoUpdated) machineTodoUpdated.textContent = `Longest waiting first ┬╖ Updated ${new Date().toLocaleTimeString([], {hour12:false})}`;
+    if(machineTodoUpdated) machineTodoUpdated.textContent = `Longest waiting first | Updated ${new Date().toLocaleTimeString([], {hour12:false})}`;
     if(machineTodoSummary) machineTodoSummary.innerHTML = `
       ${machineTodoSummaryItemHtml("Machines without weight", lists.qc)}
       ${machineTodoSummaryItemHtml("Checks still needed", lists.supervisor)}
@@ -18431,11 +18431,11 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const rotationCount = Math.max(rotations.length, Number(source.supervisor_rotation_count || 0));
     const latestRotation = rows.find(row => row.kind === "rotation") || null;
     const timeline = rows.length ? rows.map(row => {
-      const detail = [row.role, row.status, row.duration ? `Duration ${row.duration}` : ""].filter(Boolean).join(" ┬╖ ");
+      const detail = [row.role, row.status, row.duration ? `Duration ${row.duration}` : ""].filter(Boolean).join(" | ");
       return `<div class="supervisor-activity-row ${row.kind === "review" ? "review" : "rotation"}">
         <span class="supervisor-activity-row-dot" aria-hidden="true"></span>
         <div class="supervisor-activity-row-main">
-          <div class="supervisor-activity-row-title">${esc(row.title)} ┬╖ ${esc(row.person)}</div>
+          <div class="supervisor-activity-row-title">${esc(row.title)} | ${esc(row.person)}</div>
           <div class="supervisor-activity-row-meta">${esc(detail)}</div>
         </div>
         <div class="supervisor-activity-row-time">${esc(fmtDateLocal(row.at))}</div>
@@ -18468,7 +18468,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     setMachineDetailSupervisorMenuOpen(false);
     machineDetailSupervisorBtn.hidden = false;
     machineDetailSupervisorBtn.innerHTML = `<span class="supervisor-check-dot" aria-hidden="true"></span><span>Supervisor ${esc(total)}</span><span class="supervisor-caret" aria-hidden="true">&#9662;</span>`;
-    machineDetailSupervisorBtn.title = `${rotationCount} rotation check${rotationCount === 1 ? "" : "s"} ┬╖ ${reviews.length} review${reviews.length === 1 ? "" : "s"}`;
+    machineDetailSupervisorBtn.title = `${rotationCount} rotation check${rotationCount === 1 ? "" : "s"} | ${reviews.length} review${reviews.length === 1 ? "" : "s"}`;
     renderMachineDetailSupervisorMenu(source);
   }
 
@@ -18504,9 +18504,9 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         : `Saved shift ${index + 1}`;
       const totalGood = row.total_good ?? row.partial_qty ?? row.good_total ?? 0;
       return `<button class="machine-finish-shift-option" type="button" role="menuitem" data-machine-code="${escAttr(code)}" data-finish-shift-key="${escAttr(jobKey)}">
-        <span class="shift-main">${esc(shiftLabel)} ┬╖ ${esc(fmtDateLocal(endedAt))}</span>
+        <span class="shift-main">${esc(shiftLabel)} | ${esc(fmtDateLocal(endedAt))}</span>
         <span class="shift-status ${escAttr(statusClass)}">${esc(reviewStatus)}</span>
-        <span class="shift-meta">${esc(operator)} ┬╖ Good ${esc(totalGood)} ┬╖ Packs ${esc(row.pack_count ?? 0)}</span>
+        <span class="shift-meta">${esc(operator)} | Good ${esc(totalGood)} | Packs ${esc(row.pack_count ?? 0)}</span>
       </button>`;
     }).join("");
   }
@@ -18591,9 +18591,9 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const session = (latestState?.sessions || []).find(row => String(row?.machine_code || "").trim() === wanted) || {};
     const machineName = session.machine_name || MACHINE_NAME_MAP[wanted] || wanted;
     const currentJob = firstValue(session.job_name, session.job_code, "Current job");
-    if(machinePartialTitle) machinePartialTitle.textContent = `${machineName} ┬╖ ${currentJob}`;
+    if(machinePartialTitle) machinePartialTitle.textContent = `${machineName} | ${currentJob}`;
     if(machinePartialSubtitle) machinePartialSubtitle.textContent = rows.length
-      ? `${rows.length} saved Finish Shift partial${rows.length === 1 ? "" : "s"} for this same job ┬╖ newest first`
+      ? `${rows.length} saved Finish Shift partial${rows.length === 1 ? "" : "s"} for this same job | newest first`
       : "No saved Finish Shift partials were found for this current job.";
     machinePartialBody.innerHTML = rows.length ? rows.map(row => {
       const flags = machinePartialFlags(row);
@@ -18606,7 +18606,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         <article class="machine-partial-row ${escAttr(rowClass)}">
           <div class="machine-partial-primary">
             <div class="machine-partial-job" title="${esc(finishedShiftJobName(row))}">${esc(finishedShiftJobName(row))}</div>
-            <div class="machine-partial-meta">${esc(fmtDateLocal(endedAt))} ┬╖ Shift ${esc(row.shift_index ?? "-")} ┬╖ ${esc(operator)}</div>
+            <div class="machine-partial-meta">${esc(fmtDateLocal(endedAt))} | Shift ${esc(row.shift_index ?? "-")} | ${esc(operator)}</div>
           </div>
           <div class="machine-partial-metrics">
             <div class="machine-partial-metric"><span class="k">Good</span><span class="v">${esc(row.total_good ?? row.partial_qty ?? row.good_total ?? 0)}</span></div>
@@ -18784,7 +18784,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         <div class="machine-job-estimate">
           <div class="machine-job-estimate-head"><span>Estimated finish</span><strong>${esc(jobProgressPct.toFixed(1))}%</strong></div>
           <div class="machine-job-estimate-track"><span class="machine-job-estimate-fill" style="width:${esc(jobProgressPct.toFixed(2))}%"></span></div>
-          <div class="machine-job-estimate-caption" title="${esc(`${estimatedFinish} | ${estimateCaption}`)}">${esc(estimatedFinish)} ┬╖ ${esc(estimateCaption)}</div>
+          <div class="machine-job-estimate-caption" title="${esc(`${estimatedFinish} | ${estimateCaption}`)}">${esc(estimatedFinish)} | ${esc(estimateCaption)}</div>
         </div>
       </div>
     `;
