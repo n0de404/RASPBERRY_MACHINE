@@ -26857,6 +26857,15 @@ QWidget#ClientUIRoot {{
             else:
                 item_session_id = str(item_payload.get("production_session_id") or "").strip()
                 current_local_session_id = str(self.state.production_session_id or "").strip()
+                # During startup the dispatcher can begin replaying before the
+                # UI thread has restored its active-session snapshot.  A stale
+                # 409 includes the server's authoritative session ID, so prefer
+                # that fence and fall back to the locally restored value.
+                authoritative_session_id = str(
+                    response_body.get("current_production_session_id")
+                    or current_local_session_id
+                    or ""
+                ).strip()
                 retire_stale_job_start = (
                     session_conflict_code == "STALE_PRODUCTION_SESSION"
                     and event_type == "JOB_SET"
@@ -26865,8 +26874,8 @@ QWidget#ClientUIRoot {{
                     session_conflict_code == "STALE_PRODUCTION_SESSION"
                     and event_type not in {"FINISH_SHIFT", "FINISH_JOB"}
                     and bool(item_session_id)
-                    and bool(current_local_session_id)
-                    and item_session_id != current_local_session_id
+                    and bool(authoritative_session_id)
+                    and item_session_id != authoritative_session_id
                 )
                 retire_session_fence_event = (
                     session_conflict_code == "MISSING_PRODUCTION_SESSION"
