@@ -4992,6 +4992,91 @@ def _profile_qr_png_data_url(payload: str, role: str, layout: str = "barcode_4x1
     return f"data:image/png;base64,{b64}"
 
 
+TEST_MACHINE_CODE = "TEST-MACHINE"
+
+
+def _normalize_test_machine_settings(value: Any) -> Dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    try:
+        target_packs = max(1, min(100000, int(raw.get("target_packs", 10))))
+    except (TypeError, ValueError):
+        target_packs = 10
+    try:
+        pack_qty = max(1, min(1000000, int(raw.get("pack_qty", 10))))
+    except (TypeError, ValueError):
+        pack_qty = 10
+    try:
+        pack_count = max(0, int(raw.get("pack_count", 0) or 0))
+        good_total = max(0, int(raw.get("good_total", 0) or 0))
+        reject_total = max(0, int(raw.get("reject_total", 0) or 0))
+    except (TypeError, ValueError):
+        pack_count = good_total = reject_total = 0
+    breakdown = _canonical_reject_breakdown(raw.get("reject_breakdown"))
+    pack_logs = [dict(row) for row in (raw.get("pack_logs") or []) if isinstance(row, dict)][-500:]
+    reject_logs = [dict(row) for row in (raw.get("reject_logs") or []) if isinstance(row, dict)][-500:]
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "target_packs": target_packs,
+        "pack_qty": pack_qty,
+        "pack_count": pack_count,
+        "good_total": good_total,
+        "reject_total": reject_total,
+        "reject_breakdown": breakdown,
+        "pack_logs": pack_logs,
+        "reject_logs": reject_logs,
+        "last_event": str(raw.get("last_event") or "Test machine ready").strip(),
+        "updated_at_utc": str(raw.get("updated_at_utc") or "").strip(),
+    }
+
+
+def _test_machine_session_payload(settings: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    config = _normalize_test_machine_settings(
+        (settings or SERVER_SETTINGS).get("test_machine") if isinstance(settings or SERVER_SETTINGS, dict) else {}
+    )
+    if not config["enabled"]:
+        return None
+    updated_at = config["updated_at_utc"] or utc_now().isoformat()
+    return {
+        "client_id": "SERVER-TEST-SANDBOX",
+        "machine_code": TEST_MACHINE_CODE,
+        "machine_name": "TEST MACHINE",
+        "job_code": "TEST-JOB",
+        "job_name": "Dashboard Test Job",
+        "product_sku": "TEST-SKU",
+        "product_name": "Test Product (Not Production)",
+        "operator_id": "TEST OPERATOR",
+        "production_session_id": "TEST-SANDBOX-SESSION",
+        "pack_total": config["pack_count"],
+        "pack_count": config["pack_count"],
+        "good_total": config["good_total"],
+        "butal_total": 0,
+        "reject_total": config["reject_total"],
+        "reject_breakdown": config["reject_breakdown"],
+        "no_shot_total": 0,
+        "startup_reject_total": 0,
+        "raw_sacks_count": 0,
+        "raw_material_scans": [],
+        "raw_material_logs": [],
+        "product_pack_history_logs": config["pack_logs"],
+        "butal_scan_logs": [],
+        "reject_review_logs": config["reject_logs"],
+        "linkage_jobs": [],
+        "supervisor_review_logs": [],
+        "supervisor_rotation_logs": [],
+        "supervisor_rotation_count": 0,
+        "pdr_downtime_logs": [],
+        "operator_shift_logs": [],
+        "cycle_time_current": "60",
+        "qty_per_packing": config["pack_qty"],
+        "test_target_packs": config["target_packs"],
+        "is_test_machine": True,
+        "last_event": config["last_event"],
+        "last_event_at_utc": updated_at,
+        "last_seen_utc": updated_at,
+        "summary_only": False,
+    }
+
+
 def load_server_settings() -> Dict[str, Any]:
     raw = _load_server_settings_sql()
     if not isinstance(raw, dict):
@@ -5017,6 +5102,7 @@ def load_server_settings() -> Dict[str, Any]:
         "theme": str(raw.get("theme", "Default")).strip() or "Default",
         "qrgen_base_url": str(raw.get("qrgen_base_url", QRGEN_BASE_URL)).strip().rstrip("/"),
         "visible_machine_codes": visible_machine_codes,
+        "test_machine": _normalize_test_machine_settings(raw.get("test_machine")),
     }
 
 
@@ -7032,6 +7118,9 @@ def _state_payload(
         row["product_part_shortage_names"] = list(shortages.get("names") or [])
         row["product_part_shortage_details"] = list(shortages.get("details") or [])
         row["product_part_shortage_since_utc"] = str(shortages.get("since_utc") or "")
+    test_machine_session = _test_machine_session_payload()
+    if test_machine_session is not None:
+        sessions.append(test_machine_session)
     payload = {
         "type": "STATE",
         "active_ttl_seconds": ACTIVE_TTL_SECONDS,
@@ -8532,6 +8621,12 @@ DASHBOARD_HTML = r"""
     .settings-row input, .settings-row select { width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 10px; padding: 9px 10px; font: inherit; background: #fff; }
     .settings-actions { margin-top: 12px; display: flex; justify-content: flex-end; gap: 8px; }
     .settings-note { font-size: 0.85rem; color: #64748b; line-height: 1.35; }
+    .test-machine-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:8px; }
+    .test-machine-action-card { border:1px solid #dbe4f0; border-radius:12px; background:#fff; padding:12px; display:grid; gap:9px; }
+    .test-machine-action-card h4 { margin:0; color:#334155; }
+    .test-machine-warning { border:1px solid #f59e0b; background:#fffbeb; color:#92400e; border-radius:10px; padding:9px 10px; font-size:.84rem; line-height:1.4; }
+    .machine-test-only-pill { display:inline-flex; align-items:center; border:1px solid #7c3aed; background:#ede9fe; color:#5b21b6; border-radius:999px; padding:3px 7px; font-size:.48rem; font-weight:950; letter-spacing:.06em; }
+    .card.test-machine { border-color:#8b5cf6 !important; box-shadow:0 0 0 2px rgba(139,92,246,.16),0 8px 20px rgba(76,29,149,.12); }
     .machine-picker-actions { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
     .machine-picker-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(145px, 1fr)); gap:8px; max-height:420px; overflow:auto; padding:4px; }
     .machine-picker-item { display:flex; align-items:center; gap:8px; border:1px solid #dbe4f0; border-radius:10px; background:#fff; padding:8px 10px; cursor:pointer; user-select:none; }
@@ -9134,6 +9229,8 @@ DASHBOARD_HTML = r"""
     body[data-theme="Dark"] .settings-row label { color: #cbd5e1; }
     body[data-theme="Dark"] .settings-row input, body[data-theme="Dark"] .settings-row select { background: #111827; color: #e5e7eb; border-color: #334155; }
     body[data-theme="Dark"] .settings-note { color: #94a3b8; }
+    body[data-theme="Dark"] .test-machine-action-card { background:#111827; border-color:#334155; }
+    body[data-theme="Dark"] .test-machine-action-card h4 { color:#e5e7eb; }
     body[data-theme="Dark"] .people-role-list, body[data-theme="Dark"] .settings-table-wrap { background: #111827; border-color: #334155; }
     body[data-theme="Dark"] .people-role-row { border-bottom-color: #253041; color: #d1d5db; }
     body[data-theme="Dark"] .people-role-row.head { background: #1f2937; color: #cbd5e1; }
@@ -10008,6 +10105,7 @@ DASHBOARD_HTML = r"""
           <button id="settingsNavGeneral" class="settings-nav-btn active" type="button">Settings</button>
           <button id="settingsNavTheme" class="settings-nav-btn" type="button">Theme</button>
           <button id="settingsNavMachines" class="settings-nav-btn" type="button">Machines</button>
+          <button id="settingsNavTestMachine" class="settings-nav-btn" type="button">Test Machine</button>
           <button id="settingsNavClients" class="settings-nav-btn" type="button">Clients &amp; IP</button>
           <button id="settingsNavInventory" class="settings-nav-btn" type="button">Inventory</button>
           <button id="settingsNavApi" class="settings-nav-btn" type="button">API Configuration</button>
@@ -10064,6 +10162,46 @@ DASHBOARD_HTML = r"""
                 <button id="settingsMachineClearBtn" class="btn-secondary" type="button" disabled>Clear Selected Machine Data</button>
               </div>
               <div id="settingsMachineClearStatus" class="settings-note"></div>
+            </div>
+          </div>
+          <div id="settingsPageTestMachine" class="settings-page">
+            <div class="settings-form">
+              <div class="test-machine-warning"><strong>Isolated test sandbox.</strong> This machine never enters production sessions, finished-job history, client status, job planning, or production reports.</div>
+              <div class="settings-row">
+                <label>Test Machine</label>
+                <select id="settingsTestMachineEnabled">
+                  <option value="false">Off - hidden from dashboard</option>
+                  <option value="true">On - show TEST MACHINE</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label>Target Packs</label>
+                <input id="settingsTestTargetPacks" type="number" min="1" max="100000" step="1" value="10" />
+              </div>
+              <div class="settings-row">
+                <label>Pieces Per Pack</label>
+                <input id="settingsTestPackQty" type="number" min="1" max="1000000" step="1" value="10" />
+              </div>
+              <div class="settings-actions">
+                <button id="settingsTestSaveBtn" class="btn-primary" type="button">Apply Test Machine</button>
+              </div>
+              <div class="test-machine-actions">
+                <div class="test-machine-action-card">
+                  <h4>Add Test Packs</h4>
+                  <div class="settings-row"><label>Number of packs</label><input id="settingsTestPackAddCount" type="number" min="1" max="1000" step="1" value="1" /></div>
+                  <button id="settingsTestAddPackBtn" class="btn-primary" type="button">Add Pack</button>
+                </div>
+                <div class="test-machine-action-card">
+                  <h4>Add Test Rejects</h4>
+                  <div class="settings-row"><label>Reject reason</label><select id="settingsTestRejectReason"><option value="DENT">Dent</option><option value="SHORT_SHOT">Short Shot</option><option value="FLASH">Flash</option><option value="COLOR">Color</option><option value="TEST_REJECT">Test Reject</option></select></div>
+                  <div class="settings-row"><label>Reject quantity</label><input id="settingsTestRejectCount" type="number" min="1" max="1000" step="1" value="1" /></div>
+                  <button id="settingsTestAddRejectBtn" class="btn-secondary" type="button">Add Reject</button>
+                </div>
+              </div>
+              <div class="settings-actions">
+                <button id="settingsTestResetBtn" class="btn-secondary" type="button">Reset Test Data</button>
+              </div>
+              <div id="settingsTestStatus" class="settings-note">Test machine is loading...</div>
             </div>
           </div>
           <div id="settingsPageClients" class="settings-page">
@@ -10218,6 +10356,7 @@ DASHBOARD_HTML = r"""
   const settingsNavGeneral = document.getElementById("settingsNavGeneral");
   const settingsNavTheme = document.getElementById("settingsNavTheme");
   const settingsNavMachines = document.getElementById("settingsNavMachines");
+  const settingsNavTestMachine = document.getElementById("settingsNavTestMachine");
   const settingsNavClients = document.getElementById("settingsNavClients");
   const settingsNavInventory = document.getElementById("settingsNavInventory");
   const settingsNavApi = document.getElementById("settingsNavApi");
@@ -10225,6 +10364,7 @@ DASHBOARD_HTML = r"""
   const settingsPageGeneral = document.getElementById("settingsPageGeneral");
   const settingsPageTheme = document.getElementById("settingsPageTheme");
   const settingsPageMachines = document.getElementById("settingsPageMachines");
+  const settingsPageTestMachine = document.getElementById("settingsPageTestMachine");
   const settingsPageClients = document.getElementById("settingsPageClients");
   const settingsPageInventory = document.getElementById("settingsPageInventory");
   const settingsPageApi = document.getElementById("settingsPageApi");
@@ -10245,6 +10385,17 @@ DASHBOARD_HTML = r"""
   const settingsMachineClearSelect = document.getElementById("settingsMachineClearSelect");
   const settingsMachineClearBtn = document.getElementById("settingsMachineClearBtn");
   const settingsMachineClearStatus = document.getElementById("settingsMachineClearStatus");
+  const settingsTestMachineEnabled = document.getElementById("settingsTestMachineEnabled");
+  const settingsTestTargetPacks = document.getElementById("settingsTestTargetPacks");
+  const settingsTestPackQty = document.getElementById("settingsTestPackQty");
+  const settingsTestSaveBtn = document.getElementById("settingsTestSaveBtn");
+  const settingsTestPackAddCount = document.getElementById("settingsTestPackAddCount");
+  const settingsTestAddPackBtn = document.getElementById("settingsTestAddPackBtn");
+  const settingsTestRejectReason = document.getElementById("settingsTestRejectReason");
+  const settingsTestRejectCount = document.getElementById("settingsTestRejectCount");
+  const settingsTestAddRejectBtn = document.getElementById("settingsTestAddRejectBtn");
+  const settingsTestResetBtn = document.getElementById("settingsTestResetBtn");
+  const settingsTestStatus = document.getElementById("settingsTestStatus");
   const settingsClientsTableBody = document.getElementById("settingsClientsTableBody");
   const settingsClientsRefreshBtn = document.getElementById("settingsClientsRefreshBtn");
   const settingsInventorySearch = document.getElementById("settingsInventorySearch");
@@ -10666,6 +10817,7 @@ DASHBOARD_HTML = r"""
   }
 
   function statusClass(lastSeenUtc, activeTtlSeconds = 30, manualStatus = "", session = null){
+    if(session?.is_test_machine) return "active";
     if(String(manualStatus || "").trim()) return "maintenance";
     const ongoing = hasOngoingMachineSession(session);
     if(!lastSeenUtc) return ongoing ? "disconnected" : "inactive";
@@ -12660,6 +12812,7 @@ DASHBOARD_HTML = r"""
       general: [settingsNavGeneral, settingsPageGeneral],
       theme: [settingsNavTheme, settingsPageTheme],
       machines: [settingsNavMachines, settingsPageMachines],
+      testMachine: [settingsNavTestMachine, settingsPageTestMachine],
       clients: [settingsNavClients, settingsPageClients],
       inventory: [settingsNavInventory, settingsPageInventory],
       api: [settingsNavApi, settingsPageApi],
@@ -12943,11 +13096,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         theme: s.theme || "Default",
         qrgen_base_url: s.qrgen_base_url || "",
         visible_machine_codes: Array.isArray(s.visible_machine_codes) ? s.visible_machine_codes : [],
+        test_machine: (s.test_machine && typeof s.test_machine === "object") ? s.test_machine : {},
       };
       visibleMachineCodesState = serverSettingsState.visible_machine_codes;
       if(applyTheme) applyDashboardTheme(serverSettingsState.theme);
       if(settingsThemeSelect) settingsThemeSelect.value = serverSettingsState.theme;
       if(settingsQrApiBaseUrl) settingsQrApiBaseUrl.value = serverSettingsState.qrgen_base_url;
+      renderTestMachineSettings(serverSettingsState.test_machine);
       renderMachinePicker();
     } catch {}
     await loadProductsSettingsInfo(false);
@@ -12986,6 +13141,11 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       theme: (settingsThemeSelect?.value || "Default").trim(),
       qrgen_base_url: (settingsQrApiBaseUrl?.value || "").trim(),
       visible_machine_codes: selectedVisibleMachineCodes(),
+      test_machine: {
+        enabled: settingsTestMachineEnabled?.value === "true",
+        target_packs: Number(settingsTestTargetPacks?.value || 10),
+        pack_qty: Number(settingsTestPackQty?.value || 10),
+      },
     };
     if(!payload.qrgen_base_url){
       alert("QR Print API Base URL is required.");
@@ -13006,8 +13166,51 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     visibleMachineCodesState = Array.isArray(serverSettingsState.visible_machine_codes) ? serverSettingsState.visible_machine_codes : [];
     applyDashboardTheme(serverSettingsState.theme);
     renderMachinePicker();
+    renderTestMachineSettings(serverSettingsState.test_machine || {});
     render(latestState);
     alert("Server settings applied.");
+  }
+
+  function renderTestMachineSettings(config){
+    const item = (config && typeof config === "object") ? config : {};
+    if(settingsTestMachineEnabled) settingsTestMachineEnabled.value = item.enabled ? "true" : "false";
+    if(settingsTestTargetPacks) settingsTestTargetPacks.value = String(Math.max(1, Number(item.target_packs || 10)));
+    if(settingsTestPackQty) settingsTestPackQty.value = String(Math.max(1, Number(item.pack_qty || 10)));
+    const enabled = Boolean(item.enabled);
+    if(settingsTestAddPackBtn) settingsTestAddPackBtn.disabled = !enabled;
+    if(settingsTestAddRejectBtn) settingsTestAddRejectBtn.disabled = !enabled;
+    if(settingsTestStatus){
+      settingsTestStatus.textContent = `${enabled ? "ON" : "OFF"} | Packs ${Number(item.pack_count || 0)} / ${Number(item.target_packs || 10)} | Good ${Number(item.good_total || 0)} | Rejects ${Number(item.reject_total || 0)}`;
+    }
+  }
+
+  async function runTestMachineAction(action){
+    if(action === "reset" && !window.confirm("Reset only the TEST MACHINE counters and test logs? Production data will not be changed.")) return;
+    const button = action === "add_pack" ? settingsTestAddPackBtn : action === "add_reject" ? settingsTestAddRejectBtn : settingsTestResetBtn;
+    if(button) button.disabled = true;
+    if(settingsTestStatus) settingsTestStatus.textContent = "Updating isolated test machine...";
+    try {
+      const body = {action};
+      if(action === "add_pack") body.count = Number(settingsTestPackAddCount?.value || 1);
+      if(action === "add_reject"){
+        body.count = Number(settingsTestRejectCount?.value || 1);
+        body.reason = String(settingsTestRejectReason?.value || "TEST_REJECT");
+      }
+      const resp = await fetch("/api/test-machine/action", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify(body),
+      });
+      const out = await resp.json().catch(() => ({}));
+      if(!resp.ok || !out.ok) throw new Error(out.error || `Server returned ${resp.status}`);
+      serverSettingsState.test_machine = out.test_machine || {};
+      renderTestMachineSettings(serverSettingsState.test_machine);
+    } catch(error) {
+      if(settingsTestStatus) settingsTestStatus.textContent = `Test action failed: ${error?.message || error}`;
+    } finally {
+      if(button) button.disabled = false;
+      renderTestMachineSettings(serverSettingsState.test_machine || {});
+    }
   }
 
   function knownPersonNameFromBadge(code){
@@ -18653,14 +18856,19 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const targetPackCount = producedPerShift > 0 && packQty > 0
       ? Math.ceil(producedPerShift / packQty)
       : 0;
+    const effectiveTargetPackCount = s.is_test_machine
+      ? Math.max(1, Number(s.test_target_packs || 1))
+      : targetPackCount;
     const currentPackCount = Math.max(0, Number(s.pack_total || 0));
-    const progressPct = targetPackCount > 0
-      ? Math.max(0, Math.min(100, Math.round((currentPackCount / targetPackCount) * 100)))
+    const progressPct = effectiveTargetPackCount > 0
+      ? Math.max(0, Math.min(100, Math.round((currentPackCount / effectiveTargetPackCount) * 100)))
       : 0;
-    const progressCountText = targetPackCount > 0
-      ? `${currentPackCount} / ${targetPackCount} packs`
+    const progressCountText = effectiveTargetPackCount > 0
+      ? `${currentPackCount} / ${effectiveTargetPackCount} packs`
       : `${currentPackCount} packs`;
-    const progressTooltip = targetPackCount > 0
+    const progressTooltip = s.is_test_machine
+      ? "Isolated test target configured in Server Settings"
+      : targetPackCount > 0
       ? `${cycleTimeSeconds} sec cycle | ${producedPerShift} units / 12-hour shift | ${packQty} units / pack`
       : "Cycle time or pack quantity is not available";
     const queueRow = (Array.isArray(latestState?.job_queue) ? latestState.job_queue : []).find(row =>
@@ -18713,6 +18921,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         <div class="machine-card-head">
           <div class="machine-card-title">
             <h3>${esc(machineName)}</h3>
+            ${s.is_test_machine ? `<span class="machine-test-only-pill">TEST ONLY</span>` : ""}
             ${supervisorRotationBadge}
             ${alertMeta.pills.map(alert => `<span class="machine-card-alert-pill ${esc(alert.kind)} ${esc(alert.prominence)}" title="${esc(alert.title)}">${esc(alert.label)}</span>`).join("")}
           </div>
@@ -18811,7 +19020,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const manual = machineStatusOverrideFor(code);
     const hasStatusAlert = Boolean(String((manual && manual.status) || "").trim());
     const alertMeta = machineCardAlertMeta(s, code, css);
-    const nextClassName = `card ${css}${hasStatusAlert ? " status-alert" : ""}${alertMeta.className ? ` ${alertMeta.className}` : ""}`;
+    const nextClassName = `card ${css}${s.is_test_machine ? " test-machine" : ""}${hasStatusAlert ? " status-alert" : ""}${alertMeta.className ? ` ${alertMeta.className}` : ""}`;
     const nextHtml = machineCardHtml(s, code, css, statusLabel);
     const nextRenderSig = `${nextClassName}|${nextHtml}`;
     if(card.dataset.renderSig !== nextRenderSig){
@@ -19463,6 +19672,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   settingsNavGeneral?.addEventListener("click", () => showServerSettingsPage("general"));
   settingsNavTheme?.addEventListener("click", () => showServerSettingsPage("theme"));
   settingsNavMachines?.addEventListener("click", () => { renderMachinePicker(); renderMachineDataClearer(); showServerSettingsPage("machines"); });
+  settingsNavTestMachine?.addEventListener("click", () => { renderTestMachineSettings(serverSettingsState.test_machine || {}); showServerSettingsPage("testMachine"); });
   settingsNavClients?.addEventListener("click", async () => { await loadSettingsClientsUi(); showServerSettingsPage("clients"); });
   settingsNavInventory?.addEventListener("click", async () => { showServerSettingsPage("inventory"); await loadSettingsInventoryUi(); });
   settingsNavApi?.addEventListener("click", () => showServerSettingsPage("api"));
@@ -19476,6 +19686,10 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   settingsThemeSelect?.addEventListener("change", () => applyDashboardTheme(settingsThemeSelect.value));
   serverSettingsSaveBtn?.addEventListener("click", saveServerSettingsUi);
   settingsMachinesSaveBtn?.addEventListener("click", saveServerSettingsUi);
+  settingsTestSaveBtn?.addEventListener("click", saveServerSettingsUi);
+  settingsTestAddPackBtn?.addEventListener("click", () => runTestMachineAction("add_pack"));
+  settingsTestAddRejectBtn?.addEventListener("click", () => runTestMachineAction("add_reject"));
+  settingsTestResetBtn?.addEventListener("click", () => runTestMachineAction("reset"));
   settingsMachinesAllBtn?.addEventListener("click", () => {
     visibleMachineCodesState = [...DEFAULT_MACHINE_CODES];
     renderMachinePicker();
@@ -23614,6 +23828,7 @@ def api_server_settings():
             "theme": str(SERVER_SETTINGS.get("theme", "Default")),
             "qrgen_base_url": current_qrgen_base_url(),
             "visible_machine_codes": SERVER_SETTINGS.get("visible_machine_codes", []),
+            "test_machine": _normalize_test_machine_settings(SERVER_SETTINGS.get("test_machine")),
         },
     }
 
@@ -23681,14 +23896,107 @@ async def api_server_settings_save(req: Request):
                 visible_machine_codes.append(code)
     if not qrgen_base_url:
         return JSONResponse({"ok": False, "error": "qrgen_base_url is required"}, status_code=400)
+    incoming_test = data.get("test_machine")
+    test_machine = _normalize_test_machine_settings(
+        incoming_test if isinstance(incoming_test, dict) else SERVER_SETTINGS.get("test_machine")
+    )
+    # Settings edits may change configuration, but never silently replace the
+    # sandbox counters or audit rows already created by test actions.
+    current_test = _normalize_test_machine_settings(SERVER_SETTINGS.get("test_machine"))
+    if isinstance(incoming_test, dict):
+        for key in ("pack_count", "good_total", "reject_total", "reject_breakdown", "pack_logs", "reject_logs", "last_event", "updated_at_utc"):
+            test_machine[key] = current_test[key]
     SERVER_SETTINGS = {
         "theme": theme,
         "qrgen_base_url": qrgen_base_url,
         "visible_machine_codes": visible_machine_codes,
+        "test_machine": test_machine,
     }
     save_server_settings(SERVER_SETTINGS)
     await broadcast_state()
     return {"ok": True, "settings": SERVER_SETTINGS}
+
+
+@APP.post("/api/test-machine/action")
+async def api_test_machine_action(req: Request):
+    global SERVER_SETTINGS
+    data = await req.json()
+    action = str(data.get("action") or "").strip().lower()
+    if action not in {"add_pack", "add_reject", "reset"}:
+        return JSONResponse({"ok": False, "error": "action must be add_pack, add_reject, or reset"}, status_code=400)
+    config = _normalize_test_machine_settings(SERVER_SETTINGS.get("test_machine"))
+    if not config["enabled"] and action != "reset":
+        return JSONResponse({"ok": False, "error": "Enable the test machine in Server Settings first"}, status_code=409)
+    now = utc_now().isoformat()
+    if action == "reset":
+        config.update({
+            "pack_count": 0,
+            "good_total": 0,
+            "reject_total": 0,
+            "reject_breakdown": {},
+            "pack_logs": [],
+            "reject_logs": [],
+            "last_event": "TEST RESET",
+            "updated_at_utc": now,
+        })
+    elif action == "add_pack":
+        try:
+            count = max(1, min(1000, int(data.get("count", 1) or 1)))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "count must be a whole number"}, status_code=400)
+        first_index = int(config["pack_count"] or 0) + 1
+        for offset in range(count):
+            index = first_index + offset
+            config["pack_logs"].append({
+                "pack_key": f"TEST-PACK-{index}",
+                "raw_scan": f"TEST~PACK~{index}",
+                "product_name": "Test Product (Not Production)",
+                "qty_q": str(config["pack_qty"]),
+                "qty": config["pack_qty"],
+                "index": str(index),
+                "lot_number": "TEST-LOT",
+                "status": "TEST_ONLY",
+                "source": "SERVER_TEST_MACHINE",
+                "scanned_at": now,
+                "voided": False,
+            })
+        config["pack_logs"] = config["pack_logs"][-500:]
+        config["pack_count"] += count
+        config["good_total"] += count * config["pack_qty"]
+        config["last_event"] = f"TEST PACK +{count}"
+        config["updated_at_utc"] = now
+    else:
+        try:
+            count = max(1, min(1000, int(data.get("count", 1) or 1)))
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "count must be a whole number"}, status_code=400)
+        reason = str(data.get("reason") or "TEST_REJECT").strip().upper()[:80] or "TEST_REJECT"
+        config["reject_total"] += count
+        config["reject_breakdown"][reason] = int(config["reject_breakdown"].get(reason, 0) or 0) + count
+        for offset in range(count):
+            config["reject_logs"].append({
+                "reject_scan_id": f"TEST-REJECT-{uuid.uuid4().hex.upper()}",
+                "entry_type": "REJECT_SCAN",
+                "reason_code": reason,
+                "reason_text": reason.replace("_", " ").title(),
+                "raw_scan": reason,
+                "operator": "TEST OPERATOR",
+                "operator_name": "TEST OPERATOR",
+                "scanned_at": now,
+                "voided": False,
+                "source": "SERVER_TEST_MACHINE",
+            })
+        config["reject_logs"] = config["reject_logs"][-500:]
+        config["last_event"] = f"TEST REJECT {reason} +{count}"
+        config["updated_at_utc"] = now
+    SERVER_SETTINGS = {**SERVER_SETTINGS, "test_machine": _normalize_test_machine_settings(config)}
+    save_server_settings(SERVER_SETTINGS)
+    await broadcast_state()
+    return {
+        "ok": True,
+        "test_machine": SERVER_SETTINGS["test_machine"],
+        "session": _test_machine_session_payload(),
+    }
 
 
 @APP.post("/api/finished-jobs/review")
