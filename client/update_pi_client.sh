@@ -141,12 +141,18 @@ if [[ -f "install_pi_client_autostart.sh" ]]; then
   chmod +x install_pi_client_autostart.sh
 fi
 
+LEGACY_OUTBOX="$RUNTIME_DATA_DIR/server_event_queue.json"
+if [[ -s "$LEGACY_OUTBOX" && -f "$PROJECT_DIR/compact_outbox.py" ]]; then
+  echo "Compacting the durable client outbox (a recoverable backup will be kept)..."
+  python "$PROJECT_DIR/compact_outbox.py" "$LEGACY_OUTBOX"
+fi
+
 echo "Checking Python syntax..."
 if [[ -f ".venv/bin/activate" ]]; then
   # shellcheck disable=SC1091
   source ".venv/bin/activate"
 fi
-python -m py_compile client.py mappings.py ui_theme.py
+python -m py_compile client.py compact_outbox.py mappings.py ui_theme.py
 
 echo "Rebuilding client from: $PROJECT_DIR/client.py"
 ./build_client_pi.sh
