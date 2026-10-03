@@ -201,6 +201,18 @@ fi
 echo
 echo "Starting rebuilt client..."
 mkdir -p "$HOME/.local/state/raspberry-machine-client" "$RUNTIME_DATA_DIR"
+# Updates are commonly launched over SSH, which does not inherit the desktop
+# session.  Supply the local graphical-session environment explicitly so Qt
+# can connect to the kiosk display after a remote rebuild.
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [[ -S "$XDG_RUNTIME_DIR/wayland-0" ]]; then
+  export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+fi
+if [[ -S "$XDG_RUNTIME_DIR/bus" ]]; then
+  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+fi
 export MACHINE_DATA_DIR="$RUNTIME_DATA_DIR"
 if [[ -n "$SERVER_URL" ]]; then
   export MACHINE_SERVER_URL="$SERVER_URL"
@@ -220,8 +232,8 @@ fi
 nohup "$PROJECT_DIR/dist/RaspberryMachineClient" \
   >>"$HOME/.local/state/raspberry-machine-client/client.log" 2>&1 &
 
-sleep 1
-if pgrep -f "$PROJECT_DIR/dist/RaspberryMachineClient" >/dev/null 2>&1; then
+sleep 3
+if pgrep -f "$PROJECT_DIR/dist/[R]aspberryMachineClient" >/dev/null 2>&1; then
   echo "Started rebuilt client."
 else
   echo "Client did not stay running. Check log:" >&2
