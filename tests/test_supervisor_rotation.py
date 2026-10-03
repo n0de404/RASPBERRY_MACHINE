@@ -74,6 +74,32 @@ class SupervisorRotationTests(unittest.TestCase):
         self.assertIn("machineSupervisorActivityRows", dashboard_server.DASHBOARD_HTML)
         self.assertIn("Rotation checks", dashboard_server.DASHBOARD_HTML)
 
+    def test_dashboard_summary_includes_compact_rotation_identity_and_time(self):
+        session = self._session()
+        dashboard_server._apply_supervisor_rotation_check(
+            session,
+            {
+                "checked_at_utc": "2026-10-02T02:00:00+00:00",
+                "supervisor_code": "SUP-01",
+                "supervisor_name": "Supervisor One",
+            },
+        )
+
+        summary = session.to_dashboard_dict()
+
+        self.assertNotIn("supervisor_rotation_logs", summary)
+        self.assertEqual(
+            summary["supervisor_rotation_summary_logs"],
+            [{
+                "checked_at_utc": "2026-10-02T02:00:00+00:00",
+                "supervisor_code": "SUP-01",
+                "supervisor_name": "Supervisor One",
+                "supervisor_role": "SUPERVISOR",
+            }],
+        )
+        self.assertIn("Last supervisor", dashboard_server.DASHBOARD_HTML)
+        self.assertIn("Last check time", dashboard_server.DASHBOARD_HTML)
+
 
 if __name__ == "__main__":
     unittest.main()

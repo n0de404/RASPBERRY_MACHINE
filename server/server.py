@@ -2114,6 +2114,40 @@ class MachineSession:
         d["manpower_count"] = (1 if d.get("operator_id") else 0) + len(d["crew_members"])
         d["current_supervisor_review"] = d.get("current_supervisor_review") or {}
         d["supervisor_rotation_count"] = max(0, int(d.get("supervisor_rotation_count") or 0))
+        # The complete audit ledgers stay out of the high-frequency dashboard
+        # payload, but the supervisor popover still needs a small who/when
+        # timeline.  Copy only display fields from the most recent entries.
+        d["supervisor_rotation_summary_logs"] = [
+            {
+                key: row.get(key)
+                for key in (
+                    "checked_at_utc",
+                    "supervisor_code",
+                    "supervisor_name",
+                    "supervisor_role",
+                )
+            }
+            for row in (self.supervisor_rotation_logs or [])[-20:]
+            if isinstance(row, dict)
+        ]
+        d["supervisor_review_summary_logs"] = [
+            {
+                key: row.get(key)
+                for key in (
+                    "actor_code",
+                    "actor_name",
+                    "actor_role",
+                    "action",
+                    "status",
+                    "opened_at_utc",
+                    "closed_at_utc",
+                    "last_updated_at_utc",
+                    "duration_seconds",
+                )
+            }
+            for row in (self.supervisor_review_logs or [])[-20:]
+            if isinstance(row, dict)
+        ]
         d["butal_by_job"] = d.get("butal_by_job") or {}
         d["last_shift_butal_by_job"] = d.get("last_shift_butal_by_job") or {}
         d["summary_only"] = True
@@ -8683,7 +8717,7 @@ DASHBOARD_HTML = r"""
     .machine-detail-supervisor-btn[aria-expanded="true"] .supervisor-caret { transform:rotate(180deg); }
     .machine-detail-supervisor-menu { position:fixed; z-index:1121; width:min(460px,calc(100vw - 24px)); max-height:min(520px,calc(100vh - 90px)); overflow:auto; padding:10px; border:1px solid #bbf7d0; border-radius:16px; background:#fff; box-shadow:0 20px 46px rgba(15,23,42,.24); }
     .machine-detail-supervisor-menu[hidden] { display:none; }
-    .supervisor-activity-summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; margin-bottom:9px; }
+    .supervisor-activity-summary { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; margin-bottom:9px; }
     .supervisor-activity-stat { min-width:0; padding:9px; border:1px solid #d1fae5; border-radius:11px; background:#f0fdf4; }
     .supervisor-activity-stat .k { color:#64748b; font-size:.52rem; line-height:1; font-weight:900; text-transform:uppercase; letter-spacing:.035em; }
     .supervisor-activity-stat .v { margin-top:5px; color:#065f46; font-size:.78rem; line-height:1.15; font-weight:950; overflow-wrap:anywhere; }
@@ -8694,7 +8728,7 @@ DASHBOARD_HTML = r"""
     .supervisor-activity-row-main { min-width:0; }
     .supervisor-activity-row-title { color:#172338; font-size:.70rem; line-height:1.2; font-weight:950; }
     .supervisor-activity-row-meta { margin-top:3px; color:#64748b; font-size:.59rem; line-height:1.35; font-weight:750; overflow-wrap:anywhere; }
-    .supervisor-activity-row-time { color:#475569; font-size:.57rem; line-height:1.25; font-weight:850; text-align:right; white-space:nowrap; }
+    .supervisor-activity-row-time { color:#065f46; font-size:.62rem; line-height:1.25; font-weight:950; text-align:right; white-space:nowrap; }
     .supervisor-activity-empty { padding:14px 10px; color:#64748b; font-size:.70rem; font-weight:800; text-align:center; }
     .machine-finish-shift-option { width:100%; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:5px 10px; align-items:center; padding:10px 11px; border:0; border-radius:10px; background:transparent; color:#172338; font:inherit; text-align:left; cursor:pointer; }
     .machine-finish-shift-option + .machine-finish-shift-option { margin-top:3px; }
@@ -18317,7 +18351,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
 
   function machineSupervisorActivityRows(session){
     const source = session && typeof session === "object" ? session : {};
-    const rotationRows = (Array.isArray(source.supervisor_rotation_logs) ? source.supervisor_rotation_logs : [])
+    const rotationSource = Array.isArray(source.supervisor_rotation_summary_logs)
+      ? source.supervisor_rotation_summary_logs
+      : (Array.isArray(source.supervisor_rotation_logs) ? source.supervisor_rotation_logs : []);
+    const reviewSource = Array.isArray(source.supervisor_review_summary_logs)
+      ? source.supervisor_review_summary_logs
+      : (Array.isArray(source.supervisor_review_logs) ? source.supervisor_review_logs : []);
+    const rotationRows = rotationSource
       .filter(row => row && typeof row === "object")
       .map(row => ({
         kind: "rotation",
@@ -18328,7 +18368,19 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         at: firstValue(row.checked_at_utc, row.created_at_utc, ""),
         duration: "",
       }));
-    const reviewRows = (Array.isArray(source.supervisor_review_logs) ? source.supervisor_review_logs : [])
+    if(!rotationRows.length && Number(source.supervisor_rotation_count || 0) > 0
+      && (source.last_supervisor_check_name || source.last_supervisor_check_at_utc)){
+      rotationRows.push({
+        kind: "rotation",
+        title: "Rotation check",
+        person: firstValue(source.last_supervisor_check_name, source.last_supervisor_check_code, "Supervisor"),
+        role: "SUPERVISOR",
+        status: "Checked",
+        at: firstValue(source.last_supervisor_check_at_utc, ""),
+        duration: "",
+      });
+    }
+    const reviewRows = reviewSource
       .filter(row => row && typeof row === "object")
       .map(row => ({
         kind: "review",
@@ -18367,13 +18419,17 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   function renderMachineDetailSupervisorMenu(session){
     if(!machineDetailSupervisorMenu) return;
     const source = session && typeof session === "object" ? session : {};
-    const rotations = (Array.isArray(source.supervisor_rotation_logs) ? source.supervisor_rotation_logs : [])
+    const rotations = (Array.isArray(source.supervisor_rotation_summary_logs)
+      ? source.supervisor_rotation_summary_logs
+      : (Array.isArray(source.supervisor_rotation_logs) ? source.supervisor_rotation_logs : []))
       .filter(row => row && typeof row === "object");
-    const reviews = (Array.isArray(source.supervisor_review_logs) ? source.supervisor_review_logs : [])
+    const reviews = (Array.isArray(source.supervisor_review_summary_logs)
+      ? source.supervisor_review_summary_logs
+      : (Array.isArray(source.supervisor_review_logs) ? source.supervisor_review_logs : []))
       .filter(row => row && typeof row === "object");
     const rows = machineSupervisorActivityRows(source);
     const rotationCount = Math.max(rotations.length, Number(source.supervisor_rotation_count || 0));
-    const latest = rows[0] || null;
+    const latestRotation = rows.find(row => row.kind === "rotation") || null;
     const timeline = rows.length ? rows.map(row => {
       const detail = [row.role, row.status, row.duration ? `Duration ${row.duration}` : ""].filter(Boolean).join(" ┬╖ ");
       return `<div class="supervisor-activity-row ${row.kind === "review" ? "review" : "rotation"}">
@@ -18389,7 +18445,8 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       <div class="supervisor-activity-summary">
         <div class="supervisor-activity-stat"><div class="k">Rotation checks</div><div class="v">${esc(rotationCount)}</div></div>
         <div class="supervisor-activity-stat"><div class="k">Reviews</div><div class="v">${esc(reviews.length)}</div></div>
-        <div class="supervisor-activity-stat"><div class="k">Last check</div><div class="v">${esc(latest ? latest.person : "-")}</div></div>
+        <div class="supervisor-activity-stat"><div class="k">Last supervisor</div><div class="v">${esc(latestRotation ? latestRotation.person : firstValue(source.last_supervisor_check_name, source.last_supervisor_check_code, "-"))}</div></div>
+        <div class="supervisor-activity-stat"><div class="k">Last check time</div><div class="v">${esc(fmtDateLocal(latestRotation ? latestRotation.at : source.last_supervisor_check_at_utc))}</div></div>
       </div>
       <div class="supervisor-activity-log">${timeline}</div>
     `;
@@ -18398,9 +18455,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   function syncMachineDetailSupervisorActivity(session){
     if(!machineDetailSupervisorBtn) return;
     const source = session && typeof session === "object" ? session : {};
-    const rotations = (Array.isArray(source.supervisor_rotation_logs) ? source.supervisor_rotation_logs : [])
+    const rotations = (Array.isArray(source.supervisor_rotation_summary_logs)
+      ? source.supervisor_rotation_summary_logs
+      : (Array.isArray(source.supervisor_rotation_logs) ? source.supervisor_rotation_logs : []))
       .filter(row => row && typeof row === "object");
-    const reviews = (Array.isArray(source.supervisor_review_logs) ? source.supervisor_review_logs : [])
+    const reviews = (Array.isArray(source.supervisor_review_summary_logs)
+      ? source.supervisor_review_summary_logs
+      : (Array.isArray(source.supervisor_review_logs) ? source.supervisor_review_logs : []))
       .filter(row => row && typeof row === "object");
     const rotationCount = Math.max(rotations.length, Number(source.supervisor_rotation_count || 0));
     const total = rotationCount + reviews.length;
