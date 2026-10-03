@@ -673,7 +673,11 @@ def _load_server_event_queue_json() -> List[Dict[str, Any]]:
         if isinstance(row, dict) and isinstance(row.get("payload"), dict)
     ]
     clean = _trim_server_event_queue_rows(loaded)
-    if len(clean) != len(loaded):
+    # Trimming can make an event dramatically smaller without changing the
+    # row count (for example, by removing an embedded session snapshot).  A
+    # length-only check left those oversized payloads in the durable outbox,
+    # so every scan paid the cost of decoding them again.
+    if clean != loaded:
         RUNTIME_STORE.replace_outbox(clean)
     return clean
 
@@ -816,6 +820,7 @@ def _trim_server_event_queue_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, 
     clean: List[Dict[str, Any]] = []
     latest_session_sync: Dict[tuple, Dict[str, Any]] = {}
     finish_shift_indexes: Dict[tuple, int] = {}
+    pending_finish_shifts: Set[str] = set()
     pending_finished_jobs: Set[str] = set()
     for row in rows or []:
         if _server_event_queue_row_is_defective(row):
@@ -846,6 +851,17 @@ def _trim_server_event_queue_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, 
                 if finished_job_key in pending_finished_jobs:
                     continue
                 pending_finished_jobs.add(finished_job_key)
+
+        # A periodic finish-shift sync can encounter the same locally saved
+        # shift before its first event is acknowledged.  Keep the oldest event
+        # ID and discard only semantically identical retries.  This must run
+        # before the protocol-2 fast path below or duplicates bypass trimming.
+        if event_type == "FINISH_SHIFT":
+            finish_shift_key = _server_event_queue_finish_shift_key(compact_row)
+            if finish_shift_key:
+                if finish_shift_key in pending_finish_shifts:
+                    continue
+                pending_finish_shifts.add(finish_shift_key)
 
         if int(payload.get("sync_protocol_requested") or 0) >= SERVER_SYNC_PROTOCOL_VERSION:
             # Preserve protocol 2 in its exact original order after the safe
@@ -11221,7 +11237,10 @@ QWidget#ClientUIRoot {{
             "reprint_qr_logs": list(s.reprint_qr_logs or []),
             "production_adjustment_logs": list((s.production_adjustment_logs or [])[adjustment_from:]),
             "action_logs": list(getattr(self, "_action_logs", []) or []),
-            "client_app_logs": list(getattr(self, "_app_logs", []) or []),
+            # Audit rows are uploaded incrementally.  Embedding the full
+            # 1,000-row log in every retry made one finish-shift event hundreds
+            # of kilobytes and caused severe UI stalls on Raspberry Pi clients.
+            "client_app_logs": self._pending_server_activity_logs(limit=80),
             "downtime_active": bool(s.downtime_active),
             "downtime_reason_code": s.downtime_reason_code,
             "downtime_reason_text": s.downtime_reason_text,
@@ -11669,7 +11688,7 @@ QWidget#ClientUIRoot {{
             "product_pack_history_logs": list(s.product_pack_history_logs or []),
             "butal_scan_logs": list(s.butal_scan_logs or []),
             "action_logs": list(getattr(self, "_action_logs", []) or []),
-            "client_app_logs": list(getattr(self, "_app_logs", []) or []),
+            "client_app_logs": self._pending_server_activity_logs(limit=80),
             "startup_reject_total": int(s.startup_reject_total or 0),
             "reject_review_open": bool(s.reject_review_open),
             "reject_review_phase": int(s.reject_review_phase or 0),
