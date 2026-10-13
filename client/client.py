@@ -14710,6 +14710,44 @@ QWidget#ClientUIRoot {{
         # Older/offline payloads may not include an approval quantity.
         return True
 
+    def _job_part_has_recorded_activity(self, part: Any) -> bool:
+        """Keep a zero-approved part visible when it already has scan/use history."""
+        if not isinstance(part, dict):
+            return False
+        part_keys = (
+            self._part_material_match_keys(part)
+            | self._part_material_name_keys(part)
+        )
+        if not part_keys:
+            return False
+        for row in (self.state.raw_material_logs or []):
+            if not isinstance(row, dict) or bool(row.get("voided")):
+                continue
+            row_keys = (
+                self._raw_material_match_keys(row)
+                | self._raw_material_name_keys(row)
+            )
+            if part_keys.intersection(row_keys):
+                return True
+        for pack_row in (self.state.product_pack_history_logs or []):
+            if not isinstance(pack_row, dict) or bool(pack_row.get("voided")):
+                continue
+            for usage in (pack_row.get("raw_part_consumption") or []):
+                if not isinstance(usage, dict):
+                    continue
+                usage_keys = (
+                    self._part_material_match_keys(usage)
+                    | self._part_material_name_keys(usage)
+                )
+                used_qty = self._parse_number(
+                    usage.get("used_qty_kg")
+                    if usage.get("used_qty_kg") not in (None, "")
+                    else usage.get("used_qty")
+                )
+                if used_qty > 0 and part_keys.intersection(usage_keys):
+                    return True
+        return False
+
     def _job_part_rows(self, payload: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         def _rows_from_payload(source: Any) -> List[Dict[str, Any]]:
             base_payload = source if isinstance(source, dict) else {}
@@ -14733,9 +14771,13 @@ QWidget#ClientUIRoot {{
             def _annotated_rows(rows: Any) -> List[Dict[str, Any]]:
                 annotated: List[Dict[str, Any]] = []
                 for raw_part in rows if isinstance(rows, list) else []:
-                    if not self._job_part_is_active(raw_part):
+                    active = self._job_part_is_active(raw_part)
+                    if not active and not self._job_part_has_recorded_activity(raw_part):
                         continue
                     part = dict(raw_part)
+                    if not active:
+                        part["_approved_qty_zero"] = True
+                        part["_validation_exempt"] = True
                     part["_job_approved_output_qty"] = approved_output_qty
                     part["_job_requested_output_qty"] = requested_output_qty
                     annotated.append(part)
@@ -15503,6 +15545,8 @@ QWidget#ClientUIRoot {{
             return []
         entries: List[Dict[str, Any]] = []
         for part in self._job_part_rows():
+            if bool(part.get("_validation_exempt")):
+                continue
             owner_job_code = self._normalize_job_code(part.get("required_from_job_code"))
             owner_locked = isinstance(job_output_qty, dict) and bool(job_output_qty)
             owner_produced_qty = produced_qty
@@ -15772,6 +15816,8 @@ QWidget#ClientUIRoot {{
         seen: Set[str] = set()
         auto_part_keys = self._job_identity_auto_part_keys()
         for part in parts:
+            if bool(part.get("_validation_exempt")):
+                continue
             part_keys_all = self._part_material_match_keys(part)
             if auto_part_keys.intersection(part_keys_all):
                 # A part produced by the running/main or hooked linked job is
@@ -15992,6 +16038,8 @@ QWidget#ClientUIRoot {{
         )
         statuses: List[Dict[str, Any]] = []
         for part in part_rows:
+            if bool(part.get("_validation_exempt")):
+                continue
             part_match_keys = self._part_material_match_keys(part) | self._part_material_name_keys(part)
             if auto_part_keys.intersection(part_match_keys):
                 continue
@@ -18631,6 +18679,10 @@ QWidget#ClientUIRoot {{
                 self.jobPartsTable.setRowCount(0)
                 for part_group in display_part_groups:
                     part = part_group[0]
+                    historical_zero_approved = all(
+                        bool(group_part.get("_validation_exempt"))
+                        for group_part in part_group
+                    )
                     r = self.jobPartsTable.rowCount()
                     self.jobPartsTable.insertRow(r)
                     request_part_qty = sum(
@@ -18724,7 +18776,11 @@ QWidget#ClientUIRoot {{
                             required_jobs.append(owner)
                     remaining_part_qty = max(request_part_qty - job_used_raw_qty, 0.0)
                     request_part_display = self._safe_text(part.get("request_part_qty"), "-")
-                    if request_part_qty > 0:
+                    if historical_zero_approved:
+                        request_part_display = f"{_fmt_number(job_used_raw_qty)} used"
+                        remaining_part_qty = 0.0
+                        required_jobs = ["Historical - 0 approved"]
+                    elif request_part_qty > 0:
                         request_part_display = f"{_fmt_number(job_used_raw_qty)} / {_fmt_number(request_part_qty)}"
                     else:
                         request_part_display = _fmt_number(job_used_raw_qty)
@@ -18736,7 +18792,7 @@ QWidget#ClientUIRoot {{
                         self._format_part_qty_per_unit_display(part_qty_per_unit, unit_kind),
                         "-" if show_separate_scanned_row else _fmt_number(available_raw_qty),
                         request_part_display,
-                        _fmt_number(remaining_part_qty),
+                        "-" if historical_zero_approved else _fmt_number(remaining_part_qty),
                         " / ".join(required_jobs),
                     ]
                     for c, val in enumerate(values):
