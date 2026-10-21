@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import math
+from decimal import Decimal, InvalidOperation
 import queue
 import uuid
 from collections import deque
@@ -176,6 +177,22 @@ ANIMATION_BURST_WINDOW_SECONDS = float(os.environ.get("MACHINE_ANIMATION_BURST_W
 PULSE_CARD_MIN_INTERVAL_MS = int(os.environ.get("MACHINE_PULSE_CARD_MIN_INTERVAL_MS", "140"))
 CIRCLE_PROGRESS_ANIM_INTERVAL_MS = int(os.environ.get("MACHINE_CIRCLE_PROGRESS_INTERVAL_MS", "66"))
 HEAVY_ANIM_INTERVAL_MS = int(os.environ.get("MACHINE_HEAVY_ANIM_INTERVAL_MS", "100"))
+
+
+def _system_uptime_seconds() -> int:
+    """Return device uptime so the server can distinguish Pi uptime from machine runtime."""
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as handle:
+            return max(0, int(float(handle.read().split()[0])))
+    except (OSError, ValueError, IndexError):
+        pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            return max(0, int(ctypes.windll.kernel32.GetTickCount64() / 1000))
+        except Exception:
+            pass
+    return max(0, int(time.monotonic()))
 
 
 def _completion_pack_projection(
@@ -3463,6 +3480,7 @@ class ClientUI(QWidget):
     average_weight_received = pyqtSignal(float, str, str, str, str)
     server_average_weight_received = pyqtSignal(str, float, str, str, str, str, str)
     server_session_received = pyqtSignal(dict)
+    server_closed_session_received = pyqtSignal(str, str)
     virtual_pack_reservation_received = pyqtSignal(dict)
 
     @staticmethod
@@ -6643,6 +6661,7 @@ QWidget#ClientUIRoot {{
         self.average_weight_received.connect(self._apply_external_average_weight)
         self.server_average_weight_received.connect(self._apply_server_average_weight)
         self.server_session_received.connect(self._apply_acknowledged_server_session)
+        self.server_closed_session_received.connect(self._apply_server_closed_session)
         self.virtual_pack_reservation_received.connect(self._apply_virtual_pack_reservation)
         self._ui_refresh_timer = QTimer(self)
         self._ui_refresh_timer.setSingleShot(True)
@@ -9039,7 +9058,9 @@ QWidget#ClientUIRoot {{
 
     def _authorized_person_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
         code = self._clean_badge_scan_code(raw)
-        if not code:
+        # The review command opens a workflow; it is never a person's badge,
+        # even if an older profile cache grants this command supervisor rights.
+        if not code or code.lower() == "svisorreview~1":
             return None
         self._trigger_identity_cache_sync(force=False)
 
@@ -11976,6 +11997,25 @@ QWidget#ClientUIRoot {{
             self._append_app_log("RECOVERY", f"Server active-session recovery failed: {e}")
             return None
 
+    def _locally_completed_session_ids(self) -> Set[str]:
+        """Return production sessions already approved for local completion.
+
+        A finish event is deliberately durable so an offline client can safely
+        send it after a restart.  Such a session must never be auto-resumed
+        merely because the server has not received that finish event yet.
+        """
+        closed: Set[str] = set()
+        for row in list(_load_finish_shift_json()) + list(_load_finished_jobs_json()):
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("review_status") or "").strip().upper()
+            if status not in {REVIEW_STATUS_APPROVED, REVIEW_STATUS_CLOSED}:
+                continue
+            session_id = str(row.get("production_session_id") or "").strip()
+            if session_id:
+                closed.add(session_id)
+        return closed
+
     def _restore_owned_session_on_startup(self) -> None:
         """Resume this terminal's one active job after an app restart."""
         if str(self.state.machine_code or "").strip():
@@ -11988,6 +12028,14 @@ QWidget#ClientUIRoot {{
         )
         local_snap = local_candidates[0] if len(local_candidates) == 1 else None
         server_snap = self._fetch_active_session_snapshot_from_server()
+        locally_completed_ids = self._locally_completed_session_ids()
+        if isinstance(local_snap, dict) and str(local_snap.get("production_session_id") or "").strip() in locally_completed_ids:
+            self._clear_active_session_snapshot(str(local_snap.get("machine_code") or ""))
+            local_snap = None
+        if isinstance(server_snap, dict) and str(server_snap.get("production_session_id") or "").strip() in locally_completed_ids:
+            # The locally approved finish will be delivered by the durable
+            # outbox; do not briefly resurrect the closing job on this Pi.
+            server_snap = None
         server_ok = isinstance(server_snap, dict) and self._snapshot_is_recoverable(server_snap)
         local_ok = isinstance(local_snap, dict) and self._snapshot_is_recoverable(local_snap)
 
@@ -12054,6 +12102,25 @@ QWidget#ClientUIRoot {{
             if local_ts is not None and (server_ts is None or local_ts > server_ts):
                 return dict(local_snap)
             return dict(server_snap)
+
+        # A void makes counters non-monotonic. Prefer the copy carrying the
+        # latest correction instead of resurrecting pre-void rows via max/union.
+        def latest_void(snap):
+            stamps = []
+            for row in snap.get("production_adjustment_logs") or []:
+                if isinstance(row, dict) and str(row.get("action") or "").upper() == "VOID":
+                    stamp = self._snapshot_timestamp_value({"saved_at_utc": row.get("logged_at")})
+                    if stamp is not None:
+                        stamps.append(stamp)
+            return max(stamps) if stamps else None
+
+        server_void, local_void = latest_void(server_snap), latest_void(local_snap)
+        if server_void is not None or local_void is not None:
+            if server_void != local_void:
+                return dict(local_snap if (local_void or 0) > (server_void or 0) else server_snap)
+            server_ts = self._snapshot_timestamp_value(server_snap)
+            local_ts = self._snapshot_timestamp_value(local_snap)
+            return dict(local_snap if (local_ts or 0) >= (server_ts or 0) else server_snap)
 
         merged = dict(server_snap or {})
         merged.update(dict(local_snap or {}))
@@ -12251,6 +12318,24 @@ QWidget#ClientUIRoot {{
         self._restore_state_from_snapshot(merged)
         self._refresh_ui()
         self._save_active_session_snapshot(force=True)
+
+    def _apply_server_closed_session(self, production_session_id: str, event_type: str) -> None:
+        """Remove a locally displayed session once its completion is accepted.
+
+        This runs on the Qt thread because the event dispatcher receives the
+        server acknowledgement on a worker thread.  It is deliberately fenced
+        by session ID so a completion acknowledgement can never clear a newer
+        job that an operator has already started.
+        """
+        closed_id = str(production_session_id or "").strip()
+        if not closed_id or closed_id != str(self.state.production_session_id or "").strip():
+            return
+        preserve_carryover = str(event_type or "").strip().upper() == "FINISH_SHIFT"
+        self._clear_shift_session_keep_machine(preserve_carryover=preserve_carryover)
+        self._append_app_log(
+            "SESSION",
+            f"Cleared locally completed production session {closed_id} after server acknowledgement",
+        )
 
     def _recovery_shift_segment_key_from_row(self, row: Dict[str, Any], base_snap: Dict[str, Any]) -> str:
         job_key = self._normalize_job_code(row.get("job_code"))
@@ -16405,10 +16490,21 @@ QWidget#ClientUIRoot {{
         raw = str(self.state.reject_multiplier_input or "").strip()
         if not raw:
             return 1
+
         try:
             return max(1, int(raw))
         except Exception:
             return 1
+
+    def _butal_scan_quantity(self, value: Any, multiplier: int) -> Optional[int]:
+        """Multiply before converting to piece counts; never silently truncate."""
+        try:
+            total = Decimal(str(value)) * Decimal(str(multiplier))
+            if total.is_finite() and total > 0 and total == total.to_integral_value():
+                return int(total)
+        except (InvalidOperation, ValueError, TypeError):
+            pass
+        return None
 
     def _clear_reject_multiplier(self):
         self.state.reject_multiplier_input = ""
@@ -18496,6 +18592,11 @@ QWidget#ClientUIRoot {{
         if not self.state.machine_code or not self.state.waiting_linkage_job_scan:
             self._clear_pending_linked_job_api_retry()
             return
+        if not bool(getattr(self, "_server_connection_ok", False)):
+            raw_scan = str(pending.get("raw_scan") or "")
+            self._clear_pending_linked_job_api_retry()
+            QTimer.singleShot(0, lambda value=raw_scan: self.on_scanned(value))
+            return
         pending["attempts"] = int(pending.get("attempts") or 0) + 1
         self._pending_linked_job_api_retry = pending
         self.status.setText(
@@ -18534,6 +18635,46 @@ QWidget#ClientUIRoot {{
             str(pending.get("display_name") or pending.get("job_identifier") or ""),
         )
 
+    def _offline_linkage_payload(self, identifier: str, display_name: str) -> Dict[str, Any]:
+        return {
+            "_offline_linkage_pending": True,
+            "_offline_job_identifier": str(identifier or "").strip(),
+            "data": {"job": {"ref_no": str(display_name or identifier).strip()}},
+        }
+
+    def _refresh_offline_linkage_details(self):
+        if not bool(getattr(self, "_server_connection_ok", False)):
+            return
+        if time.time() - float(getattr(self, "_last_offline_linkage_lookup", 0)) < 15:
+            return
+        for row in list(self.state.linkage_jobs or []):
+            payload = row.get("job_payload") if isinstance(row, dict) else None
+            if not isinstance(payload, dict) or not payload.get("_offline_linkage_pending"):
+                continue
+            self._last_offline_linkage_lookup = time.time()
+            session_id = self.state.production_session_id
+            identifier = str(payload.get("_offline_job_identifier") or row.get("job_code") or "")
+            fetched = self._fetch_job_payload_from_api(identifier)
+            if not isinstance(fetched, dict) or fetched.get("_offline_linkage_pending"):
+                return
+            data = fetched.get("data") if isinstance(fetched.get("data"), dict) else fetched
+            job = data.get("job") if isinstance(data.get("job"), dict) else {}
+            if not job or session_id != self.state.production_session_id:
+                return
+            if not any(candidate is row for candidate in (self.state.linkage_jobs or [])):
+                return
+            # Preserve the scanned job code: offline pack allocations may reference it.
+            row["job_payload"] = fetched
+            row["job_name"] = str(job.get("ref_no") or row.get("job_name") or identifier)
+            if str(self.state.linkage_job_code or "") == str(row.get("job_code") or ""):
+                self.state.linkage_job_payload = fetched
+                self.state.linkage_job_name = row["job_name"]
+            self._reconcile_pending_pack_raw_consumption()
+            self._save_active_session_snapshot()
+            self._refresh_ui()
+            self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (OFFLINE LINKAGE DETAILS)")
+            return
+
     def _fetch_job_payload_from_api(self, job_identifier: str) -> Optional[Dict[str, Any]]:
         server_url = str((self.client_config or {}).get("server_url", SERVER_URL) or SERVER_URL).strip().rstrip("/")
         raw_job_id = str(job_identifier or "").strip()
@@ -18555,9 +18696,10 @@ QWidget#ClientUIRoot {{
                 url,
                 headers={"Content-Type": "application/json", "Accept": "application/json"},
                 json={"job_identifier": raw_job_id},
-                # Fail over to the local cache quickly when the LAN/server is
-                # down. Pending-job retry continues in the background.
-                timeout=(0.75, 3.0),
+                # A heartbeat/event timeout only describes the previous
+                # request. Probe the job endpoint with a short connection
+                # timeout, but allow time for BMS token refresh and lookup.
+                timeout=(0.75, 15.0),
             )
             if resp.status_code != 200:
                 self._append_job_api_log(f"SERVER JOB LOOKUP unavailable HTTP {resp.status_code}")
@@ -21429,7 +21571,8 @@ QWidget#ClientUIRoot {{
         self._pulse_card(self.cardStatTotalGood)
         self._save_active_session_snapshot()
         self.push_event(
-            {"type": "BUTAL", "qty": qty, "assigned_job_code": job_code, "assigned_job_name": job_name},
+            {"type": "BUTAL", "qty": qty, "assigned_job_code": job_code, "assigned_job_name": job_name,
+             "butal_record": dict(scan_row)},
             f"BUTAL +{qty} {job_name or job_code}",
         )
         return True
@@ -23059,7 +23202,9 @@ QWidget#ClientUIRoot {{
                 return
             self._assign_pending_butal_to_job(target)
             return
-        reviewer = self._reviewer_from_scan(raw_s) if res_pre is None else None
+        # A personal badge may also be in the legacy operator map. Resolve its
+        # current privileges before treating it as an operator handoff.
+        reviewer = self._reviewer_from_scan(raw_s) if res_pre is None or res_pre.kind == "OPERATOR" else None
         if reviewer is not None:
             reviewer_can_supervisor = str(reviewer.get("can_supervisor", "0")) == "1"
             in_downtime_flow = (
@@ -23079,7 +23224,7 @@ QWidget#ClientUIRoot {{
                     return
                 if reviewer_can_supervisor:
                     checked_at_utc = datetime.now(timezone.utc).isoformat()
-                    self.push_event(
+                    queued = self.push_event(
                         {
                             "type": "SUPERVISOR_ROTATION_CHECK",
                             "checked_at_utc": checked_at_utc,
@@ -23091,6 +23236,13 @@ QWidget#ClientUIRoot {{
                         silent=True,
                         defer_snapshot=True,
                     )
+                    name = reviewer.get("name") or reviewer.get("code") or "Supervisor"
+                    if queued:
+                        self.status.setText(f"Supervisor rotation check recorded: {name}. Queued for server delivery.")
+                        self._show_info_overlay("SUPERVISOR ROTATION CHECK", f"{name}\nCheck recorded and queued for server delivery.", hide_ms=2500)
+                    else:
+                        self.status.setText("Supervisor rotation check could not be saved. Please scan again.")
+                        self._show_invalid_overlay("Rotation check was not saved. Please scan again.")
                     return
                 if not reviewer_can_supervisor:
                     self.status.setText("Authorized badge scanned. No supervisor action pending.")
@@ -24134,7 +24286,12 @@ QWidget#ClientUIRoot {{
                 self._clear_void_modes()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
-                self.push_event({"type": "PRODUCT_PART_VOID"}, "PRODUCT PART VOID", defer_snapshot=True)
+                self.push_event({
+                    "type": "PRODUCT_PART_VOID",
+                    "void_record": dict(getattr(self, "_last_voided_product_part_record", {}) or {}),
+                    "post_raw_sacks_count": int(s.raw_sacks_count or 0),
+                    "post_raw_material_scans": list(s.raw_material_scans or []),
+                }, "PRODUCT PART VOID", defer_snapshot=True)
                 return
             if res.kind == "PACK":
                 if s.supervisor_review_open and not s.cycle_time_pending_supervisor:
@@ -24992,6 +25149,10 @@ QWidget#ClientUIRoot {{
                         else None
                     )
                     if pending_link:
+                        if not bool(getattr(self, "_server_connection_ok", False)):
+                            self._clear_pending_linked_job_api_retry()
+                            pending_link = None
+                    if pending_link:
                         self.status.setText(
                             f"Still retrying linked job "
                             f"{pending_link.get('display_name') or pending_link.get('job_identifier')}. "
@@ -25019,6 +25180,10 @@ QWidget#ClientUIRoot {{
                             fetched_linked_payload = self._fetch_job_payload_from_api(requested_job_id)
                         finally:
                             self._hide_bms_loading()
+                    if not isinstance(fetched_linked_payload, dict) and not bool(getattr(self, "_server_connection_ok", False)):
+                        fetched_linked_payload = self._offline_linkage_payload(
+                            requested_job_id, self._safe_text(res.value, requested_job_id)
+                        )
                     api_job = {}
                     if isinstance(fetched_linked_payload, dict):
                         if isinstance(fetched_linked_payload.get("data"), dict) and isinstance(fetched_linked_payload["data"].get("job"), dict):
@@ -25031,6 +25196,8 @@ QWidget#ClientUIRoot {{
                     ):
                         linked_job_payload = fetched_linked_payload
                         linked_job_code = (
+                            self._safe_text(fetched_linked_payload.get("_offline_job_identifier"), "")
+                            or
                             self._safe_text(api_job.get("id"), "")
                             or self._safe_text(api_job.get("ref_no"), "")
                             or requested_job_id
@@ -25133,6 +25300,11 @@ QWidget#ClientUIRoot {{
                     self.status.setText(
                         f"Linked job added: {linked_job_name or linked_job_code}. "
                         "Scan Job Linkage again to add another job."
+                    )
+                if linked_job_payload.get("_offline_linkage_pending"):
+                    self.status.setText(
+                        f"Linked job saved offline: {linked_job_name or linked_job_code}. "
+                        "Job details will load when the server reconnects."
                     )
                 self._refresh_ui()
                 self._save_active_session_snapshot()
@@ -26117,9 +26289,13 @@ QWidget#ClientUIRoot {{
                 return
 
             if res.kind == "BUTAL":
-                base_qty = int(res.qty or 0)
+                base_qty = res.qty or 0
                 multiplier = self._reject_multiplier_value()
-                qty = base_qty * multiplier
+                qty = self._butal_scan_quantity(base_qty, multiplier)
+                if qty is None:
+                    self.status.setText("BUTAL not counted: quantity × multiplier must be a positive whole piece count.")
+                    self._show_invalid_overlay("Invalid BUTAL quantity. Adjust the multiplier or scan a whole-piece quantity.")
+                    return
                 if s.linkage_enabled and (s.linkage_jobs or []):
                     s.waiting_butal_job_assignment = True
                     s.pending_butal_qty = qty
@@ -26167,13 +26343,14 @@ QWidget#ClientUIRoot {{
                 self._refresh_ui()
                 self._pulse_card(self.cardStatButal)
                 self._pulse_card(self.cardStatTotalGood)
-                self.push_event({"type": "BUTAL", "qty": qty}, f"BUTAL +{qty}")
+                self.push_event({"type": "BUTAL", "qty": qty, "butal_record": dict(s.butal_scan_logs[-1])}, f"BUTAL +{qty}")
                 return
 
         self.status.setText(f"Scan handled: {res.kind}")
         self._refresh_ui()
     def send_heartbeat(self):
         if self.state.machine_code:
+            self._refresh_offline_linkage_details()
             self._resolve_pending_operator_profile()
             self.push_event(
                 {"type": "HEARTBEAT"},
@@ -26233,12 +26410,15 @@ QWidget#ClientUIRoot {{
         if not self._persist_server_event_item(item):
             self._server_recovery_snapshot_queued = False
             return
-        try:
-            self._event_queue.put_nowait(item)
-        except queue.Full:
-            # The item is durable. A successful dispatch refills persisted
-            # entries, and a session conflict promotes a recovery item directly.
-            pass
+        # Reserve the next dispatch slot even when the in-memory queue is full.
+        # The displaced tail is already durable in SQLite and will be refilled.
+        with self._event_queue.mutex:
+            if self._event_queue.maxsize > 0 and len(self._event_queue.queue) >= self._event_queue.maxsize:
+                self._event_queue.queue.pop()
+                self._event_queue.unfinished_tasks -= 1
+            self._event_queue.queue.appendleft(item)
+            self._event_queue.unfinished_tasks += 1
+            self._event_queue.not_empty.notify()
 
     def _event_superseded_by_recovery_snapshot(self, item: Dict[str, Any]) -> bool:
         payload = item.get("payload") if isinstance(item, dict) else {}
@@ -26250,6 +26430,7 @@ QWidget#ClientUIRoot {{
         # butal, void and finish events) must retain their own event IDs so the
         # server can record every scan exactly once after an offline period.
         compactable_types = {
+            "SESSION_SYNC",
             "MACHINE_SET",
             "JOB_SET",
             "JOB_STUB_SET",
@@ -26765,6 +26946,10 @@ QWidget#ClientUIRoot {{
             session_conflict = False
             session_conflict_code = ""
             last_error: Any = ""
+            # A connection failure can occur before any HTTP response exists.
+            # Reset this for every event so retry handling cannot crash or reuse
+            # a previous event's production-session fence.
+            response_body: Dict[str, Any] = {}
             connection_was_unavailable = bool(
                 getattr(self, "_server_was_offline", False)
                 or not getattr(self, "_server_connection_ok", False)
@@ -26783,7 +26968,6 @@ QWidget#ClientUIRoot {{
                         timeout=request_timeout,
                     )
                     status_code = int(resp.status_code or 0)
-                    response_body: Dict[str, Any] = {}
                     try:
                         parsed_body = resp.json()
                         if isinstance(parsed_body, dict):
@@ -26881,6 +27065,7 @@ QWidget#ClientUIRoot {{
                     acknowledged_recovery_session = response_body.get("session") if isinstance(response_body.get("session"), dict) else {}
                     if (
                         recovery_session_id
+                        and response_body.get("snapshot_applied") is True
                         and recovery_session_id == str(acknowledged_recovery_session.get("production_session_id") or "").strip()
                     ):
                         self._prune_persisted_mutations_represented_by_snapshot(
@@ -27000,11 +27185,20 @@ QWidget#ClientUIRoot {{
                     finished_row = event_body.get("finished_job")
                     if isinstance(finished_row, dict):
                         self._remove_acknowledged_local_finish_shift(finished_row)
+                        self.server_closed_session_received.emit(
+                            str(finished_row.get("production_session_id") or item_payload.get("production_session_id") or ""),
+                            "FINISH_SHIFT",
+                        )
                 if event_type == "FINISH_JOB" and isinstance(event_body, dict):
                     finished_row = event_body.get("finished_job")
                     if isinstance(finished_row, dict):
                         self._remove_server_acknowledged_app_logs(finished_row.get("client_app_logs"))
                         self._remove_acknowledged_local_finished_job(finished_row)
+                        if not discard_item:
+                            self.server_closed_session_received.emit(
+                                str(finished_row.get("production_session_id") or item_payload.get("production_session_id") or ""),
+                                "FINISH_JOB",
+                            )
                 if event_type == "SESSION_SYNC" and isinstance(event_body, dict) and isinstance(event_body.get("session_snapshot"), dict):
                     self._server_recovery_snapshot_queued = False
             else:
@@ -27243,6 +27437,7 @@ QWidget#ClientUIRoot {{
         # encoding the same batch on every production scan adds latency without
         # improving delivery because the server already deduplicates the rows.
         if event_type == "HEARTBEAT":
+            event_payload.setdefault("rpi_uptime_seconds", _system_uptime_seconds())
             event_payload.setdefault(
                 "request_session",
                 bool(getattr(self, "_server_authoritative_reconcile_needed", True)),

@@ -34,6 +34,7 @@ except Exception:
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 
 try:
     import pymysql
@@ -65,12 +66,15 @@ async def _app_lifespan(app: FastAPI):
 
 
 APP = FastAPI(title="Machine Dashboard Server", lifespan=_app_lifespan)
+APP.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 APP.mount("/Images", StaticFiles(directory=str(Path(__file__).resolve().parent / "Images")), name="images")
 APP.mount("/PERSON", StaticFiles(directory=str(Path(__file__).resolve().parent / "PERSON")), name="person")
 MACHINE_EVENT_LOCKS: Dict[str, asyncio.Lock] = {}
 BATCH_BROADCAST_DEFERRED: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "batch_broadcast_deferred", default=False
 )
+SLOW_API_LOG_LAST_AT: Dict[str, float] = {}
+SLOW_HEARTBEAT_LOG_INTERVAL_SECONDS = 10.0
 
 
 @APP.middleware("http")
@@ -96,11 +100,20 @@ async def _request_timing_middleware(request: Request, call_next):
         response = await call_next(request)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}, machine-lock;dur={lock_wait_ms:.1f}"
-    if request.url.path.startswith("/api/") and elapsed_ms >= 100.0:
+    path = request.url.path
+    is_heartbeat = path == "/api/heartbeat"
+    slow_threshold_ms = 1000.0 if is_heartbeat else 100.0
+    now = time.monotonic()
+    heartbeat_log_due = (
+        not is_heartbeat
+        or now - SLOW_API_LOG_LAST_AT.get(path, 0.0) >= SLOW_HEARTBEAT_LOG_INTERVAL_SECONDS
+    )
+    if path.startswith("/api/") and elapsed_ms >= slow_threshold_ms and heartbeat_log_due:
+        SLOW_API_LOG_LAST_AT[path] = now
         _append_server_app_log(
             "slow_api_request",
             {
-                "path": request.url.path,
+                "path": path,
                 "method": request.method,
                 "machine_code": machine_code,
                 "lock_wait_ms": round(lock_wait_ms, 1),
@@ -127,6 +140,14 @@ SERVING_RATE_API_URL = os.environ.get(
 ).strip()
 ACTIVE_MACHINE_SESSIONS_FILE = Path(__file__).resolve().parent / "Database" / "active_machine_sessions.json"
 SERVER_APP_LOG_FILE = Path(__file__).resolve().parent / "Database" / "server_app_logs.jsonl"
+MIXING_PARTIAL_ACK_FILE = Path(__file__).resolve().parent / "Database" / "mixing_partial_acknowledgements.json"
+MIXING_PARTIAL_ACK_LOCK = threading.RLock()
+MIXING_PARTIAL_REQUEST_LOCKS: Dict[str, asyncio.Lock] = {}
+SUPERVISOR_ROTATION_HISTORY_FILE = Path(__file__).resolve().parent / "Database" / "supervisor_rotation_history.json"
+SUPERVISOR_ROTATION_HISTORY_LOCK = threading.RLock()
+BREAKTIME_STATE_FILE = Path(__file__).resolve().parent / "Database" / "breaktime_integration.json"
+BREAKTIME_STATE_LOCK = threading.RLock()
+PROFILE_SYNC_LOCK = threading.RLock()
 SERVER_APP_LOG_MAX_BYTES = max(
     1_000_000,
     int(os.environ.get("MACHINE_SERVER_APP_LOG_MAX_BYTES", "20000000") or 20_000_000),
@@ -196,12 +217,16 @@ MACHINE_NAME_MAP: Dict[str, str] = {
     "M00142": "IMM 442",
     "M00143": "IMM 443",
     "M00144": "IMM 444",
+    "MT-301": "MT-301",
+    "MT-302": "MT-302",
+    "MT-303": "MT-303",
 }
 ADDITIONAL_MACHINE_CODES = {
     "M00111", "M00112", "M00113", "M00114", "M00115", "M00116", "M00117", "M00118",
     "M00121", "M00122", "M00123", "M00124", "M00125", "M00126",
     "M00141", "M00142", "M00143", "M00144",
 }
+MIXING_MACHINE_CODES = {"MT-301", "MT-302", "MT-303"}
 SUPERVISOR_BADGES: Dict[str, str] = {"3000001": "Charlie Brown"}
 QC_BADGES: Dict[str, str] = {"4000001": "Lucy Van Pelt"}
 APP_BASE_DIR = Path(__file__).resolve().parent
@@ -429,6 +454,18 @@ def _save_json_list(path: Path, rows: List[Dict[str, Any]]) -> bool:
         return False
 
 
+def _save_json_object(path: Path, payload: Dict[str, Any]) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        return True
+    except Exception as e:
+        print(f"[JSON] Failed to save {path.name}: {e}")
+        return False
+
+
 def _append_server_app_log(kind: str, row: Dict[str, Any]) -> None:
     try:
         kind_text = str(kind or "").strip()
@@ -465,6 +502,90 @@ def _load_processed_event_ids() -> List[str]:
 
 PROCESSED_EVENT_IDS: List[str] = _load_processed_event_ids()
 PROCESSED_EVENT_ID_SET = set(PROCESSED_EVENT_IDS)
+
+
+def _supervisor_rotation_history_key(row: Dict[str, Any]) -> tuple:
+    return (
+        str(row.get("checked_at_utc") or "").strip(),
+        str(row.get("machine_code") or "").strip().upper(),
+        str(row.get("supervisor_code") or "").strip().casefold(),
+        str(row.get("supervisor_name") or "").strip().casefold(),
+    )
+
+
+def _load_supervisor_rotation_history() -> List[Dict[str, Any]]:
+    rows = _load_json_list(SUPERVISOR_ROTATION_HISTORY_FILE)
+    changed = False
+    for row in rows:
+        machine_code = str(row.get("machine_code") or "").strip().upper()
+        machine_name = str(row.get("machine_name") or "").strip()
+        extended_match = re.fullmatch(r"M0+(\d{3})", machine_code)
+        normalized_name = MACHINE_NAME_MAP.get(machine_code) or (f"IMM {extended_match.group(1)}" if extended_match else machine_code)
+        if normalized_name and (not machine_name or machine_name == machine_code):
+            row["machine_name"] = normalized_name
+            changed = True
+    seen = {_supervisor_rotation_history_key(row) for row in rows}
+    audit_paths = [SERVER_APP_LOG_FILE.with_suffix(SERVER_APP_LOG_FILE.suffix + ".1"), SERVER_APP_LOG_FILE]
+    for path in audit_paths:
+        if not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    try:
+                        item = json.loads(line)
+                    except Exception:
+                        continue
+                    if (
+                        str(item.get("kind") or "").strip() != "api_event_received"
+                        or str(item.get("event_type") or "").strip().upper() != "SUPERVISOR_ROTATION_CHECK"
+                    ):
+                        continue
+                    actor_name = str(item.get("last_event") or "").strip()
+                    prefix = "SUPERVISOR ROTATION CHECK"
+                    if actor_name.upper().startswith(prefix):
+                        actor_name = actor_name[len(prefix):].strip()
+                    machine_code = str(item.get("machine_code") or "").strip().upper()
+                    extended_match = re.fullmatch(r"M0+(\d{3})", machine_code)
+                    row = {
+                        "checked_at_utc": str(item.get("at_utc") or "").strip(),
+                        "supervisor_code": "",
+                        "supervisor_name": actor_name or "Supervisor",
+                        "supervisor_role": "SUPERVISOR",
+                        "machine_code": machine_code,
+                        "machine_name": MACHINE_NAME_MAP.get(machine_code) or (f"IMM {extended_match.group(1)}" if extended_match else machine_code),
+                        "job_code": "",
+                        "client_id": str(item.get("client_id") or "").strip(),
+                        "source": "SERVER_AUDIT_RECOVERY",
+                    }
+                    key = _supervisor_rotation_history_key(row)
+                    if not row["checked_at_utc"] or key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append(row)
+                    changed = True
+        except Exception:
+            continue
+    rows.sort(key=lambda row: str(row.get("checked_at_utc") or ""))
+    if changed or (rows and not SUPERVISOR_ROTATION_HISTORY_FILE.exists()):
+        _save_json_list(SUPERVISOR_ROTATION_HISTORY_FILE, rows)
+    return rows
+
+
+SUPERVISOR_ROTATION_HISTORY: List[Dict[str, Any]] = _load_supervisor_rotation_history()
+
+
+def _record_supervisor_rotation_history(row: Dict[str, Any]) -> None:
+    item = dict(row or {})
+    if not str(item.get("checked_at_utc") or "").strip():
+        return
+    key = _supervisor_rotation_history_key(item)
+    with SUPERVISOR_ROTATION_HISTORY_LOCK:
+        if any(_supervisor_rotation_history_key(existing) == key for existing in SUPERVISOR_ROTATION_HISTORY):
+            return
+        SUPERVISOR_ROTATION_HISTORY.append(item)
+        SUPERVISOR_ROTATION_HISTORY.sort(key=lambda existing: str(existing.get("checked_at_utc") or ""))
+        _save_json_list(SUPERVISOR_ROTATION_HISTORY_FILE, SUPERVISOR_ROTATION_HISTORY)
 
 
 def _mark_event_id_processed(event_id: str) -> None:
@@ -1059,14 +1180,18 @@ _HISTORY_HEAVY_COLUMNS = {
 }
 _HISTORY_JSON_TEXT_FIELDS = (
     "production_session_id", "product_id", "product_sku", "product_name",
-    "job_started_at", "mold", "mold_no", "custom_05",
+    "job_started_at", "mold", "mold_no", "custom_05", "manpower_count",
+    "_wrong_or_voided_scan_count", "_missing_component_part_count",
+    "_pdr_waiting_seconds_average", "_post_pdr_weight_ok",
 )
 _HISTORY_JSON_COUNT_FIELDS = {
+    "_crew_member_count": "crew_members",
     "_raw_material_log_count": "raw_material_logs",
     "_pack_history_log_count": "product_pack_history_logs",
     "_butal_scan_log_count": "butal_scan_logs",
     "_reject_review_log_count": "reject_review_logs",
     "_pdr_downtime_log_count": "pdr_downtime_logs",
+    "_supervisor_rotation_log_count": "supervisor_rotation_logs",
 }
 _HISTORY_DETAIL_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _HISTORY_DETAIL_CACHE_LOCK = threading.Lock()
@@ -1168,6 +1293,67 @@ def _load_history_detail_sql(row: Dict[str, Any]) -> Dict[str, Any]:
         return dict(row)
     finally:
         conn.close()
+
+
+def _load_history_details_batch_sql(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Hydrate a small group of history rows with at most one query per table."""
+    output: Dict[str, Dict[str, Any]] = {}
+    pending: Dict[str, List[tuple[Any, Dict[str, Any], str]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        job_key = _finished_job_key(row)
+        if not row.get("_history_summary_only"):
+            output[job_key] = dict(row)
+            continue
+        table_name = str(row.get("_history_source_table") or "").strip()
+        source_id = row.get("_history_source_id")
+        if table_name not in {"finished_jobs", "finish_shift", "archived_jobs_server"} or source_id in (None, ""):
+            output[job_key] = dict(row)
+            continue
+        cache_key = _history_detail_cache_key(row)
+        with _HISTORY_DETAIL_CACHE_LOCK:
+            cached = _HISTORY_DETAIL_CACHE.get(cache_key)
+            if cached is not None:
+                _HISTORY_DETAIL_CACHE.move_to_end(cache_key)
+                output[job_key] = dict(cached)
+                continue
+        pending.setdefault(table_name, []).append((source_id, row, job_key))
+
+    for table_name, entries in pending.items():
+        conn = _sql_conn()
+        if conn is None:
+            for _source_id, row, job_key in entries:
+                output[job_key] = dict(row)
+            continue
+        try:
+            placeholders = ",".join(["%s"] * len(entries))
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT `id`, `raw_json` FROM `{table_name}` WHERE `id` IN ({placeholders})",
+                    tuple(source_id for source_id, _row, _job_key in entries),
+                )
+                fetched = {str(item.get("id")): item.get("raw_json") for item in (cur.fetchall() or [])}
+            for source_id, row, job_key in entries:
+                detail = _sql_decode_json(fetched.get(str(source_id)), {})
+                if not isinstance(detail, dict) or not detail:
+                    output[job_key] = dict(row)
+                    continue
+                detail["_history_source_table"] = table_name
+                detail["_history_source_id"] = source_id
+                output[job_key] = detail
+                with _HISTORY_DETAIL_CACHE_LOCK:
+                    _HISTORY_DETAIL_CACHE[_history_detail_cache_key(row)] = dict(detail)
+                    _HISTORY_DETAIL_CACHE.move_to_end(_history_detail_cache_key(row))
+                    while len(_HISTORY_DETAIL_CACHE) > _HISTORY_DETAIL_CACHE_MAX:
+                        _HISTORY_DETAIL_CACHE.popitem(last=False)
+        except Exception as exc:
+            print(f"[SQL] Failed to batch-load history detail from {table_name}: {exc}")
+            for _source_id, row, job_key in entries:
+                output[job_key] = dict(row)
+        finally:
+            conn.close()
+    return [{"job_key": job_key, "item": item} for job_key, item in output.items()]
 
 
 def _load_archived_jobs_sql() -> Optional[List[Dict[str, Any]]]:
@@ -1630,7 +1816,49 @@ _FINISHED_SQL_INT_COLUMNS = {
 
 def _finished_sql_value(row: Dict[str, Any], column: str) -> Any:
     if column == "raw_json":
-        return json.dumps(row, ensure_ascii=False)
+        payload = dict(row)
+        pack_logs = payload.get("product_pack_history_logs") if isinstance(payload.get("product_pack_history_logs"), list) else []
+        butal_logs = payload.get("butal_scan_logs") if isinstance(payload.get("butal_scan_logs"), list) else []
+        payload["_wrong_or_voided_scan_count"] = sum(
+            1 for item in [*pack_logs, *butal_logs]
+            if isinstance(item, dict) and bool(item.get("voided"))
+        )
+        missing_component_keys: set[str] = set()
+        for pack in pack_logs:
+            if not isinstance(pack, dict) or bool(pack.get("voided")):
+                continue
+            parts = pack.get("raw_part_consumption") if isinstance(pack.get("raw_part_consumption"), list) else []
+            for part in parts:
+                if not isinstance(part, dict) or str(part.get("part_qty_per_unit_source") or "").strip().lower() != "missing":
+                    continue
+                sku = str(part.get("sku") or part.get("material_sku") or "").strip().upper()
+                if sku.startswith("Z-RM-"):
+                    continue
+                missing_component_keys.add(sku or str(part.get("part_product_id") or len(missing_component_keys)))
+        payload["_missing_component_part_count"] = len(missing_component_keys)
+        pdr_logs = payload.get("pdr_downtime_logs") if isinstance(payload.get("pdr_downtime_logs"), list) else []
+        waits = []
+        for event in pdr_logs:
+            if not isinstance(event, dict) or event.get("waiting_seconds") in (None, ""):
+                continue
+            try:
+                waits.append(max(0.0, float(event.get("waiting_seconds") or 0)))
+            except (TypeError, ValueError):
+                continue
+        payload["_pdr_waiting_seconds_average"] = round(sum(waits) / len(waits), 2) if waits else None
+        latest_pdr_finished: Optional[datetime] = None
+        for event in pdr_logs:
+            if not isinstance(event, dict):
+                continue
+            finished = _parse_iso_utc(event.get("finished_at_utc") or event.get("resolved_at_utc") or event.get("closed_at_utc"))
+            if finished is not None and (latest_pdr_finished is None or finished > latest_pdr_finished):
+                latest_pdr_finished = finished
+        received_weight = _parse_iso_utc(payload.get("external_average_weight_received_at"))
+        payload["_post_pdr_weight_ok"] = (
+            bool(received_weight is not None and received_weight >= latest_pdr_finished)
+            if latest_pdr_finished is not None else None
+        )
+        return json.dumps(payload, ensure_ascii=False)
     if column in _FINISHED_SQL_JSON_COLUMNS:
         default: Any = {} if column in {"reject_breakdown", "job_payload"} else []
         return json.dumps(row.get(column, default), ensure_ascii=False)
@@ -1946,6 +2174,7 @@ DASHBOARD_HEAVY_SESSION_FIELDS = {
     "supervisor_rotation_logs",
     "butal_scan_logs",
     "client_app_logs",
+    "mixing_open_jobs",
 }
 
 
@@ -2036,6 +2265,7 @@ class MachineSession:
     linkage_job_name: Optional[str] = None
     linkage_job_payload: Dict[str, Any] = None
     linkage_jobs: List[Dict[str, Any]] = None
+    mixing_open_jobs: List[Dict[str, Any]] = None
     operator_shift_logs: List[Dict[str, Any]] = None
     butal_by_job: Dict[str, int] = None
     last_shift_butal_qty: int = 0
@@ -2047,6 +2277,8 @@ class MachineSession:
     last_event: str = ""
     last_event_at_utc: Optional[str] = None
     last_seen_utc: str = ""
+    rpi_uptime_seconds: Optional[int] = None
+    rpi_uptime_reported_at_utc: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -2070,6 +2302,7 @@ class MachineSession:
         d["job_payload"] = d["job_payload"] or {}
         d["linkage_job_payload"] = d["linkage_job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
+        d["mixing_open_jobs"] = d["mixing_open_jobs"] or []
         d["operator_shift_logs"] = d["operator_shift_logs"] or []
         d["crew_members"] = d["crew_members"] or []
         d["manpower_count"] = (1 if d.get("operator_id") else 0) + len(d["crew_members"])
@@ -2110,6 +2343,19 @@ class MachineSession:
         d["job_payload"] = d.get("job_payload") or {}
         d["linkage_job_payload"] = d.get("linkage_job_payload") or {}
         d["linkage_jobs"] = d.get("linkage_jobs") or []
+        mixing_summary_fields = (
+            "mixing_job_key", "mixing_active", "job_code", "job_name",
+            "job_started_at", "production_session_id", "operator_id",
+            "product_id", "product_sku", "product_name", "pack_total",
+            "pack_count", "good_total", "butal_total", "reject_total",
+            "raw_sacks_count", "mixing_sack_count", "mixing_total_kg",
+            "mixing_last_active_at",
+        )
+        d["mixing_open_jobs"] = [
+            {key: row.get(key) for key in mixing_summary_fields if key in row}
+            for row in (self.mixing_open_jobs or [])
+            if isinstance(row, dict)
+        ]
         d["crew_members"] = d.get("crew_members") or []
         d["manpower_count"] = (1 if d.get("operator_id") else 0) + len(d["crew_members"])
         d["current_supervisor_review"] = d.get("current_supervisor_review") or {}
@@ -2531,6 +2777,10 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         linkage_job_name=raw.get("linkage_job_name"),
         linkage_job_payload=dict(raw.get("linkage_job_payload") or {}),
         linkage_jobs=list(raw.get("linkage_jobs") or []),
+        mixing_open_jobs=[
+            dict(row) for row in (raw.get("mixing_open_jobs") or [])
+            if isinstance(row, dict)
+        ],
         operator_shift_logs=_clean_operator_shift_logs_for_session(
             raw.get("operator_shift_logs") or [],
             client_id=client_id,
@@ -2546,6 +2796,8 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         last_event=_clean_dashboard_last_event(raw.get("last_event")),
         last_event_at_utc=raw.get("last_event_at_utc"),
         last_seen_utc=last_seen_utc,
+        rpi_uptime_seconds=_parse_int_or_none(raw.get("rpi_uptime_seconds")),
+        rpi_uptime_reported_at_utc=str(raw.get("rpi_uptime_reported_at_utc") or "").strip() or None,
     )
 
 
@@ -2613,7 +2865,9 @@ def _save_active_sessions_json(rows: Dict[str, MachineSession]) -> bool:
         ACTIVE_MACHINE_SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = Path(f"{ACTIVE_MACHINE_SESSIONS_FILE}.tmp")
         with tmp.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+            # This is a machine-readable recovery snapshot. Compact encoding
+            # preserves every field while substantially reducing backup I/O.
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
             f.flush()
             os.fsync(f.fileno())
         _backup_active_sessions_file()
@@ -2686,29 +2940,36 @@ def _upsert_machine_activity_logs_sql(machine_code: str, rows: Any) -> bool:
         conn.close()
 
 
-def _load_machine_activity_logs_sql(machine_code: str, limit: int = 400) -> Optional[Dict[str, Any]]:
+def _load_machine_activity_logs_sql(
+    machine_code: str,
+    limit: int = 400,
+    since_utc: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     code = str(machine_code or "").strip()
     if not code:
         return {"items": [], "total": 0}
     conn = _sql_conn()
     if conn is None:
         return None
-    safe_limit = max(1, min(1000, int(limit or 400)))
+    safe_limit = max(1, min(10000, int(limit or 400)))
+    since = str(since_utc or "").strip()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) AS total FROM `machine_activity_logs` WHERE `machine_code`=%s",
-                (code,),
-            )
+            where_sql = "`machine_code`=%s"
+            params: List[Any] = [code]
+            if since:
+                where_sql += " AND `timestamp_utc` >= %s"
+                params.append(since)
+            cur.execute(f"SELECT COUNT(*) AS total FROM `machine_activity_logs` WHERE {where_sql}", tuple(params))
             count_row = cur.fetchone() or {}
             cur.execute(
-                """
+                f"""
                 SELECT `raw_json` FROM `machine_activity_logs`
-                WHERE `machine_code`=%s
+                WHERE {where_sql}
                 ORDER BY `timestamp_utc` DESC, `activity_id` DESC
                 LIMIT %s
                 """,
-                (code, safe_limit),
+                tuple(params + [safe_limit]),
             )
             fetched = cur.fetchall() or []
         return {
@@ -2755,10 +3016,12 @@ def _persist_active_sessions_state(machine_code: Optional[str] = None) -> bool:
     global ACTIVE_SESSIONS_JSON_DIRTY
     code = str(machine_code or "").strip()
     sql_saved = True
-    if code and code in SESSIONS:
-        sql_saved = _upsert_active_session_sql(SESSIONS[code].to_dict())
+    session = SESSIONS.get(code) if code else None
+    if session is not None:
+        sql_saved = _upsert_active_session_sql(session.to_dict())
     else:
-        for sess in SESSIONS.values():
+        # SQL calls release the GIL; event handlers can add/remove sessions.
+        for sess in list(SESSIONS.values()):
             sql_saved = _upsert_active_session_sql(sess.to_dict()) and sql_saved
     ACTIVE_SESSIONS_JSON_DIRTY = True
     if sql_saved:
@@ -3703,6 +3966,7 @@ def _profile_identity(profile: Dict[str, Any]) -> Dict[str, str]:
         "id_number": str((profile or {}).get("id_number") or "").strip(),
         "name": str((profile or {}).get("name") or "").strip(),
         "role": str((profile or {}).get("role") or (profile or {}).get("company_role") or "").strip(),
+        "department": str((profile or {}).get("department") or "").strip(),
         "photo_data_url": str((profile or {}).get("photo_data_url") or "").strip(),
     }
 
@@ -3742,6 +4006,162 @@ def _clean_profile_photo_data_url(value: Any) -> str:
     if not re.match(r"^data:image/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=\s]+$", raw, re.IGNORECASE):
         raise ValueError("Profile photo must be a PNG, JPG, or WebP image.")
     return re.sub(r"\s+", "", raw)
+
+
+def load_breaktime_state() -> Dict[str, Any]:
+    raw = _load_server_document_sql("breaktime_integration")
+    if raw is None:
+        raw = _load_json_object(BREAKTIME_STATE_FILE)
+    elif not raw:
+        legacy = _load_json_object(BREAKTIME_STATE_FILE)
+        if legacy:
+            raw = legacy
+            _save_server_document_sql("breaktime_integration", legacy)
+    statuses = raw.get("statuses") if isinstance(raw, dict) and isinstance(raw.get("statuses"), dict) else {}
+    notifications = raw.get("notifications") if isinstance(raw, dict) and isinstance(raw.get("notifications"), list) else []
+    return {
+        "statuses": {str(key): dict(value) for key, value in statuses.items() if str(key).strip() and isinstance(value, dict)},
+        "notifications": [dict(row) for row in notifications if isinstance(row, dict)][-200:],
+        "revision": max(0, int((raw or {}).get("revision", 0) or 0)),
+        "updated_at_utc": str((raw or {}).get("updated_at_utc") or ""),
+    }
+
+
+def save_breaktime_state() -> None:
+    with BREAKTIME_STATE_LOCK:
+        BREAKTIME_STATE["revision"] = int(BREAKTIME_STATE.get("revision", 0) or 0) + 1
+        BREAKTIME_STATE["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "statuses": dict(BREAKTIME_STATE.get("statuses") or {}),
+            "notifications": list(BREAKTIME_STATE.get("notifications") or [])[-200:],
+            "revision": BREAKTIME_STATE["revision"],
+            "updated_at_utc": BREAKTIME_STATE["updated_at_utc"],
+        }
+        if not _save_server_document_sql("breaktime_integration", payload):
+            if not _save_json_object(BREAKTIME_STATE_FILE, payload):
+                raise RuntimeError("Breaktime integration storage is unavailable")
+
+
+def _breaktime_public_profile(profile: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "name": str((profile or {}).get("name") or "").strip(),
+        "id_number": str((profile or {}).get("id_number") or "").strip(),
+        "role": _normalize_company_role((profile or {}).get("role") or (profile or {}).get("company_role") or ""),
+        "department": str((profile or {}).get("department") or "").strip(),
+    }
+
+
+def _breaktime_open_notifications() -> List[Dict[str, Any]]:
+    with BREAKTIME_STATE_LOCK:
+        rows = [dict(row) for row in BREAKTIME_STATE.get("notifications", []) if isinstance(row, dict) and not row.get("acknowledged_at_utc")]
+    rows.sort(key=lambda row: str(row.get("last_seen_at_utc") or row.get("created_at_utc") or ""), reverse=True)
+    return rows
+
+
+def _breaktime_record_unregistered(id_number: str, source: str = "status", name: str = "") -> Dict[str, Any]:
+    code = str(id_number or "").strip()
+    now_text = datetime.now(timezone.utc).isoformat()
+    with BREAKTIME_STATE_LOCK:
+        notifications = BREAKTIME_STATE.setdefault("notifications", [])
+        existing = next(
+            (
+                row for row in notifications
+                if isinstance(row, dict)
+                and not row.get("acknowledged_at_utc")
+                and str(row.get("id_number") or "").strip() == code
+            ),
+            None,
+        )
+        if existing is None:
+            existing = {
+                "type": "breaktime_user_not_registered",
+                "id_number": code,
+                "name": str(name or "").strip(),
+                "source": str(source or "status").strip(),
+                "message": f"Breaktime user ID {code or '-'} is not registered on the server.",
+                "created_at_utc": now_text,
+                "occurrences": 0,
+            }
+            notifications.append(existing)
+        existing["last_seen_at_utc"] = now_text
+        existing["occurrences"] = int(existing.get("occurrences", 0) or 0) + 1
+        if name:
+            existing["name"] = str(name).strip()
+        BREAKTIME_STATE["notifications"] = notifications[-200:]
+        result = dict(existing)
+        save_breaktime_state()
+    return result
+
+
+def _breaktime_resolve_notifications_for_id(id_number: str) -> bool:
+    code = str(id_number or "").strip()
+    if not code:
+        return False
+    changed = False
+    now_text = datetime.now(timezone.utc).isoformat()
+    with BREAKTIME_STATE_LOCK:
+        for row in BREAKTIME_STATE.get("notifications", []):
+            if not isinstance(row, dict) or row.get("acknowledged_at_utc"):
+                continue
+            if str(row.get("id_number") or "").strip() == code:
+                row["acknowledged_at_utc"] = now_text
+                row["acknowledged_reason"] = "user_matched"
+                changed = True
+        if changed:
+            save_breaktime_state()
+    return changed
+
+
+def _profile_is_locally_available(profile: Dict[str, Any]) -> bool:
+    for session in SESSIONS.values():
+        if _operator_record_matches_profile(getattr(session, "operator_id", ""), profile):
+            return True
+        if _operator_record_matches_profile(getattr(session, "reliever_id", ""), profile):
+            return True
+    return False
+
+
+def _breaktime_profile_status(profile: Dict[str, Any]) -> Dict[str, str]:
+    id_number = str((profile or {}).get("id_number") or "").strip()
+    locally_available = _profile_is_locally_available(profile)
+    resolved_status = "AVAILABLE" if locally_available else "NOT_AVAILABLE"
+    source = "server_activity"
+    since = ""
+    with BREAKTIME_STATE_LOCK:
+        external = dict((BREAKTIME_STATE.get("statuses") or {}).get(id_number) or {})
+    external_status = str(external.get("status") or "").strip().upper()
+    if external_status in {"ON_BREAK", "OVERBREAK"}:
+        resolved_status = external_status
+        source = "breaktime"
+        since = str(external.get("status_since_utc") or external.get("updated_at_utc") or "")
+    labels = {
+        "AVAILABLE": "Available",
+        "ON_BREAK": "On break",
+        "OVERBREAK": "Overbreak",
+        "NOT_AVAILABLE": "Not available",
+    }
+    return {
+        "availability_status": resolved_status,
+        "availability_label": labels[resolved_status],
+        "availability_source": source,
+        "availability_since_utc": since,
+    }
+
+
+def _breaktime_status_snapshot() -> Dict[str, Any]:
+    items = []
+    for profile in PROFILES:
+        if not isinstance(profile, dict):
+            continue
+        items.append({**_breaktime_public_profile(profile), **_breaktime_profile_status(profile)})
+    with BREAKTIME_STATE_LOCK:
+        revision = int(BREAKTIME_STATE.get("revision", 0) or 0)
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "revision": revision,
+        "items": items,
+        "notification_count": len(_breaktime_open_notifications()),
+    }
 
 
 def _row_label(row: Dict[str, Any]) -> str:
@@ -3851,12 +4271,494 @@ def _kpi_job_summary(row: Dict[str, Any], issues: List[Dict[str, Any]], active: 
     }
 
 
+def _kpi_list_count(row: Dict[str, Any], field: str, summary_alias: str = "") -> int:
+    value = (row or {}).get(field)
+    if isinstance(value, list):
+        return len([item for item in value if isinstance(item, dict)])
+    if summary_alias:
+        try:
+            return max(0, int((row or {}).get(summary_alias, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _kpi_component(
+    key: str,
+    label: str,
+    passed: float,
+    total: float,
+    *,
+    weight: float = 20.0,
+    detail: str = "",
+) -> Dict[str, Any]:
+    safe_total = max(0.0, float(total or 0))
+    safe_passed = max(0.0, min(safe_total, float(passed or 0))) if safe_total else 0.0
+    percent = round((safe_passed / safe_total) * 100.0, 2) if safe_total else None
+    earned = round((percent / 100.0) * float(weight), 2) if percent is not None else None
+    return {
+        "key": key,
+        "label": label,
+        "weight_percent": round(float(weight), 2),
+        "passed": round(safe_passed, 2),
+        "total": round(safe_total, 2),
+        "score_percent": percent,
+        "earned_percent": earned,
+        "detail": str(detail or "").strip(),
+    }
+
+
+def _kpi_timed_component(
+    key: str,
+    label: str,
+    seconds_values: List[float],
+    *,
+    target_seconds: float,
+    maximum_seconds: float,
+    weight: float,
+    detail: str,
+) -> Dict[str, Any]:
+    clean = [max(0.0, float(value)) for value in seconds_values if value is not None]
+    if not clean:
+        return _kpi_component(key, label, 0, 0, weight=weight, detail=detail)
+    average = sum(clean) / len(clean)
+    if average <= target_seconds:
+        percent = 100.0
+    elif average >= maximum_seconds:
+        percent = 0.0
+    else:
+        percent = ((maximum_seconds - average) / max(1.0, maximum_seconds - target_seconds)) * 100.0
+    component = _kpi_component(key, label, percent, 100, weight=weight, detail=detail)
+    component["sample_count"] = len(clean)
+    component["average_seconds"] = round(average, 2)
+    return component
+
+
+def _kpi_numeric_event_values(events: List[Dict[str, Any]], field: str) -> List[float]:
+    values: List[float] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        raw = event.get(field)
+        if raw in (None, "") or str(raw).strip().lower() in {"null", "none", "nan"}:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return values
+
+
+def _kpi_seconds_between(start_value: Any, end_value: Any) -> Optional[float]:
+    start = _parse_iso_utc(start_value)
+    end = _parse_iso_utc(end_value)
+    if start is None or end is None:
+        return None
+    return max(0.0, (end - start).total_seconds())
+
+
+def _kpi_active_job_overdue(row: Dict[str, Any], hours: float = 12.0) -> bool:
+    started = _parse_iso_utc((row or {}).get("job_started_at") or (row or {}).get("started_at_utc"))
+    if started is None:
+        return False
+    return (utc_now() - started).total_seconds() > max(1.0, float(hours)) * 3600.0
+
+
+def _kpi_rating_band(rating: Optional[float]) -> str:
+    if rating is None:
+        return "BUILDING DATA"
+    if rating >= 90:
+        return "EXCELLENT"
+    if rating >= 80:
+        return "STRONG"
+    if rating >= 70:
+        return "ON TRACK"
+    return "COACHING SUPPORT"
+
+
+def _kpi_rating_from_components(
+    components: List[Dict[str, Any]],
+    *,
+    activity_records: int,
+    minimum_activity: int,
+) -> Optional[float]:
+    if int(activity_records or 0) <= 0:
+        return None
+    if not components or any(component.get("earned_percent") is None for component in components):
+        return None
+    return round(sum(float(component.get("earned_percent") or 0) for component in components), 2)
+
+
+def _kpi_rotation_count(row: Dict[str, Any]) -> int:
+    return _kpi_list_count(row, "supervisor_rotation_logs", "_supervisor_rotation_log_count") or max(
+        0, int((row or {}).get("supervisor_rotation_count", 0) or 0)
+    )
+
+
+def _kpi_person_rotation_matches(row: Dict[str, Any], profile: Dict[str, Any]) -> bool:
+    logs = (row or {}).get("supervisor_rotation_logs")
+    if isinstance(logs, list):
+        return any(
+            isinstance(item, dict) and (
+                _profile_matches_person_value(item.get("supervisor_code"), profile)
+                or _profile_matches_person_value(item.get("supervisor_name"), profile)
+            )
+            for item in logs
+        )
+    return False
+
+
+def _kpi_maintenance_events(rows: List[Dict[str, Any]], profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for row in rows:
+        logs = row.get("pdr_downtime_logs") if isinstance(row.get("pdr_downtime_logs"), list) else []
+        for log in logs:
+            if not isinstance(log, dict):
+                continue
+            owner = log.get("maintenance") or log.get("confirmed_by") or row.get("maintenance_name")
+            if not _profile_matches_person_value(owner, profile):
+                continue
+            events.append(log)
+        if not logs and _profile_matches_person_value(row.get("maintenance_name"), profile):
+            waiting_seconds = row.get("_pdr_waiting_seconds_average")
+            if waiting_seconds in (None, ""):
+                try:
+                    wait_started = float(row.get("downtime_wait_started_at") or 0)
+                    repair_started = float(row.get("downtime_started_at") or 0)
+                    if wait_started > 0:
+                        waiting_seconds = max(0.0, (repair_started or time.time()) - wait_started)
+                except (TypeError, ValueError):
+                    waiting_seconds = None
+            events.append({
+                "duration_seconds": row.get("downtime_last_seconds") if not bool(row.get("downtime_active")) else None,
+                "waiting_seconds": waiting_seconds,
+            })
+    return events
+
+
+def _kpi_post_pdr_weight_ok(row: Dict[str, Any]) -> Optional[bool]:
+    saved = (row or {}).get("_post_pdr_weight_ok")
+    if isinstance(saved, bool):
+        return saved
+    if str(saved or "").strip().lower() in {"true", "1", "yes"}:
+        return True
+    if str(saved or "").strip().lower() in {"false", "0", "no"}:
+        return False
+    logs = (row or {}).get("pdr_downtime_logs")
+    if not isinstance(logs, list) or not logs:
+        if int((row or {}).get("_pdr_downtime_log_count", 0) or 0) > 0:
+            return None
+        return True
+    latest_finished: Optional[datetime] = None
+    for log in logs:
+        if not isinstance(log, dict):
+            continue
+        finished = _parse_iso_utc(log.get("finished_at_utc") or log.get("resolved_at_utc") or log.get("closed_at_utc"))
+        if finished is not None and (latest_finished is None or finished > latest_finished):
+            latest_finished = finished
+    if latest_finished is None:
+        return None
+    received = _parse_iso_utc((row or {}).get("external_average_weight_received_at"))
+    return bool(received is not None and received >= latest_finished)
+
+
+def _kpi_activity_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc) if float(value) > 0 else None
+        except (OverflowError, OSError, ValueError):
+            return None
+    return _parse_iso_utc(value)
+
+
+def _kpi_machine_label(row: Dict[str, Any]) -> str:
+    code = str((row or {}).get("machine_code") or "").strip()
+    return _machine_display_name(code, (row or {}).get("machine_name") or code or "-")
+
+
+def _kpi_latest_activity(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    valid = [
+        row for row in candidates
+        if isinstance(row, dict) and _kpi_activity_datetime(row.get("at_utc")) is not None
+    ]
+    if not valid:
+        return {}
+    return max(valid, key=lambda row: _kpi_activity_datetime(row.get("at_utc")) or datetime.min.replace(tzinfo=timezone.utc))
+
+
+def _kpi_current_shift_window(now_utc: Optional[datetime] = None) -> tuple[datetime, datetime]:
+    """Return the current 07:00-19:00 / 19:00-07:00 Singapore production shift."""
+    now = now_utc or utc_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    singapore_tz = timezone(timedelta(hours=8))
+    local_now = now.astimezone(singapore_tz)
+    day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if local_now.hour >= 19:
+        start_local = day_start + timedelta(hours=19)
+        end_local = day_start + timedelta(days=1, hours=7)
+    elif local_now.hour >= 7:
+        start_local = day_start + timedelta(hours=7)
+        end_local = day_start + timedelta(hours=19)
+    else:
+        start_local = day_start - timedelta(days=1) + timedelta(hours=19)
+        end_local = day_start + timedelta(hours=7)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def _kpi_presence_status(
+    profile: Dict[str, Any],
+    active_rows: List[Dict[str, Any]],
+    history_rows: List[Dict[str, Any]],
+    _availability: Dict[str, str],
+) -> Dict[str, Any]:
+    """Describe a person's current assignment and most recent role activity."""
+    all_rows = [*active_rows, *history_rows]
+    result = {
+        "activity_status": "OFFLINE",
+        "activity_label": "Offline",
+        "activity_detail": "No recorded machine activity",
+        "activity_machine_code": "",
+        "activity_machine_name": "",
+        "activity_at_utc": "",
+        "activity_type": "",
+        "supervisor_activity_history": [],
+    }
+
+    def set_result(status: str, label: str, detail: str, row: Dict[str, Any], at_utc: Any = "", activity_type: str = "") -> Dict[str, Any]:
+        result.update({
+            "activity_status": status,
+            "activity_label": label,
+            "activity_detail": detail,
+            "activity_machine_code": str((row or {}).get("machine_code") or "").strip(),
+            "activity_machine_name": _kpi_machine_label(row),
+            "activity_at_utc": str(at_utc or "").strip(),
+            "activity_type": str(activity_type or "").strip().upper(),
+        })
+        return result
+
+    if _profile_has_role(profile, "operator"):
+        relieving = [
+            row for row in active_rows
+            if bool(row.get("break_active")) and _operator_record_matches_profile(row.get("reliever_id"), profile)
+        ]
+        originals = [row for row in active_rows if _operator_record_matches_profile(row.get("operator_id"), profile)]
+        if relieving:
+            row = max(relieving, key=lambda item: _activity_timestamp(item) or datetime.min.replace(tzinfo=timezone.utc))
+            machine = _kpi_machine_label(row)
+            return set_result("RELIEVER", f"Reliever on {machine}", "Covering the assigned operator", row, row.get("last_seen_utc"))
+        if originals:
+            row = max(originals, key=lambda item: _activity_timestamp(item) or datetime.min.replace(tzinfo=timezone.utc))
+            if bool(row.get("break_active")):
+                logs = [item for item in (row.get("break_sessions") or []) if isinstance(item, dict)]
+                open_break = next((item for item in reversed(logs) if _open_break_is_within_window(item)), None)
+                if open_break:
+                    machine = _kpi_machine_label(row)
+                    return set_result("ON_BREAK", "On Break", f"Away from {machine}", row, open_break.get("break_out_time"))
+            machine = _kpi_machine_label(row)
+            return set_result("WORKING", f"Working on {machine}", "Assigned machine operator", row, row.get("last_seen_utc"))
+        prior = [row for row in history_rows if _operator_record_matches_profile(row.get("operator_id"), profile)]
+        if prior:
+            row = max(prior, key=lambda item: _activity_timestamp(item) or datetime.min.replace(tzinfo=timezone.utc))
+            machine = _kpi_machine_label(row)
+            return set_result("OFFLINE", "Offline", f"Last worked on {machine}", row, row.get("finished_at_utc") or row.get("ended_at_utc"))
+        return result
+
+    candidates: List[Dict[str, Any]] = []
+    if _profile_has_role(profile, "supervisor"):
+        for row in all_rows:
+            machine = _kpi_machine_label(row)
+            rotation_logs = [
+                *[log for log in (row.get("supervisor_rotation_logs") or []) if isinstance(log, dict)],
+                *[log for log in (row.get("supervisor_rotation_summary_logs") or []) if isinstance(log, dict)],
+            ]
+            for log in rotation_logs:
+                if isinstance(log, dict) and (
+                    _profile_matches_person_value(log.get("supervisor_code"), profile)
+                    or _profile_matches_person_value(log.get("supervisor_name"), profile)
+                ):
+                    candidates.append({
+                        "row": row,
+                        "at_utc": log.get("checked_at_utc"),
+                        "activity_type": "CHECK",
+                        "machine": machine,
+                        "label": f"Last check on {machine}",
+                        "shift_detail": f"Check this shift on {machine}",
+                    })
+            if (
+                int(row.get("supervisor_rotation_count") or 0) > 0
+                and row.get("last_supervisor_check_at_utc")
+                and (
+                    _profile_matches_person_value(row.get("last_supervisor_check_code"), profile)
+                    or _profile_matches_person_value(row.get("last_supervisor_check_name"), profile)
+                )
+            ):
+                candidates.append({
+                    "row": row,
+                    "at_utc": row.get("last_supervisor_check_at_utc"),
+                    "activity_type": "CHECK",
+                    "machine": machine,
+                    "label": f"Last check on {machine}",
+                    "shift_detail": f"Check this shift on {machine}",
+                })
+            review_logs = [
+                *[log for log in (row.get("supervisor_review_logs") or []) if isinstance(log, dict)],
+                *[log for log in (row.get("supervisor_review_summary_logs") or []) if isinstance(log, dict)],
+            ]
+            for log in review_logs:
+                if isinstance(log, dict) and (
+                    _profile_matches_person_value(log.get("actor_code"), profile)
+                    or _profile_matches_person_value(log.get("actor_name"), profile)
+                ):
+                    candidates.append({
+                        "row": row,
+                        "at_utc": log.get("closed_at_utc") or log.get("last_updated_at_utc") or log.get("opened_at_utc"),
+                        "activity_type": "REVIEW",
+                        "machine": machine,
+                        "label": f"Last review on {machine}",
+                        "shift_detail": f"Review this shift on {machine}",
+                    })
+            if (
+                _profile_matches_person_value(row.get("approved_by_code"), profile)
+                or _profile_matches_person_value(row.get("approved_by"), profile)
+            ):
+                candidates.append({
+                    "row": row,
+                    "at_utc": row.get("approved_at_utc") or row.get("finished_at_utc"),
+                    "activity_type": "REVIEW",
+                    "machine": machine,
+                    "label": f"Last review on {machine}",
+                    "shift_detail": f"Review this shift on {machine}",
+                })
+        with SUPERVISOR_ROTATION_HISTORY_LOCK:
+            persistent_rotation_rows = [dict(row) for row in SUPERVISOR_ROTATION_HISTORY]
+        for audit_row in persistent_rotation_rows:
+            if not (
+                _profile_matches_person_value(audit_row.get("supervisor_code"), profile)
+                or _profile_matches_person_value(audit_row.get("supervisor_name"), profile)
+            ):
+                continue
+            machine_code = str(audit_row.get("machine_code") or "").strip()
+            machine_name = str(audit_row.get("machine_name") or MACHINE_NAME_MAP.get(machine_code, machine_code)).strip()
+            audit_machine_row = {
+                "machine_code": machine_code,
+                "machine_name": machine_name,
+            }
+            machine = _kpi_machine_label(audit_machine_row)
+            candidates.append({
+                "row": audit_machine_row,
+                "at_utc": audit_row.get("checked_at_utc"),
+                "activity_type": "CHECK",
+                "machine": machine,
+                "label": f"Last check on {machine}",
+                "shift_detail": f"Check this shift on {machine}",
+            })
+        ordered_candidates = sorted(
+            [candidate for candidate in candidates if _kpi_activity_datetime(candidate.get("at_utc")) is not None],
+            key=lambda candidate: _kpi_activity_datetime(candidate.get("at_utc")) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        seen_activity = set()
+        for candidate in ordered_candidates:
+            activity_key = (
+                str(candidate.get("activity_type") or ""),
+                str(candidate.get("machine") or ""),
+                str(candidate.get("at_utc") or ""),
+            )
+            if activity_key in seen_activity:
+                continue
+            seen_activity.add(activity_key)
+            result["supervisor_activity_history"].append({
+                "type": activity_key[0],
+                "machine": activity_key[1],
+                "machine_code": str((candidate.get("row") or {}).get("machine_code") or "").strip(),
+                "at_utc": activity_key[2],
+            })
+            if len(result["supervisor_activity_history"]) >= 1000:
+                break
+        latest = ordered_candidates[0] if ordered_candidates else {}
+        if latest:
+            row = latest["row"]
+            activity_at = _kpi_activity_datetime(latest["at_utc"])
+            shift_start, shift_end = _kpi_current_shift_window()
+            if activity_at is not None and shift_start <= activity_at < shift_end:
+                machine = _kpi_machine_label(row)
+                action = "Checked" if str(latest.get("activity_type") or "").upper() == "CHECK" else "Reviewed"
+                return set_result("ONLINE", f"{action} on {machine}", latest["shift_detail"], row, latest["at_utc"], latest["activity_type"])
+            return set_result("OFFLINE", "Offline", latest["label"], row, latest["at_utc"], latest["activity_type"])
+
+    elif _profile_has_role(profile, "qa/qc"):
+        for row in all_rows:
+            if _profile_matches_person_value(row.get("external_average_weight_sender"), profile):
+                candidates.append({
+                    "row": row,
+                    "at_utc": row.get("external_average_weight_received_at") or row.get("external_average_weight_sent_at"),
+                    "label": f"Last weight sent to {_kpi_machine_label(row)}",
+                })
+        latest = _kpi_latest_activity(candidates)
+        if latest:
+            return set_result("OFFLINE", "Offline", latest["label"], latest["row"], latest["at_utc"])
+
+    elif _profile_has_role(profile, "material loader"):
+        owner_fields = ("material_loader", "material_loader_name", "loader_name", "raw_material_issued_by")
+        for row in all_rows:
+            row_owner_matches = any(_profile_matches_person_value(row.get(field), profile) for field in owner_fields)
+            for log in row.get("raw_material_logs") or []:
+                if not isinstance(log, dict):
+                    continue
+                log_owner_matches = any(
+                    _profile_matches_person_value(log.get(field), profile)
+                    for field in (*owner_fields, "active_operator", "active_operator_name", "scanner_id", "scanned_by")
+                )
+                if not row_owner_matches and not log_owner_matches:
+                    continue
+                sku = str(log.get("material_sku") or log.get("job_part_sku") or log.get("sku") or "").strip().upper()
+                if not sku.startswith("Z-RM"):
+                    continue
+                candidates.append({"row": row, "at_utc": log.get("scanned_at"), "label": f"Last Z-RM scan on {_kpi_machine_label(row)}"})
+        latest = _kpi_latest_activity(candidates)
+        if latest:
+            return set_result("OFFLINE", "Offline", latest["label"], latest["row"], latest["at_utc"])
+
+    elif _profile_has_role(profile, "maintenance"):
+        fixing = [
+            row for row in active_rows
+            if bool(row.get("downtime_active")) and _profile_matches_person_value(row.get("maintenance_name"), profile)
+        ]
+        if fixing:
+            row = max(
+                fixing,
+                key=lambda item: _kpi_activity_datetime(item.get("downtime_started_at")) or _activity_timestamp(item) or datetime.min.replace(tzinfo=timezone.utc),
+            )
+            machine = _kpi_machine_label(row)
+            return set_result("WORKING", f"Fixing downtime on {machine}", str(row.get("downtime_reason_text") or "Downtime repair"), row, row.get("downtime_started_at"))
+        for row in all_rows:
+            logs = [item for item in (row.get("pdr_downtime_logs") or []) if isinstance(item, dict)]
+            for log in logs:
+                owner = log.get("maintenance") or log.get("confirmed_by") or row.get("maintenance_name")
+                if not _profile_matches_person_value(owner, profile):
+                    continue
+                candidates.append({
+                    "row": row,
+                    "at_utc": log.get("finished_at_utc") or log.get("resolved_at_utc") or log.get("closed_at_utc"),
+                    "label": f"Last downtime repair on {_kpi_machine_label(row)}",
+                })
+        latest = _kpi_latest_activity(candidates)
+        if latest:
+            return set_result("OFFLINE", "Offline", latest["label"], latest["row"], latest["at_utc"])
+
+    return result
+
+
 def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
-    """Build conservative per-user KPIs from existing server records.
+    """Build supportive per-user performance snapshots from server records.
 
     These metrics only count items visible in active/finished/archive data.  They
-    are not disciplinary proof; they identify follow-up points the system can
-    infer from missing scans, pending reviews, voided scans, and waiting states.
+    are not disciplinary proof. A numeric snapshot needs at least ten activities,
+    only uses records owned by that person, and caps deductions so a small number
+    of follow-ups cannot define an employee's overall card.
     """
     role_filter_key = str(role_filter or "all").strip().casefold()
     history_rows = [r for r in [*FINISHED_JOBS, *ARCHIVED_JOBS] if isinstance(r, dict)]
@@ -3866,6 +4768,8 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
         profiles = [p for p in profiles if _profile_has_role(p, "operator")]
     elif role_filter_key in ("supervisor", "supervisors"):
         profiles = [p for p in profiles if _profile_has_role(p, "supervisor")]
+    elif role_filter_key not in ("", "all"):
+        profiles = [p for p in profiles if _profile_has_role(p, role_filter_key)]
 
     unassigned_supervisor_issues: List[Dict[str, Any]] = []
     if role_filter_key not in ("operator", "operators"):
@@ -3889,12 +4793,37 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
                 unassigned_supervisor_issues.append(
                     _kpi_issue("unassigned_waiting_supervisor", row, f"{_row_label(row)} is currently waiting for supervisor QR.")
                 )
+        for row in history_rows:
+            if str(row.get("job_code") or "").strip() and not str(row.get("external_average_weight_received_at") or "").strip():
+                unassigned_supervisor_issues.append(
+                    _kpi_issue("unassigned_qc_weight", row, f"No QC weight or QC sender is recorded for {_row_label(row)}.")
+                )
+            if _kpi_list_count(row, "raw_material_logs", "_raw_material_log_count") <= 0:
+                unassigned_supervisor_issues.append(
+                    _kpi_issue("unassigned_raw_material", row, f"Raw material is missing for {_row_label(row)}, but no material loader owner is recorded.")
+                )
+        for alert in PLANNING_QUEUE_ALERTS.values():
+            if not isinstance(alert, dict):
+                continue
+            unassigned_supervisor_issues.append({
+                "type": "unassigned_planning_mismatch",
+                "detail": f"Running SKU {alert.get('running_sku') or '-'} does not match planned SKU {alert.get('queued_sku') or '-'}, but no planner owner is recorded.",
+                "machine_code": alert.get("machine_code", ""),
+                "machine_name": alert.get("machine_name", ""),
+                "job_code": alert.get("running_job", ""),
+                "job_name": alert.get("queued_item", ""),
+                "at_utc": alert.get("detected_at_utc", ""),
+            })
 
     items: List[Dict[str, Any]] = []
     for profile in profiles:
         ident = _profile_identity(profile)
         is_operator = _profile_has_role(profile, "operator")
         is_supervisor = _profile_has_role(profile, "supervisor")
+        is_maintenance = _profile_has_role(profile, "maintenance")
+        is_qc = _profile_has_role(profile, "qa/qc")
+        is_material_loader = _profile_has_role(profile, "material loader")
+        is_planner = _profile_has_role(profile, "planner") or _profile_has_role(profile, "production manager")
         user_rows = [
             row for row in history_rows
             if _operator_record_matches_profile(row.get("operator_id"), profile)
@@ -3908,22 +4837,60 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
             if _profile_matches_person_value(row.get("approved_by_code"), profile)
             or _profile_matches_person_value(row.get("approved_by"), profile)
             or _profile_matches_person_value(row.get("supervisor_name"), profile)
+            or _kpi_person_rotation_matches(row, profile)
         ]
         active_supervisor_rows = [
             row for row in active_rows
             if _profile_matches_person_value(row.get("supervisor_name"), profile)
+        ]
+        maintenance_rows = [
+            row for row in history_rows
+            if _profile_matches_person_value(row.get("maintenance_name"), profile)
+        ]
+        active_maintenance_rows = [
+            row for row in active_rows
+            if _profile_matches_person_value(row.get("maintenance_name"), profile)
+        ]
+        qc_rows = [
+            row for row in history_rows
+            if _profile_matches_person_value(row.get("external_average_weight_sender"), profile)
+        ]
+        active_qc_rows = [
+            row for row in active_rows
+            if _profile_matches_person_value(row.get("external_average_weight_sender"), profile)
+        ]
+        material_loader_rows = [
+            row for row in history_rows
+            if any(_profile_matches_person_value(row.get(field), profile) for field in (
+                "material_loader", "material_loader_name", "loader_name", "raw_material_issued_by",
+            ))
+        ]
+        active_material_loader_rows = [
+            row for row in active_rows
+            if any(_profile_matches_person_value(row.get(field), profile) for field in (
+                "material_loader", "material_loader_name", "loader_name", "raw_material_issued_by",
+            ))
         ]
 
         out: Dict[str, Any] = {
             "id_number": ident["id_number"],
             "name": ident["name"],
             "role": ident["role"],
+            "department": ident["department"],
             "photo_data_url": ident["photo_data_url"],
             "is_operator": is_operator,
             "is_supervisor": is_supervisor,
+            "is_maintenance": is_maintenance,
+            "is_qc": is_qc,
+            "is_material_loader": is_material_loader,
+            "is_planner": is_planner,
             "handled_records": len(user_rows),
             "active_records": len(active_user_rows),
             "approved_records": len(approved_rows),
+            "maintenance_records": len(maintenance_rows),
+            "active_maintenance_records": len(active_maintenance_rows),
+            "qc_records": len(qc_rows),
+            "material_loader_records": len(material_loader_rows),
             "raw_material_scans": 0,
             "pack_qr_scans": 0,
             "reject_scans": 0,
@@ -3932,6 +4899,9 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
             "missed_breakdown": {},
             "issues": [],
         }
+        availability = _breaktime_profile_status(profile)
+        out.update(availability)
+        out.update(_kpi_presence_status(profile, active_rows, history_rows, availability))
 
         if is_operator:
             for row in user_rows:
@@ -3949,6 +4919,13 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
                     _kpi_add_issue(out, "missing_pack_qr_scan", row, f"Pack count exists but no pack QR history for {_row_label(row)}.")
                 if reject_total > 0 and _reject_scan_count(row) <= 0:
                     _kpi_add_issue(out, "missing_reject_scan_review", row, f"Reject totals exist but no reject scan/review log for {_row_label(row)}.")
+                if _count_voided(pack_logs) + _count_voided(row.get("butal_scan_logs")) > 0:
+                    _kpi_add_issue(out, "wrong_voided_scan", row, f"Voided scan activity needs checking for {_row_label(row)}.")
+                if int(row.get("_missing_component_part_count", 0) or 0) > 0:
+                    _kpi_add_issue(out, "missing_component_part", row, f"A required component part is missing for {_row_label(row)}.")
+            for row in active_user_rows:
+                if _kpi_active_job_overdue(row):
+                    _kpi_add_issue(out, "operator_job_not_closed", row, f"The started job has remained open beyond 12 hours for {_row_label(row)}.")
 
         if is_supervisor:
             for row in history_rows:
@@ -3965,10 +4942,188 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
                     _kpi_add_issue(out, "pending_shift_approval", row, f"Shift still has review status {review_status} for {_row_label(row)}.")
                 if has_rejects and not row.get("approved_by") and not row.get("supervisor_name"):
                     _kpi_add_issue(out, "missing_supervisor_reject_review", row, f"Rejects exist but no supervisor/approval recorded for {_row_label(row)}.")
+                review_seconds = _kpi_seconds_between(
+                    row.get("finished_at_utc") or row.get("ended_at_utc"),
+                    row.get("approved_at_utc"),
+                )
+                if review_status == "APPROVED" and review_seconds is not None and review_seconds > 7200:
+                    _kpi_add_issue(out, "late_supervisor_review", row, f"Review was completed more than two hours late for {_row_label(row)}.")
+                if _kpi_rotation_count(row) <= 0:
+                    _kpi_add_issue(out, "missing_supervisor_rotation", row, f"No machine rotation check is recorded for {_row_label(row)}.")
+                if (
+                    _kpi_list_count(row, "raw_material_logs", "_raw_material_log_count") <= 0
+                    or (int(row.get("pack_count", 0) or 0) > 0 and _kpi_list_count(row, "product_pack_history_logs", "_pack_history_log_count") <= 0)
+                    or int(row.get("_missing_component_part_count", 0) or 0) > 0
+                ):
+                    _kpi_add_issue(out, "unresolved_production_followup", row, f"A material, part, or pack follow-up remains for {_row_label(row)}.")
             for row in active_rows:
                 if bool(row.get("waiting_supervisor_qr")) and _profile_matches_person_value(row.get("supervisor_name"), profile):
                     _kpi_add_issue(out, "active_waiting_supervisor", row, f"{_row_label(row)} is currently waiting for supervisor QR.")
+                if _profile_matches_person_value(row.get("supervisor_name"), profile) and _kpi_active_job_overdue(row):
+                    _kpi_add_issue(out, "supervisor_job_not_closed", row, f"The assigned job or shift has remained open beyond 12 hours for {_row_label(row)}.")
             out["active_supervisor_records"] = len(active_supervisor_rows)
+
+        rating_components: List[Dict[str, Any]] = []
+        rating_activity_records = 0
+        minimum_activity = 1
+        rating_basis = "No measurable role activity is assigned yet."
+
+        if is_operator:
+            completed = list(user_rows)
+            overdue_active = [row for row in active_user_rows if _kpi_active_job_overdue(row)]
+            total_jobs = len(completed) + len(overdue_active)
+            rating_activity_records = total_jobs
+            rating_basis = "Five operator responsibilities weighted at 20% each."
+            reject_passed = sum(
+                1 for row in completed
+                if (
+                    int(row.get("reject_total", 0) or 0)
+                    + int(row.get("startup_reject_total", 0) or 0)
+                    + int(row.get("no_shot_total", 0) or 0) <= 0
+                    or _reject_scan_count(row) > 0
+                )
+            )
+            scan_accuracy_passed = sum(
+                1 for row in completed
+                if (
+                    _count_voided(row.get("product_pack_history_logs"))
+                    + _count_voided(row.get("butal_scan_logs"))
+                    + int(row.get("_wrong_or_voided_scan_count", 0) or 0)
+                ) <= 0
+            )
+            material_passed = sum(
+                1 for row in completed
+                if _kpi_list_count(row, "raw_material_logs", "_raw_material_log_count") > 0
+                and int(row.get("_missing_component_part_count", 0) or 0) <= 0
+            )
+            pack_passed = sum(
+                1 for row in completed
+                if int(row.get("pack_count", row.get("pack_total", 0)) or 0) <= 0
+                or _kpi_list_count(row, "product_pack_history_logs", "_pack_history_log_count") > 0
+            )
+            rating_components = [
+                _kpi_component("reject_scan", "Reject scans", reject_passed, len(completed), detail="Rejects must have a scan or review record."),
+                _kpi_component("scan_accuracy", "Scan accuracy", scan_accuracy_passed, len(completed), detail="No wrong or voided pack/reject scans."),
+                _kpi_component("jobs_closed", "Jobs handled", len(completed), total_jobs, detail="Started jobs must be closed; only jobs open over 12 hours count as overdue."),
+                _kpi_component("materials_parts", "Raw mats & parts", material_passed, len(completed), detail="Raw material scans are present and no component part remains missing."),
+                _kpi_component("pack_qr", "Pack QR", pack_passed, len(completed), detail="Jobs with packed output must have pack QR history."),
+            ]
+
+        elif is_supervisor:
+            owned_history = list(approved_rows)
+            overdue_active = [row for row in active_supervisor_rows if _kpi_active_job_overdue(row)]
+            total_owned = len(owned_history) + len(overdue_active)
+            rating_activity_records = total_owned
+            rating_basis = "Five supervisor responsibilities weighted at 20% each."
+            reviewed = sum(1 for row in owned_history if str(row.get("review_status") or "").strip().upper() == "APPROVED")
+            timely_reviews = 0
+            for row in owned_history:
+                elapsed = _kpi_seconds_between(
+                    row.get("finished_at_utc") or row.get("ended_at_utc"),
+                    row.get("approved_at_utc"),
+                )
+                if str(row.get("review_status") or "").strip().upper() == "APPROVED" and elapsed is not None and elapsed <= 7200:
+                    timely_reviews += 1
+            rotations = sum(1 for row in owned_history if _kpi_rotation_count(row) > 0)
+            resolved = sum(
+                1 for row in owned_history
+                if _kpi_list_count(row, "raw_material_logs", "_raw_material_log_count") > 0
+                and (
+                    int(row.get("pack_count", 0) or 0) <= 0
+                    or _kpi_list_count(row, "product_pack_history_logs", "_pack_history_log_count") > 0
+                )
+                and int(row.get("_missing_component_part_count", 0) or 0) <= 0
+            )
+            rating_components = [
+                _kpi_component("shift_completion", "Jobs & shifts finished", len(owned_history), total_owned, detail="Assigned jobs or shifts open over 12 hours count as overdue."),
+                _kpi_component("review_completion", "Reviews completed", reviewed, len(owned_history), detail="Finished shifts must be reviewed and approved."),
+                _kpi_component("review_timeliness", "Reviews on time", timely_reviews, len(owned_history), detail="Review target is within two hours after the shift record finishes."),
+                _kpi_component("rotation_checks", "Rotation checks", rotations, len(owned_history), detail="At least one recorded machine rotation check per owned shift/job."),
+                _kpi_component("issue_resolution", "Issues resolved", resolved, len(owned_history), detail="No unresolved missing raw material, component part, or pack QR follow-up."),
+            ]
+
+        elif is_maintenance:
+            events = _kpi_maintenance_events([*history_rows, *active_rows], profile)
+            repair_seconds = _kpi_numeric_event_values(events, "duration_seconds")
+            waiting_seconds = _kpi_numeric_event_values(events, "waiting_seconds")
+            assigned_active = len(active_maintenance_rows)
+            available_now = 1 if assigned_active <= 0 else 0
+            rating_activity_records = len(events)
+            minimum_activity = 1
+            rating_basis = "Availability is 10%; response time and repair time are 45% each."
+            rating_components = [
+                _kpi_component("availability", "Available when needed", available_now, 1, weight=10, detail="Available now earns the 10% availability portion."),
+                _kpi_timed_component("response_time", "Response time", waiting_seconds, target_seconds=300, maximum_seconds=1800, weight=45, detail="Full score at five minutes or faster; reaches zero at 30 minutes."),
+                _kpi_timed_component("repair_time", "Downtime completion", repair_seconds, target_seconds=900, maximum_seconds=7200, weight=45, detail="Full score at 15 minutes or faster; reaches zero at two hours."),
+            ]
+
+        elif is_qc:
+            owned_rows = [*qc_rows, *active_qc_rows]
+            rating_activity_records = len(owned_rows)
+            minimum_activity = 1
+            rating_basis = "QC weights are scored only when the weighing sender identifies this person."
+            on_time = 0
+            post_pdr_passed = 0
+            post_pdr_total = 0
+            completed_documented = 0
+            for row in owned_rows:
+                elapsed = _kpi_seconds_between(
+                    row.get("started_at_utc") or row.get("job_started_at"),
+                    row.get("external_average_weight_received_at"),
+                )
+                if elapsed is not None and elapsed <= 7200:
+                    on_time += 1
+                post_pdr = _kpi_post_pdr_weight_ok(row)
+                if post_pdr is not None:
+                    post_pdr_total += 1
+                    if post_pdr:
+                        post_pdr_passed += 1
+                if row in qc_rows and row.get("external_average_weight_received_at"):
+                    completed_documented += 1
+            total = len(owned_rows)
+            rating_components = [
+                _kpi_component("weight_coverage", "Weights recorded", total, total, detail="A weight record is linked to the QC sender."),
+                _kpi_component("weight_timeliness", "Initial weights on time", on_time, total, detail="Initial weight target is within two hours after job start."),
+                _kpi_component("late_weight_avoidance", "No late weights", on_time, total, detail="Weights beyond the two-hour target count as late."),
+                _kpi_component("post_pdr_weight", "Post-PDR reweigh", post_pdr_passed, post_pdr_total, detail="A new weight must be received after completed PDR downtime."),
+                _kpi_component("weight_documentation", "Completed documentation", completed_documented, len(qc_rows), detail="Finished records retain the QC weight and sender."),
+            ]
+
+        elif is_material_loader:
+            owned_rows = [*material_loader_rows, *active_material_loader_rows]
+            rating_activity_records = len(owned_rows)
+            minimum_activity = 1
+            rating_basis = "Only raw-material ownership is scored; component parts are excluded."
+            supplied = sum(1 for row in owned_rows if _kpi_list_count(row, "raw_material_logs", "_raw_material_log_count") > 0)
+            resolved = sum(1 for row in owned_rows if not bool(row.get("raw_consumption_pending")))
+            rating_components = [
+                _kpi_component("raw_delivery", "Raw materials supplied", supplied, len(owned_rows), weight=50, detail="Component parts are intentionally excluded."),
+                _kpi_component("raw_resolution", "Missing raw resolved", resolved, len(owned_rows), weight=50, detail="A raw-material shortage must not remain pending."),
+            ]
+
+        elif is_planner:
+            planner_cards = [
+                card for cards in (PLANNING_BOARD.get("lanes") or {}).values() if isinstance(cards, list)
+                for card in cards if isinstance(card, dict) and any(
+                    _profile_matches_person_value(card.get(field), profile)
+                    for field in ("planner_id", "planner_name", "created_by", "assigned_by")
+                )
+            ]
+            rating_activity_records = len(planner_cards)
+            minimum_activity = 1
+            rating_basis = "Plans need an identified planner before queue or mold mismatches can affect an individual."
+            mismatch_card_ids = {
+                str(alert.get("queued_card_id") or "").strip()
+                for alert in PLANNING_QUEUE_ALERTS.values() if isinstance(alert, dict)
+            }
+            matched = sum(
+                1 for card in planner_cards
+                if not bool(card.get("mismatch")) and str(card.get("id") or "").strip() not in mismatch_card_ids
+            )
+            rating_components = [
+                _kpi_component("plan_followed", "Plan followed", matched, len(planner_cards), weight=50, detail="Running production should match the assigned plan."),
+                _kpi_component("mold_match", "Correct mold", matched, len(planner_cards), weight=50, detail="Planned and running mold must match when mold data is available."),
+            ]
 
         out["missed_total"] = len(out.get("issues") or [])
         issues_by_job: Dict[str, List[Dict[str, Any]]] = {}
@@ -4009,16 +5164,55 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
                 and str(issue.get("job_code") or "").strip() == row_job
             ]
 
-        if is_operator:
-            job_rows = [_kpi_job_summary(row, _issues_for_job(row), active=False) for row in user_rows]
-            active_job_rows = [_kpi_job_summary(row, _issues_for_job(row), active=True) for row in active_user_rows]
-            out["handled_jobs"] = [*active_job_rows, *job_rows][:80]
-        denominator = max(1, out["handled_records"] + out["approved_records"] + out["active_records"] + int(out.get("active_supervisor_records", 0) or 0))
-        out["issue_rate_percent"] = round(min(100.0, (out["missed_total"] / denominator) * 100.0), 2)
+        tracked_history_rows = [*user_rows, *approved_rows, *maintenance_rows, *qc_rows, *material_loader_rows]
+        tracked_active_rows = [
+            *active_user_rows, *active_supervisor_rows, *active_maintenance_rows,
+            *active_qc_rows, *active_material_loader_rows,
+        ]
+
+        def _unique_kpi_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            unique: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for row in rows:
+                key = _kpi_row_key(row)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append(row)
+            return unique
+
+        tracked_history_rows = _unique_kpi_rows(tracked_history_rows)
+        tracked_active_rows = _unique_kpi_rows(tracked_active_rows)
+        job_rows = [_kpi_job_summary(row, _issues_for_job(row), active=False) for row in tracked_history_rows]
+        active_job_rows = [_kpi_job_summary(row, _issues_for_job(row), active=True) for row in tracked_active_rows]
+        out["handled_jobs"] = [*active_job_rows, *job_rows][:80]
+        out["activity_records"] = len(tracked_history_rows) + len(tracked_active_rows)
+        out["rating_activity_records"] = int(rating_activity_records or 0)
+        out["rating_basis"] = rating_basis
+        out["rating_components"] = rating_components
+        activity_records = int(out["activity_records"] or 0)
+        denominator = max(1, int(rating_activity_records or activity_records or 0))
+        follow_up_rate = round(min(100.0, (out["missed_total"] / denominator) * 100.0), 2)
+        out["follow_up_rate_percent"] = follow_up_rate
+        # Keep the old API field as a compatibility alias for existing clients.
+        out["issue_rate_percent"] = follow_up_rate
+        out["minimum_activity_required"] = minimum_activity
+        out["rating_confidence"] = (
+            "HIGH" if rating_activity_records >= 25 else
+            "MEDIUM" if rating_activity_records >= 10 else
+            "LOW"
+        )
+        rating = _kpi_rating_from_components(
+            rating_components,
+            activity_records=rating_activity_records,
+            minimum_activity=minimum_activity,
+        )
+        out["kpi_rating_percent"] = rating
+        out["rating_band"] = _kpi_rating_band(rating)
         out["issues"] = out["issues"][:50]
         items.append(out)
 
-    items.sort(key=lambda x: (int(x.get("missed_total", 0) or 0), int(x.get("wrong_or_voided_scans", 0) or 0)), reverse=True)
+    items.sort(key=lambda x: (str(x.get("name") or "").casefold(), str(x.get("id_number") or "").casefold()))
     return {
         "generated_at_utc": utc_now().isoformat() if "utc_now" in globals() else datetime.now(timezone.utc).isoformat(),
         "role_filter": role_filter_key,
@@ -4030,6 +5224,8 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
             "unassigned_supervisor_issues": len(unassigned_supervisor_issues),
         },
         "unassigned_supervisor_issues": unassigned_supervisor_issues[:50],
+        "unassigned_followups": unassigned_supervisor_issues[:50],
+        "breaktime_notifications": _breaktime_open_notifications(),
     }
 
 
@@ -5288,7 +6484,10 @@ def load_server_settings() -> Dict[str, Any]:
         # Newly configured additional machines should become visible without
         # requiring an administrator to reset an older saved visibility list.
         for code in MACHINE_NAME_MAP:
-            if code in ADDITIONAL_MACHINE_CODES and code not in seen_codes:
+            if (
+                code in (ADDITIONAL_MACHINE_CODES | MIXING_MACHINE_CODES)
+                and code not in seen_codes
+            ):
                 seen_codes.add(code)
                 visible_machine_codes.append(code)
     else:
@@ -5767,35 +6966,9 @@ def fetch_planning_job_from_bms(identifier: str) -> Dict[str, Any]:
     cfg = _load_product_source_config()
     bms = cfg.get("bms") if isinstance(cfg.get("bms"), dict) else {}
     base_url = str(bms.get("base_url", "")).strip().rstrip("/")
-    username = str(bms.get("username") or bms.get("user") or "").strip()
-    password = str(bms.get("password") or "").strip()
-    ttl_seconds = int(bms.get("ttl_seconds", 604800) or 604800)
-    force_new_token = bool(bms.get("force_new_token", True))
-    if not (base_url and username and password):
-        raise RuntimeError("BMS config is missing base_url, username, or password")
-
-    req_auth = urllib_request.Request(
-        url=f"{base_url}/auth/login",
-        data=json.dumps({
-            "identity": username,
-            "password": password,
-            "ttlSeconds": ttl_seconds,
-            "forceNewToken": force_new_token,
-        }).encode("utf-8"),
-        method="POST",
-    )
-    req_auth.add_header("Content-Type", "application/json")
-    req_auth.add_header("Accept", "application/json")
-    with urllib_request.urlopen(req_auth, timeout=12) as resp:
-        auth_parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
-    token = str(((auth_parsed or {}).get("data") or {}).get("token") or "").strip()
-    if not token:
-        raise RuntimeError("BMS login did not return a token")
-
     req_job = urllib_request.Request(url=f"{base_url}/jobs/{job_id}", method="GET")
-    req_job.add_header("Authorization", f"Bearer {token}")
     req_job.add_header("Accept", "application/json")
-    with urllib_request.urlopen(req_job, timeout=12) as resp:
+    with _bms_open(bms, req_job, timeout=12) as resp:
         parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
     if not isinstance(parsed, dict):
         raise RuntimeError("BMS job response is invalid")
@@ -5813,15 +6986,113 @@ def fetch_job_payload_from_bms(identifier: str) -> Dict[str, Any]:
     base_url = str(bms.get("base_url", "")).strip().rstrip("/")
     if not base_url:
         raise RuntimeError("BMS config is missing base_url")
-    token = _bms_login_token(bms)
     req_job = urllib_request.Request(url=f"{base_url}/jobs/{job_id}", method="GET")
-    req_job.add_header("Authorization", f"Bearer {token}")
     req_job.add_header("Accept", "application/json")
-    with urllib_request.urlopen(req_job, timeout=8) as resp:
+    with _bms_open(bms, req_job, timeout=8) as resp:
         parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
     if not isinstance(parsed, dict):
         raise RuntimeError("BMS job response is invalid")
     return parsed
+
+
+def create_job_partial_in_bms(
+    job_id: Any,
+    body: Dict[str, Any],
+    idempotency_key: str = "",
+) -> Dict[str, Any]:
+    """Create one job partial using the server's shared BMS authentication."""
+    raw_job_id = str(job_id or "").strip()
+    if not raw_job_id.isdigit() or int(raw_job_id) <= 0:
+        raise ValueError("a positive numeric job_id is required")
+    if not isinstance(body, dict):
+        raise ValueError("partial request body must be a JSON object")
+    try:
+        partial_qty = float(body.get("partial_qty"))
+    except (TypeError, ValueError):
+        raise ValueError("partial_qty must be numeric")
+    if not math.isfinite(partial_qty) or partial_qty <= 0:
+        raise ValueError("partial_qty must be greater than zero")
+    try:
+        partial_by = int(body.get("partial_by"))
+    except (TypeError, ValueError):
+        raise ValueError("partial_by must be an employee ID")
+    if partial_by <= 0:
+        raise ValueError("partial_by must be an employee ID")
+    partial_by_name = str(body.get("partial_by_name") or "").strip()
+    if not partial_by_name:
+        raise ValueError("partial_by_name is required")
+
+    cfg = _load_product_source_config()
+    bms = cfg.get("bms") if isinstance(cfg.get("bms"), dict) else {}
+    base_url = str(bms.get("base_url", "")).strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("BMS config is missing base_url")
+    request_body = dict(body)
+    request_body["partial_qty"] = partial_qty
+    request_body["partial_by"] = partial_by
+    request_body["partial_by_name"] = partial_by_name
+    req_partial = urllib_request.Request(
+        url=f"{base_url}/jobs/{int(raw_job_id)}/partials",
+        data=json.dumps(request_body).encode("utf-8"),
+        method="POST",
+    )
+    req_partial.add_header("Content-Type", "application/json")
+    req_partial.add_header("Accept", "application/json")
+    if str(idempotency_key or "").strip():
+        req_partial.add_header(
+            "Idempotency-Key", str(idempotency_key).strip()
+        )
+    with _bms_open(bms, req_partial, timeout=20) as resp:
+        parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("BMS partial response is invalid")
+    response_code = parsed.get("code")
+    if response_code not in (None, ""):
+        try:
+            numeric_code = int(response_code)
+        except (TypeError, ValueError):
+            numeric_code = 500
+        if numeric_code < 200 or numeric_code >= 300:
+            # Preserve BMS validation/permission details for the client log.
+            # Never include authentication headers or credentials here.
+            detail = {
+                key: parsed.get(key)
+                for key in ("code", "message", "warning", "error", "errors", "data")
+                if parsed.get(key) not in (None, "", [], {})
+            }
+            raise RuntimeError(
+                json.dumps(detail, ensure_ascii=False, separators=(",", ":"))
+                if detail
+                else f"BMS returned code {response_code}"
+            )
+    return parsed
+
+
+def _load_mixing_partial_acknowledgements() -> Dict[str, Dict[str, Any]]:
+    try:
+        loaded = json.loads(MIXING_PARTIAL_ACK_FILE.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            return {
+                str(key): dict(value)
+                for key, value in loaded.items()
+                if isinstance(value, dict)
+            }
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _save_mixing_partial_acknowledgements(
+    rows: Dict[str, Dict[str, Any]],
+) -> None:
+    MIXING_PARTIAL_ACK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Retain a bounded acknowledgement history while preserving insertion order.
+    bounded = dict(list(rows.items())[-5000:])
+    temporary = MIXING_PARTIAL_ACK_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(bounded, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(temporary, MIXING_PARTIAL_ACK_FILE)
 
 
 def _enrich_finished_job_identity(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -5878,42 +7149,12 @@ def _fetch_products_from_source() -> List[Dict[str, str]]:
     #     "username": "...",
     #     "password": "...",
     #     "ttl_seconds": 604800,
-    #     "force_new_token": true
+    #     "force_new_token": false
     #   }
     # }
     if isinstance(cfg.get("bms"), dict):
         bms = cfg["bms"]
         base_url = str(bms.get("base_url", "")).strip().rstrip("/")
-        username = str(bms.get("username", "")).strip()
-        password = str(bms.get("password", "")).strip()
-        ttl_seconds = int(bms.get("ttl_seconds", 604800) or 604800)
-        force_new_token = bool(bms.get("force_new_token", True))
-        if not (base_url and username and password):
-            return []
-
-        auth_url = f"{base_url}/auth/login"
-        auth_body = {
-            "identity": username,
-            "password": password,
-            "ttlSeconds": ttl_seconds,
-            "forceNewToken": force_new_token,
-        }
-        req_auth = urllib_request.Request(
-            url=auth_url,
-            data=json.dumps(auth_body).encode("utf-8"),
-            method="POST",
-        )
-        req_auth.add_header("Content-Type", "application/json")
-        with urllib_request.urlopen(req_auth, timeout=12) as resp:
-            auth_raw = resp.read().decode("utf-8", errors="ignore")
-        try:
-            auth_parsed = json.loads(auth_raw)
-        except Exception:
-            return []
-        token = str(((auth_parsed or {}).get("data") or {}).get("token") or "").strip()
-        if not token:
-            return []
-
         all_items: List[Dict[str, str]] = []
         seen_ids = set()
         per_page = int(bms.get("per_page", 1000) or 1000)
@@ -5923,8 +7164,7 @@ def _fetch_products_from_source() -> List[Dict[str, str]]:
         while page <= max_pages:
             products_url = f"{base_url}/products?{urlencode({'page': page, 'perPage': per_page, 'includeInactive': 0})}"
             req_prod = urllib_request.Request(url=products_url, method="GET")
-            req_prod.add_header("Authorization", f"Bearer {token}")
-            with urllib_request.urlopen(req_prod, timeout=12) as resp:
+            with _bms_open(bms, req_prod, timeout=12) as resp:
                 prod_raw = resp.read().decode("utf-8", errors="ignore")
             try:
                 prod_parsed = json.loads(prod_raw)
@@ -6081,18 +7321,141 @@ def _fetch_products_from_source() -> List[Dict[str, str]]:
     return _extract_products_from_payload(parsed)
 
 
-def _bms_login_token(bms: Dict[str, Any]) -> str:
+_BMS_TOKEN_LOCK = threading.Lock()
+_BMS_TOKEN_CACHE: Dict[str, Any] = {}
+BMS_TOKEN_CACHE_FILE = PRODUCT_API_CONFIG_FILE.with_name("bms_token_cache.json")
+
+
+def _bms_token_key(bms: Dict[str, Any]) -> str:
+    # Credentials are part of the fingerprint, never persisted in the cache.
+    identity = [str(bms.get("base_url", "")).strip().rstrip("/"),
+                str(bms.get("username") or bms.get("user") or "").strip(),
+                str(bms.get("password") or "").strip()]
+    return hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
+
+
+def _bms_token_expiry(payload: Dict[str, Any], token: str, issued_at: float, ttl: int) -> float:
+    expiries = [issued_at + ttl]
+    data = payload.get("data")
+    for obj in (payload, data if isinstance(data, dict) else {}):
+        for name in ("expires_in", "expiresIn", "ttlSeconds", "ttl_seconds"):
+            try:
+                if obj.get(name) is not None:
+                    expiries.append(issued_at + float(obj[name]))
+            except (TypeError, ValueError):
+                pass
+        for name in ("expires_at", "expiresAt", "expiry", "exp"):
+            value = obj.get(name)
+            if value is None:
+                continue
+            try:
+                epoch = float(value)
+                expiries.append(epoch / 1000 if epoch > 100000000000 else epoch)
+            except (TypeError, ValueError):
+                try:
+                    date = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    expiries.append(date.replace(tzinfo=timezone.utc).timestamp()
+                                    if date.tzinfo is None else date.timestamp())
+                except ValueError:
+                    pass
+    # JWT expiry is only a scheduling hint, never an authentication decision.
+    try:
+        segment = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+        expiries.append(float(claims["exp"]))
+    except (ValueError, KeyError, IndexError, TypeError):
+        pass
+    return min(value for value in expiries if math.isfinite(value))
+
+
+def _bms_login_token(bms: Dict[str, Any], rejected_token: str = "") -> str:
+    """Share one token across threads and restarts; replace a rejected token once."""
+    key = _bms_token_key(bms)
+    with _BMS_TOKEN_LOCK:
+        cached = _BMS_TOKEN_CACHE.get(key)
+        if cached is None:
+            try:
+                saved = json.loads(BMS_TOKEN_CACHE_FILE.read_text(encoding="utf-8"))
+                if isinstance(saved, dict) and saved.get("key") == key:
+                    cached = saved
+            except (OSError, ValueError):
+                pass
+        token = str((cached or {}).get("token") or "")
+        try:
+            valid = float((cached or {}).get("expires_at", 0)) > time.time()
+        except (TypeError, ValueError):
+            valid = False
+        if token and valid and token != rejected_token:
+            _BMS_TOKEN_CACHE[key] = cached
+            return token
+        # Remove stale disk state before login, including when refresh fails.
+        _BMS_TOKEN_CACHE.pop(key, None)
+        try:
+            BMS_TOKEN_CACHE_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        issued_at = time.time()
+        payload, token = _bms_request_login(bms, force_new=bool(rejected_token))
+        ttl = max(1, int(bms.get("ttl_seconds", 604800) or 604800))
+        cached = {"key": key, "token": token,
+                  "expires_at": _bms_token_expiry(payload, token, issued_at, ttl)}
+        _BMS_TOKEN_CACHE[key] = cached
+        # The ignored runtime directory already stores the BMS credentials.
+        temporary = BMS_TOKEN_CACHE_FILE.with_suffix(".tmp")
+        try:
+            BMS_TOKEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(cached, stream)
+            os.replace(temporary, BMS_TOKEN_CACHE_FILE)
+        except OSError:
+            # In-memory reuse still works if persistence is unavailable.
+            pass
+        return token
+
+
+def _bms_read_response(request: Any, timeout: float):
+    # BMS can report authentication failure in a JSON envelope with HTTP 200.
+    with urllib_request.urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, UnicodeError):
+        parsed = None
+    if isinstance(parsed, dict) and (
+        str(parsed.get("code")) == "401"
+        or str(parsed.get("message") or "").strip().lower() == "unauthorized"
+    ):
+        raise urllib_error.HTTPError(request.full_url, 401, "Unauthorized", {}, io.BytesIO(raw))
+    return io.BytesIO(raw)
+
+
+def _bms_open(bms: Dict[str, Any], request: Any, timeout: float = 12):
+    token = _bms_login_token(bms)
+    request.add_header("Authorization", f"Bearer {token}")
+    try:
+        return _bms_read_response(request, timeout)
+    except urllib_error.HTTPError as error:
+        if error.code != 401:
+            raise
+        error.close()
+    token = _bms_login_token(bms, rejected_token=token)
+    request.add_header("Authorization", f"Bearer {token}")
+    # A second rejection propagates; do not loop or refresh on ordinary errors.
+    return _bms_read_response(request, timeout)
+
+
+def _bms_request_login(bms: Dict[str, Any], force_new: bool = False):
     base_url = str(bms.get("base_url", "")).strip().rstrip("/")
     username = str(bms.get("username") or bms.get("user") or "").strip()
     password = str(bms.get("password") or "").strip()
     ttl_seconds = int(bms.get("ttl_seconds", 604800) or 604800)
-    force_new_token = bool(bms.get("force_new_token", True))
     if not (base_url and username and password):
         raise RuntimeError("BMS config is missing base_url, username, or password")
     auth_url = f"{base_url}/auth/login"
     auth_variants = [
-        {"identity": username, "password": password, "ttlSeconds": ttl_seconds, "forceNewToken": force_new_token},
-        {"username": username, "password": password},
+        {"identity": username, "password": password, "ttlSeconds": ttl_seconds, "forceNewToken": force_new},
+        {"username": username, "password": password, "ttlSeconds": ttl_seconds, "forceNewToken": force_new},
     ]
     last_error: Optional[Exception] = None
     auth_parsed: Dict[str, Any] = {}
@@ -6108,7 +7471,11 @@ def _bms_login_token(bms: Dict[str, Any]) -> str:
             with urllib_request.urlopen(req_auth, timeout=12) as resp:
                 auth_parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
             break
-        except Exception as e:
+        except urllib_error.HTTPError as e:
+            # Only retry the alternate field name for a request-shape error.
+            # Timeouts, bad credentials and rate limits must not double logins.
+            if e.code not in (400, 422):
+                raise
             last_error = e
             auth_parsed = {}
     if not auth_parsed and last_error is not None:
@@ -6122,7 +7489,7 @@ def _bms_login_token(bms: Dict[str, Any]) -> str:
     ).strip()
     if not token:
         raise RuntimeError("BMS login did not return a bearer token")
-    return token
+    return auth_parsed, token
 
 
 def _extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
@@ -6343,7 +7710,6 @@ def _fetch_low_stock_recommendations(threshold: float = 100.0, force_refresh: bo
     abc_result = _fetch_serving_rate_abc(force_refresh=force_refresh)
     abc_items = abc_result.get("items") if isinstance(abc_result.get("items"), list) else []
 
-    token = _bms_login_token(bms)
     warehouse_ids = bms.get("inventory_warehouse_ids")
     if not isinstance(warehouse_ids, list) or not warehouse_ids:
         warehouse_ids = [3, 5, 14, 18, 2]
@@ -6451,9 +7817,8 @@ def _fetch_low_stock_recommendations(threshold: float = 100.0, force_refresh: bo
         if not wh_id:
             continue
         req_inv = urllib_request.Request(url=f"{base_url}/inventory/{quote(wh_id)}", method="GET")
-        req_inv.add_header("Authorization", f"Bearer {token}")
         req_inv.add_header("Accept", "application/json")
-        with urllib_request.urlopen(req_inv, timeout=20) as resp:
+        with _bms_open(bms, req_inv, timeout=20) as resp:
             parsed = json.loads(resp.read().decode("utf-8", errors="ignore"))
         rows = _extract_rows_from_payload(parsed)
         for inv in rows:
@@ -6664,6 +8029,7 @@ CLOSED_PRODUCTION_SESSION_IDS: set[str] = _stored_production_session_ids(
     FINISHED_JOBS, ARCHIVED_JOBS
 )
 PROFILES: List[Dict[str, Any]] = load_profiles()
+BREAKTIME_STATE: Dict[str, Any] = load_breaktime_state()
 PLANNING_BOARD: Dict[str, Any] = load_planning_board()
 TRIAL_BOARD: Dict[str, Any] = load_trial_board()
 PLANNING_ACTIVITY_LOG: List[Dict[str, Any]] = load_planning_activity_log()
@@ -6801,12 +8167,17 @@ FINISHED_SHIFT_DISPLAY_CUTOFF_UTC = datetime(2026, 6, 1, tzinfo=timezone.utc)
 def _dashboard_finished_summary(row: Dict[str, Any]) -> Dict[str, Any]:
     """Small list row; large logs/payloads are fetched only when opened."""
     fields = (
-        "record_type", "reason", "shift_index", "started_at_utc", "ended_at_utc", "finished_at_utc",
+        "record_type", "client_mode", "reason", "shift_index", "started_at_utc", "ended_at_utc", "finished_at_utc",
         "client_id", "machine_code", "machine_name", "job_code", "job_name",
         "product_id", "product_sku", "product_name", "operator_id", "operator_name",
+        "manpower_count", "crew_members", "_crew_member_count",
         "pack_count", "good_total", "butal_total", "reject_total", "total_good", "partial_qty",
         "startup_reject_total", "no_shot_total", "raw_sacks_count", "downtime_last_seconds",
-        "machine_counter_difference",
+        "machine_counter_start", "machine_counter_app_end", "machine_counter_end",
+        "machine_counter_app_delta", "machine_counter_difference",
+        "mixing_total_kg", "mixing_sack_count", "mixing_kg_per_sack",
+        "mixing_kg_counter_start", "mixing_kg_counter_end", "mixing_kg_produced_shift",
+        "mixing_sack_cycle_time_seconds",
         "downtime_reason_code", "downtime_reason_text", "cycle_time_current",
         "maintenance_name", "supervisor_name", "review_status", "approved_by", "approved_by_code",
         "approved_by_role", "approved_remarks", "approved_at_utc", "changed_by", "changed_by_code",
@@ -6852,6 +8223,40 @@ def _dashboard_finished_history() -> List[Dict[str, Any]]:
         else:
             final_jobs.append(_dashboard_finished_summary(row))
     return shifts + final_jobs
+
+
+def _pdr_month_key(row: Dict[str, Any]) -> str:
+    """Return the production month for a shift using the dashboard's 7 AM SGT day boundary."""
+    stamp = _parse_iso_utc(row.get("started_at_utc") or row.get("ended_at_utc") or row.get("finished_at_utc"))
+    if stamp is None:
+        return ""
+    singapore_time = stamp.astimezone(timezone(timedelta(hours=8)))
+    if singapore_time.hour < 7:
+        singapore_time -= timedelta(days=1)
+    return singapore_time.strftime("%Y-%m")
+
+
+def _pdr_month_summaries(month: str = "") -> Dict[str, Any]:
+    """Build the compact PDR list without hydrating large history payloads."""
+    now = utc_now()
+    rows: List[tuple[str, Dict[str, Any]]] = []
+    for row in FINISHED_JOBS:
+        if not isinstance(row, dict) or str(row.get("record_type") or "").strip().upper() != "SHIFT_PARTIAL":
+            continue
+        stamp = _parse_iso_utc(row.get("finished_at_utc") or row.get("ended_at_utc"))
+        if stamp is None or stamp < FINISHED_SHIFT_DISPLAY_CUTOFF_UTC or stamp > now:
+            continue
+        month_key = _pdr_month_key(row)
+        if month_key:
+            rows.append((month_key, row))
+    months = sorted({month_key for month_key, _row in rows})
+    selected_month = month if month in months else (months[-1] if months else "")
+    items = [
+        _dashboard_finished_summary(row)
+        for month_key, row in rows
+        if month_key == selected_month
+    ]
+    return {"month": selected_month, "months": months, "items": items}
 
 
 def _material_usage_identity(*values: Any) -> str:
@@ -6996,9 +8401,20 @@ def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, 
     machine_code = str(session.get("machine_code") or "").strip().upper()
     job_code = str(session.get("job_code") or session.get("job_name") or "").strip().upper()
     if not machine_code or not job_code:
-        return {"partial_count": 0, "scan_count": 0, "consumed_units": 0, "rows": []}
+        return {
+            "partial_count": 0,
+            "scan_count": 0,
+            "consumed_units": 0,
+            "rows": [],
+            "scans": [],
+        }
 
     matching_rows: List[Dict[str, Any]] = []
+    current_is_partial = str(session.get("record_type") or "").strip().upper() == "SHIFT_PARTIAL"
+    current_finished_at = str(
+        session.get("finished_at_utc") or session.get("ended_at_utc") or ""
+    ).strip()
+    current_record_key = _finished_job_key(session) if current_is_partial else ""
     latest_completed_at = ""
     for row in FINISHED_JOBS:
         if not isinstance(row, dict):
@@ -7011,6 +8427,13 @@ def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, 
         record_type = str(row.get("record_type") or "").strip().upper()
         row_time = str(row.get("finished_at_utc") or row.get("ended_at_utc") or "").strip()
         if record_type == "SHIFT_PARTIAL":
+            # When the report itself is a completed partial, only earlier
+            # shifts belong in its prior totals. Active sessions have no
+            # finished timestamp and continue to include every saved partial.
+            if current_record_key and _finished_job_key(row) == current_record_key:
+                continue
+            if current_finished_at and row_time and row_time >= current_finished_at:
+                continue
             matching_rows.append(row)
         elif row_time and row_time > latest_completed_at:
             latest_completed_at = row_time
@@ -7040,6 +8463,7 @@ def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, 
     consumed_units = 0.0
     material_groups: Dict[str, Dict[str, Any]] = {}
     seen_scans: set = set()
+    scan_rows: List[Dict[str, Any]] = []
     scan_count = 0
     for partial in unique_partials:
         output_total = sum(
@@ -7073,6 +8497,9 @@ def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, 
             if unique_key in seen_scans:
                 continue
             seen_scans.add(unique_key)
+            scan_item = dict(raw)
+            scan_item["mixing_cumulative_scan_id"] = unique_key
+            scan_rows.append(scan_item)
             qty = max(0.0, _parse_number_like(raw.get("qty") or raw.get("quantity")))
             product_id = str(raw.get("material_product_id") or raw.get("product_id") or "").strip()
             sku = str(raw.get("material_sku") or raw.get("sku") or raw.get("material_code") or "").strip()
@@ -7117,6 +8544,7 @@ def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, 
         "scan_count": scan_count,
         "consumed_units": consumed_units,
         "rows": list(material_groups.values()),
+        "scans": scan_rows,
     }
 
 
@@ -7153,6 +8581,13 @@ def _dashboard_standard_product_weight(row: Any) -> Dict[str, Any]:
     components: List[Dict[str, Any]] = []
     total = 0.0
     for part in _dashboard_job_payload_parts(payload):
+        # Only raw-material allocations are kilograms. Stickers and other
+        # piece-counted BOM components must not contribute to product weight.
+        sku = str(next((part.get(key) for key in (
+            "sku", "part_sku", "product_sku", "material_sku", "part_code", "product_code", "code"
+        ) if part.get(key)), "")).strip().upper()
+        if not sku.startswith("Z-RM"):
+            continue
         rate = _dashboard_part_standard_rate(part, payload)
         if rate <= 0:
             continue
@@ -7178,15 +8613,40 @@ def _dashboard_material_identity_keys(row: Any) -> set[str]:
     return keys
 
 
-def _dashboard_product_part_shortages(row: Dict[str, Any]) -> Dict[str, Any]:
+def _dashboard_part_is_running_product_or_mold(part: Dict[str, Any], row: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    job = data.get("job") if isinstance(data.get("job"), dict) else {}
+    details = data.get("job_details") if isinstance(data.get("job_details"), dict) else {}
+    running_identifiers = {
+        _material_usage_identity(value)
+        for value in (
+            row.get("product_sku"), job.get("sku"), job.get("product_sku"),
+            row.get("mold"), row.get("mold_no"),
+            details.get("mold"), details.get("mold_no"), job.get("custom_05"),
+        )
+    }
+    running_identifiers.discard("")
+    part_identifiers = {
+        _material_usage_identity(part.get(key))
+        for key in ("sku", "part_sku", "product_code", "name", "part_name")
+    }
+    part_identifiers.discard("")
+    return bool(running_identifiers.intersection(part_identifiers))
+
+
+def _dashboard_product_part_shortages(row: Dict[str, Any], *, include_prior_partials: bool = True) -> Dict[str, Any]:
     item = row if isinstance(row, dict) else {}
     cache_key = (
         str(item.get("production_session_id") or item.get("machine_code") or ""),
+        include_prior_partials,
         hashlib.sha256(json.dumps({
             "job_payload": item.get("job_payload"),
             "raw_material_logs": item.get("raw_material_logs"),
             "product_pack_history_logs": item.get("product_pack_history_logs"),
             "prior": item.get("prior_partial_raw_material_totals"),
+            "product_sku": item.get("product_sku"),
+            "mold": item.get("mold"),
+            "mold_no": item.get("mold_no"),
         }, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
     )
     cached = _DASHBOARD_PART_SHORTAGE_CACHE.get(cache_key)
@@ -7196,15 +8656,25 @@ def _dashboard_product_part_shortages(row: Dict[str, Any]) -> Dict[str, Any]:
     payload = item.get("job_payload") if isinstance(item.get("job_payload"), dict) else {}
     parts = _dashboard_job_payload_parts(payload)
     prior = item.get("prior_partial_raw_material_totals") if isinstance(item.get("prior_partial_raw_material_totals"), dict) else {}
-    prior_rows = [r for r in (prior.get("rows") or []) if isinstance(r, dict)]
-    scans = [r for r in (item.get("raw_material_logs") or []) if isinstance(r, dict)]
+    prior_rows = [r for r in (prior.get("rows") or []) if isinstance(r, dict)] if include_prior_partials else []
+    scans = [r for r in (item.get("raw_material_logs") or []) if isinstance(r, dict) and not bool(r.get("voided"))]
     packs = [r for r in (item.get("product_pack_history_logs") or []) if isinstance(r, dict) and not bool(r.get("voided"))]
     details: List[Dict[str, Any]] = []
+    counted_parts: set[str] = set()
 
     for part in parts:
+        if _dashboard_part_is_running_product_or_mold(part, item, payload):
+            continue
         part_keys = _dashboard_material_identity_keys(part)
         if not part_keys:
             continue
+        part_identity = _material_usage_identity(
+            part.get("part_product_id") or part.get("product_id")
+            or part.get("sku") or part.get("part_sku") or part.get("name")
+        )
+        if part_identity in counted_parts:
+            continue
+        counted_parts.add(part_identity)
         scanned = 0.0
         used = 0.0
         for raw in prior_rows:
@@ -7233,6 +8703,7 @@ def _dashboard_product_part_shortages(row: Dict[str, Any]) -> Dict[str, Any]:
             "scanned_qty": round(scanned, 6),
             "used_qty": round(used, 6),
             "shortage_qty": round(max(0.0, used - scanned), 6),
+            "unit": str(part.get("unit") or next((r.get("unit") for r in scans if part_keys.intersection(_dashboard_material_identity_keys(r)) and r.get("unit")), "")),
         })
     result = {"count": len(details), "names": [row["name"] for row in details], "details": details}
     _DASHBOARD_PART_SHORTAGE_CACHE[cache_key] = (time.monotonic(), result)
@@ -7308,11 +8779,14 @@ def _state_payload(
         row["standard_product_weight_kg"] = float(standard.get("weight_kg") or 0)
         row["standard_product_weight_source"] = str(standard.get("source") or "")
         row["standard_product_weight_components"] = list(standard.get("components") or [])
-        shortages = _dashboard_product_part_shortages(calculation_row)
+        shortages = _dashboard_product_part_shortages(calculation_row, include_prior_partials=False)
+        job_shortages = _dashboard_product_part_shortages(calculation_row)
         row["product_part_shortage_count"] = int(shortages.get("count") or 0)
         row["product_part_shortage_names"] = list(shortages.get("names") or [])
         row["product_part_shortage_details"] = list(shortages.get("details") or [])
         row["product_part_shortage_since_utc"] = str(shortages.get("since_utc") or "")
+        row["product_part_job_shortage_count"] = int(job_shortages.get("count") or 0)
+        row["product_part_job_shortage_details"] = list(job_shortages.get("details") or [])
     test_machine_session = _test_machine_session_payload()
     if test_machine_session is not None:
         sessions.append(test_machine_session)
@@ -7435,99 +8909,100 @@ DASHBOARD_HTML = r"""
   <style>
     * { box-sizing: border-box; }
     html, body { min-height: 100%; margin: 0; }
-    body { font-family: "Poppins", sans-serif; background: #f8f8f8; color: #333; display: flex; flex-direction: column; overflow-x: hidden; }
-    .diagnostics { padding: 8px clamp(8px, 1.2vw, 14px); background: #e9ecef; border-bottom: 1px solid #d9d9d9; display: grid; grid-template-columns: repeat(4, 48px) repeat(4, minmax(140px, 1fr)); gap: 8px; align-items: stretch; }
-    .server-menu-btn { width: 48px; min-width: 48px; border: 1px solid #d4dae4; border-radius: 11px; background: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
-    .server-menu-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(15,23,42,0.08); background: #fbfcfe; }
+    body { font-family: "Poppins", sans-serif; background: var(--ui-subtle); color: var(--ui-text); display: flex; flex-direction: column; overflow-x: hidden; }
+    .diagnostics { padding: 8px clamp(8px, 1.2vw, 14px); background: var(--ui-subtle); border-bottom: 1px solid var(--ui-border); display: grid; grid-template-columns: repeat(4, 48px) repeat(4, minmax(140px, 1fr)); gap: 8px; align-items: stretch; }
+    .server-menu-btn { width: 48px; min-width: 48px; border: 1px solid var(--ui-border); border-radius: 11px; background: var(--ui-surface); cursor: pointer; display: flex; align-items: center; justify-content: center; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
+    .server-menu-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(15,23,42,0.08); background: var(--ui-surface); }
     .server-menu-btn:active { transform: translateY(0) scale(0.985); }
     .server-menu-icon { width: 20px; height: 14px; position: relative; }
-    .server-menu-icon span { display: block; position: absolute; left: 0; right: 0; height: 2px; background: #334155; border-radius: 999px; }
+    .server-menu-icon span { display: block; position: absolute; left: 0; right: 0; height: 2px; background: var(--ui-text); border-radius: 999px; }
     .server-menu-icon span:nth-child(1){ top: 0; }
     .server-menu-icon span:nth-child(2){ top: 6px; }
     .server-menu-icon span:nth-child(3){ top: 12px; }
     .menu-ico-img { width: 20px; height: 20px; display: block; object-fit: contain; }
     .person-menu-icon { width: 20px; height: 20px; position: relative; }
-    .person-menu-icon::before { content: ""; position: absolute; top: 1px; left: 5px; width: 10px; height: 10px; border: 2px solid #334155; border-radius: 50%; box-sizing: border-box; }
-    .person-menu-icon::after { content: ""; position: absolute; bottom: 1px; left: 2px; width: 16px; height: 8px; border: 2px solid #334155; border-top-left-radius: 10px; border-top-right-radius: 10px; border-bottom: none; box-sizing: border-box; }
+    .person-menu-icon::before { content: ""; position: absolute; top: 1px; left: 5px; width: 10px; height: 10px; border: 2px solid var(--ui-border); border-radius: 50%; box-sizing: border-box; }
+    .person-menu-icon::after { content: ""; position: absolute; bottom: 1px; left: 2px; width: 16px; height: 8px; border: 2px solid var(--ui-border); border-top-left-radius: 10px; border-top-right-radius: 10px; border-bottom: none; box-sizing: border-box; }
     .person-menu-icon.with-plus::marker { content: ""; }
-    .person-plus-badge { position: absolute; right: -2px; bottom: -2px; width: 10px; height: 10px; border-radius: 50%; background: #2563eb; color: #fff; font-size: 9px; line-height: 1; display:flex; align-items:center; justify-content:center; font-weight: 700; }
-    .diag-item { min-width:0; background: #fff; border-radius: 10px; padding: 6px 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); font-size: 12px; line-height: 1.15; }
+    .person-plus-badge { position: absolute; right: -2px; bottom: -2px; width: 10px; height: 10px; border-radius: 50%; background: var(--ui-accent); color: var(--ui-on-accent); font-size: 9px; line-height: 1; display:flex; align-items:center; justify-content:center; font-weight: 700; }
+    .diag-item { min-width:0; background: var(--ui-surface); border-radius: 10px; padding: 6px 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); font-size: 12px; line-height: 1.15; }
     .diag-item .value { font-weight: 700; margin-top: 4px; line-height: 1.12; }
     .diag-item, .diag-item .value { overflow-wrap:anywhere; }
     .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
     .connected { background: #4CAF50; }
     .disconnected { background: #f44336; }
     .main-tabs { display: flex; gap: 10px; padding: 14px clamp(10px, 1.6vw, 20px) 10px; flex-wrap: wrap; }
-    .main-tab-button { background: #e1e5ef; border: none; border-radius: 20px; padding: 8px 18px; font-weight: 600; cursor: pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
+    .main-tab-button { position:relative; background: var(--ui-subtle); border: none; border-radius: 20px; padding: 8px 18px; font-weight: 600; cursor: pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
+    .production-cards-notif-badge { position:absolute; top:-7px; right:-7px; min-width:19px; height:19px; box-sizing:border-box; padding:0 5px; border:2px solid var(--ui-border); border-radius:999px; background:#dc2626; color:var(--ui-on-accent); font-size:.62rem; line-height:15px; font-weight:900; text-align:center; box-shadow:0 4px 10px rgba(185,28,28,.30); }
     .main-tab-button:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(15,23,42,0.10); }
     .main-tab-button:active { transform: translateY(0) scale(0.985); }
-    .main-tab-button.active { background: #1f8ef1; color: #fff; }
+    .main-tab-button.active { background: var(--ui-accent); color: var(--ui-on-accent); }
     .machine-filter-wrap { position:relative; margin-left:auto; display:flex; align-items:center; gap:8px; }
-    .machine-filter-btn { width:38px; height:38px; display:inline-flex; align-items:center; justify-content:center; border:1px solid #cdd6e2; border-radius:50%; background:#fff; color:#475569; cursor:pointer; box-shadow:0 4px 12px rgba(15,23,42,.07); }
+    .machine-filter-btn { width:38px; height:38px; display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--ui-border); border-radius:50%; background:var(--ui-surface); color:var(--ui-muted); cursor:pointer; box-shadow:0 4px 12px rgba(15,23,42,.07); }
     .machine-filter-btn[hidden] { display:none; }
-    .machine-filter-btn:hover { color:#0f64bd; border-color:#93b8df; background:#f8fbff; }
-    .machine-filter-btn.active { color:#fff; border-color:#0f64bd; background:#0f64bd; }
+    .machine-filter-btn:hover { color:var(--ui-link); border-color:var(--ui-border); background:var(--ui-surface); }
+    .machine-filter-btn.active { color:var(--ui-on-accent); border-color:var(--ui-accent); background:var(--ui-accent); }
     .machine-filter-btn svg { width:18px; height:18px; display:block; }
-    .machine-todo-btn { position:relative; color:#0f64bd; }
-    .machine-todo-count { position:absolute; right:-5px; top:-6px; min-width:18px; height:18px; display:inline-flex; align-items:center; justify-content:center; padding:0 5px; border:2px solid #eef4fb; border-radius:999px; background:#dc2626; color:#fff; font-size:.58rem; line-height:1; font-weight:950; box-shadow:0 3px 8px rgba(220,38,38,.28); }
+    .machine-todo-btn { position:relative; color:var(--ui-link); }
+    .machine-todo-count { position:absolute; right:-5px; top:-6px; min-width:18px; height:18px; display:inline-flex; align-items:center; justify-content:center; padding:0 5px; border:2px solid var(--ui-border); border-radius:999px; background:#dc2626; color:var(--ui-on-accent); font-size:.58rem; line-height:1; font-weight:950; box-shadow:0 3px 8px rgba(220,38,38,.28); }
     .machine-todo-count[hidden] { display:none; }
-    .planning-overview-btn { color:#0f64bd; }
+    .planning-overview-btn { color:var(--ui-link); }
     .planning-overview-btn svg { width:20px; height:20px; }
-    .trial-board-btn { color:#0f64bd; }
+    .trial-board-btn { color:var(--ui-link); }
     .trial-board-btn img { width:20px; height:20px; display:block; }
     .trial-board-btn.active img { filter:brightness(0) invert(1); }
-    .machine-filter-menu { position:absolute; z-index:80; top:calc(100% + 8px); right:0; width:230px; padding:10px; border:1px solid #cfd9e6; border-radius:10px; background:#fff; box-shadow:0 14px 32px rgba(15,23,42,.18); }
+    .machine-filter-menu { position:absolute; z-index:80; top:calc(100% + 8px); right:0; width:230px; padding:10px; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); box-shadow:0 14px 32px rgba(15,23,42,.18); }
     .machine-filter-menu[hidden] { display:none; }
-    .machine-filter-option { display:flex; align-items:center; gap:9px; padding:9px 10px; border-radius:8px; color:#0f172a; font-size:.84rem; font-weight:850; cursor:pointer; }
-    .machine-filter-option:hover { background:#f1f5f9; }
+    .machine-filter-option { display:flex; align-items:center; gap:9px; padding:9px 10px; border-radius:8px; color:var(--ui-text); font-size:.84rem; font-weight:850; cursor:pointer; }
+    .machine-filter-option:hover { background:var(--ui-subtle); }
     .machine-filter-option input { width:16px; height:16px; accent-color:#0f64bd; }
-    #machineTodoOverlay { background:rgba(177,190,208,.66); backdrop-filter:blur(10px); }
-    .overlay-card.machine-todo-card { width:min(1728px,93vw); height:min(1110px,88vh); max-height:calc(100vh - 52px); border:0; border-radius:34px; background:#f0f4fa; box-shadow:0 28px 64px rgba(55,72,97,.24); color:#172338; }
-    .machine-todo-card > .overlay-head { flex:0 0 auto; min-height:150px; padding:40px 42px 32px; border-bottom:1px solid #d1dbe8; background:transparent; gap:28px; }
-    .machine-todo-head-copy { min-width:300px; margin-right:auto; }
-    .machine-todo-head-copy .overlay-title { color:#172338; font-size:2rem; line-height:1.12; font-weight:700; letter-spacing:-.035em; }
-    .machine-todo-head-copy .sub { margin-top:9px; color:#6e7f98; font-size:1rem; line-height:1.3; font-weight:500; }
-    .machine-todo-head-tools { display:flex; align-items:center; justify-content:flex-end; gap:16px; min-width:0; }
-    .machine-todo-search { width:282px; height:64px; padding:0 25px; border:0; outline:0; border-radius:22px; background:#edf2f8; color:#172338; font:500 1.20rem/1 "Poppins",sans-serif; box-shadow:inset 0 7px 14px rgba(72,91,119,.14),0 8px 18px rgba(72,91,119,.06); }
-    .machine-todo-search::placeholder { color:#74849c; opacity:1; }
-    .machine-todo-tool-btn { height:64px; padding:0 27px; border:0; border-radius:22px; background:#edf2f8; color:#172338; font:700 1.16rem/1 "Poppins",sans-serif; white-space:nowrap; cursor:pointer; box-shadow:0 11px 20px rgba(69,87,113,.18),inset 0 1px 0 rgba(255,255,255,.7); transition:transform .15s ease,background-color .15s ease,color .15s ease; }
-    .machine-todo-tool-btn:hover { transform:translateY(-1px); background:#f7f9fc; }
-    .machine-todo-tool-btn.active { background:#dbe8f8; color:#1f67cb; box-shadow:inset 0 3px 8px rgba(51,83,126,.15); }
-    .machine-todo-card .overlay-close { flex:0 0 auto; width:64px; height:64px; border:0; border-radius:20px; background:#edf2f8; color:#657791; box-shadow:0 11px 20px rgba(69,87,113,.18); }
-    .machine-todo-card .overlay-close::before { font-size:32px; font-weight:400; }
-    .machine-todo-body { min-height:0; flex:1 1 auto; display:flex; flex-direction:column; overflow:hidden; padding:32px 40px 42px; }
-    .machine-todo-summary { flex:0 0 auto; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:30px; margin-bottom:36px; }
-    .machine-todo-summary-item { display:flex; align-items:center; justify-content:space-between; gap:18px; min-height:118px; padding:25px 32px; border:0; border-radius:30px; background:#e7edf5; box-shadow:0 16px 25px rgba(63,81,108,.18),inset 0 1px 0 rgba(255,255,255,.72); }
+    #machineTodoOverlay { background:rgba(15,23,42,.38); backdrop-filter:none; }
+    .overlay-card.machine-todo-card { width:min(1380px,calc(100vw - 48px)); height:min(760px,calc(100vh - 48px)); max-height:calc(100vh - 48px); border:1px solid var(--ui-border); border-radius:16px; background:var(--ui-surface); box-shadow:0 12px 32px rgba(15,23,42,.18); color:var(--ui-text); }
+    .machine-todo-card > .overlay-head { flex:0 0 auto; min-height:74px; padding:16px 20px; border-bottom:1px solid var(--ui-border); background:var(--ui-surface); gap:16px; }
+    .machine-todo-head-copy { min-width:260px; margin-right:auto; }
+    .machine-todo-head-copy .overlay-title { color:var(--ui-text); font-size:1.24rem; line-height:1.15; font-weight:800; letter-spacing:-.02em; }
+    .machine-todo-head-copy .sub { margin-top:4px; color:var(--ui-muted); font-size:.70rem; line-height:1.3; font-weight:500; }
+    .machine-todo-head-tools { display:flex; align-items:center; justify-content:flex-end; gap:8px; min-width:0; }
+    .machine-todo-search { width:240px; height:38px; padding:0 12px; border:1px solid var(--ui-border); outline:0; border-radius:8px; background:var(--ui-surface); color:var(--ui-text); font:500 .76rem/1 "Poppins",sans-serif; box-shadow:none; }
+    .machine-todo-search::placeholder { color:var(--ui-muted); opacity:1; }
+    .machine-todo-tool-btn { height:38px; padding:0 14px; border:1px solid var(--ui-border); border-radius:8px; background:var(--ui-surface); color:var(--ui-text); font:700 .72rem/1 "Poppins",sans-serif; white-space:nowrap; cursor:pointer; box-shadow:none; transition:border-color .15s ease,background-color .15s ease,color .15s ease; }
+    .machine-todo-tool-btn:hover { background:var(--ui-subtle); border-color:var(--ui-border); }
+    .machine-todo-tool-btn.active { background:var(--ui-subtle); color:var(--ui-link); border-color:var(--ui-accent); box-shadow:none; }
+    .machine-todo-card .overlay-close { flex:0 0 auto; width:38px; height:38px; border:1px solid var(--ui-border); border-radius:8px; background:var(--ui-surface); color:var(--ui-muted); box-shadow:none; }
+    .machine-todo-card .overlay-close::before { font-size:20px; font-weight:400; }
+    .machine-todo-body { min-height:0; flex:1 1 auto; display:flex; flex-direction:column; overflow:hidden; padding:14px 18px 18px; }
+    .machine-todo-summary { flex:0 0 auto; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-bottom:12px; }
+    .machine-todo-summary-item { display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:60px; padding:12px 15px; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); box-shadow:none; }
     .machine-todo-summary-item .copy { display:block; min-width:0; }
-    .machine-todo-summary-item .label { display:block; color:#66768e; font-size:1.34rem; line-height:1.22; font-weight:700; letter-spacing:0; text-transform:none; }
-    .machine-todo-summary-item .note { display:block; min-height:1.25em; margin-top:9px; color:#eb4654; font-size:1rem; line-height:1.25; font-weight:700; }
-    .machine-todo-summary-item .count { flex:0 0 auto; min-width:54px; text-align:center; color:#172338; font-size:2.35rem; line-height:1; font-weight:700; }
-    .machine-todo-columns { min-height:0; flex:1 1 auto; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:30px; align-items:stretch; }
-    .machine-todo-section { min-width:0; min-height:0; display:flex; flex-direction:column; overflow:hidden; border:0; border-radius:30px; background:#e7edf5; box-shadow:0 18px 30px rgba(63,81,108,.18),inset 0 1px 0 rgba(255,255,255,.68); }
-    .machine-todo-section-head { flex:0 0 auto; display:block; padding:32px 33px 40px; border:0; background:transparent !important; }
-    .machine-todo-section-head .title { color:#172338; font-size:1.38rem; line-height:1.2; font-weight:700; }
-    .machine-todo-section-head .role { margin-top:5px; color:#718198; font-size:1.05rem; line-height:1.25; font-weight:500; }
+    .machine-todo-summary-item .label { display:block; color:var(--ui-muted); font-size:.76rem; line-height:1.22; font-weight:700; letter-spacing:0; text-transform:none; }
+    .machine-todo-summary-item .note { display:block; min-height:1.2em; margin-top:3px; color:#dc2626; font-size:.60rem; line-height:1.2; font-weight:700; }
+    .machine-todo-summary-item .count { flex:0 0 auto; min-width:34px; text-align:center; color:var(--ui-text); font-size:1.35rem; line-height:1; font-weight:800; }
+    .machine-todo-columns { min-height:0; flex:1 1 auto; display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; align-items:stretch; }
+    .machine-todo-section { min-width:0; min-height:0; display:flex; flex-direction:column; overflow:hidden; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); box-shadow:none; }
+    .machine-todo-section-head { flex:0 0 auto; display:block; padding:13px 15px 10px; border-bottom:1px solid var(--ui-border); background:var(--ui-surface) !important; }
+    .machine-todo-section-head .title { color:var(--ui-text); font-size:.82rem; line-height:1.2; font-weight:800; }
+    .machine-todo-section-head .role { margin-top:2px; color:var(--ui-muted); font-size:.62rem; line-height:1.25; font-weight:500; }
     .machine-todo-section-head .badge { display:none; }
-    .machine-todo-list { min-height:0; flex:1 1 auto; display:grid; align-content:start; gap:24px; overflow:auto; padding:10px 27px 30px; scrollbar-width:thin; scrollbar-color:#bdc9d9 transparent; }
-    .machine-todo-item { width:100%; display:block; padding:22px 24px 20px; border:0; border-radius:22px; background:#edf2f8; color:#172338; text-align:left; cursor:pointer; box-shadow:inset 0 7px 14px rgba(72,91,119,.13),0 8px 14px rgba(90,105,128,.08); transition:transform .15s ease,box-shadow .15s ease,background-color .15s ease; }
-    .machine-todo-item:hover { transform:translateY(-2px); background:#f3f6fa; box-shadow:inset 0 5px 12px rgba(72,91,119,.1),0 13px 22px rgba(72,91,119,.13); }
+    .machine-todo-list { min-height:0; flex:1 1 auto; display:grid; align-content:start; gap:8px; overflow:auto; padding:10px 11px 12px; scrollbar-width:thin; scrollbar-color:#bdc9d9 transparent; }
+    .machine-todo-item { width:100%; display:block; padding:11px 12px; border:1px solid var(--ui-border); border-radius:8px; background:var(--ui-surface); color:var(--ui-text); text-align:left; cursor:pointer; box-shadow:none; transition:border-color .15s ease,background-color .15s ease; }
+    .machine-todo-item:hover { background:var(--ui-subtle); border-color:var(--ui-border); box-shadow:none; }
     .machine-todo-item:focus-visible { outline:3px solid rgba(55,116,216,.34); outline-offset:2px; }
     .machine-todo-item-top { display:flex; align-items:center; justify-content:space-between; gap:12px; }
-    .machine-todo-machine { min-width:0; color:#172338; font-size:1.34rem; line-height:1.2; font-weight:700; }
-    .machine-todo-status { flex:0 0 auto; display:inline-flex; align-items:center; gap:8px; max-width:62%; padding:6px 12px; border-radius:999px; color:#2aaa77; background:#edf3f8; font-size:.94rem; line-height:1; font-weight:700; white-space:nowrap; box-shadow:inset 0 4px 10px rgba(72,91,119,.13); }
-    .machine-todo-status::before { content:""; width:10px; height:10px; border-radius:50%; background:currentColor; }
+    .machine-todo-machine { min-width:0; color:var(--ui-text); font-size:.80rem; line-height:1.2; font-weight:800; }
+    .machine-todo-status { flex:0 0 auto; display:inline-flex; align-items:center; gap:5px; max-width:62%; padding:4px 7px; border:1px solid var(--ui-border); border-radius:6px; color:#169c68; background:var(--ui-surface); font-size:.57rem; line-height:1; font-weight:700; white-space:nowrap; box-shadow:none; }
+    .machine-todo-status::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; }
     .machine-todo-status.late { color:#d99500; }
     .machine-todo-status.urgent { color:#eb4654; }
-    .machine-todo-message { display:block; margin-top:17px; color:#172338; font-size:1.28rem; line-height:1.35; font-weight:700; overflow-wrap:anywhere; }
-    .machine-todo-description,.machine-todo-material,.machine-todo-time { display:block; margin-top:12px; color:#718198; font-size:1.04rem; line-height:1.38; font-weight:500; overflow-wrap:anywhere; }
-    .machine-todo-material { margin-top:13px; }
-    .machine-todo-footer { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:17px; }
-    .machine-todo-job { min-width:0; overflow:hidden; color:#3274db; font-size:1.05rem; line-height:1.2; font-weight:700; white-space:nowrap; text-overflow:ellipsis; }
-    .machine-todo-action { flex:0 0 auto; min-height:48px; padding:0 20px; border:0; border-radius:18px; background:#edf2f8; color:#3274db; font:700 1.02rem/1 "Poppins",sans-serif; cursor:pointer; box-shadow:0 9px 17px rgba(69,87,113,.16); }
-    .machine-todo-empty { padding:38px 18px; border-radius:22px; background:#edf2f8; color:#718198; font-size:.92rem; font-weight:600; text-align:center; box-shadow:inset 0 5px 12px rgba(72,91,119,.1); }
+    .machine-todo-message { display:block; margin-top:8px; color:var(--ui-text); font-size:.75rem; line-height:1.3; font-weight:700; overflow-wrap:anywhere; }
+    .machine-todo-description,.machine-todo-material,.machine-todo-time { display:block; margin-top:5px; color:var(--ui-muted); font-size:.61rem; line-height:1.32; font-weight:500; overflow-wrap:anywhere; }
+    .machine-todo-material { margin-top:6px; }
+    .machine-todo-footer { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:8px; }
+    .machine-todo-job { min-width:0; overflow:hidden; color:var(--ui-link); font-size:.63rem; line-height:1.2; font-weight:700; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-todo-action { flex:0 0 auto; min-height:29px; padding:0 10px; border:1px solid var(--ui-border); border-radius:7px; background:var(--ui-surface); color:var(--ui-link); font:700 .61rem/1 "Poppins",sans-serif; cursor:pointer; box-shadow:none; }
+    .machine-todo-empty { padding:24px 12px; border:1px dashed var(--ui-border); border-radius:8px; background:var(--ui-surface); color:var(--ui-muted); font-size:.66rem; font-weight:600; text-align:center; box-shadow:none; }
     @media (max-height:1000px) and (min-width:1041px) {
-      .overlay-card.machine-todo-card { height:calc(100vh - 50px); max-height:calc(100vh - 50px); border-radius:24px; }
-      .machine-todo-card > .overlay-head { min-height:88px; padding:16px 32px 14px; gap:16px; }
+      .overlay-card.machine-todo-card { height:calc(100vh - 40px); max-height:calc(100vh - 40px); border-radius:14px; }
+      .machine-todo-card > .overlay-head { min-height:66px; padding:12px 16px; gap:12px; }
       .machine-todo-head-copy { min-width:250px; }
       .machine-todo-head-copy .overlay-title { font-size:1.28rem; }
       .machine-todo-head-copy .sub { margin-top:4px; font-size:.66rem; }
@@ -7536,19 +9011,19 @@ DASHBOARD_HTML = r"""
       .machine-todo-tool-btn { height:42px; padding:0 18px; border-radius:14px; font-size:.72rem; }
       .machine-todo-card .overlay-close { width:42px; height:42px; border-radius:14px; }
       .machine-todo-card .overlay-close::before { font-size:22px; }
-      .machine-todo-body { padding:14px 28px 18px; }
-      .machine-todo-summary { gap:18px; margin-bottom:14px; }
-      .machine-todo-summary-item { min-height:58px; padding:10px 18px; border-radius:18px; }
+      .machine-todo-body { padding:12px 14px 14px; }
+      .machine-todo-summary { gap:10px; margin-bottom:10px; }
+      .machine-todo-summary-item { min-height:54px; padding:9px 13px; border-radius:8px; }
       .machine-todo-summary-item .label { font-size:.78rem; }
       .machine-todo-summary-item .note { margin-top:3px; font-size:.58rem; }
       .machine-todo-summary-item .count { min-width:34px; font-size:1.35rem; }
-      .machine-todo-columns { gap:18px; }
-      .machine-todo-section { border-radius:18px; }
-      .machine-todo-section-head { padding:14px 18px 14px; }
+      .machine-todo-columns { gap:10px; }
+      .machine-todo-section { border-radius:8px; }
+      .machine-todo-section-head { padding:10px 12px 8px; }
       .machine-todo-section-head .title { font-size:.82rem; }
       .machine-todo-section-head .role { margin-top:2px; font-size:.62rem; }
-      .machine-todo-list { gap:10px; padding:6px 14px 16px; }
-      .machine-todo-item { padding:10px 13px; border-radius:14px; }
+      .machine-todo-list { gap:7px; padding:8px 9px 10px; }
+      .machine-todo-item { padding:9px 10px; border-radius:7px; }
       .machine-todo-machine { font-size:.80rem; }
       .machine-todo-status { gap:5px; padding:4px 8px; font-size:.58rem; }
       .machine-todo-status::before { width:7px; height:7px; }
@@ -7592,30 +9067,30 @@ DASHBOARD_HTML = r"""
       .machine-todo-summary-item { padding:20px 24px; }
       .machine-todo-summary-item .count { font-size:2rem; }
     }
-    .overlay-card.machine-partial-card { width:min(980px,calc(100vw - 40px)); max-height:calc(100vh - 48px); border:0; border-radius:22px; background:#f4f7fb; box-shadow:0 24px 60px rgba(15,23,42,.24); }
-    .machine-partial-card > .overlay-head { min-height:78px; padding:16px 20px; background:#fff; border-bottom:1px solid #dce5f0; }
+    .overlay-card.machine-partial-card { width:min(980px,calc(100vw - 40px)); max-height:calc(100vh - 48px); border:0; border-radius:22px; background:var(--ui-subtle); box-shadow:0 24px 60px rgba(15,23,42,.24); }
+    .machine-partial-card > .overlay-head { min-height:78px; padding:16px 20px; background:var(--ui-surface); border-bottom:1px solid var(--ui-border); }
     .machine-partial-head-copy { min-width:0; }
-    .machine-partial-head-copy .overlay-title { color:#172338; font-size:1.18rem; font-weight:800; }
-    .machine-partial-head-copy .sub { margin-top:3px; color:#64748b; font-size:.72rem; font-weight:650; }
+    .machine-partial-head-copy .overlay-title { color:var(--ui-text); font-size:1.18rem; font-weight:800; }
+    .machine-partial-head-copy .sub { margin-top:3px; color:var(--ui-muted); font-size:.72rem; font-weight:650; }
     .machine-partial-body { min-height:180px; overflow:auto; display:grid; align-content:start; gap:10px; padding:16px 18px 20px; }
-    .machine-partial-row { display:grid; grid-template-columns:minmax(170px,1.1fr) minmax(230px,1.5fr) auto; gap:14px; align-items:center; padding:13px 14px; border:1px solid #dce5f0; border-left:4px solid #22c55e; border-radius:13px; background:#fff; box-shadow:0 5px 14px rgba(15,23,42,.055); }
-    .machine-partial-row.warning { border-left-color:#f59e0b; background:#fffdf7; }
-    .machine-partial-row.issue { border-left-color:#ef4444; background:#fffafa; }
+    .machine-partial-row { display:grid; grid-template-columns:minmax(170px,1.1fr) minmax(230px,1.5fr) auto; gap:14px; align-items:center; padding:13px 14px; border:1px solid var(--ui-border); border-left:4px solid #22c55e; border-radius:13px; background:var(--ui-surface); box-shadow:0 5px 14px rgba(15,23,42,.055); }
+    .machine-partial-row.warning { border-left-color:#f59e0b; background:var(--ui-surface); }
+    .machine-partial-row.issue { border-left-color:#ef4444; background:var(--ui-surface); }
     .machine-partial-primary { min-width:0; }
-    .machine-partial-job { overflow:hidden; color:#172338; font-size:.84rem; font-weight:900; white-space:nowrap; text-overflow:ellipsis; }
-    .machine-partial-meta { margin-top:3px; color:#64748b; font-size:.66rem; font-weight:700; }
+    .machine-partial-job { overflow:hidden; color:var(--ui-text); font-size:.84rem; font-weight:900; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-partial-meta { margin-top:3px; color:var(--ui-muted); font-size:.66rem; font-weight:700; }
     .machine-partial-metrics { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:6px; }
-    .machine-partial-metric { min-width:0; padding:6px 7px; border-radius:8px; background:#f1f5f9; text-align:center; }
-    .machine-partial-metric .k { display:block; color:#94a3b8; font-size:.49rem; font-weight:900; text-transform:uppercase; }
-    .machine-partial-metric .v { display:block; margin-top:2px; overflow:hidden; color:#26364d; font-size:.74rem; font-weight:900; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-partial-metric { min-width:0; padding:6px 7px; border-radius:8px; background:var(--ui-subtle); text-align:center; }
+    .machine-partial-metric .k { display:block; color:var(--ui-muted); font-size:.49rem; font-weight:900; text-transform:uppercase; }
+    .machine-partial-metric .v { display:block; margin-top:2px; overflow:hidden; color:var(--ui-text); font-size:.74rem; font-weight:900; white-space:nowrap; text-overflow:ellipsis; }
     .machine-partial-review { display:flex; flex-direction:column; align-items:flex-end; gap:7px; }
     .machine-partial-flags { display:flex; justify-content:flex-end; flex-wrap:wrap; gap:4px; }
     .machine-partial-flag { padding:4px 7px; border-radius:999px; background:#dcfce7; color:#047857; font-size:.54rem; font-weight:900; white-space:nowrap; }
     .machine-partial-flag.warning { background:#fef3c7; color:#92400e; }
     .machine-partial-flag.issue { background:#fee2e2; color:#b91c1c; }
-    .machine-partial-open { min-height:34px; padding:0 12px; border:1px solid #bfdbfe; border-radius:9px; background:#eff6ff; color:#1d4ed8; font-size:.66rem; font-weight:900; cursor:pointer; }
-    .machine-partial-open:hover { border-color:#60a5fa; background:#dbeafe; }
-    .machine-partial-empty { padding:42px 18px; border:1px dashed #cbd5e1; border-radius:14px; background:#fff; color:#64748b; text-align:center; font-size:.80rem; font-weight:750; }
+    .machine-partial-open { min-height:34px; padding:0 12px; border:1px solid var(--ui-accent-soft); border-radius:9px; background:var(--ui-subtle); color:var(--ui-link); font-size:.66rem; font-weight:900; cursor:pointer; }
+    .machine-partial-open:hover { border-color:var(--ui-accent); background:var(--ui-subtle); }
+    .machine-partial-empty { padding:42px 18px; border:1px dashed var(--ui-border); border-radius:14px; background:var(--ui-surface); color:var(--ui-muted); text-align:center; font-size:.80rem; font-weight:750; }
     @media (max-width:760px) {
       .overlay-card.machine-partial-card { width:calc(100vw - 20px); max-height:calc(100vh - 20px); }
       .machine-partial-row { grid-template-columns:1fr; gap:10px; }
@@ -7626,162 +9101,235 @@ DASHBOARD_HTML = r"""
     .main-tab-content { display: none; padding: 0 clamp(10px, 1.6vw, 20px) clamp(12px, 1.6vw, 20px); min-width:0; }
     .main-tab-content.active { display: block; }
     .kpi-filter-row { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
-    .kpi-filter-btn { border:1px solid #dbe4f0; background:#fff; color:#334155; border-radius:999px; padding:7px 14px; font-weight:800; cursor:pointer; }
-    .kpi-filter-btn.active { background:#1f8ef1; border-color:#1f8ef1; color:#fff; }
+    .kpi-filter-btn { border:1px solid var(--ui-border); background:var(--ui-surface); color:var(--ui-text); border-radius:999px; padding:7px 14px; font-weight:800; cursor:pointer; }
+    .kpi-filter-btn.active { background:#1f8ef1; border-color:#1f8ef1; color:var(--ui-on-accent); }
     .kpi-issue-list { display:grid; gap:6px; margin-top:6px; min-width:220px; }
-    .kpi-issue-item { border:1px solid #dbe4f0; border-radius:10px; background:#f8fbff; padding:7px 8px; font-size:.78rem; line-height:1.35; }
-    .kpi-issue-type { font-weight:900; color:#0f172a; }
-    .kpi-issue-meta { color:#64748b; font-weight:700; margin-top:2px; }
-    .kpi-table-wrap { max-height: 68vh; overflow:auto; border:1px solid #dbe4f0; border-radius:14px; background:#fff; }
+    .kpi-issue-item { border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); padding:7px 8px; font-size:.78rem; line-height:1.35; }
+    .kpi-issue-type { font-weight:900; color:var(--ui-text); }
+    .kpi-issue-meta { color:var(--ui-muted); font-weight:700; margin-top:2px; }
+    .kpi-table-wrap { max-height: 68vh; overflow:auto; border:1px solid var(--ui-border); border-radius:14px; background:var(--ui-surface); }
     .kpi-table { width:100%; border-collapse:separate; border-spacing:0; min-width:1180px; }
-    .kpi-table th { position:sticky; top:0; z-index:2; background:#f8fafc; color:#475569; font-size:.72rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; text-align:left; padding:10px 12px; border-bottom:1px solid #dbe4f0; white-space:nowrap; }
-    .kpi-table td { padding:11px 12px; border-bottom:1px solid #e8eef6; vertical-align:top; font-size:.84rem; color:#0f172a; }
+    .kpi-table th { position:sticky; top:0; z-index:2; background:var(--ui-surface); color:var(--ui-muted); font-size:.72rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; text-align:left; padding:10px 12px; border-bottom:1px solid var(--ui-border); white-space:nowrap; }
+    .kpi-table td { padding:11px 12px; border-bottom:1px solid var(--ui-border); vertical-align:top; font-size:.84rem; color:var(--ui-text); }
     .kpi-table tr:last-child td { border-bottom:none; }
-    .kpi-table tr.warn td { background:#fffaf3; }
-    .kpi-table tr.bad td { background:#fff5f5; }
-    .kpi-table tr:hover td { background:#f8fbff; }
+    .kpi-table tr.warn td { background:var(--ui-subtle); }
+    .kpi-table tr.bad td { background:var(--ui-surface); }
+    .kpi-table tr:hover td { background:var(--ui-surface); }
     .kpi-user-cell { min-width:180px; }
-    .kpi-person-name { font-weight:900; color:#0f172a; overflow-wrap:anywhere; }
-    .kpi-person-id { margin-top:2px; color:#64748b; font-weight:800; font-size:.78rem; }
-    .kpi-role-pill { border-radius:999px; background:#e0f2fe; color:#075985; padding:5px 9px; font-size:.72rem; font-weight:900; white-space:nowrap; }
+    .kpi-person-name { font-weight:900; color:var(--ui-text); overflow-wrap:anywhere; }
+    .kpi-person-id { margin-top:2px; color:var(--ui-muted); font-weight:800; font-size:.78rem; }
+    .kpi-role-pill { border-radius:999px; background:var(--ui-subtle); color:#075985; padding:5px 9px; font-size:.72rem; font-weight:900; white-space:nowrap; }
     .kpi-number { font-weight:950; text-align:right; white-space:nowrap; }
     .kpi-number.bad { color:#b91c1c; }
     .kpi-number.warn { color:#b45309; }
-    .kpi-breakdown { min-width:220px; font-weight:800; color:#334155; }
-    .kpi-unassigned { grid-column:1 / -1; border:1px solid #fed7aa; border-radius:14px; background:#fff7ed; padding:12px; margin-top:0; }
-    .kpi-unassigned-title { font-weight:950; color:#9a3412; margin-bottom:4px; }
-    .user-kpi-shell { min-height:calc(100vh - 120px); padding:24px 28px 28px; border:1px solid #d6dee9; border-radius:16px; background:linear-gradient(135deg,#f8fbff 0%,#eef4fb 55%,#f7fbff 100%); box-shadow:inset 0 1px 0 rgba(255,255,255,.86); color:#0f172a; }
-    .user-kpi-head { display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:18px; }
-    .user-kpi-title-row { display:flex; align-items:flex-start; gap:14px; min-width:0; }
-    .user-kpi-mark { color:#155aa8; font-weight:950; font-size:.86rem; line-height:.75; text-align:center; padding-top:4px; }
+    .kpi-breakdown { min-width:220px; font-weight:800; color:var(--ui-text); }
+    .kpi-unassigned { grid-column:1 / -1; border:1px solid var(--ui-border); border-left:4px solid #d89a19; border-radius:13px; background:var(--ui-surface); padding:16px 22px; margin:0 0 10px; box-shadow:0 1px 2px rgba(15,23,42,.02); }
+    .kpi-unassigned-title { font-weight:800; color:#c8870d; margin-bottom:3px; }
+    .breaktime-alert { grid-column:1 / -1; border:1px solid #fecaca; border-left:4px solid #dc2626; border-radius:13px; background:var(--ui-surface); padding:14px 18px; margin:0 0 10px; color:#7f1d1d; box-shadow:0 1px 2px rgba(15,23,42,.02); }
+    .breaktime-alert-head { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    .breaktime-alert-title { font-weight:850; }
+    .breaktime-alert button { border:1px solid #fecaca; border-radius:8px; background:var(--ui-surface); color:#b91c1c; padding:6px 10px; font-size:.7rem; font-weight:800; cursor:pointer; }
+    .breaktime-alert-list { margin-top:7px; color:#991b1b; font-size:.76rem; line-height:1.45; font-weight:600; }
+    #userKpiTab.main-tab-content { background:var(--ui-subtle) !important; padding:28px clamp(18px,4vw,64px) 44px !important; }
+    .user-kpi-shell { width:100%; min-height:calc(100vh - 120px); margin:0; padding:0; border:0; border-radius:0; background:transparent; box-shadow:none; color:var(--ui-text); }
+    .user-kpi-head { display:flex; justify-content:space-between; align-items:flex-start; gap:24px; margin-bottom:26px; }
+    .user-kpi-title-row { display:flex; align-items:flex-start; gap:0; min-width:0; }
+    .user-kpi-mark { display:none; color:var(--ui-link); font-weight:950; font-size:.86rem; line-height:.75; text-align:center; padding-top:4px; }
     .user-kpi-mark span { font-size:.72rem; letter-spacing:.06em; }
-    .user-kpi-head h3 { margin:0 0 6px; font-size:1.7rem; line-height:1; letter-spacing:0; color:#0b1220; }
-    .user-kpi-actions { display:flex; gap:12px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
-    .user-kpi-date, .user-kpi-refresh { border:1px solid #cbd7e6; border-radius:10px; background:rgba(255,255,255,.78); color:#0f315f; min-height:38px; padding:0 16px; font-weight:850; box-shadow:0 4px 14px rgba(15,23,42,.05); cursor:pointer; }
-    .user-kpi-refresh { background:#e8f1fb; color:#164f91; }
-    #userKpiTab .kpi-filter-row { margin:0 0 18px; }
-    #userKpiTab .kpi-filter-btn { min-width:96px; border-radius:999px; background:#eef2f7; color:#0f172a; border-color:#cdd6e2; padding:9px 18px; box-shadow:inset 0 1px 0 rgba(255,255,255,.7); }
-    #userKpiTab .kpi-filter-btn.active { background:#0f64bd; border-color:#0f64bd; color:#fff; box-shadow:0 8px 18px rgba(15,100,189,.22); }
-    #userKpiTab .job-queue-summary { grid-template-columns:repeat(6,minmax(150px,1fr)); gap:14px; margin:0 0 22px; }
-    #userKpiTab .job-queue-metric { min-height:88px; display:grid; grid-template-columns:54px minmax(0,1fr); gap:12px; align-items:center; border:1px solid #cfd9e6; border-radius:12px; background:rgba(255,255,255,.72); box-shadow:0 10px 22px rgba(15,23,42,.08); padding:14px 16px; }
-    #userKpiTab .job-queue-metric .ico { width:48px; height:48px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:1.35rem; font-weight:950; color:#1859a6; background:#dce8f7; }
+    .user-kpi-head h3 { margin:0 0 7px; font-size:1.85rem; line-height:1.05; letter-spacing:-.025em; color:var(--ui-text); }
+    .user-kpi-head .muted { color:var(--ui-muted); font-size:.88rem; font-weight:500; }
+    .user-kpi-actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+    .user-kpi-date, .user-kpi-refresh, .user-kpi-theme { border:1px solid var(--ui-border); border-radius:11px; background:var(--ui-surface); color:var(--ui-text); min-height:43px; padding:0 18px; font-weight:750; box-shadow:0 1px 3px rgba(15,23,42,.025); cursor:pointer; }
+    .user-kpi-date { cursor:default; }
+    .user-kpi-refresh, .user-kpi-theme { background:var(--ui-surface); color:var(--ui-text); }
+    #userKpiTab .kpi-filter-row { margin:0 0 26px; gap:10px; }
+    #userKpiTab .kpi-filter-btn { min-width:118px; min-height:42px; border:1px solid var(--ui-border); border-radius:999px; background:var(--ui-surface); color:var(--ui-muted); padding:9px 20px; font-weight:750; box-shadow:0 1px 2px rgba(15,23,42,.02); }
+    #userKpiTab .kpi-filter-btn.active { background:var(--ui-accent); border-color:var(--ui-accent); color:var(--ui-on-accent); box-shadow:none; }
+    #userKpiTab .job-queue-summary { grid-template-columns:repeat(6,minmax(0,1fr)); gap:18px; margin:0 0 26px; }
+    #userKpiTab .job-queue-metric { min-height:108px; display:grid; grid-template-columns:50px minmax(0,1fr); gap:14px; align-items:center; border:1px solid var(--ui-border); border-radius:13px; background:var(--ui-surface); box-shadow:0 1px 2px rgba(15,23,42,.02); padding:18px; }
+    #userKpiTab .job-queue-metric .ico { width:48px; height:48px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:.86rem; font-weight:800; color:var(--ui-link); background:var(--ui-subtle); }
     #userKpiTab .job-queue-metric .ico.warn { color:#b45309; background:#f7ead3; }
     #userKpiTab .job-queue-metric .ico.bad { color:#b91c1c; background:#f1dada; }
     #userKpiTab .job-queue-metric .ico.good { color:#15803d; background:#d8efe5; }
-    #userKpiTab .job-queue-metric .k { font-size:.67rem; color:#1f2937; letter-spacing:.03em; }
-    #userKpiTab .job-queue-metric .v { margin:3px 0 2px; font-size:1.38rem; line-height:1; font-weight:950; color:#0b1220; }
-    #userKpiTab .job-queue-metric .sub { font-size:.74rem; font-weight:750; color:#475569; }
-    .user-kpi-body { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:18px; align-items:start; }
-    .user-kpi-main-panel, .user-kpi-side-card { border:1px solid #cfd9e6; border-radius:12px; background:rgba(255,255,255,.70); box-shadow:0 10px 24px rgba(15,23,42,.08); overflow:hidden; }
-    .user-kpi-panel-head { min-height:58px; display:flex; align-items:center; justify-content:space-between; gap:14px; padding:14px 16px; border-bottom:1px solid #d8e1ed; }
-    .user-kpi-panel-head h4, .user-kpi-side-card h4 { margin:0; font-size:1rem; color:#0b1220; }
+    #userKpiTab .job-queue-metric .k { display:none; }
+    #userKpiTab .job-queue-metric .v { margin:0 0 4px; font-size:1.6rem; line-height:1; font-weight:800; color:var(--ui-text); }
+    #userKpiTab .job-queue-metric .sub { font-size:.76rem; line-height:1.45; font-weight:500; color:var(--ui-muted); }
+    .user-kpi-body { display:grid; grid-template-columns:minmax(0,1fr) 320px; gap:24px; align-items:start; }
+    .user-kpi-main-panel { min-width:0; border:0; border-radius:0; background:transparent; box-shadow:none; overflow:visible; }
+    .user-kpi-side-card { border:1px solid var(--ui-border); border-radius:13px; background:var(--ui-surface); box-shadow:0 1px 2px rgba(15,23,42,.025); overflow:hidden; }
+    .user-kpi-panel-head { min-height:54px; display:flex; align-items:center; justify-content:space-between; gap:14px; padding:0 0 18px; border:0; }
+    .user-kpi-panel-head h4, .user-kpi-side-card h4 { margin:0; font-size:1.02rem; color:var(--ui-text); font-weight:800; }
     .user-kpi-tools { display:flex; gap:10px; align-items:center; }
-    .user-kpi-search { width:190px; min-height:34px; border:1px solid #cfd9e6; border-radius:10px; background:#f8fbff; padding:0 12px; font-weight:700; color:#334155; }
-    .user-kpi-tool-btn { min-height:34px; border:1px solid #cfd9e6; border-radius:10px; background:#f8fbff; color:#164f91; padding:0 12px; font-weight:900; }
-    .user-kpi-card-grid { display:grid; grid-template-columns:repeat(4,minmax(180px,1fr)); gap:14px; padding:16px; }
-    .user-kpi-card { min-width:0; border:1px solid #c7d2e0; border-radius:12px; background:linear-gradient(180deg,rgba(255,255,255,.92),rgba(246,250,254,.92)); box-shadow:0 10px 20px rgba(15,23,42,.10); padding:12px; cursor:pointer; transition:transform .12s ease, box-shadow .16s ease, border-color .16s ease; }
-    .user-kpi-card:hover { transform:translateY(-2px); border-color:#7aa7dc; box-shadow:0 14px 26px rgba(15,23,42,.14); }
-    .user-kpi-card-head { display:grid; grid-template-columns:50px minmax(0,1fr); gap:10px; align-items:center; margin-bottom:12px; }
-    .user-kpi-avatar { position:relative; width:48px; height:48px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:#dce8f7; color:#102c62; font-size:1.18rem; font-weight:900; }
+    .user-kpi-search { width:222px; min-height:43px; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); padding:0 16px; font-weight:500; color:var(--ui-text); box-shadow:0 1px 2px rgba(15,23,42,.02); }
+    .user-kpi-tool-btn { min-height:34px; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); color:var(--ui-link); padding:0 12px; font-weight:900; }
+    .user-kpi-card-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); justify-content:start; gap:18px; padding:0; }
+    .user-kpi-card { min-width:0; min-height:268px; box-sizing:border-box; border:1px solid var(--ui-border); border-radius:13px; background:var(--ui-surface); box-shadow:0 1px 2px rgba(15,23,42,.02); padding:18px; cursor:pointer; transition:transform .12s ease, box-shadow .16s ease, border-color .16s ease; }
+    .user-kpi-card:hover { transform:translateY(-2px); border-color:var(--ui-border); box-shadow:0 10px 24px rgba(42,53,76,.09); }
+    .user-kpi-card-head { display:grid; grid-template-columns:48px minmax(0,1fr); gap:12px; align-items:center; margin-bottom:14px; }
+    .user-kpi-avatar { position:relative; width:46px; height:46px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:var(--ui-subtle); color:var(--ui-link); font-size:.86rem; font-weight:800; }
     .user-kpi-avatar img { width:100%; height:100%; border-radius:50%; object-fit:cover; display:block; }
-    .user-kpi-avatar::after { content:""; position:absolute; right:1px; top:3px; width:10px; height:10px; border-radius:50%; background:#22c55e; border:2px solid #fff; }
-    .user-kpi-card.busy .user-kpi-avatar::after { background:#f97316; }
-    .user-kpi-card.break .user-kpi-avatar::after { background:#eab308; }
-    .user-kpi-card-name { font-weight:950; color:#0b1220; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .user-kpi-card-id { margin-top:2px; color:#0f172a; font-size:.78rem; font-weight:750; }
-    .user-kpi-stat { display:grid; grid-template-columns:82px 1fr; gap:8px; align-items:center; margin:8px 0; font-size:.82rem; font-weight:900; }
-    .user-kpi-stat-value { color:#0b1220; font-weight:950; }
-    .user-kpi-bar { height:5px; border-radius:999px; background:#dbe2ea; overflow:hidden; margin-top:3px; }
-    .user-kpi-bar span { display:block; height:100%; border-radius:999px; background:#be123c; }
-    .user-kpi-bar.good span { background:#2ca968; }
+    .user-kpi-avatar::after { content:""; position:absolute; right:1px; top:1px; width:9px; height:9px; border-radius:50%; background:#94a3b8; border:2px solid var(--ui-border); }
+    .user-kpi-card.availability-available .user-kpi-avatar::after { background:#22c55e; }
+    .user-kpi-card.availability-on-break .user-kpi-avatar::after { background:#f59e0b; }
+    .user-kpi-card.availability-overbreak .user-kpi-avatar::after { background:#dc2626; }
+    .user-kpi-card.availability-not-available .user-kpi-avatar::after { background:#94a3b8; }
+    .user-kpi-card-name { font-size:.86rem; font-weight:800; color:var(--ui-text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .user-kpi-card-id { margin-top:2px; color:var(--ui-muted); font-size:.68rem; font-weight:500; }
+    .user-kpi-card-profile { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 15px; }
+    .user-kpi-profile-pill { display:inline-flex; align-items:center; max-width:100%; border-radius:999px; padding:4px 9px; background:var(--ui-subtle); color:var(--ui-link); font-size:.61rem; font-weight:750; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .user-kpi-profile-pill.department { background:var(--ui-subtle); color:var(--ui-muted); }
+    .user-kpi-activity { display:grid; gap:3px; margin:-4px 0 13px; border:1px solid var(--ui-border); border-radius:9px; padding:8px 10px; background:var(--ui-surface); color:var(--ui-muted); }
+    .user-kpi-activity strong { font-size:.69rem; line-height:1.2; color:inherit; }
+    .user-kpi-activity span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.59rem; line-height:1.2; color:var(--ui-muted); }
+    .user-kpi-activity time { color:var(--ui-muted); font-size:.56rem; line-height:1.2; font-weight:650; }
+    .user-kpi-activity.online,
+    .user-kpi-activity.working { border-color:#bbf7d0; background:var(--ui-subtle); color:#15803d; }
+    .user-kpi-activity.reliever { border-color:var(--ui-accent-soft); background:var(--ui-subtle); color:var(--ui-link); }
+    .user-kpi-activity.on-break { border-color:#fde68a; background:var(--ui-subtle); color:#b45309; }
+    .user-kpi-activity.overbreak { border-color:#fecaca; background:var(--ui-subtle); color:#b91c1c; }
+    .user-kpi-stat { display:grid; grid-template-columns:82px minmax(0,1fr); gap:8px; align-items:center; margin:10px 0; color:var(--ui-muted); font-size:.69rem; line-height:1.1; font-weight:700; }
+    .user-kpi-stat-value { color:var(--ui-text); font-weight:800; }
+    .user-kpi-bar { height:6px; border-radius:999px; background:var(--ui-subtle); overflow:hidden; margin-top:5px; }
+    .user-kpi-bar span { display:block; height:100%; border-radius:999px; background:#d64567; }
+    .user-kpi-bar.good span { background:#2fac83; }
     .user-kpi-bar.mid span { background:#d99a16; }
-    .user-kpi-status { margin-top:10px; border-radius:8px; padding:8px 10px; text-align:center; font-size:.82rem; font-weight:950; background:#d9f4e6; color:#147a3f; }
-    .user-kpi-card.busy .user-kpi-status { background:#f5d7d7; color:#9b111e; }
-    .user-kpi-card.break .user-kpi-status { background:#f5edc8; color:#9a6a08; }
-    .user-kpi-footer { display:flex; align-items:center; justify-content:flex-end; gap:22px; min-height:40px; padding:0 16px 14px; color:#475569; font-size:.78rem; font-weight:750; }
-    .user-kpi-footer select { border:1px solid #cfd9e6; border-radius:8px; background:#f8fbff; padding:5px 24px 5px 8px; }
-    .user-kpi-side { display:grid; gap:16px; }
-    .user-kpi-side-card { padding:16px; }
+    .user-kpi-status { margin-top:14px; border-radius:9px; padding:10px 8px; text-align:center; font-size:.64rem; line-height:1.15; font-weight:750; background:var(--ui-subtle); color:#21966d; }
+    .user-kpi-card.rating-coaching .user-kpi-status { background:#f5d7d7; color:#9b111e; }
+    .user-kpi-card.rating-strong .user-kpi-status { background:#f5edc8; color:#9a6a08; }
+    .user-kpi-card.rating-building .user-kpi-status { background:var(--ui-subtle); color:var(--ui-muted); }
+    .user-kpi-footer { display:flex; align-items:center; justify-content:flex-end; gap:22px; min-height:40px; padding:12px 0 0; color:var(--ui-muted); font-size:.72rem; font-weight:500; }
+    .user-kpi-footer select { border:1px solid var(--ui-border); border-radius:8px; background:var(--ui-surface); padding:5px 24px 5px 8px; }
+    .user-kpi-side { display:grid; gap:24px; }
+    .user-kpi-side-card { padding:22px; }
     .user-kpi-side-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; }
-    .user-kpi-side-head a { color:#0f4f91; font-weight:950; font-size:.8rem; text-decoration:none; }
-    .user-kpi-issue-row { display:grid; grid-template-columns:24px minmax(0,1fr) 26px; gap:10px; align-items:center; margin:14px 0; }
-    .user-kpi-issue-dot { width:24px; height:24px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:#f1dada; color:#b91c1c; font-weight:950; font-size:.75rem; }
+    .user-kpi-side-head a { border:1px solid var(--ui-border); border-radius:9px; padding:6px 12px; color:var(--ui-link); background:var(--ui-surface); font-weight:700; font-size:.68rem; text-decoration:none; }
+    .user-kpi-issue-row { display:grid; grid-template-columns:minmax(0,1fr) 38px; gap:10px; align-items:center; margin:18px 0; }
+    .user-kpi-issue-dot { display:none; }
     .user-kpi-issue-dot.orange { background:#fde6cf; color:#c66a16; }
     .user-kpi-issue-dot.yellow { background:#f7edc6; color:#b48a0a; }
     .user-kpi-issue-dot.purple { background:#eadcf8; color:#7e22ce; }
-    .user-kpi-issue-dot.blue { background:#dfeaf8; color:#2563eb; }
-    .user-kpi-issue-label { font-size:.78rem; font-weight:900; color:#111827; margin-bottom:7px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .user-kpi-issue-track { height:5px; border-radius:999px; background:#dbe2ea; overflow:hidden; }
-    .user-kpi-issue-fill { height:100%; border-radius:999px; background:#d31d2f; }
-    .user-kpi-issue-count { text-align:right; font-size:.86rem; font-weight:950; color:#0f172a; }
-    .user-kpi-donut-row { display:grid; grid-template-columns:130px minmax(0,1fr); gap:18px; align-items:center; }
-    .user-kpi-donut { width:118px; height:118px; border-radius:50%; background:conic-gradient(#dc2626 0 18%, #d99a16 18% 35%, #2ca968 35% 100%); display:flex; align-items:center; justify-content:center; }
-    .user-kpi-donut-inner { width:78px; height:78px; border-radius:50%; background:#f8fbff; display:flex; flex-direction:column; align-items:center; justify-content:center; font-weight:950; color:#0b1220; }
-    .user-kpi-donut-inner span { font-size:.72rem; color:#475569; font-weight:800; }
-    .user-kpi-legend { display:grid; gap:13px; font-size:.8rem; font-weight:850; }
-    .user-kpi-legend-row { display:grid; grid-template-columns:10px minmax(0,1fr) 24px; gap:8px; align-items:center; }
+    .user-kpi-issue-dot.blue { background:var(--ui-subtle); color:var(--ui-link); }
+    .user-kpi-issue-label { font-size:.72rem; font-weight:750; color:var(--ui-text); margin-bottom:8px; white-space:normal; overflow:visible; text-overflow:clip; }
+    .user-kpi-issue-track { height:6px; border-radius:999px; background:var(--ui-subtle); overflow:hidden; }
+    .user-kpi-issue-fill { height:100%; border-radius:999px; background:#d64567; }
+    .user-kpi-issue-count { text-align:right; font-size:.72rem; font-weight:750; color:var(--ui-muted); }
+    .user-kpi-donut-row { display:grid; grid-template-columns:1fr; gap:18px; align-items:center; justify-items:center; }
+    .user-kpi-donut { width:154px; height:154px; border-radius:50%; background:conic-gradient(#dc2626 0 18%, #d99a16 18% 35%, #2ca968 35% 100%); display:flex; align-items:center; justify-content:center; }
+    .user-kpi-donut-inner { width:100px; height:100px; border-radius:50%; background:var(--ui-surface); display:flex; flex-direction:column; align-items:center; justify-content:center; font-size:1.55rem; font-weight:800; color:var(--ui-text); }
+    .user-kpi-donut-inner span { font-size:.72rem; color:var(--ui-muted); font-weight:800; }
+    .user-kpi-legend { width:100%; display:grid; gap:11px; font-size:.72rem; font-weight:500; color:var(--ui-muted); }
+    .user-kpi-legend-row { display:grid; grid-template-columns:10px minmax(0,1fr) 28px; gap:8px; align-items:center; }
     .user-kpi-legend-dot { width:8px; height:8px; border-radius:50%; background:#dc2626; }
     .user-kpi-legend-dot.mid { background:#d99a16; }
     .user-kpi-legend-dot.low { background:#2ca968; }
-    .user-kpi-note { margin-top:14px; font-size:.72rem; color:#64748b; font-weight:750; }
-    .user-kpi-detail-card { width:min(1060px, calc(100vw - 34px)); max-height:min(88vh, 860px); border:1px solid #cfd9e6; border-radius:16px; background:#f8fbff; box-shadow:0 24px 54px rgba(15,23,42,.24); overflow:hidden; }
-    .user-kpi-detail-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:16px 18px; border-bottom:1px solid #d8e1ed; background:rgba(255,255,255,.74); }
-    .user-kpi-detail-person { display:grid; grid-template-columns:62px minmax(0,1fr); gap:12px; align-items:center; min-width:0; }
-    .user-kpi-detail-avatar { width:58px; height:58px; border-radius:50%; background:#dce8f7; color:#102c62; display:flex; align-items:center; justify-content:center; font-weight:950; font-size:1.25rem; overflow:hidden; }
+    .user-kpi-legend-dot.blue { background:#d64567; }
+    .user-kpi-legend-dot.slate { background:#768198; }
+    .user-kpi-note { margin-top:14px; font-size:.72rem; color:var(--ui-muted); font-weight:750; }
+    #userKpiDetailOverlay { overflow-y:auto; }
+    .user-kpi-detail-card { width:min(1100px, calc(100vw - 40px)); height:min(790px, calc(100dvh - 40px)); max-height:none; margin:auto 0; display:flex; flex-direction:column; border:0; border-radius:18px; background:var(--ui-subtle); box-shadow:0 20px 60px rgba(15,23,42,.25); overflow:hidden; color:var(--ui-text); }
+    .user-kpi-detail-head { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:20px 24px; border-bottom:1px solid var(--ui-border); background:var(--ui-surface); }
+    .user-kpi-detail-person { display:grid; grid-template-columns:52px minmax(0,1fr); gap:16px; align-items:center; min-width:0; }
+    .user-kpi-detail-avatar { width:52px; height:52px; border-radius:50%; background:var(--ui-subtle); color:var(--ui-link); display:flex; align-items:center; justify-content:center; font-weight:800; font-size:1rem; overflow:hidden; }
     .user-kpi-detail-avatar img { width:100%; height:100%; object-fit:cover; display:block; }
-    .user-kpi-detail-name { font-size:1.2rem; font-weight:950; color:#0b1220; overflow-wrap:anywhere; }
-    .user-kpi-detail-sub { margin-top:3px; color:#475569; font-weight:750; font-size:.84rem; }
-    .user-kpi-detail-body { padding:16px; display:grid; grid-template-columns:280px minmax(0,1fr); gap:16px; max-height:calc(88vh - 92px); overflow:auto; }
-    .user-kpi-detail-summary, .user-kpi-detail-jobs, .user-kpi-job-detail { border:1px solid #d8e1ed; border-radius:12px; background:#fff; box-shadow:0 8px 18px rgba(15,23,42,.06); }
-    .user-kpi-detail-summary { padding:14px; display:grid; gap:10px; align-content:start; }
-    .user-kpi-detail-metric { display:flex; justify-content:space-between; gap:10px; border-bottom:1px solid #eef2f7; padding-bottom:8px; font-size:.84rem; font-weight:850; }
+    .user-kpi-detail-name { font-size:1.2rem; font-weight:800; letter-spacing:-.01em; color:var(--ui-text); overflow-wrap:anywhere; }
+    .user-kpi-detail-sub { display:flex; flex-wrap:wrap; gap:8px; margin-top:4px; color:var(--ui-muted); font-size:.74rem; font-weight:600; }
+    .user-kpi-detail-chip { padding:2px 10px; border-radius:999px; background:var(--ui-subtle); }
+    .user-kpi-detail-chip.status { color:#2f8f70; background:var(--ui-subtle); font-weight:800; }
+    #userKpiDetailCloseBtn { flex:none; width:38px; height:38px; border-radius:10px; border:1px solid var(--ui-border); background:var(--ui-surface); color:var(--ui-muted); }
+    .user-kpi-detail-body { flex:1 1 auto; min-height:0; padding:20px 24px 24px; display:grid; grid-template-columns:260px minmax(0,1fr); gap:20px; overflow:hidden; }
+    .user-kpi-detail-summary, .user-kpi-detail-jobs, .user-kpi-job-detail { border:1px solid var(--ui-border); border-radius:14px; background:var(--ui-surface); box-shadow:none; }
+    .user-kpi-detail-summary { min-height:0; height:100%; position:static; padding:18px; display:grid; gap:0; align-content:start; overflow:visible; }
+    .user-kpi-score { display:flex; align-items:center; gap:14px; margin-bottom:18px; }
+    .user-kpi-score-ring { width:72px; height:72px; flex:none; display:grid; place-items:center; border-radius:50%; background:conic-gradient(#2fa37a var(--score-deg),var(--ui-subtle) 0); }
+    .user-kpi-score-ring::after { content:attr(data-score); width:56px; height:56px; display:grid; place-items:center; border-radius:50%; background:var(--ui-surface); color:var(--ui-text); font-size:.82rem; font-weight:800; }
+    .user-kpi-score-copy span { display:block; color:var(--ui-muted); font-size:.7rem; }
+    .user-kpi-score-copy strong { color:var(--ui-text); font-size:.9rem; font-weight:800; }
+    .user-kpi-summary-heading { margin:14px 0 5px; color:var(--ui-muted); font-size:.65rem; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
+    .user-kpi-summary-heading:first-of-type { margin-top:0; }
+    .user-kpi-detail-metric { display:flex; justify-content:space-between; gap:10px; border-bottom:1px solid var(--ui-border); padding:7px 0; color:var(--ui-muted); font-size:.78rem; font-weight:500; }
     .user-kpi-detail-metric:last-child { border-bottom:none; padding-bottom:0; }
-    .user-kpi-detail-metric strong { color:#0b1220; font-weight:950; }
-    .user-kpi-detail-jobs { overflow:hidden; }
-    .user-kpi-detail-jobs-head { display:flex; justify-content:space-between; align-items:center; padding:12px 14px; border-bottom:1px solid #eef2f7; }
-    .user-kpi-detail-jobs-head h4 { margin:0; font-size:.96rem; color:#0b1220; }
-    .user-kpi-job-list { display:grid; gap:8px; padding:12px; max-height:560px; overflow:auto; }
-    .user-kpi-job-row { border:1px solid #dbe4f0; border-radius:10px; background:#f8fbff; padding:10px; cursor:pointer; transition:background .12s ease, border-color .12s ease; }
-    .user-kpi-job-row:hover, .user-kpi-job-row.active { background:#eef6ff; border-color:#93c5fd; }
+    .user-kpi-detail-metric strong { color:var(--ui-text); font-weight:800; text-align:right; }
+    .user-kpi-detail-main { min-width:0; min-height:0; height:100%; display:grid; grid-template-rows:44px minmax(0,1fr); gap:20px; align-content:stretch; overflow:hidden; }
+    .user-kpi-detail-tabs { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:4px; height:44px; min-height:44px; align-self:start; box-sizing:border-box; padding:4px; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-subtle); }
+    .user-kpi-detail-tabs.two-tabs { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    #userKpiDetailOverlay .user-kpi-detail-tab { min-width:0; min-height:34px; height:34px; padding:0 9px; border:1px solid transparent; border-radius:7px; background:transparent; color:var(--ui-muted); font-size:.7rem; line-height:1.1; font-weight:800; cursor:pointer; }
+    .user-kpi-detail-tab:hover { color:var(--ui-link); background:var(--ui-surface); }
+    .user-kpi-detail-tab.active { border-color:var(--ui-accent-soft); background:var(--ui-surface); color:var(--ui-link); box-shadow:0 2px 8px rgba(38,78,160,.1); }
+    #userKpiDetailOverlay .user-kpi-detail-tab:focus { outline:none; }
+    #userKpiDetailOverlay .user-kpi-detail-tab:focus-visible { outline:2px solid var(--ui-accent); outline-offset:1px; }
+    .user-kpi-detail-tab-panel { min-width:0; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-color:#929bab transparent; }
+    .user-kpi-detail-tab-panel::-webkit-scrollbar { width:8px; }
+    .user-kpi-detail-tab-panel::-webkit-scrollbar-thumb { border-radius:999px; background:#a8b0bd; }
+    .user-kpi-detail-tab-panel::-webkit-scrollbar-track { background:transparent; }
+    .user-kpi-detail-tab-panel[hidden] { display:none !important; }
+    #userKpiJobsPanel { overflow:hidden; }
+    .user-kpi-detail-jobs { height:100%; box-sizing:border-box; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-color:#929bab transparent; padding:8px 6px 14px; }
+    .user-kpi-detail-jobs::-webkit-scrollbar { width:8px; }
+    .user-kpi-detail-jobs::-webkit-scrollbar-thumb { border-radius:999px; background:#a8b0bd; }
+    .user-kpi-detail-jobs::-webkit-scrollbar-track { background:transparent; }
+    .user-kpi-detail-jobs-head { position:sticky; top:-8px; z-index:2; display:flex; justify-content:space-between; align-items:baseline; padding:18px 12px 12px; background:var(--ui-surface); }
+    .user-kpi-detail-jobs-head h4 { margin:0; font-size:1rem; color:var(--ui-text); font-weight:900; }
+    .user-kpi-detail-jobs-head .muted { color:var(--ui-muted); font-size:.78rem; }
+    .user-kpi-jobs-layout { display:grid; grid-template-columns:minmax(220px,.62fr) minmax(0,1fr); gap:22px; padding:4px 12px 10px; }
+    .user-kpi-job-list { display:grid; gap:10px; align-content:start; max-height:520px; overflow:auto; padding-right:2px; }
+    .user-kpi-job-row { border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-subtle); padding:16px 18px; cursor:pointer; transition:background .12s ease, border-color .12s ease, box-shadow .12s ease; }
+    .user-kpi-job-row:hover, .user-kpi-job-row.active { background:var(--ui-subtle); border-color:var(--ui-accent); box-shadow:0 1px 2px rgba(37,99,235,.08); }
     .user-kpi-job-top { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
-    .user-kpi-job-name { font-weight:950; color:#0b1220; overflow-wrap:anywhere; }
-    .user-kpi-job-meta { margin-top:3px; color:#64748b; font-size:.78rem; font-weight:750; }
-    .user-kpi-job-meta.product { color:#475569; font-weight:900; }
+    .user-kpi-job-name { font-size:.9rem; font-weight:950; color:var(--ui-text); overflow-wrap:anywhere; }
+    .user-kpi-job-item { margin-top:5px; color:var(--ui-muted); font-size:.68rem; line-height:1.3; font-weight:600; overflow-wrap:anywhere; }
+    .user-kpi-job-meta { margin-top:3px; color:var(--ui-muted); font-size:.78rem; font-weight:750; }
+    .user-kpi-job-meta.product { color:var(--ui-muted); font-weight:900; }
     .user-kpi-job-badge { flex:0 0 auto; border-radius:999px; padding:4px 8px; font-size:.68rem; font-weight:950; color:#166534; background:#dcfce7; }
     .user-kpi-job-badge.warn { color:#92400e; background:#fef3c7; }
     .user-kpi-job-badge.bad { color:#991b1b; background:#fee2e2; }
-    .user-kpi-job-detail { padding:14px; margin-top:12px; }
-    .user-kpi-job-detail h4 { margin:0 0 10px; color:#0b1220; }
-    .user-kpi-job-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin:10px 0; }
-    .user-kpi-job-metric { border:1px solid #e2e8f0; border-radius:9px; background:#f8fafc; padding:9px; }
-    .user-kpi-job-metric .k { color:#64748b; font-size:.68rem; font-weight:900; text-transform:uppercase; }
-    .user-kpi-job-metric .v { margin-top:4px; color:#0b1220; font-weight:950; }
-    .user-kpi-detail-section-title { margin:12px 0 6px; font-size:.8rem; font-weight:950; color:#334155; text-transform:uppercase; letter-spacing:.03em; }
-    .user-kpi-detail-list { display:grid; gap:6px; }
-    .user-kpi-detail-list div { border-left:3px solid #93c5fd; padding:6px 8px; background:#f8fbff; border-radius:0 8px 8px 0; font-size:.82rem; color:#334155; font-weight:750; }
-    .main-tab-content:not(#userKpiTab) { border:1px solid #d6dee9; border-radius:16px; background:linear-gradient(135deg,#f8fbff 0%,#eef4fb 55%,#f7fbff 100%); box-shadow:inset 0 1px 0 rgba(255,255,255,.86); margin:0 clamp(10px,1.6vw,20px) clamp(12px,1.6vw,20px); padding:18px; min-height:calc(100vh - 156px); color:#0f172a; }
+    .user-kpi-job-detail { min-width:0; padding:2px 0 0; border:0; border-radius:0; }
+    .user-kpi-job-detail-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+    .user-kpi-job-detail h4 { margin:0; color:var(--ui-text); font-size:1.05rem; font-weight:950; overflow-wrap:anywhere; }
+    .user-kpi-job-detail .user-kpi-job-meta { margin-top:7px; font-size:.73rem; font-weight:500; color:var(--ui-muted); }
+    .user-kpi-job-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:16px 0 6px; }
+    .user-kpi-job-metric { min-height:82px; border:0; border-radius:12px; background:var(--ui-subtle); padding:13px 14px; }
+    .user-kpi-job-metric .k { color:var(--ui-muted); font-size:.63rem; font-weight:900; letter-spacing:.07em; text-transform:uppercase; }
+    .user-kpi-job-metric .v { margin-top:7px; color:#07132b; font-size:1.32rem; line-height:1; font-weight:950; }
+    .user-kpi-job-metric .sub { margin-top:9px; color:var(--ui-muted); font-size:.67rem; font-weight:500; }
+    .user-kpi-detail-section-title { margin:16px 0 8px; font-size:.66rem; font-weight:800; color:var(--ui-muted); text-transform:uppercase; letter-spacing:.08em; }
+    .user-kpi-detail-list { display:grid; gap:8px; }
+    .user-kpi-detail-list > div { border-left:3px solid var(--ui-accent); padding:9px 10px; background:var(--ui-subtle); border-radius:0 10px 10px 0; font-size:.78rem; color:var(--ui-muted); font-weight:600; }
+    .user-kpi-problem-list, .user-kpi-notable-list { display:grid; gap:8px; }
+    .user-kpi-problem-item { display:grid; grid-template-columns:20px minmax(0,1fr); gap:10px; padding:12px 14px; border-radius:12px; background:#fff2c7; color:#7c3d0b; font-size:.74rem; }
+    .user-kpi-problem-icon { color:#b45309; font-size:1rem; line-height:1.15; }
+    .user-kpi-problem-item strong { display:block; margin-bottom:3px; color:#8a3f08; font-size:.78rem; }
+    .user-kpi-notable-item { padding:11px 14px; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); color:var(--ui-text); font-size:.74rem; font-weight:500; }
+    .user-kpi-rating-card { padding:18px; border:1px solid var(--ui-border); border-radius:14px; background:var(--ui-surface); }
+    .user-kpi-rating-card h4 { margin:0; color:var(--ui-text); font-size:1rem; font-weight:800; }
+    .user-kpi-rating-list { display:grid; gap:6px; margin-top:10px; }
+    .user-kpi-rating-item { padding:10px 10px 10px 12px; border-left:3px solid var(--ui-accent); border-radius:0 10px 10px 0; background:var(--ui-subtle); }
+    .user-kpi-rating-top { display:flex; justify-content:space-between; gap:12px; color:var(--ui-muted); font-size:.78rem; font-weight:800; }
+    .user-kpi-rating-bar { height:6px; margin:7px 0 5px; overflow:hidden; border-radius:999px; background:var(--ui-subtle); }
+    .user-kpi-rating-bar span { display:block; height:100%; border-radius:inherit; background:#2fa37a; }
+    .user-kpi-rating-meta, .user-kpi-rating-detail { color:var(--ui-muted); font-size:.7rem; font-weight:600; }
+    .main-tab-content:not(#userKpiTab) { border:1px solid var(--ui-border); border-radius:16px; background:linear-gradient(135deg,var(--ui-surface) 0%,var(--ui-subtle) 55%,var(--ui-surface) 100%); box-shadow:inset 0 1px 0 color-mix(in srgb, var(--ui-surface) 86%, transparent); margin:0 clamp(10px,1.6vw,20px) clamp(12px,1.6vw,20px); padding:18px; min-height:calc(100vh - 156px); color:var(--ui-text); }
     #machinesTab.main-tab-content { padding:18px; }
     .main-tab-content:not(#userKpiTab) .panel,
     .main-tab-content:not(#userKpiTab) .planning-shell,
-    #maintenanceTab .maintenance-shell { border:1px solid #cfd9e6; border-radius:12px; background:rgba(255,255,255,.72); box-shadow:0 10px 24px rgba(15,23,42,.08); overflow:hidden; }
+    #maintenanceTab .maintenance-shell { border:1px solid var(--ui-border); border-radius:12px; background:color-mix(in srgb, var(--ui-surface) 72%, transparent); box-shadow:0 10px 24px rgba(15,23,42,.08); overflow:hidden; }
     .main-tab-content:not(#userKpiTab) .panel { margin-top:0; padding:16px; }
     #machineArchiveTab .panel + .panel { margin-top:16px; }
     .main-tab-content:not(#userKpiTab) .panel h3,
     .main-tab-content:not(#userKpiTab) .planning-title h3,
     #maintenanceTab .maintenance-topbar h3,
     #maintenanceTab .maintenance-section-title,
-    #maintenanceTab .maintenance-performance-title { margin:0 0 6px; font-size:1.18rem; line-height:1.05; font-weight:950; letter-spacing:0; color:#0b1220; }
-    .main-tab-content:not(#userKpiTab) .muted { color:#475569; font-size:.86rem; font-weight:750; }
+    #maintenanceTab .maintenance-performance-title { margin:0 0 6px; font-size:1.18rem; line-height:1.05; font-weight:950; letter-spacing:0; color:var(--ui-text); }
+    .main-tab-content:not(#userKpiTab) .muted { color:var(--ui-muted); font-size:.86rem; font-weight:750; }
     .main-tab-content:not(#userKpiTab) .table-wrap,
     #maintenanceTab .maintenance-performance-wrap,
-    #maintenanceTab .maintenance-call-board { border:1px solid #cfd9e6; border-radius:12px; background:rgba(255,255,255,.74); box-shadow:0 10px 24px rgba(15,23,42,.07); overflow:auto; }
-    .main-tab-content:not(#userKpiTab) .data-table th { background:#f8fafc; color:#475569; font-size:.72rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; }
-    .main-tab-content:not(#userKpiTab) .data-table td { color:#0f172a; font-size:.84rem; font-weight:700; }
-    .main-tab-content:not(#userKpiTab) .placeholder { border:1px dashed #cfd9e6; border-radius:12px; background:#f8fbff; color:#64748b; font-weight:800; }
+    #maintenanceTab .maintenance-call-board { border:1px solid var(--ui-border); border-radius:12px; background:color-mix(in srgb, var(--ui-surface) 74%, transparent); box-shadow:0 10px 24px rgba(15,23,42,.07); overflow:auto; }
+    .main-tab-content:not(#userKpiTab) .data-table th { background:var(--ui-surface); color:var(--ui-muted); font-size:.72rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; }
+    .main-tab-content:not(#userKpiTab) .data-table td { color:var(--ui-text); font-size:.84rem; font-weight:700; }
+    .main-tab-content:not(#userKpiTab) .placeholder { border:1px dashed var(--ui-border); border-radius:12px; background:var(--ui-surface); color:var(--ui-muted); font-weight:800; }
     .main-tab-content:not(#userKpiTab) input,
     .main-tab-content:not(#userKpiTab) select,
-    .main-tab-content:not(#userKpiTab) textarea { border:1px solid #cfd9e6; border-radius:10px; background:#f8fbff; color:#334155; font-weight:750; }
-    .main-tab-content:not(#userKpiTab) button:not(.sub-tab-button):not(.approve-print-btn):not(.overlay-close):not(.review-slide-arrow) { border:1px solid #cfd9e6; border-radius:10px; background:#f8fbff; color:#164f91; font-weight:900; box-shadow:0 4px 14px rgba(15,23,42,.05); }
+    .main-tab-content:not(#userKpiTab) textarea { border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); color:var(--ui-text); font-weight:750; }
+    .main-tab-content:not(#userKpiTab) button:not(.sub-tab-button):not(.approve-print-btn):not(.overlay-close):not(.review-slide-arrow) { border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); color:var(--ui-link); font-weight:900; box-shadow:0 4px 14px rgba(15,23,42,.05); }
     .job-queue-metric,
     .planning-ops-metric,
     .planning-lane,
@@ -7789,116 +9337,148 @@ DASHBOARD_HTML = r"""
     .finished-item,
     .maintenance-metric,
     .maintenance-person,
-    .maintenance-call-card { border-radius:12px; border-color:#cfd9e6; box-shadow:0 10px 22px rgba(15,23,42,.08); }
-    .main-tabs { background:#eef4fb; border-top:1px solid #d6dee9; border-bottom:1px solid #d6dee9; }
-    .main-tab-button { border:1px solid #cdd6e2; border-radius:999px; background:#eef2f7; color:#0f172a; padding:9px 18px; font-weight:900; box-shadow:inset 0 1px 0 rgba(255,255,255,.7); }
-    .main-tab-button.active { background:#0f64bd; border-color:#0f64bd; color:#fff; box-shadow:0 8px 18px rgba(15,100,189,.22); }
+    .maintenance-call-card { border-radius:12px; border-color:var(--ui-border); box-shadow:0 10px 22px rgba(15,23,42,.08); }
+    .main-tabs { background:var(--ui-subtle); border-top:1px solid var(--ui-border); border-bottom:1px solid var(--ui-border); }
+    .main-tab-button { border:1px solid var(--ui-border); border-radius:999px; background:var(--ui-subtle); color:var(--ui-text); padding:9px 18px; font-weight:900; box-shadow:inset 0 1px 0 color-mix(in srgb, var(--ui-surface) 70%, transparent); }
+    .main-tab-button.active { background:var(--ui-accent); border-color:var(--ui-accent); color:var(--ui-on-accent); box-shadow:0 8px 18px rgba(15,100,189,.22); }
     .sub-tabs { display:flex; gap:8px; margin-top:12px; margin-bottom:12px; flex-wrap:wrap; }
-    .sub-tab-button { background:#fff; border:1px solid #cbd5e1; border-radius:999px; padding:8px 14px; font-weight:700; color:#334155; cursor:pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
+    .sub-tab-button { background:var(--ui-surface); border:1px solid var(--ui-border); border-radius:999px; padding:8px 14px; font-weight:700; color:var(--ui-text); cursor:pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .sub-tab-button:hover { transform: translateY(-1px); box-shadow: 0 6px 14px rgba(15,23,42,0.08); }
-    .sub-tab-button.active { background:#1f8ef1; color:#fff; border-color:#1f8ef1; }
+    .sub-tab-button.active { background:#1f8ef1; color:var(--ui-on-accent); border-color:#1f8ef1; }
     .sub-tab-content { display:none; }
     .sub-tab-content.active { display:block; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(clamp(150px, 11vw, 190px), 1fr)); gap: clamp(10px, 1.2vw, 18px); }
-    #machineGrid, #additionalMachineGrid { grid-template-columns:repeat(6, minmax(0, 1fr)); justify-content:stretch; align-items:stretch; gap:10px; perspective:1200px; }
-    #additionalMachineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); align-content:start; gap:8px; min-height:176px; padding:13px 14px; border:1px solid #e2e8f0; border-radius:11px; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); box-shadow:0 4px 14px rgba(15,23,42,.07); overflow:hidden; cursor:pointer; }
-    #additionalMachineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
-    #additionalMachineGrid .card.inactive { border-color:#d8e2ef; border-top-color:#94a3b8; background:#f8fafc; }
-    #additionalMachineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; background:#fffafa; }
-    #additionalMachineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); }
-    #additionalMachineGrid .card.status-alert { border-color:#fed7aa; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); animation:none; }
-    #additionalMachineGrid .card .machine-card-title h3 { margin:0; color:#1e293b; font-size:.90rem; }
-    .additional-machines-section { margin-top:24px; padding-top:18px; border-top:2px solid #dbe4f0; }
-    .additional-machines-title { margin:0 0 12px; color:#334155; font-size:1rem; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
-    .card { min-width:0; background: #fff; border-radius: 12px; padding: clamp(10px, 1vw, 16px); border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform .12s ease, box-shadow .12s ease; }
+    #machineGrid, #additionalMachineGrid, #mixingMachineGrid { grid-template-columns:repeat(6, minmax(0, 1fr)); justify-content:stretch; align-items:stretch; gap:10px; perspective:1200px; }
+    #additionalMachineGrid .card, #mixingMachineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); align-content:start; gap:8px; min-height:176px; padding:13px 14px; border:1px solid var(--ui-border); border-radius:11px; background:linear-gradient(145deg,var(--ui-surface) 0%,var(--ui-surface) 100%); box-shadow:0 4px 14px rgba(15,23,42,.07); overflow:hidden; cursor:pointer; }
+    #additionalMachineGrid .card.active, #mixingMachineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:var(--ui-surface); }
+    #additionalMachineGrid .card.inactive, #mixingMachineGrid .card.inactive { border-color:var(--ui-border); border-top-color:var(--ui-border); background:var(--ui-surface); }
+    #additionalMachineGrid .card.disconnected, #mixingMachineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; background:var(--ui-surface); }
+    #additionalMachineGrid .card.maintenance, #mixingMachineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; background:linear-gradient(145deg,var(--ui-surface) 0%,var(--ui-surface) 100%); }
+    #additionalMachineGrid .card.status-alert, #mixingMachineGrid .card.status-alert { border-color:#fed7aa; background:linear-gradient(145deg,var(--ui-surface) 0%,var(--ui-surface) 100%); animation:none; }
+    #additionalMachineGrid .card .machine-card-title h3, #mixingMachineGrid .card .machine-card-title h3 { margin:0; color:var(--ui-text); font-size:.90rem; }
+    .additional-machines-section { margin-top:24px; padding-top:18px; border-top:2px solid var(--ui-border); }
+    .additional-machines-title { margin:0 0 12px; color:var(--ui-text); font-size:1rem; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
+    .card { min-width:0; background: var(--ui-surface); border-radius: 12px; padding: clamp(10px, 1vw, 16px); border: 2px solid transparent; box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; transition: transform .12s ease, box-shadow .12s ease; }
     .card[hidden] { display:none !important; }
     .card:hover { transform: translateY(-2px); box-shadow: 0 8px 18px rgba(0,0,0,0.12); }
     .card.active { border-color: #4CAF50; animation: cardPulseGreen 1.5s ease-in-out infinite; }
-    .card.inactive { border-color:#cbd5e1; background:#f8fafc; animation:none; }
+    .card.inactive { border-color:var(--ui-border); background:var(--ui-surface); animation:none; }
     .card.disconnected { border-color: #f44336; }
     .card.maintenance { border-color: #FF9800; animation: cardPulseOrange 1.5s ease-in-out infinite; }
-    .card h3 { margin: 0 0 10px; font-size: clamp(.9rem, .9vw, 1.05rem); border-bottom: 1px solid #eee; padding-bottom: 8px; overflow-wrap:anywhere; }
+    .card h3 { margin: 0 0 10px; font-size: clamp(.9rem, .9vw, 1.05rem); border-bottom: 1px solid var(--ui-border); padding-bottom: 8px; overflow-wrap:anywhere; }
     .card p { margin: 6px 0; font-size: 0.9rem; overflow-wrap:break-word; word-break:normal; }
-    #machineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); align-content:start; gap:8px; min-height:176px; padding:13px 14px; border:1px solid #e2e8f0; border-radius:11px; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); box-shadow:0 4px 14px rgba(15,23,42,.07); overflow:hidden; cursor:pointer; transform-style:preserve-3d; backface-visibility:hidden; will-change:transform, box-shadow; }
-    #machineGrid .card:hover, #additionalMachineGrid .card:hover { transform:translateY(-1px); box-shadow:0 8px 20px rgba(15,23,42,.10); }
-    #machineGrid .card:focus-visible, #additionalMachineGrid .card:focus-visible { outline:3px solid #2563eb; outline-offset:3px; }
-    #machineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:#fbfffd; }
-    #machineGrid .card.inactive { border-color:#d8e2ef; border-top-color:#94a3b8; animation:none; background:#f8fafc; }
-    #machineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; animation:none; background:#fffafa; }
-    #machineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; animation:none; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); }
-    #machineGrid .card.status-alert { border-color:#fed7aa; background:linear-gradient(145deg,#fff 0%,#fbfcfe 100%); animation:none; }
+    #machineGrid .card { position:relative; display:grid; grid-template-columns:minmax(0,1fr); align-content:start; gap:8px; min-height:176px; padding:13px 14px; border:1px solid var(--ui-border); border-radius:11px; background:linear-gradient(145deg,var(--ui-surface) 0%,var(--ui-surface) 100%); box-shadow:0 4px 14px rgba(15,23,42,.07); overflow:hidden; cursor:pointer; transform-style:preserve-3d; backface-visibility:hidden; will-change:transform, box-shadow; }
+    #machineGrid .card:hover, #additionalMachineGrid .card:hover, #mixingMachineGrid .card:hover { transform:translateY(-1px); box-shadow:0 8px 20px rgba(15,23,42,.10); }
+    #machineGrid .card:focus-visible, #additionalMachineGrid .card:focus-visible, #mixingMachineGrid .card:focus-visible { outline:3px solid var(--ui-accent); outline-offset:3px; }
+    #machineGrid .card.active { border-color:#bbf7d0; border-top-color:#16a34a; animation:none; background:var(--ui-surface); }
+    #machineGrid .card.inactive { border-color:var(--ui-border); border-top-color:var(--ui-border); animation:none; background:var(--ui-surface); }
+    #machineGrid .card.disconnected { border-color:#fecaca; border-top-color:#ef4444; animation:none; background:var(--ui-surface); }
+    #machineGrid .card.maintenance { border-color:#fed7aa; border-top-color:#f59e0b; animation:none; background:linear-gradient(145deg,var(--ui-surface) 0%,var(--ui-surface) 100%); }
+    #machineGrid .card.status-alert { border-color:#fed7aa; background:linear-gradient(145deg,var(--ui-surface) 0%,var(--ui-surface) 100%); animation:none; }
     @property --maintenance-stripe-turn { syntax:"<angle>"; inherits:false; initial-value:0deg; }
     #machineGrid .card.machine-alert-status,
-    #additionalMachineGrid .card.machine-alert-status { isolation:isolate; overflow:visible; border-color:#111827; animation:none; }
+    #additionalMachineGrid .card.machine-alert-status,
+    #mixingMachineGrid .card.machine-alert-status { isolation:isolate; overflow:visible; border-color:var(--ui-border); animation:none; }
     #machineGrid .card.machine-alert-status::before,
-    #additionalMachineGrid .card.machine-alert-status::before { content:""; position:absolute; inset:-3px; z-index:6; padding:2px; border-radius:14px; pointer-events:none; background:repeating-conic-gradient(from var(--maintenance-stripe-turn),#facc15 0deg 8deg,#111827 8deg 16deg); -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0); -webkit-mask-composite:xor; mask-composite:exclude; animation:machineMaintenanceStripeRotate 7s linear var(--machine-alert-delay,0s) infinite; }
+    #additionalMachineGrid .card.machine-alert-status::before,
+    #mixingMachineGrid .card.machine-alert-status::before { content:""; position:absolute; inset:-3px; z-index:6; padding:2px; border-radius:14px; pointer-events:none; background:repeating-conic-gradient(from var(--maintenance-stripe-turn),#facc15 0deg 8deg,#111827 8deg 16deg); -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0); -webkit-mask-composite:xor; mask-composite:exclude; animation:machineMaintenanceStripeRotate 7s linear var(--machine-alert-delay,0s) infinite; }
     #machineGrid .card.machine-alert-status > *,
-    #additionalMachineGrid .card.machine-alert-status > * { z-index:1; }
+    #additionalMachineGrid .card.machine-alert-status > *,
+    #mixingMachineGrid .card.machine-alert-status > * { z-index:1; }
     #machineGrid .card.machine-alert-supervisor,
-    #additionalMachineGrid .card.machine-alert-supervisor { border-color:#fdba74; border-top-color:#f97316; animation:machineSupervisorCardBlink 1.7s ease-in-out var(--machine-alert-delay,0s) infinite; }
+    #additionalMachineGrid .card.machine-alert-supervisor,
+    #mixingMachineGrid .card.machine-alert-supervisor { border-color:#fdba74; border-top-color:#f97316; animation:machineSupervisorCardBlink 1.7s ease-in-out var(--machine-alert-delay,0s) infinite; }
     #machineGrid .card.machine-alert-parts,
-    #additionalMachineGrid .card.machine-alert-parts { border-color:#dc2626; border-top-color:#dc2626; animation:machinePartShortageCardBlink var(--part-alert-speed,.75s) steps(2,end) var(--machine-alert-delay,0s) infinite; }
+    #additionalMachineGrid .card.machine-alert-parts,
+    #mixingMachineGrid .card.machine-alert-parts { border-color:#dc2626; border-top-color:#dc2626; animation:machinePartShortageCardBlink var(--part-alert-speed,.75s) steps(2,end) var(--machine-alert-delay,0s) infinite; }
     .machine-card-face { min-width:0; height:100%; transition:opacity .24s ease, transform .28s cubic-bezier(.2,.72,.25,1); }
     .machine-card-face-normal { display:grid; grid-template-rows:auto 1fr auto; gap:8px; opacity:1; transform:translateY(0) scale(1); }
-    .machine-card-face-hover { position:absolute; inset:0; z-index:4; display:grid; grid-template-rows:auto auto auto 1fr; gap:5px; padding:9px 10px; background:linear-gradient(145deg,rgba(255,255,255,.99),rgba(244,249,255,.99)); opacity:0; transform:translateY(10px) scale(.97); pointer-events:none; }
+    .machine-card-face-hover { position:absolute; inset:0; z-index:4; display:grid; grid-template-rows:auto auto auto 1fr; gap:5px; padding:9px 10px; background:linear-gradient(145deg,color-mix(in srgb, var(--ui-surface) 99%, transparent),color-mix(in srgb, var(--ui-subtle) 99%, transparent)); opacity:0; transform:translateY(10px) scale(.97); pointer-events:none; }
     #machineGrid .card:hover .machine-card-face-normal,
-    #additionalMachineGrid .card:hover .machine-card-face-normal { opacity:0; transform:translateY(-8px) scale(.98); }
+    #additionalMachineGrid .card:hover .machine-card-face-normal,
+    #mixingMachineGrid .card:hover .machine-card-face-normal { opacity:0; transform:translateY(-8px) scale(.98); }
     #machineGrid .card:hover .machine-card-face-hover,
-    #additionalMachineGrid .card:hover .machine-card-face-hover { opacity:1; transform:translateY(0) scale(1); }
+    #additionalMachineGrid .card:hover .machine-card-face-hover,
+    #mixingMachineGrid .card:hover .machine-card-face-hover { opacity:1; transform:translateY(0) scale(1); }
     .machine-hover-head { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:7px; }
-    .machine-hover-head strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#1e293b; font-size:.78rem; line-height:1; font-weight:950; }
-    .machine-hover-head span { flex:0 0 auto; color:#64748b; font-size:.56rem; line-height:1; font-weight:850; }
+    .machine-hover-head strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ui-text); font-size:.78rem; line-height:1; font-weight:950; }
+    .machine-hover-head span { flex:0 0 auto; color:var(--ui-muted); font-size:.56rem; line-height:1; font-weight:850; }
     .machine-hover-counters { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:4px; }
-    .machine-hover-counter { min-width:0; min-height:42px; padding:5px 2px; border:1px solid #dbe5f0; border-radius:7px; background:rgba(255,255,255,.88); text-align:center; box-shadow:0 3px 8px rgba(15,23,42,.035); display:flex; flex-direction:column; align-items:center; justify-content:center; }
-    .machine-hover-counter .k { display:flex; align-items:center; justify-content:center; min-height:16px; overflow:hidden; color:#94a3b8; font-size:.42rem; line-height:1.05; font-weight:950; text-transform:uppercase; white-space:normal; text-overflow:ellipsis; }
-    .machine-hover-counter .v { display:block; margin-top:3px; overflow:hidden; color:#0f172a; font-size:.82rem; line-height:1; font-weight:950; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-hover-counter { min-width:0; min-height:42px; padding:5px 2px; border:1px solid var(--ui-border); border-radius:7px; background:color-mix(in srgb, var(--ui-surface) 88%, transparent); text-align:center; box-shadow:0 3px 8px rgba(15,23,42,.035); display:flex; flex-direction:column; align-items:center; justify-content:center; }
+    .machine-hover-counter .k { display:flex; align-items:center; justify-content:center; min-height:16px; overflow:hidden; color:var(--ui-muted); font-size:.42rem; line-height:1.05; font-weight:950; text-transform:uppercase; white-space:normal; text-overflow:ellipsis; }
+    .machine-hover-counter .v { display:block; margin-top:3px; overflow:hidden; color:var(--ui-text); font-size:.82rem; line-height:1; font-weight:950; white-space:nowrap; text-overflow:ellipsis; }
     .machine-hover-counter.good .v, .machine-hover-counter.total .v { color:#059669; }
     .machine-hover-counter.butal .v { color:#d97706; }
     .machine-hover-counter.reject .v { color:#dc2626; }
     .machine-hover-lines { display:grid; grid-template-columns:minmax(0,1fr); gap:2px; }
-    .machine-hover-line { min-width:0; display:flex; align-items:center; gap:5px; padding:2px 5px; border-radius:5px; background:#f8fafc; color:#64748b; font-size:.52rem; line-height:1.05; font-weight:850; }
-    .machine-hover-line .k { flex:0 0 auto; color:#94a3b8; text-transform:uppercase; }
-    .machine-hover-line .v { min-width:0; flex:1; overflow:hidden; color:#334155; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-hover-line { min-width:0; display:flex; align-items:center; gap:5px; padding:2px 5px; border-radius:5px; background:var(--ui-surface); color:var(--ui-muted); font-size:.52rem; line-height:1.05; font-weight:850; }
+    .machine-hover-line .k { flex:0 0 auto; color:var(--ui-muted); text-transform:uppercase; }
+    .machine-hover-line .v { min-width:0; flex:1; overflow:hidden; color:var(--ui-text); white-space:nowrap; text-overflow:ellipsis; }
     .machine-hover-info-row { min-width:0; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:5px; }
     .machine-linked-btn { display:flex; align-items:center; justify-content:flex-start; width:34px; height:34px; padding:0; border:0; border-radius:50%; cursor:pointer; position:relative; overflow:hidden; transition:width .48s cubic-bezier(.2,.72,.25,1), border-radius .48s ease, transform .12s ease; box-shadow:2px 2px 10px rgba(37,99,235,.24); background:rgb(37,99,235); pointer-events:auto; }
     .machine-linked-btn .sign { width:34px; min-width:34px; height:34px; transition:width .48s cubic-bezier(.2,.72,.25,1), padding-left .48s ease; display:flex; align-items:center; justify-content:center; }
     .machine-linked-btn .sign img { display:block; width:17px; height:17px; filter:brightness(0) invert(1); }
-    .machine-linked-btn .text { position:absolute; right:0; width:0; opacity:0; overflow:hidden; color:#fff; font-size:.60rem; line-height:1; font-weight:800; white-space:nowrap; transition:width .48s cubic-bezier(.2,.72,.25,1), opacity .38s ease .08s, padding-right .48s ease; }
+    .machine-linked-btn .text { position:absolute; right:0; width:0; opacity:0; overflow:hidden; color:var(--ui-on-accent); font-size:.60rem; line-height:1; font-weight:800; white-space:nowrap; transition:width .48s cubic-bezier(.2,.72,.25,1), opacity .38s ease .08s, padding-right .48s ease; }
     .machine-linked-btn:hover { width:108px; border-radius:40px; }
     .machine-linked-btn:hover .sign { width:31%; padding-left:7px; }
     .machine-linked-btn:hover .text { width:69%; opacity:1; padding-right:7px; }
     .machine-linked-btn:active { transform:translate(2px,2px); }
     #machinesTab #machineGrid .machine-linked-btn,
-    #machinesTab #additionalMachineGrid .machine-linked-btn { padding:0 !important; border:0 !important; border-radius:50% !important; background:#2563eb !important; color:#fff !important; box-shadow:2px 2px 10px rgba(37,99,235,.24) !important; }
+    #machinesTab #additionalMachineGrid .machine-linked-btn,
+    #machinesTab #mixingMachineGrid .machine-linked-btn { padding:0 !important; border:0 !important; border-radius:50% !important; background:var(--ui-accent) !important; color:var(--ui-on-accent) !important; box-shadow:2px 2px 10px rgba(37,99,235,.24) !important; }
     #machinesTab #machineGrid .machine-linked-btn:hover,
-    #machinesTab #additionalMachineGrid .machine-linked-btn:hover { width:108px; border-radius:40px !important; background:#1d4ed8 !important; }
-    .machine-job-estimate { align-self:end; display:grid; gap:4px; padding-top:5px; border-top:1px solid #e8eef5; }
-    .machine-job-estimate-head { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:7px; color:#64748b; font-size:.52rem; line-height:1; font-weight:900; }
+    #machinesTab #additionalMachineGrid .machine-linked-btn:hover,
+    #machinesTab #mixingMachineGrid .machine-linked-btn:hover { width:108px; border-radius:40px !important; background:var(--ui-accent) !important; }
+    .machine-job-estimate { align-self:end; display:grid; gap:4px; padding-top:5px; border-top:1px solid var(--ui-border); }
+    .machine-job-estimate-head { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:7px; color:var(--ui-muted); font-size:.52rem; line-height:1; font-weight:900; }
     .machine-job-estimate-head span { min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-    .machine-job-estimate-head strong { flex:0 0 auto; color:#0f64bd; font-size:.61rem; }
-    .machine-job-estimate-track { height:7px; overflow:hidden; border-radius:999px; background:#dfe8f2; }
-    .machine-job-estimate-fill { display:block; height:100%; border-radius:inherit; background:linear-gradient(90deg,#0ea5e9,#2563eb); transition:width .35s ease; }
-    .machine-job-estimate-caption { min-width:0; overflow:hidden; color:#64748b; font-size:.49rem; line-height:1.15; font-weight:800; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-job-estimate-head strong { flex:0 0 auto; color:var(--ui-link); font-size:.61rem; }
+    .machine-job-estimate-track { height:7px; overflow:hidden; border-radius:999px; background:var(--ui-subtle); }
+    .machine-job-estimate-fill { display:block; height:100%; border-radius:inherit; background:linear-gradient(90deg,#0ea5e9,var(--ui-accent)); transition:width .35s ease; }
+    .machine-job-estimate-caption { min-width:0; overflow:hidden; color:var(--ui-muted); font-size:.49rem; line-height:1.15; font-weight:800; white-space:nowrap; text-overflow:ellipsis; }
     .machine-card-head { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px; align-items:center; }
     .machine-card-title { min-width:0; display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
-    #machineGrid .card .machine-card-title h3 { margin:0; padding:0; border:0; color:#1e293b; font-size:.90rem; line-height:1.15; letter-spacing:.01em; }
-    .machine-supervisor-rotation { display:inline-flex; align-items:center; gap:4px; border:1px solid #86efac; border-radius:999px; padding:2px 6px; background:#ecfdf5; color:#047857; font-size:.52rem; line-height:1; font-weight:950; white-space:nowrap; box-shadow:0 2px 7px rgba(22,163,74,.12); }
+    #machineGrid .card .machine-card-title h3 { margin:0; padding:0; border:0; color:var(--ui-text); font-size:.90rem; line-height:1.15; letter-spacing:.01em; }
+    .machine-supervisor-rotation { display:inline-flex; align-items:center; gap:4px; border:1px solid #86efac; border-radius:999px; padding:2px 6px; background:var(--ui-subtle); color:#047857; font-size:.52rem; line-height:1; font-weight:950; white-space:nowrap; box-shadow:0 2px 7px rgba(22,163,74,.12); }
     .machine-supervisor-rotation-dot { width:7px; height:7px; border-radius:999px; background:#22c55e; box-shadow:0 0 0 2px rgba(34,197,94,.14); }
     .machine-card-alert-pill { display:inline-flex; width:max-content; max-width:100%; border:1px solid transparent; border-radius:999px; padding:3px 6px; font-size:.48rem; line-height:1; font-weight:950; letter-spacing:.035em; text-transform:uppercase; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .machine-card-alert-pill.secondary { padding:2px 5px; opacity:.72; filter:saturate(.72); }
     .machine-card-alert-pill.primary { box-shadow:0 2px 7px rgba(15,23,42,.10); }
     .machine-card-alert-pill.maintenance { border-color:#fb923c; background:#ffedd5; color:#9a3412; }
     .machine-card-alert-pill.supervisor { border-color:#f97316; background:linear-gradient(90deg,#fee2e2,#ffedd5); color:#991b1b; }
-    .machine-card-alert-pill.parts { border-color:#b91c1c; background:#dc2626; color:#fff; }
+    .machine-card-alert-pill.parts { border-color:#b91c1c; background:#dc2626; color:var(--ui-on-accent); }
     .machine-card-code { display:none; }
     .machine-card-status-stack { display:flex; flex-direction:column; align-items:flex-end; justify-content:center; gap:3px; }
     .machine-hover-head-actions { flex:0 0 auto; display:flex; align-items:center; gap:5px; }
-    .machine-tonnage { color:#64748b; font-size:.62rem; line-height:1; font-weight:850; letter-spacing:.015em; white-space:nowrap; }
-    .machine-status-badge { flex:0 0 auto; display:inline-flex; align-items:center; gap:5px; border-radius:6px; padding:5px 7px; font-size:.56rem; line-height:1; font-weight:950; letter-spacing:.04em; text-transform:uppercase; background:#f1f5f9; color:#475569; border:1px solid #e2e8f0; box-shadow:0 3px 10px rgba(15,23,42,.06); }
+    .machine-tonnage { color:var(--ui-muted); font-size:.62rem; line-height:1; font-weight:850; letter-spacing:.015em; white-space:nowrap; }
+    .machine-uptime { color:var(--ui-success); font-size:.65rem; line-height:1.2; font-weight:800; white-space:nowrap; font-variant-numeric:tabular-nums; }
+    .machine-time-btn { position:static; flex:0 0 auto; height:24px; display:inline-flex; align-items:center; gap:5px; padding:0 8px; border:1px solid var(--ui-accent); border-radius:999px; background:var(--ui-subtle); color:var(--ui-link); font:900 .50rem/1 "Poppins",sans-serif; letter-spacing:.02em; cursor:pointer; box-shadow:0 4px 10px rgba(37,99,235,.14); pointer-events:auto; }
+    .machine-time-btn:hover { border-color:var(--ui-accent); background:var(--ui-subtle); }
+    .machine-time-btn .clock { width:12px; height:12px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+    .machine-hover-head .machine-time-btn span { color:inherit; font-size:inherit; font-weight:inherit; }
+    #machineTimeOverlay { display:flex; visibility:hidden; opacity:0; pointer-events:none; transition:opacity .24s ease,visibility 0s linear .32s; }
+    #machineTimeOverlay.active { visibility:visible; opacity:1; pointer-events:auto; transition-delay:0s; }
+    .overlay-card.machine-time-card { width:min(520px,calc(100vw - 28px)); border-radius:20px; background:var(--ui-surface); opacity:0; transform:translateY(18px) scale(.965); transition:opacity .22s ease,transform .32s cubic-bezier(.2,.8,.2,1); }
+    #machineTimeOverlay.active .machine-time-card { opacity:1; transform:translateY(0) scale(1); }
+    .machine-time-body { display:grid; gap:18px; padding:22px; }
+    .machine-time-machine { color:#0f2a68; font-size:1.05rem; font-weight:950; }
+    .machine-time-note { color:var(--ui-muted); font-size:.72rem; line-height:1.5; }
+    .machine-time-metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .machine-time-metric { min-width:0; display:grid; gap:8px; padding:18px 14px; border:1px solid var(--ui-border); border-radius:14px; background:var(--ui-surface); text-align:center; box-shadow:0 8px 20px rgba(15,23,42,.06); }
+    .machine-time-metric .k { color:var(--ui-muted); font-size:.62rem; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
+    .machine-time-metric .v { color:var(--ui-text); font-size:1.35rem; line-height:1; font-weight:950; font-variant-numeric:tabular-nums; }
+    .machine-time-metric.total .v { color:var(--ui-link); }
+    .machine-time-metric.utilized .v { color:#15803d; }
+    .machine-time-metric.downtime .v { color:#c2410c; }
+    .machine-time-metric.rpi .v { color:#7c3aed; font-size:1rem; line-height:1.2; }
+    .machine-time-equation { padding:11px 13px; border-radius:10px; background:var(--ui-subtle); color:var(--ui-text); font-size:.72rem; line-height:1.4; font-weight:800; text-align:center; }
+    @media (max-width:460px){ .machine-time-metrics { grid-template-columns:1fr; } }
+    @media (prefers-reduced-motion:reduce){ #machineTimeOverlay,.machine-time-card { transition:none; } }
+    .machine-status-badge { flex:0 0 auto; display:inline-flex; align-items:center; gap:5px; border-radius:6px; padding:5px 7px; font-size:.56rem; line-height:1; font-weight:950; letter-spacing:.04em; text-transform:uppercase; background:var(--ui-subtle); color:var(--ui-muted); border:1px solid var(--ui-border); box-shadow:0 3px 10px rgba(15,23,42,.06); }
     .machine-status-badge::before { content:""; flex:0 0 auto; width:6px; height:6px; border-radius:999px; background:#94a3b8; box-shadow:none; }
     .machine-status-badge.active { background:#dcfce7; color:#047857; border-color:#86efac; }
-    .machine-status-badge.inactive { background:#f1f5f9; color:#64748b; border-color:#cbd5e1; }
-    .machine-status-badge.disconnected { background:#fef2f2; color:#b91c1c; border-color:#fecaca; }
+    .machine-status-badge.inactive { background:var(--ui-subtle); color:var(--ui-muted); border-color:var(--ui-border); }
+    .machine-status-badge.disconnected { background:var(--ui-subtle); color:#b91c1c; border-color:#fecaca; }
     .machine-status-badge.maintenance { background:#ffedd5; color:#b45309; border-color:#fed7aa; }
     .machine-status-badge.active::before { background:#22c55e; animation:none; }
     .machine-status-badge.inactive::before { background:#94a3b8; animation:none; }
@@ -7906,50 +9486,50 @@ DASHBOARD_HTML = r"""
     .machine-status-badge.maintenance::before { background:#f59e0b; animation:none; }
     .machine-compact-meta { min-width:0; display:grid; gap:3px; }
     .machine-compact-row { min-width:0; display:grid; gap:1px; }
-    .machine-compact-row .k { color:#94a3b8; font-size:.55rem; line-height:1; font-weight:850; }
-    .machine-compact-row .v { min-width:0; color:#334155; font-size:.67rem; line-height:1.2; font-weight:850; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .machine-last-action { min-height:28px; padding-top:5px; border-top:1px solid #eef2f7; color:#64748b; font-size:.61rem; line-height:1.3; font-weight:750; overflow:hidden; overflow-wrap:anywhere; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
-    .machine-compact-bottom { align-self:end; margin-top:auto; padding-top:5px; border-top:1px solid #eef2f7; }
+    .machine-compact-row .k { color:var(--ui-muted); font-size:.55rem; line-height:1; font-weight:850; }
+    .machine-compact-row .v { min-width:0; color:var(--ui-text); font-size:.67rem; line-height:1.2; font-weight:850; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .machine-last-action { min-height:28px; padding-top:5px; border-top:1px solid var(--ui-border); color:var(--ui-muted); font-size:.61rem; line-height:1.3; font-weight:750; overflow:hidden; overflow-wrap:anywhere; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
+    .machine-compact-bottom { align-self:end; margin-top:auto; padding-top:5px; border-top:1px solid var(--ui-border); }
     .machine-progress-row { display:grid; gap:5px; color:#16a34a; font-size:.56rem; font-weight:950; }
     .machine-progress-summary { min-width:0; display:flex; align-items:center; justify-content:space-between; gap:8px; }
-    .machine-progress-count { min-width:0; overflow:hidden; color:#64748b; font-size:.61rem; line-height:1; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-progress-count { min-width:0; overflow:hidden; color:var(--ui-muted); font-size:.61rem; line-height:1; white-space:nowrap; text-overflow:ellipsis; }
     .machine-progress-row strong { flex:0 0 auto; font-size:.76rem; line-height:1; text-align:right; }
-    .machine-progress-track { height:6px; overflow:hidden; border-radius:999px; background:#e9eef5; }
+    .machine-progress-track { height:6px; overflow:hidden; border-radius:999px; background:var(--ui-subtle); }
     .machine-progress-fill { display:block; width:0; height:100%; border-radius:inherit; background:linear-gradient(90deg,#22c55e,#16a34a); transition:width .25s ease; }
     .machine-progress-row.disconnected { color:#ef4444; }
     .machine-progress-row.disconnected .machine-progress-fill { background:#ef4444; }
-    .machine-progress-row.inactive { color:#64748b; }
+    .machine-progress-row.inactive { color:var(--ui-muted); }
     .machine-progress-row.inactive .machine-progress-fill { background:#94a3b8; }
-    .machine-offline-note { display:flex; align-items:center; justify-content:center; gap:6px; min-height:25px; border:1px solid #fecaca; border-radius:7px; background:#fef2f2; color:#b91c1c; font-size:.62rem; line-height:1; font-weight:950; text-transform:uppercase; letter-spacing:.03em; }
+    .machine-offline-note { display:flex; align-items:center; justify-content:center; gap:6px; min-height:25px; border:1px solid #fecaca; border-radius:7px; background:var(--ui-subtle); color:#b91c1c; font-size:.62rem; line-height:1; font-weight:950; text-transform:uppercase; letter-spacing:.03em; }
     .machine-offline-note .offline-icon { font-size:.82rem; }
-    .machine-compact-duration { display:flex; align-items:center; gap:8px; min-height:32px; padding:7px 9px; border:1px solid #ffedd5; border-radius:7px; background:#fffdfa; color:#f97316; font-size:.72rem; line-height:1.1; font-weight:950; }
-    .machine-compact-duration .clock { font-size:.92rem; }
-    .machine-no-schedule-overlay { position:absolute; inset:0; z-index:7; overflow:hidden; border-radius:inherit; background:#fff; pointer-events:auto; isolation:isolate; }
-    .machine-no-schedule-caption { position:absolute; z-index:2; left:10px; right:10px; top:9px; display:flex; align-items:center; justify-content:space-between; gap:8px; color:#334155; }
+    .machine-compact-duration { display:flex; align-items:center; gap:8px; min-height:32px; padding:7px 9px; border:1px solid #ffedd5; border-radius:7px; background:var(--ui-surface); color:#f97316; font-size:.72rem; line-height:1.1; font-weight:950; }
+    .machine-compact-duration .clock { width:15px; height:15px; flex:0 0 15px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+    .machine-no-schedule-overlay { position:absolute; inset:0; z-index:7; overflow:hidden; border-radius:inherit; background:var(--ui-surface); pointer-events:auto; isolation:isolate; }
+    .machine-no-schedule-caption { position:absolute; z-index:2; left:10px; right:10px; top:9px; display:flex; align-items:center; justify-content:space-between; gap:8px; color:var(--ui-text); }
     .machine-no-schedule-caption strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.74rem; font-weight:950; }
-    .machine-no-schedule-caption span { flex:0 0 auto; border:1px solid #fed7aa; border-radius:6px; padding:4px 6px; background:#fff7ed; color:#c2410c; font-size:.50rem; line-height:1; font-weight:950; letter-spacing:.035em; }
+    .machine-no-schedule-caption span { flex:0 0 auto; border:1px solid #fed7aa; border-radius:6px; padding:4px 6px; background:var(--ui-subtle); color:#c2410c; font-size:.50rem; line-height:1; font-weight:950; letter-spacing:.035em; }
     .machine-no-schedule-stage { position:absolute; left:50%; bottom:-5px; width:114px; height:171px; margin-left:-57px; transform-origin:50% 100%; transition:transform .08s linear; will-change:transform; }
-    .machine-no-schedule-image { display:block; width:100%; height:100%; object-fit:contain; background:#fff; filter:brightness(1.035) contrast(1.025); mix-blend-mode:multiply; user-select:none; -webkit-user-drag:none; }
-    .machine-no-schedule-symbol { position:absolute; z-index:3; right:-5px; top:4px; display:none; min-width:30px; text-align:center; font-size:1.45rem; line-height:1; font-weight:950; text-shadow:0 2px 4px rgba(255,255,255,.95); }
+    .machine-no-schedule-image { display:block; width:100%; height:100%; object-fit:contain; background:var(--ui-surface); filter:brightness(1.035) contrast(1.025); mix-blend-mode:multiply; user-select:none; -webkit-user-drag:none; }
+    .machine-no-schedule-symbol { position:absolute; z-index:3; right:-5px; top:4px; display:none; min-width:30px; text-align:center; font-size:1.45rem; line-height:1; font-weight:950; text-shadow:0 2px 4px color-mix(in srgb, var(--ui-surface) 95%, transparent); }
     .machine-no-schedule-overlay.waiting .machine-no-schedule-symbol.question { display:block; color:#f59e0b; animation:machineNoScheduleQuestion .8s ease-in-out infinite; }
-    .machine-no-schedule-overlay.sleeping .machine-no-schedule-symbol.sleep { display:block; color:#2563eb; font-size:1.05rem; letter-spacing:.12em; animation:machineNoScheduleSleep 1.2s ease-in-out infinite; }
+    .machine-no-schedule-overlay.sleeping .machine-no-schedule-symbol.sleep { display:block; color:var(--ui-link); font-size:1.05rem; letter-spacing:.12em; animation:machineNoScheduleSleep 1.2s ease-in-out infinite; }
     .machine-no-schedule-overlay.finishing { opacity:0; transition:opacity .45s ease; }
     .machine-no-schedule-overlay.hover-fading, .machine-pack-overlay.hover-fading { opacity:0; transition:opacity .35s ease; }
     .machine-no-schedule-overlay.snoring .machine-no-schedule-image { transform-origin:50% 72%; animation:machineNoScheduleBreathe 1.45s ease-in-out infinite; }
     @keyframes machineNoScheduleQuestion { 0%,100% { transform:translateY(0) rotate(-5deg); } 50% { transform:translateY(-4px) rotate(5deg); } }
     @keyframes machineNoScheduleSleep { 0%,100% { transform:translate(0,2px) scale(.92) scaleX(1.18); opacity:.62; } 50% { transform:translate(4px,-5px) scale(1.08) scaleX(1.30); opacity:1; } }
     @keyframes machineNoScheduleBreathe { 0%,100% { transform:scaleX(1) scaleY(1); } 50% { transform:scaleX(1.018) scaleY(.985) translateY(1px); } }
-    .machine-pack-overlay { position:absolute; inset:0; z-index:8; display:grid; place-items:center; overflow:hidden; border-radius:inherit; background:linear-gradient(145deg,#ffffff 0%,#f8fafc 100%); cursor:default; isolation:isolate; }
+    .machine-pack-overlay { position:absolute; inset:0; z-index:8; display:grid; place-items:center; overflow:hidden; border-radius:inherit; background:linear-gradient(145deg,var(--ui-surface) 0%,var(--ui-surface) 100%); cursor:default; isolation:isolate; }
     .machine-pack-stage { position:relative; width:calc(100% - 14px); aspect-ratio:2321 / 715; transform-origin:center; }
     .machine-pack-image { display:block; width:100%; height:100%; object-fit:contain; user-select:none; -webkit-user-drag:none; }
-    .machine-pack-signal { position:absolute; left:6%; top:-3%; width:5px; height:10px; transform:translateX(-50%); border:1px solid rgba(51,65,85,.70); border-radius:1px; background:rgba(203,213,225,.72); box-shadow:0 0 0 1px rgba(255,255,255,.45); }
+    .machine-pack-signal { position:absolute; left:6%; top:-3%; width:5px; height:10px; transform:translateX(-50%); border:1px solid rgba(51,65,85,.70); border-radius:1px; background:rgba(203,213,225,.72); box-shadow:0 0 0 1px color-mix(in srgb, var(--ui-surface) 45%, transparent); }
     .machine-pack-signal::after { content:""; position:absolute; left:2px; top:100%; width:1px; height:9px; background:#475569; }
     .machine-pack-signal span { position:absolute; left:0; width:3px; height:3px; border-radius:1px; }
     .machine-pack-signal .red { top:1px; background:#a83232; }
     .machine-pack-signal .green { bottom:1px; background:#22c55e; animation:machinePackLight .52s steps(1,end) infinite; }
     .machine-pack-smoke { position:absolute; left:41%; top:48%; width:1px; height:1px; opacity:0; pointer-events:none; }
     .machine-pack-overlay.pressing .machine-pack-smoke { opacity:1; }
-    .machine-pack-smoke i { --smoke-size:12px; --smoke-y:-12px; --smoke-delay:0ms; position:absolute; left:0; top:0; width:var(--smoke-size); height:calc(var(--smoke-size) * .72); margin:calc(var(--smoke-size) * -.5); border-radius:50%; opacity:0; filter:blur(1.4px); background:radial-gradient(ellipse at center,rgba(255,255,255,.92) 0%,rgba(226,232,240,.68) 45%,rgba(203,213,225,0) 100%); animation:machinePackSmokeRight .9s ease-out var(--smoke-delay) infinite; }
+    .machine-pack-smoke i { --smoke-size:12px; --smoke-y:-12px; --smoke-delay:0ms; position:absolute; left:0; top:0; width:var(--smoke-size); height:calc(var(--smoke-size) * .72); margin:calc(var(--smoke-size) * -.5); border-radius:50%; opacity:0; filter:blur(1.4px); background:radial-gradient(ellipse at center,color-mix(in srgb, var(--ui-surface) 92%, transparent) 0%,color-mix(in srgb, var(--ui-subtle) 68%, transparent) 45%,rgba(203,213,225,0) 100%); animation:machinePackSmokeRight .9s ease-out var(--smoke-delay) infinite; }
     .machine-pack-smoke.left i { animation-name:machinePackSmokeLeft; }
     .machine-pack-overlay.pressing .machine-pack-stage { animation:machinePackShake .08s linear infinite; }
     @keyframes machinePackLight { 0%,48% { opacity:1; box-shadow:0 0 5px 3px rgba(34,197,94,.76); } 49%,100% { opacity:.24; box-shadow:none; } }
@@ -7961,28 +9541,30 @@ DASHBOARD_HTML = r"""
       .machine-no-schedule-symbol { animation:none !important; }
       .machine-no-schedule-overlay.snoring .machine-no-schedule-image { animation:none; }
     }
-    .machine-job-block { padding:0 0 9px; border-bottom:1px solid #edf2f7; }
-    .machine-job-name { color:#0f172a; font-size:1rem; line-height:1.3; font-weight:900; overflow-wrap:anywhere; }
-    .machine-job-meta { margin-top:5px; display:grid; grid-template-columns:1fr 1fr; gap:4px 10px; color:#64748b; font-size:.86rem; line-height:1.3; }
+    .machine-job-block { padding:0 0 9px; border-bottom:1px solid var(--ui-border); }
+    .machine-job-name { color:var(--ui-text); font-size:1rem; line-height:1.3; font-weight:900; overflow-wrap:anywhere; }
+    .machine-job-meta { margin-top:5px; display:grid; grid-template-columns:1fr 1fr; gap:4px 10px; color:var(--ui-muted); font-size:.86rem; line-height:1.3; }
     .machine-job-meta span { min-width:0; overflow-wrap:anywhere; }
     #machineGrid .card.linkage-fade-out .machine-card-face-hover,
-    #additionalMachineGrid .card.linkage-fade-out .machine-card-face-hover { animation:linkageJobFadeOut .72s ease-in forwards; }
+    #additionalMachineGrid .card.linkage-fade-out .machine-card-face-hover,
+    #mixingMachineGrid .card.linkage-fade-out .machine-card-face-hover { animation:linkageJobFadeOut .72s ease-in forwards; }
     #machineGrid .card.linkage-slide-in .machine-card-face-hover,
-    #additionalMachineGrid .card.linkage-slide-in .machine-card-face-hover { animation:linkageJobSlideIn .78s cubic-bezier(.2,.72,.25,1) forwards; }
-    .machine-linkage-panel { display:grid; gap:7px; padding:9px 10px; border:1px solid #bfdbfe; border-radius:8px; background:#eff6ff; }
+    #additionalMachineGrid .card.linkage-slide-in .machine-card-face-hover,
+    #mixingMachineGrid .card.linkage-slide-in .machine-card-face-hover { animation:linkageJobSlideIn .78s cubic-bezier(.2,.72,.25,1) forwards; }
+    .machine-linkage-panel { display:grid; gap:7px; padding:9px 10px; border:1px solid var(--ui-accent-soft); border-radius:8px; background:var(--ui-subtle); }
     .machine-linkage-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-    .machine-linkage-label { color:#1d4ed8; font-size:.68rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
-    .machine-linkage-job { color:#0f172a; font-size:.92rem; line-height:1.2; font-weight:900; overflow-wrap:anywhere; }
-    .machine-linkage-switch { flex:0 0 auto; border:1px solid #93c5fd; border-radius:7px; background:#fff; color:#1d4ed8; padding:5px 8px; font-size:.68rem; line-height:1; font-weight:900; letter-spacing:0; cursor:pointer; transition:transform .12s ease, box-shadow .14s ease, background-color .14s ease; }
-    .machine-linkage-switch:hover { transform:translateY(-1px); box-shadow:0 6px 14px rgba(37,99,235,.14); background:#f8fbff; }
+    .machine-linkage-label { color:var(--ui-link); font-size:.68rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
+    .machine-linkage-job { color:var(--ui-text); font-size:.92rem; line-height:1.2; font-weight:900; overflow-wrap:anywhere; }
+    .machine-linkage-switch { flex:0 0 auto; border:1px solid var(--ui-accent); border-radius:7px; background:var(--ui-surface); color:var(--ui-link); padding:5px 8px; font-size:.68rem; line-height:1; font-weight:900; letter-spacing:0; cursor:pointer; transition:transform .12s ease, box-shadow .14s ease, background-color .14s ease; }
+    .machine-linkage-switch:hover { transform:translateY(-1px); box-shadow:0 6px 14px rgba(37,99,235,.14); background:var(--ui-surface); }
     .machine-linkage-switch:active { transform:translateY(0) scale(.98); }
     .machine-metrics { display:flex; flex-wrap:wrap; gap:6px; }
-    .machine-metric { min-width:64px; flex:1 1 64px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; padding:6px 8px; }
-    .machine-metric .k { color:#64748b; font-size:.72rem; font-weight:900; text-transform:uppercase; letter-spacing:.04em; }
-    .machine-metric .v { margin-top:3px; color:#0f172a; font-size:1.08rem; line-height:1; font-weight:900; overflow-wrap:anywhere; }
+    .machine-metric { min-width:64px; flex:1 1 64px; border:1px solid var(--ui-border); border-radius:8px; background:var(--ui-surface); padding:6px 8px; }
+    .machine-metric .k { color:var(--ui-muted); font-size:.72rem; font-weight:900; text-transform:uppercase; letter-spacing:.04em; }
+    .machine-metric .v { margin-top:3px; color:var(--ui-text); font-size:1.08rem; line-height:1; font-weight:900; overflow-wrap:anywhere; }
     .machine-metric.good .v { color:#047857; }
     .machine-metric.bad .v { color:#b91c1c; }
-    .machine-card-foot { margin-top:0; padding-top:8px; border-top:1px solid #edf2f7; color:#64748b; font-size:.8rem; line-height:1.4; display:grid; gap:2px; }
+    .machine-card-foot { margin-top:0; padding-top:8px; border-top:1px solid var(--ui-border); color:var(--ui-muted); font-size:.8rem; line-height:1.4; display:grid; gap:2px; }
     .machine-status-flashcard { display:grid; gap:12px; min-height:100%; }
     .machine-status-flash-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
     .machine-status-flash-title { min-width:0; display:grid; gap:4px; }
@@ -7990,155 +9572,155 @@ DASHBOARD_HTML = r"""
     #machineGrid .card .machine-status-flash-title h3 { margin:0; padding:0; border:0; color:#7c2d12; font-size:1.24rem; line-height:1.1; overflow-wrap:anywhere; }
     .machine-status-flash-chip { flex:0 0 auto; border:1px solid #fb923c; background:#ffedd5; color:#9a3412; border-radius:7px; padding:7px 9px; font-size:.72rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
     .machine-status-flash-grid { display:grid; gap:8px; }
-    .machine-status-flash-item { border:1px solid #fed7aa; border-radius:8px; background:rgba(255,255,255,.78); padding:9px 10px; }
+    .machine-status-flash-item { border:1px solid #fed7aa; border-radius:8px; background:color-mix(in srgb, var(--ui-surface) 78%, transparent); padding:9px 10px; }
     .machine-status-flash-item .k { color:#9a3412; font-size:.72rem; line-height:1; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }
-    .machine-status-flash-item .v { margin-top:5px; color:#0f172a; font-size:.95rem; line-height:1.25; font-weight:900; overflow-wrap:anywhere; }
+    .machine-status-flash-item .v { margin-top:5px; color:var(--ui-text); font-size:.95rem; line-height:1.25; font-weight:900; overflow-wrap:anywhere; }
     .machine-status-flash-item .sub { margin-top:4px; color:#7c2d12; font-size:.84rem; line-height:1.3; overflow-wrap:anywhere; }
-    #machineGrid .machine-linkage-flag, #additionalMachineGrid .machine-linkage-flag { display:inline-flex; align-items:center; gap:8px; border:1px solid #bfdbfe; background:#eff6ff; color:#1d4ed8; border-radius:6px; padding:5px 6px 5px 8px; font-size:.64rem; font-weight:900; letter-spacing:.04em; width:max-content; max-width:100%; }
+    #machineGrid .machine-linkage-flag, #additionalMachineGrid .machine-linkage-flag, #mixingMachineGrid .machine-linkage-flag { display:inline-flex; align-items:center; gap:8px; border:1px solid var(--ui-accent-soft); background:var(--ui-subtle); color:var(--ui-link); border-radius:6px; padding:5px 6px 5px 8px; font-size:.64rem; font-weight:900; letter-spacing:.04em; width:max-content; max-width:100%; }
     .machine-notif-wrap { position:absolute; right:12px; bottom:12px; z-index:4; }
-    .machine-notif-badge { width:30px; height:30px; border-radius:999px; border:1px solid #fdba74; background:#f59e0b; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:900; font-size:.78rem; box-shadow:0 0 0 3px rgba(245,158,11,.14), 0 8px 18px rgba(146,64,14,.20); cursor:help; }
-    .panel { margin-top: 14px; background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .machine-notif-badge { width:30px; height:30px; border-radius:999px; border:1px solid #fdba74; background:#f59e0b; color:var(--ui-on-accent); display:flex; align-items:center; justify-content:center; font-weight:900; font-size:.78rem; box-shadow:0 0 0 3px rgba(245,158,11,.14), 0 8px 18px rgba(146,64,14,.20); cursor:help; }
+    .panel { margin-top: 14px; background: var(--ui-surface); border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
     .panel h3 { margin: 0 0 6px; }
-    .muted { color: #666; font-size: 0.9rem; }
-    .placeholder { border: 1px dashed #d9d9d9; border-radius: 10px; padding: 14px; color: #777; background: #fafafa; margin-top: 12px; }
-    .table-wrap { margin-top: 12px; border: 1px solid #dbe4f0; border-radius: 12px; overflow: auto; background: #fff; }
+    .muted { color: var(--ui-muted); font-size: 0.9rem; }
+    .placeholder { border: 1px dashed var(--ui-border); border-radius: 10px; padding: 14px; color: var(--ui-muted); background: var(--ui-surface); margin-top: 12px; }
+    .table-wrap { margin-top: 12px; border: 1px solid var(--ui-border); border-radius: 12px; overflow: auto; background: var(--ui-surface); }
     .data-table { width: 100%; border-collapse: collapse; min-width: 920px; }
-    .data-table th, .data-table td { padding: 10px 12px; border-bottom: 1px solid #edf2f7; text-align: left; font-size: 0.86rem; vertical-align: top; }
-    .data-table th { background: #f8fafc; color: #334155; font-weight: 700; position: sticky; top: 0; z-index: 1; }
-    .data-table tr:hover td { background: #f8fbff; }
-    .maintenance-shell { position:relative; overflow:hidden; background:linear-gradient(180deg, rgba(255,255,255,.98), rgba(246,248,252,.98)); border:1px solid #d8e2ef; border-radius:18px; padding:12px 12px 8px; }
+    .data-table th, .data-table td { padding: 10px 12px; border-bottom: 1px solid var(--ui-border); text-align: left; font-size: 0.86rem; vertical-align: top; }
+    .data-table th { background: var(--ui-surface); color: var(--ui-text); font-weight: 700; position: sticky; top: 0; z-index: 1; }
+    .data-table tr:hover td { background: var(--ui-surface); }
+    .maintenance-shell { position:relative; overflow:hidden; background:linear-gradient(180deg, color-mix(in srgb, var(--ui-surface) 98%, transparent), color-mix(in srgb, var(--ui-subtle) 98%, transparent)); border:1px solid var(--ui-border); border-radius:18px; padding:12px 12px 8px; }
     .maintenance-shell::before { content:""; position:absolute; inset:0; pointer-events:none; opacity:.22; background:linear-gradient(135deg, transparent 0 83%, rgba(148,163,184,.18) 83% 84%, transparent 84% 100%), radial-gradient(circle at 90% 16%, rgba(148,163,184,.28) 0 2px, transparent 2.5px), radial-gradient(circle at 84% 28%, rgba(148,163,184,.22) 0 3px, transparent 3.5px), radial-gradient(circle at 93% 36%, rgba(148,163,184,.18) 0 2px, transparent 2.5px); }
     .maintenance-topbar { position:relative; z-index:1; display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
     .maintenance-topbar h3 { margin:0; font-size:1.02rem; line-height:1.1; }
-    .maintenance-date { font-size:.83rem; color:#334155; white-space:nowrap; text-align:right; }
+    .maintenance-date { font-size:.83rem; color:var(--ui-text); white-space:nowrap; text-align:right; }
     .maintenance-summary { position:relative; z-index:1; display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:12px; margin-top:12px; }
-    .maintenance-metric { display:flex; align-items:center; gap:12px; min-height:86px; border:1px solid #cdd8e7; border-radius:12px; padding:14px 16px; box-shadow: inset 0 1px 0 rgba(255,255,255,.7); }
-    .maintenance-metric.blue { background:linear-gradient(180deg, #e7f1fb, #dbeafe); }
-    .maintenance-metric.green { background:linear-gradient(180deg, #e8f8eb, #dcfce7); }
+    .maintenance-metric { display:flex; align-items:center; gap:12px; min-height:86px; border:1px solid var(--ui-border); border-radius:12px; padding:14px 16px; box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ui-surface) 70%, transparent); }
+    .maintenance-metric.blue { background:linear-gradient(180deg, var(--ui-subtle), var(--ui-subtle)); }
+    .maintenance-metric.green { background:linear-gradient(180deg, var(--ui-subtle), #dcfce7); }
     .maintenance-metric.amber { background:linear-gradient(180deg, #fff4e5, #ffedd5); }
-    .maintenance-metric.red { background:linear-gradient(180deg, #feeaea, #fee2e2); }
-    .maintenance-metric .icon { width:34px; height:34px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:700; background:rgba(255,255,255,.5); color:#1e293b; flex:0 0 auto; }
-    .maintenance-metric .k { font-size:.9rem; color:#0f172a; font-weight:700; }
-    .maintenance-metric .v { font-size:1.95rem; line-height:1; font-weight:800; color:#0f172a; margin-top:2px; }
-    .maintenance-metric .s { font-size:.83rem; color:#334155; margin-top:2px; }
+    .maintenance-metric.red { background:linear-gradient(180deg, var(--ui-subtle), #fee2e2); }
+    .maintenance-metric .icon { width:34px; height:34px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; font-weight:700; background:color-mix(in srgb, var(--ui-surface) 50%, transparent); color:var(--ui-text); flex:0 0 auto; }
+    .maintenance-metric .k { font-size:.9rem; color:var(--ui-text); font-weight:700; }
+    .maintenance-metric .v { font-size:1.95rem; line-height:1; font-weight:800; color:var(--ui-text); margin-top:2px; }
+    .maintenance-metric .s { font-size:.83rem; color:var(--ui-text); margin-top:2px; }
     .maintenance-live-grid { position:relative; z-index:1; display:grid; grid-template-columns: 1fr; gap:10px; margin-top:12px; }
     .maintenance-section-title { margin:0; font-size:1rem; line-height:1.1; }
     .maintenance-list { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:12px; }
-    .maintenance-person { display:grid; grid-template-columns: 96px minmax(0, 1.2fr) minmax(160px, .9fr); border:1px solid #d5deea; border-radius:12px; background:rgba(255,255,255,.94); overflow:hidden; box-shadow:0 8px 18px rgba(15,23,42,.06); }
+    .maintenance-person { display:grid; grid-template-columns: 96px minmax(0, 1.2fr) minmax(160px, .9fr); border:1px solid var(--ui-border); border-radius:12px; background:color-mix(in srgb, var(--ui-surface) 94%, transparent); overflow:hidden; box-shadow:0 8px 18px rgba(15,23,42,.06); }
     .maintenance-person.busy { border-color:#ecc896; }
-    .maintenance-avatar-wrap { padding:10px; display:flex; align-items:center; justify-content:center; border-right:1px solid #e5ecf4; background:linear-gradient(180deg, #f8fafc, #eef2f7); }
-    .maintenance-avatar { width:78px; height:78px; border-radius:10px; background:radial-gradient(circle at 50% 34%, #cbd5e1 0 11px, transparent 12px), radial-gradient(circle at 50% 74%, #cbd5e1 0 24px, transparent 25px), linear-gradient(180deg, #f8fafc, #e2e8f0); border:1px solid #cbd5e1; box-shadow: inset 0 1px 0 rgba(255,255,255,.7); }
+    .maintenance-avatar-wrap { padding:10px; display:flex; align-items:center; justify-content:center; border-right:1px solid var(--ui-border); background:linear-gradient(180deg, var(--ui-surface), var(--ui-subtle)); }
+    .maintenance-avatar { width:78px; height:78px; border-radius:10px; background:radial-gradient(circle at 50% 34%, var(--ui-subtle) 0 11px, transparent 12px), radial-gradient(circle at 50% 74%, var(--ui-subtle) 0 24px, transparent 25px), linear-gradient(180deg, var(--ui-surface), var(--ui-subtle)); border:1px solid var(--ui-border); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ui-surface) 70%, transparent); }
     .maintenance-person-main { padding:10px 12px; min-width:0; }
     .maintenance-person-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
-    .maintenance-person .title { font-weight:800; color:#0f172a; font-size:1rem; }
-    .maintenance-person .meta { color:#111827; font-size:.85rem; line-height:1.3; }
-    .maintenance-person .submeta { color:#334155; font-size:.83rem; margin-top:6px; line-height:1.35; }
+    .maintenance-person .title { font-weight:800; color:var(--ui-text); font-size:1rem; }
+    .maintenance-person .meta { color:var(--ui-text); font-size:.85rem; line-height:1.3; }
+    .maintenance-person .submeta { color:var(--ui-text); font-size:.83rem; margin-top:6px; line-height:1.35; }
     .maintenance-badge { display:inline-flex; align-items:center; justify-content:center; min-width:86px; padding:4px 10px; border-radius:999px; font-size:.67rem; font-weight:800; letter-spacing:.03em; text-transform:uppercase; }
     .maintenance-badge.available { background:#dcfce7; color:#166534; }
     .maintenance-badge.busy { background:#ffedd5; color:#9a3412; }
     .maintenance-badge.waiting { background:#fee2e2; color:#b91c1c; }
     .maintenance-machine-grid { display:grid; grid-template-columns: 1fr; gap:6px; margin-top:8px; }
-    .maintenance-machine { display:grid; grid-template-columns:minmax(0, 1fr) auto; align-items:center; gap:8px; padding:6px 10px; border:1px solid #d7dee8; border-radius:9px; background:#f8fafc; }
-    .maintenance-machine.busy { background:#fff7ed; border-color:#fed7aa; }
-    .maintenance-machine.waiting { background:#f8fafc; }
-    .maintenance-machine-title { font-size:.84rem; color:#111827; }
-    .maintenance-machine-time { font-size:.82rem; color:#111827; white-space:nowrap; }
-    .maintenance-stats { padding:10px 12px; border-left:1px solid #e5ecf4; }
-    .maintenance-stats-title { font-size:.9rem; font-weight:700; color:#0f172a; margin-bottom:8px; }
-    .maintenance-stat-line { display:flex; align-items:center; gap:8px; font-size:.84rem; color:#111827; margin-bottom:7px; }
-    .maintenance-stat-icon { width:18px; text-align:center; color:#0f172a; font-size:.92rem; }
-    .maintenance-performance-panel { margin-top:10px; border-top:1px solid #dbe4f0; padding-top:10px; position:relative; z-index:1; }
+    .maintenance-machine { display:grid; grid-template-columns:minmax(0, 1fr) auto; align-items:center; gap:8px; padding:6px 10px; border:1px solid var(--ui-border); border-radius:9px; background:var(--ui-surface); }
+    .maintenance-machine.busy { background:var(--ui-subtle); border-color:#fed7aa; }
+    .maintenance-machine.waiting { background:var(--ui-surface); }
+    .maintenance-machine-title { font-size:.84rem; color:var(--ui-text); }
+    .maintenance-machine-time { font-size:.82rem; color:var(--ui-text); white-space:nowrap; }
+    .maintenance-stats { padding:10px 12px; border-left:1px solid var(--ui-border); }
+    .maintenance-stats-title { font-size:.9rem; font-weight:700; color:var(--ui-text); margin-bottom:8px; }
+    .maintenance-stat-line { display:flex; align-items:center; gap:8px; font-size:.84rem; color:var(--ui-text); margin-bottom:7px; }
+    .maintenance-stat-icon { width:18px; text-align:center; color:var(--ui-text); font-size:.92rem; }
+    .maintenance-performance-panel { margin-top:10px; border-top:1px solid var(--ui-border); padding-top:10px; position:relative; z-index:1; }
     .maintenance-performance-title { margin:0; font-size:1rem; line-height:1.1; }
-    .maintenance-performance-wrap { margin-top:10px; border:1px solid #dbe4f0; border-radius:0 0 12px 12px; overflow:auto; background:rgba(255,255,255,.92); }
+    .maintenance-performance-wrap { margin-top:10px; border:1px solid var(--ui-border); border-radius:0 0 12px 12px; overflow:auto; background:color-mix(in srgb, var(--ui-surface) 92%, transparent); }
     .maintenance-performance-wrap .data-table { min-width:760px; }
-    #maintenanceTab { background:#eef3f8; border-radius:18px; padding:14px; }
-    #maintenanceTab .maintenance-shell { position:relative; background:linear-gradient(180deg, #f8fbff 0%, #eef4fb 100%); border:1px solid #d4e0ec; border-radius:18px; padding:18px; box-shadow:0 18px 44px rgba(15,23,42,.10); }
+    #maintenanceTab { background:var(--ui-subtle); border-radius:18px; padding:14px; }
+    #maintenanceTab .maintenance-shell { position:relative; background:linear-gradient(180deg, var(--ui-surface) 0%, var(--ui-subtle) 100%); border:1px solid var(--ui-border); border-radius:18px; padding:18px; box-shadow:0 18px 44px rgba(15,23,42,.10); }
     #maintenanceTab .maintenance-shell::before { content:""; position:absolute; inset:0 0 auto 0; height:120px; pointer-events:none; opacity:1; background:linear-gradient(135deg, rgba(14,165,233,.14), rgba(16,185,129,.10) 48%, rgba(245,158,11,.10)); }
     #maintenanceTab .maintenance-topbar { align-items:center; padding:2px 2px 10px; border-bottom:1px solid rgba(148,163,184,.22); }
-    #maintenanceTab .maintenance-topbar h3 { font-size:1.28rem; font-weight:800; letter-spacing:0; color:#0f172a; }
-    #maintenanceTab .maintenance-date { padding:8px 12px; border:1px solid #d2deea; border-radius:999px; background:rgba(255,255,255,.78); color:#475569; box-shadow:0 6px 18px rgba(15,23,42,.06); }
+    #maintenanceTab .maintenance-topbar h3 { font-size:1.28rem; font-weight:800; letter-spacing:0; color:var(--ui-text); }
+    #maintenanceTab .maintenance-date { padding:8px 12px; border:1px solid var(--ui-border); border-radius:999px; background:color-mix(in srgb, var(--ui-surface) 78%, transparent); color:var(--ui-muted); box-shadow:0 6px 18px rgba(15,23,42,.06); }
     #maintenanceTab .maintenance-summary { gap:14px; margin-top:16px; }
-    #maintenanceTab .maintenance-metric { position:relative; display:grid; grid-template-columns:minmax(0,1fr) 44px; align-items:center; min-height:116px; border:1px solid rgba(203,213,225,.92); border-radius:14px; padding:16px; background:rgba(255,255,255,.86); box-shadow:0 12px 28px rgba(15,23,42,.08), inset 0 1px 0 rgba(255,255,255,.78); overflow:hidden; }
-    #maintenanceTab .maintenance-metric::before { content:""; position:absolute; inset:0 auto 0 0; width:4px; background:#3b82f6; }
+    #maintenanceTab .maintenance-metric { position:relative; display:grid; grid-template-columns:minmax(0,1fr) 44px; align-items:center; min-height:116px; border:1px solid rgba(203,213,225,.92); border-radius:14px; padding:16px; background:color-mix(in srgb, var(--ui-surface) 86%, transparent); box-shadow:0 12px 28px rgba(15,23,42,.08), inset 0 1px 0 color-mix(in srgb, var(--ui-surface) 78%, transparent); overflow:hidden; }
+    #maintenanceTab .maintenance-metric::before { content:""; position:absolute; inset:0 auto 0 0; width:4px; background:var(--ui-accent); }
     #maintenanceTab .maintenance-metric.green::before { background:#10b981; }
     #maintenanceTab .maintenance-metric.amber::before { background:#f59e0b; }
     #maintenanceTab .maintenance-metric.red::before { background:#ef4444; }
-    #maintenanceTab .maintenance-metric.blue { background:linear-gradient(180deg, rgba(255,255,255,.92), rgba(239,246,255,.88)); }
-    #maintenanceTab .maintenance-metric.green { background:linear-gradient(180deg, rgba(255,255,255,.92), rgba(236,253,245,.88)); }
-    #maintenanceTab .maintenance-metric.amber { background:linear-gradient(180deg, rgba(255,255,255,.92), rgba(255,251,235,.88)); }
-    #maintenanceTab .maintenance-metric.red { background:linear-gradient(180deg, rgba(255,255,255,.92), rgba(254,242,242,.88)); }
-    #maintenanceTab .maintenance-metric .icon { width:42px; height:42px; border-radius:12px; background:#eff6ff; color:#2563eb; font-size:0; }
+    #maintenanceTab .maintenance-metric.blue { background:linear-gradient(180deg, color-mix(in srgb, var(--ui-surface) 92%, transparent), color-mix(in srgb, var(--ui-subtle) 88%, transparent)); }
+    #maintenanceTab .maintenance-metric.green { background:linear-gradient(180deg, color-mix(in srgb, var(--ui-surface) 92%, transparent), color-mix(in srgb, var(--ui-subtle) 88%, transparent)); }
+    #maintenanceTab .maintenance-metric.amber { background:linear-gradient(180deg, color-mix(in srgb, var(--ui-surface) 92%, transparent), color-mix(in srgb, var(--ui-subtle) 88%, transparent)); }
+    #maintenanceTab .maintenance-metric.red { background:linear-gradient(180deg, color-mix(in srgb, var(--ui-surface) 92%, transparent), color-mix(in srgb, var(--ui-subtle) 88%, transparent)); }
+    #maintenanceTab .maintenance-metric .icon { width:42px; height:42px; border-radius:12px; background:var(--ui-subtle); color:var(--ui-link); font-size:0; }
     #maintenanceTab .maintenance-metric .icon::before { content:""; width:18px; height:18px; border-radius:6px; border:2px solid currentColor; display:block; }
-    #maintenanceTab .maintenance-metric.green .icon { background:#ecfdf5; color:#059669; }
-    #maintenanceTab .maintenance-metric.amber .icon { background:#fffbeb; color:#d97706; }
-    #maintenanceTab .maintenance-metric.red .icon { background:#fef2f2; color:#dc2626; }
-    #maintenanceTab .maintenance-metric .k { color:#475569; font-size:.8rem; font-weight:800; text-transform:uppercase; letter-spacing:.05em; }
-    #maintenanceTab .maintenance-metric .v { color:#0f172a; font-size:2.15rem; line-height:1; font-weight:800; margin-top:8px; }
-    #maintenanceTab .maintenance-metric .s { color:#64748b; font-size:.82rem; margin-top:8px; }
+    #maintenanceTab .maintenance-metric.green .icon { background:var(--ui-subtle); color:#059669; }
+    #maintenanceTab .maintenance-metric.amber .icon { background:var(--ui-subtle); color:#d97706; }
+    #maintenanceTab .maintenance-metric.red .icon { background:var(--ui-subtle); color:#dc2626; }
+    #maintenanceTab .maintenance-metric .k { color:var(--ui-muted); font-size:.8rem; font-weight:800; text-transform:uppercase; letter-spacing:.05em; }
+    #maintenanceTab .maintenance-metric .v { color:var(--ui-text); font-size:2.15rem; line-height:1; font-weight:800; margin-top:8px; }
+    #maintenanceTab .maintenance-metric .s { color:var(--ui-muted); font-size:.82rem; margin-top:8px; }
     #maintenanceTab .maintenance-live-grid { grid-template-columns:1fr; gap:14px; margin-top:16px; }
-    #maintenanceTab .maintenance-section-title, #maintenanceTab .maintenance-performance-title { color:#0f172a; font-size:1.05rem; font-weight:800; }
-    #maintenanceTab .maintenance-call-board { margin-top:12px; border:1px solid #d5e1ed; border-radius:10px; background:rgba(255,255,255,.92); box-shadow:0 8px 18px rgba(15,23,42,.06); padding:10px; }
+    #maintenanceTab .maintenance-section-title, #maintenanceTab .maintenance-performance-title { color:var(--ui-text); font-size:1.05rem; font-weight:800; }
+    #maintenanceTab .maintenance-call-board { margin-top:12px; border:1px solid var(--ui-border); border-radius:10px; background:color-mix(in srgb, var(--ui-surface) 92%, transparent); box-shadow:0 8px 18px rgba(15,23,42,.06); padding:10px; }
     #maintenanceTab .maintenance-call-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin-bottom:8px; }
-    #maintenanceTab .maintenance-call-count { border:1px solid #fecaca; background:#fef2f2; color:#b91c1c; border-radius:999px; padding:4px 8px; font-size:.7rem; font-weight:900; white-space:nowrap; }
+    #maintenanceTab .maintenance-call-count { border:1px solid #fecaca; background:var(--ui-subtle); color:#b91c1c; border-radius:999px; padding:4px 8px; font-size:.7rem; font-weight:900; white-space:nowrap; }
     #maintenanceTab .maintenance-call-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 220px), max-content)); gap:8px; align-items:start; }
-    #maintenanceTab .maintenance-call-card { width:min(100%, 260px); border:1px solid #fed7aa; border-left:4px solid #f59e0b; border-radius:9px; background:#fffbeb; padding:8px 9px; display:grid; gap:5px; box-shadow:0 6px 14px rgba(146,64,14,.07); }
-    #maintenanceTab .maintenance-call-card.active { border-color:#fdba74; background:#fff7ed; }
+    #maintenanceTab .maintenance-call-card { width:min(100%, 260px); border:1px solid #fed7aa; border-left:4px solid #f59e0b; border-radius:9px; background:var(--ui-subtle); padding:8px 9px; display:grid; gap:5px; box-shadow:0 6px 14px rgba(146,64,14,.07); }
+    #maintenanceTab .maintenance-call-card.active { border-color:#fdba74; background:var(--ui-subtle); }
     #maintenanceTab .maintenance-call-top { display:flex; align-items:flex-start; justify-content:space-between; gap:6px; }
-    #maintenanceTab .maintenance-call-machine { color:#0f172a; font-size:.9rem; font-weight:900; line-height:1.15; overflow-wrap:anywhere; }
+    #maintenanceTab .maintenance-call-machine { color:var(--ui-text); font-size:.9rem; font-weight:900; line-height:1.15; overflow-wrap:anywhere; }
     #maintenanceTab .maintenance-call-status { border-radius:999px; padding:3px 7px; font-size:.6rem; font-weight:900; background:#fee2e2; color:#b91c1c; white-space:nowrap; }
     #maintenanceTab .maintenance-call-status.active { background:#ffedd5; color:#b45309; }
-    #maintenanceTab .maintenance-call-meta { color:#64748b; font-size:.7rem; line-height:1.25; overflow-wrap:anywhere; }
+    #maintenanceTab .maintenance-call-meta { color:var(--ui-muted); font-size:.7rem; line-height:1.25; overflow-wrap:anywhere; }
     #maintenanceTab .maintenance-call-reason { color:#7c2d12; font-size:.76rem; font-weight:900; line-height:1.2; overflow-wrap:anywhere; }
     #maintenanceTab .maintenance-call-timer { font-family:"Consolas","Courier New",monospace; color:#9a3412; font-size:.95rem; font-weight:900; }
     #maintenanceTab .maintenance-list { grid-template-columns:repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap:14px; margin-top:12px; }
-    #maintenanceTab .maintenance-person { grid-template-columns:74px minmax(0,1fr) minmax(170px,.72fr); border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.92); box-shadow:0 12px 26px rgba(15,23,42,.07); }
+    #maintenanceTab .maintenance-person { grid-template-columns:74px minmax(0,1fr) minmax(170px,.72fr); border:1px solid var(--ui-border); border-radius:14px; background:color-mix(in srgb, var(--ui-surface) 92%, transparent); box-shadow:0 12px 26px rgba(15,23,42,.07); }
     #maintenanceTab .maintenance-person.busy { border-color:#f6c37a; box-shadow:0 12px 28px rgba(217,119,6,.12); }
-    #maintenanceTab .maintenance-avatar-wrap { padding:12px; background:linear-gradient(180deg, #f8fafc, #edf4fb); }
-    #maintenanceTab .maintenance-avatar { width:50px; height:50px; border-radius:50%; background:radial-gradient(circle at 50% 33%, #f3c9ad 0 13px, transparent 14px), radial-gradient(circle at 50% 92%, #64748b 0 24px, transparent 25px), linear-gradient(135deg, #e0f2fe, #f8fafc); border:1px solid #cbd5e1; }
-    #maintenanceTab .maintenance-person .title { color:#0f172a; font-size:1rem; font-weight:800; }
-    #maintenanceTab .maintenance-person .meta, #maintenanceTab .maintenance-person .submeta { color:#64748b; }
+    #maintenanceTab .maintenance-avatar-wrap { padding:12px; background:linear-gradient(180deg, var(--ui-surface), var(--ui-subtle)); }
+    #maintenanceTab .maintenance-avatar { width:50px; height:50px; border-radius:50%; background:radial-gradient(circle at 50% 33%, #f3c9ad 0 13px, transparent 14px), radial-gradient(circle at 50% 92%, #64748b 0 24px, transparent 25px), linear-gradient(135deg, var(--ui-subtle), var(--ui-surface)); border:1px solid var(--ui-border); }
+    #maintenanceTab .maintenance-person .title { color:var(--ui-text); font-size:1rem; font-weight:800; }
+    #maintenanceTab .maintenance-person .meta, #maintenanceTab .maintenance-person .submeta { color:var(--ui-muted); }
     #maintenanceTab .maintenance-badge { min-width:0; border-radius:999px; padding:5px 9px; font-size:.68rem; letter-spacing:.02em; }
     #maintenanceTab .maintenance-badge.available { background:#dcfce7; color:#047857; }
     #maintenanceTab .maintenance-badge.busy { background:#ffedd5; color:#b45309; }
     #maintenanceTab .maintenance-badge.waiting { background:#fee2e2; color:#b91c1c; }
-    #maintenanceTab .maintenance-machine { border-color:#dce6f1; border-radius:10px; background:#f8fafc; }
-    #maintenanceTab .maintenance-machine.busy { background:#fff7ed; border-color:#fed7aa; }
-    #maintenanceTab .maintenance-stats { background:#f8fafc; }
-    #maintenanceTab .maintenance-stat-icon { width:18px; height:18px; border-radius:6px; background:#e0f2fe; color:#0284c7; font-size:0; display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; }
+    #maintenanceTab .maintenance-machine { border-color:var(--ui-border); border-radius:10px; background:var(--ui-surface); }
+    #maintenanceTab .maintenance-machine.busy { background:var(--ui-subtle); border-color:#fed7aa; }
+    #maintenanceTab .maintenance-stats { background:var(--ui-surface); }
+    #maintenanceTab .maintenance-stat-icon { width:18px; height:18px; border-radius:6px; background:var(--ui-subtle); color:#0284c7; font-size:0; display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; }
     #maintenanceTab .maintenance-stat-icon::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; }
     #maintenanceTab .maintenance-performance-panel { margin-top:16px; border-top:0; padding-top:0; }
-    #maintenanceTab .maintenance-performance-wrap { border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.92); box-shadow:0 12px 26px rgba(15,23,42,.07); }
-    #maintenanceTab .maintenance-performance-wrap .data-table th { background:#f8fafc; color:#475569; }
-    .planning-shell { background:linear-gradient(180deg, #f8fbff, #eef4fb); border:1px solid #d5e1ed; border-radius:18px; padding:16px; box-shadow:0 18px 44px rgba(15,23,42,.10); }
+    #maintenanceTab .maintenance-performance-wrap { border:1px solid var(--ui-border); border-radius:14px; background:color-mix(in srgb, var(--ui-surface) 92%, transparent); box-shadow:0 12px 26px rgba(15,23,42,.07); }
+    #maintenanceTab .maintenance-performance-wrap .data-table th { background:var(--ui-surface); color:var(--ui-muted); }
+    .planning-shell { background:linear-gradient(180deg, var(--ui-surface), var(--ui-subtle)); border:1px solid var(--ui-border); border-radius:18px; padding:16px; box-shadow:0 18px 44px rgba(15,23,42,.10); }
     .planning-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
-    .planning-title h3 { margin:0; color:#0f172a; font-size:1.22rem; }
+    .planning-title h3 { margin:0; color:var(--ui-text); font-size:1.22rem; }
     .planning-controls { display:grid; grid-template-columns:minmax(0, 280px) auto auto; gap:7px; align-items:center; }
-    .planning-controls input { border:1px solid #cbd5e1; border-radius:9px; padding:8px 10px; font:inherit; background:#fff; color:#0f172a; }
-    .planning-controls button { border:0; border-radius:9px; padding:8px 11px; font-weight:800; cursor:pointer; background:#2563eb; color:#fff; box-shadow:0 8px 18px rgba(37,99,235,.22); }
-    .planning-controls button.secondary { background:#fff; color:#334155; border:1px solid #cbd5e1; box-shadow:none; }
-    .planning-status { margin-top:10px; min-height:20px; color:#64748b; font-size:.85rem; }
+    .planning-controls input { border:1px solid var(--ui-border); border-radius:9px; padding:8px 10px; font:inherit; background:var(--ui-surface); color:var(--ui-text); }
+    .planning-controls button { border:0; border-radius:9px; padding:8px 11px; font-weight:800; cursor:pointer; background:var(--ui-accent); color:var(--ui-on-accent); box-shadow:0 8px 18px rgba(37,99,235,.22); }
+    .planning-controls button.secondary { background:var(--ui-surface); color:var(--ui-text); border:1px solid var(--ui-border); box-shadow:none; }
+    .planning-status { margin-top:10px; min-height:20px; color:var(--ui-muted); font-size:.85rem; }
     .planning-ops-summary { display:grid; grid-template-columns:repeat(5, minmax(140px,1fr)); gap:8px; margin-top:0; }
-    .planning-ops-metric { min-width:0; border-radius:11px; background:#111827; color:#fff; padding:9px 12px; box-shadow:0 8px 18px rgba(15,23,42,.11); }
+    .planning-ops-metric { min-width:0; border-radius:11px; background:#111827; color:var(--ui-on-accent); padding:9px 12px; box-shadow:0 8px 18px rgba(15,23,42,.11); }
     .planning-ops-metric.warn { background:#92400e; }
     .planning-ops-metric.good { background:#065f46; }
-    .planning-ops-metric .k { color:#aeb8c8; font-size:.61rem; font-weight:900; letter-spacing:.055em; text-transform:uppercase; }
-    .planning-ops-metric .v { margin-top:3px; color:#fff; font-size:1.25rem; line-height:1; font-weight:900; }
-    .planning-ops-metric .s { margin-top:4px; color:#cbd5e1; font-size:.65rem; line-height:1.2; overflow-wrap:break-word; }
+    .planning-ops-metric .k { color:var(--ui-muted); font-size:.61rem; font-weight:900; letter-spacing:.055em; text-transform:uppercase; }
+    .planning-ops-metric .v { margin-top:3px; color:var(--ui-on-accent); font-size:1.25rem; line-height:1; font-weight:900; }
+    .planning-ops-metric .s { margin-top:4px; color:var(--ui-muted); font-size:.65rem; line-height:1.2; overflow-wrap:break-word; }
     .planning-workspace { height:680px; display:grid; grid-template-columns:minmax(480px, 520px) minmax(0,1fr); gap:12px; margin-top:14px; align-items:stretch; }
     .planning-main { min-width:0; min-height:0; height:100%; display:grid; grid-template-rows:auto minmax(0,1fr); gap:14px; align-content:stretch; }
     .planning-board { position:relative; min-height:0; height:100%; display:grid; grid-template-columns:minmax(0,1fr); gap:0; margin-top:0; overflow:hidden; }
-    .planning-lane, .planning-running { border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.88); box-shadow:0 10px 24px rgba(15,23,42,.06); min-width:0; }
+    .planning-lane, .planning-running { border:1px solid var(--ui-border); border-radius:14px; background:color-mix(in srgb, var(--ui-surface) 88%, transparent); box-shadow:0 10px 24px rgba(15,23,42,.06); min-width:0; }
     .planning-lane.backlog { display:flex; flex-direction:column; height:100%; min-height:0; overflow:hidden; }
     .planning-left-grid { display:grid; grid-template-columns:1fr; gap:14px; min-width:0; align-items:stretch; height:100%; }
-    .planning-lane-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 12px 8px; border-bottom:1px solid #e2e8f0; }
-    .planning-lane-title { font-weight:800; color:#0f172a; }
+    .planning-lane-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:12px 12px 8px; border-bottom:1px solid var(--ui-border); }
+    .planning-lane-title { font-weight:800; color:var(--ui-text); }
     .planning-lane-title-row { min-width:0; display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
-    .planning-machine-tonnage { display:inline-flex; align-items:center; border:1px solid #dbe5ef; border-radius:999px; padding:3px 7px; background:#f8fafc; color:#64748b; font-size:.62rem; line-height:1; font-weight:850; white-space:nowrap; }
-    .planning-lane-count { color:#64748b; font-size:.78rem; }
-    .planning-lane-time { grid-column:1/-1; display:grid; gap:4px; margin-top:8px; color:#475569; font-size:.72rem; line-height:1.35; }
+    .planning-machine-tonnage { display:inline-flex; align-items:center; border:1px solid var(--ui-border); border-radius:999px; padding:3px 7px; background:var(--ui-surface); color:var(--ui-muted); font-size:.62rem; line-height:1; font-weight:850; white-space:nowrap; }
+    .planning-lane-count { color:var(--ui-muted); font-size:.78rem; }
+    .planning-lane-time { grid-column:1/-1; display:grid; gap:4px; margin-top:8px; color:var(--ui-muted); font-size:.72rem; line-height:1.35; }
     .planning-lane-time span { display:block; overflow-wrap:break-word; }
     .planning-dropzone { min-height:140px; padding:10px; display:grid; gap:10px; align-content:start; }
-    .planning-dropzone.drag-over { outline:2px dashed #2563eb; outline-offset:-8px; background:#eff6ff; }
+    .planning-dropzone.drag-over { outline:2px dashed var(--ui-accent); outline-offset:-8px; background:var(--ui-subtle); }
     .planning-machine-grid { grid-area:1/1; height:100%; min-height:0; display:grid; grid-template-columns:1fr; gap:10px; align-content:start; max-height:none; overflow-y:auto; padding-right:4px; opacity:1; transform:translateX(0); transition:opacity .22s ease,transform .28s cubic-bezier(.2,.72,.25,1); }
     .planning-machine-grid .planning-lane { width:100%; }
     .planning-machine-grid .planning-lane-head { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; padding:10px 12px; }
@@ -8158,33 +9740,33 @@ DASHBOARD_HTML = r"""
     .planning-machine-grid .product-relation-badge { min-height:18px; padding:0 5px; font-size:.5rem; }
     .planning-machine-grid .planning-remove { position:absolute; top:7px; right:7px; width:18px !important; height:18px !important; min-width:18px !important; font-size:.78rem !important; }
     .planning-machine-grid .planning-card-actions { margin-top:5px; }
-    .planning-card { border:1px solid #dbe5ef; border-radius:12px; background:#fff; padding:11px; box-shadow:0 8px 18px rgba(15,23,42,.07); cursor:default; }
+    .planning-card { border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); padding:11px; box-shadow:0 8px 18px rgba(15,23,42,.07); cursor:default; }
     .planning-card[draggable="true"] { cursor:default; }
     .planning-card:active { cursor:default; }
-    .planning-card.live { cursor:default; border-color:#bbf7d0; background:#f0fdf4; }
-    .planning-card.next-job { border-color:#bfdbfe; background:#eff6ff; }
-    .planning-card.queue-job { border-color:#dbe5ef; background:#fff; }
+    .planning-card.live { cursor:default; border-color:#bbf7d0; background:var(--ui-subtle); }
+    .planning-card.next-job { border-color:var(--ui-accent-soft); background:var(--ui-subtle); }
+    .planning-card.queue-job { border-color:var(--ui-border); background:var(--ui-surface); }
     .planning-card-top { display:flex; align-items:flex-start; justify-content:space-between; gap:8px; min-width:0; }
     .planning-card-top-actions { flex:0 0 auto; display:flex; align-items:center; gap:5px; }
-    .planning-job { min-width:0; font-weight:900; color:#0f172a; overflow-wrap:break-word; word-break:normal; }
-    .planning-item-tonnage { border:1px solid #cbd5e1; border-radius:999px; padding:2px 6px; background:#f8fafc; color:#334155; font-size:.62rem; line-height:1.1; font-weight:850; white-space:nowrap; }
-    .planning-chip { border-radius:999px; padding:3px 7px; font-size:.68rem; font-weight:800; background:#dbeafe; color:#1d4ed8; white-space:nowrap; }
+    .planning-job { min-width:0; font-weight:900; color:var(--ui-text); overflow-wrap:break-word; word-break:normal; }
+    .planning-item-tonnage { border:1px solid var(--ui-border); border-radius:999px; padding:2px 6px; background:var(--ui-surface); color:var(--ui-text); font-size:.62rem; line-height:1.1; font-weight:850; white-space:nowrap; }
+    .planning-chip { border-radius:999px; padding:3px 7px; font-size:.68rem; font-weight:800; background:var(--ui-subtle); color:var(--ui-link); white-space:nowrap; }
     .planning-chip.ongoing { background:#dcfce7; color:#047857; }
-    .planning-chip.next { background:#dbeafe; color:#1d4ed8; }
-    .planning-chip.queue { background:#f1f5f9; color:#475569; }
-    .planning-meta { margin-top:7px; color:#475569; font-size:.78rem; line-height:1.4; overflow-wrap:break-word; word-break:normal; }
+    .planning-chip.next { background:var(--ui-subtle); color:var(--ui-link); }
+    .planning-chip.queue { background:var(--ui-subtle); color:var(--ui-muted); }
+    .planning-meta { margin-top:7px; color:var(--ui-muted); font-size:.78rem; line-height:1.4; overflow-wrap:break-word; word-break:normal; }
     .planning-card-actions { display:flex; justify-content:flex-end; margin-top:8px; }
     .planning-remove { border:0; background:#fee2e2; color:#b91c1c; border-radius:8px; padding:4px 8px; cursor:pointer; font-size:.72rem; font-weight:800; }
     #planningTab .planning-remove { width:20px; height:20px; min-width:20px; display:inline-flex; align-items:center; justify-content:center; padding:0 !important; border:1px solid #fecaca !important; border-radius:999px !important; background:#fee2e2 !important; color:#b91c1c !important; box-shadow:2px 2px 5px rgba(185,28,28,.12),-2px -2px 5px #fff !important; font-size:.9rem; line-height:1; font-weight:900; cursor:pointer; }
     #planningTab .planning-remove:hover { background:#fecaca !important; color:#991b1b !important; transform:translateY(-1px); }
-    .planning-empty { color:#94a3b8; border:1px dashed #cbd5e1; border-radius:10px; padding:12px; font-size:.84rem; }
-    .planning-recommend { border-top:1px solid #e2e8f0; background:#f8fbff; overflow:hidden; display:flex; flex-direction:column; height:100%; min-height:0; }
-    .planning-recommend-head { display:block; padding:7px 9px 6px; border-bottom:1px solid #e2e8f0; }
-    .planning-recommend-title { font-weight:900; color:#0f172a; }
+    .planning-empty { color:var(--ui-muted); border:1px dashed var(--ui-border); border-radius:10px; padding:12px; font-size:.84rem; }
+    .planning-recommend { border-top:1px solid var(--ui-border); background:var(--ui-surface); overflow:hidden; display:flex; flex-direction:column; height:100%; min-height:0; }
+    .planning-recommend-head { display:block; padding:7px 9px 6px; border-bottom:1px solid var(--ui-border); }
+    .planning-recommend-title { font-weight:900; color:var(--ui-text); }
     .planning-recommend-head .planning-status { min-height:15px; margin-top:3px; font-size:.7rem; line-height:1.2; }
     .planning-recommend-actions { display:contents; }
-    .planning-recommend-actions select { width:100%; min-width:0; border:1px solid #cbd5e1; border-radius:8px; padding:5px 4px; font:inherit; font-size:.72rem; background:#fff; }
-    .planning-recommend-actions button { min-width:0; border:0; border-radius:8px; padding:6px 7px; font-size:.72rem; font-weight:800; cursor:pointer; background:#0f766e; color:#fff; }
+    .planning-recommend-actions select { width:100%; min-width:0; border:1px solid var(--ui-border); border-radius:8px; padding:5px 4px; font:inherit; font-size:.72rem; background:var(--ui-surface); }
+    .planning-recommend-actions button { min-width:0; border:0; border-radius:8px; padding:6px 7px; font-size:.72rem; font-weight:800; cursor:pointer; background:#0f766e; color:var(--ui-on-accent); }
     .planning-recommend-list { padding:7px; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; overflow-y:scroll; overflow-x:hidden; scrollbar-gutter:stable; scrollbar-width:auto; scrollbar-color:#94a3b8 #dfe7ef; min-height:0; flex:1 1 0; align-content:start; align-items:start; }
     .planning-recommend-list > .planning-empty { grid-column:1/-1; }
     .planning-recommend-list .stock-rec-card { height:120px; min-height:120px; box-sizing:border-box; padding:6px; overflow:hidden; }
@@ -8202,198 +9784,198 @@ DASHBOARD_HTML = r"""
     .planning-recommend-list > .planning-card .planning-card-top { display:grid; grid-template-columns:minmax(0,1fr); gap:5px; }
     .planning-recommend-list > .planning-card .planning-card-top-actions { justify-content:flex-start; flex-wrap:wrap; }
     .planning-recommend-list::-webkit-scrollbar { width:10px; }
-    .planning-recommend-list::-webkit-scrollbar-track { border-radius:999px; background:#dfe7ef; }
-    .planning-recommend-list::-webkit-scrollbar-thumb { border:2px solid #dfe7ef; border-radius:999px; background:#94a3b8; }
+    .planning-recommend-list::-webkit-scrollbar-track { border-radius:999px; background:var(--ui-subtle); }
+    .planning-recommend-list::-webkit-scrollbar-thumb { border:2px solid var(--ui-border); border-radius:999px; background:#94a3b8; }
     .planning-recommend-list::-webkit-scrollbar-thumb:hover { background:#64748b; }
     .planning-stock-search-row { padding:5px 8px 6px; display:grid; gap:5px; }
-    .planning-stock-search-row > input { width:100%; height:31px; box-sizing:border-box; border:1px solid #cbd5e1; border-radius:8px; padding:5px 8px; font:inherit; font-size:.75rem; background:#fff; }
+    .planning-stock-search-row > input { width:100%; height:31px; box-sizing:border-box; border:1px solid var(--ui-border); border-radius:8px; padding:5px 8px; font:inherit; font-size:.75rem; background:var(--ui-surface); }
     .planning-stock-range { display:grid; grid-template-columns:50px auto; justify-content:end; gap:5px; }
     .planning-stock-range > input { width:100%; min-width:0; height:31px; box-sizing:border-box; border-radius:8px; padding:5px 7px; font-size:.75rem; }
-    .stock-rec-card { border:1px solid #dbe5ef; border-radius:10px; background:#fff; padding:7px 8px; box-shadow:0 6px 13px rgba(15,23,42,.06); }
+    .stock-rec-card { border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); padding:7px 8px; box-shadow:0 6px 13px rgba(15,23,42,.06); }
     .stock-rec-card[draggable="true"] { cursor:default; }
     .stock-rec-top { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
     .stock-rec-top-actions { display:flex; align-items:center; gap:5px; flex:0 0 auto; }
-    .stock-rec-sku { min-width:0; font-weight:900; color:#0f172a; overflow-wrap:break-word; word-break:normal; }
+    .stock-rec-sku { min-width:0; font-weight:900; color:var(--ui-text); overflow-wrap:break-word; word-break:normal; }
     .stock-rec-badge { border-radius:999px; padding:4px 8px; font-size:.68rem; font-weight:900; background:#fee2e2; color:#991b1b; white-space:nowrap; }
     .abc-class-badge { display:inline-flex; align-items:center; justify-content:center; min-width:23px; height:23px; border-radius:999px; padding:0 7px; font-size:.68rem; line-height:1; font-weight:950; white-space:nowrap; }
     .abc-class-badge.class-a { border:1px solid #fca5a5; background:#fee2e2; color:#b91c1c; }
     .abc-class-badge.class-b { border:1px solid #fcd34d; background:#fef3c7; color:#92400e; }
-    .abc-class-badge.class-c { border:1px solid #93c5fd; background:#dbeafe; color:#1d4ed8; }
+    .abc-class-badge.class-c { border:1px solid var(--ui-accent); background:var(--ui-subtle); color:var(--ui-link); }
     .product-relation-badge { display:inline-flex; align-items:center; justify-content:center; min-height:21px; border-radius:999px; padding:0 7px; font-size:.58rem; line-height:1; font-weight:950; letter-spacing:.025em; white-space:nowrap; }
     .product-relation-badge.parent { border:1px solid #a7f3d0; background:#d1fae5; color:#047857; }
     .product-relation-badge.child { border:1px solid #c4b5fd; background:#ede9fe; color:#6d28d9; }
     .stock-rec-family { min-width:0; display:grid; gap:0; }
     .stock-rec-card.has-children { cursor:pointer; }
-    .stock-rec-expand { width:21px; height:21px; flex:0 0 21px; display:inline-flex; align-items:center; justify-content:center; border:1px solid #bfdbfe; border-radius:999px; padding:0; background:#eff6ff; color:#1d4ed8; cursor:pointer; }
+    .stock-rec-expand { width:21px; height:21px; flex:0 0 21px; display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--ui-accent-soft); border-radius:999px; padding:0; background:var(--ui-subtle); color:var(--ui-link); cursor:pointer; }
     .stock-rec-expand svg { width:12px; height:12px; fill:none; stroke:currentColor; stroke-width:2.4; stroke-linecap:round; stroke-linejoin:round; transition:transform .22s ease; }
     .stock-rec-family.expanded .stock-rec-expand svg { transform:rotate(180deg); }
     .stock-rec-children { display:grid; grid-template-rows:0fr; opacity:0; padding:0 2px 0 12px; transform:translateY(-7px); transition:grid-template-rows .36s cubic-bezier(.22,.8,.24,1),opacity .24s ease,transform .32s cubic-bezier(.22,.8,.24,1),padding .32s ease; }
     .stock-rec-children-inner { min-height:0; overflow:hidden; display:grid; gap:5px; }
     .stock-rec-family.expanded .stock-rec-children { grid-template-rows:1fr; opacity:1; padding-top:6px; transform:translateY(0); }
     .stock-rec-children .stock-rec-card { border-left:3px solid #a78bfa !important; box-shadow:3px 3px 8px #d4dde7,-3px -3px 8px #fff !important; }
-    .stock-rec-name { margin-top:5px; font-size:.78rem; color:#475569; line-height:1.35; overflow-wrap:break-word; word-break:normal; }
-    .stock-rec-meta { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; font-size:.72rem; font-weight:800; color:#334155; }
-    .stock-rec-meta span { background:#f1f5f9; border:1px solid #e2e8f0; border-radius:999px; padding:3px 7px; }
+    .stock-rec-name { margin-top:5px; font-size:.78rem; color:var(--ui-muted); line-height:1.35; overflow-wrap:break-word; word-break:normal; }
+    .stock-rec-meta { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; font-size:.72rem; font-weight:800; color:var(--ui-text); }
+    .stock-rec-meta span { background:var(--ui-subtle); border:1px solid var(--ui-border); border-radius:999px; padding:3px 7px; }
     .planning-dropzone, .planning-recommend-list, .stock-rec-card { cursor:default; }
     .planning-controls input, .planning-stock-search-row input, .planning-recommend-actions input, .planning-recommend-actions select { cursor:text; }
     .planning-recommend-actions select { cursor:pointer; }
-    .planning-live-queue { margin-top:0; border:1px solid #d5e1ed; border-radius:14px; background:rgba(255,255,255,.9); box-shadow:0 10px 24px rgba(15,23,42,.06); overflow:hidden; }
-    .planning-live-queue-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid #e2e8f0; }
-    .planning-live-queue-title { color:#0f172a; font-weight:900; }
+    .planning-live-queue { margin-top:0; border:1px solid var(--ui-border); border-radius:14px; background:color-mix(in srgb, var(--ui-surface) 90%, transparent); box-shadow:0 10px 24px rgba(15,23,42,.06); overflow:hidden; }
+    .planning-live-queue-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid var(--ui-border); }
+    .planning-live-queue-title { color:var(--ui-text); font-weight:900; }
     .planning-live-queue .table-wrap { margin:0; box-shadow:none; border:0; border-radius:0; }
-    .planning-queue-toggle { position:relative; width:38px; height:38px; flex:0 0 38px; color:#0f64bd; }
+    .planning-queue-toggle { position:relative; width:38px; height:38px; flex:0 0 38px; color:var(--ui-link); }
     .planning-queue-toggle[hidden] { display:none; }
     .planning-queue-toggle svg { width:20px; height:20px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
-    .planning-queue-toggle-count { position:absolute; top:-7px; right:-7px; min-width:20px; height:20px; padding:0 5px; box-sizing:border-box; border:2px solid #eef3f8; border-radius:999px; background:#2563eb; color:#fff; font-size:.62rem; line-height:16px; font-weight:900; text-align:center; }
+    .planning-queue-toggle-count { position:absolute; top:-7px; right:-7px; min-width:20px; height:20px; padding:0 5px; box-sizing:border-box; border:2px solid var(--ui-border); border-radius:999px; background:var(--ui-accent); color:var(--ui-on-accent); font-size:.62rem; line-height:16px; font-weight:900; text-align:center; }
     .planning-queue-backdrop { position:fixed; z-index:120; inset:0; background:rgba(15,23,42,.28); opacity:0; pointer-events:none; transition:opacity .22s ease; }
     .planning-queue-backdrop.open { opacity:1; pointer-events:auto; }
-    #planningQueuePanel { position:absolute; top:0; right:0; bottom:0; width:min(1120px, calc(100vw - 24px)); margin:0; border-radius:18px 0 0 18px; background:#fff !important; box-shadow:-18px 0 42px rgba(15,23,42,.22); overflow:auto; transform:translateX(102%); transition:transform .25s ease; }
+    #planningQueuePanel { position:absolute; top:0; right:0; bottom:0; width:min(1120px, calc(100vw - 24px)); margin:0; border-radius:18px 0 0 18px; background:var(--ui-surface) !important; box-shadow:-18px 0 42px rgba(15,23,42,.22); overflow:auto; transform:translateX(102%); transition:transform .25s ease; }
     .planning-queue-backdrop.open #planningQueuePanel { transform:translateX(0); }
-    .plan-overview-inline,.trial-board-inline,.planning-activity-inline { grid-area:1/1; min-width:0; min-height:0; height:100%; display:flex; flex-direction:column; overflow:hidden; border:1px solid #d5e1ed; border-radius:13px; background:#f8fafc; opacity:0; transform:translateX(24px); pointer-events:none; transition:opacity .22s ease,transform .28s cubic-bezier(.2,.72,.25,1); }
+    .plan-overview-inline,.trial-board-inline,.planning-activity-inline { grid-area:1/1; min-width:0; min-height:0; height:100%; display:flex; flex-direction:column; overflow:hidden; border:1px solid var(--ui-border); border-radius:13px; background:var(--ui-surface); opacity:0; transform:translateX(24px); pointer-events:none; transition:opacity .22s ease,transform .28s cubic-bezier(.2,.72,.25,1); }
     .planning-board.compact-active .planning-machine-grid,.planning-board.trial-active .planning-machine-grid,.planning-board.activity-active .planning-machine-grid { opacity:0; transform:translateX(-24px); pointer-events:none; }
     .planning-board.compact-active .plan-overview-inline { opacity:1; transform:translateX(0); pointer-events:auto; }
     .planning-board.trial-active .trial-board-inline { opacity:1; transform:translateX(0); pointer-events:auto; }
     .planning-board.activity-active .planning-activity-inline { opacity:1; transform:translateX(0); pointer-events:auto; }
-    .plan-overview-tabs { display:flex; gap:7px; padding:6px 10px; border-bottom:1px solid #dbe5ef; background:#eef3f8; }
-    .plan-overview-tab { border:1px solid #bfd0e2; border-radius:999px; padding:6px 16px; background:#fff; color:#334155; font-size:.72rem; font-weight:900; cursor:pointer; }
-    .plan-overview-tab.active { border-color:#0f64bd; background:#0f64bd; color:#fff; }
-    .plan-overview-table-wrap { min-height:0; flex:1 1 auto; overflow:auto; padding:6px; background:#fff; }
+    .plan-overview-tabs { display:flex; gap:7px; padding:6px 10px; border-bottom:1px solid var(--ui-border); background:var(--ui-subtle); }
+    .plan-overview-tab { border:1px solid var(--ui-border); border-radius:999px; padding:6px 16px; background:var(--ui-surface); color:var(--ui-text); font-size:.72rem; font-weight:900; cursor:pointer; }
+    .plan-overview-tab.active { border-color:var(--ui-accent); background:var(--ui-accent); color:var(--ui-on-accent); }
+    .plan-overview-table-wrap { min-height:0; flex:1 1 auto; overflow:auto; padding:6px; background:var(--ui-surface); }
     .plan-overview-columns { min-width:0; min-height:100%; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; align-items:stretch; }
-    .plan-overview-column { min-width:0; height:100%; overflow:hidden; border:1px solid #cbd5e1; border-radius:8px; }
+    .plan-overview-column { min-width:0; height:100%; overflow:hidden; border:1px solid var(--ui-border); border-radius:8px; }
     .plan-overview-table { width:100%; height:100%; min-width:0; border-collapse:separate; border-spacing:0; table-layout:fixed; }
-    .plan-overview-table th { position:sticky; z-index:2; top:0; padding:7px 3px; border-right:1px solid #cbd5e1; border-bottom:2px solid #94a3b8; background:#e8eef5; color:#334155; font-size:.55rem; line-height:1.15; font-weight:950; letter-spacing:.01em; text-align:center; text-transform:uppercase; overflow-wrap:anywhere; }
-    .plan-overview-table td { padding:6px 4px; border-right:1px solid #d7e0e9; border-bottom:1px solid #d7e0e9; color:#0f172a; font-size:.66rem; line-height:1.2; font-weight:750; vertical-align:middle; overflow-wrap:anywhere; }
+    .plan-overview-table th { position:sticky; z-index:2; top:0; padding:7px 3px; border-right:1px solid var(--ui-border); border-bottom:2px solid var(--ui-border); background:var(--ui-subtle); color:var(--ui-text); font-size:.55rem; line-height:1.15; font-weight:950; letter-spacing:.01em; text-align:center; text-transform:uppercase; overflow-wrap:anywhere; }
+    .plan-overview-table td { padding:6px 4px; border-right:1px solid var(--ui-border); border-bottom:1px solid var(--ui-border); color:var(--ui-text); font-size:.66rem; line-height:1.2; font-weight:750; vertical-align:middle; overflow-wrap:anywhere; }
     .plan-overview-table th:last-child,.plan-overview-table td:last-child { border-right:0; }
     .plan-overview-machine { text-align:center; font-weight:950; }
-    .plan-overview-machine small { display:block; margin-top:2px; color:#64748b; font-size:.58rem; }
+    .plan-overview-machine small { display:block; margin-top:2px; color:var(--ui-muted); font-size:.58rem; }
     .plan-overview-center { text-align:center; }
     .plan-overview-status { display:inline-flex; justify-content:center; max-width:100%; border-radius:5px; padding:4px 5px; font-size:.5rem; line-height:1.1; font-weight:950; text-align:center; overflow-wrap:anywhere; }
     .plan-overview-status.running { background:#dcfce7; color:#166534; }
-    .plan-overview-status.disconnected,.plan-overview-status.no-schedule { background:#f1f5f9; color:#64748b; }
+    .plan-overview-status.disconnected,.plan-overview-status.no-schedule { background:var(--ui-subtle); color:var(--ui-muted); }
     .plan-overview-status.attention { background:#fef3c7; color:#92400e; }
-    .plan-overview-plan { background:#fffdf2; font-weight:900; }
+    .plan-overview-plan { background:var(--ui-subtle); font-weight:900; }
     .plan-overview-dropzone { transition:background-color .14s ease,box-shadow .14s ease; }
-    .plan-overview-dropzone.drag-over { background:#e8f2ff; box-shadow:inset 0 0 0 2px #60a5fa; }
+    .plan-overview-dropzone.drag-over { background:var(--ui-subtle); box-shadow:inset 0 0 0 2px var(--ui-accent); }
     .plan-overview-card { display:flex; align-items:center; min-height:100%; cursor:grab; user-select:none; }
     .plan-overview-card:active { cursor:grabbing; }
-    .planning-backlog-dropzone.drag-over { outline:2px dashed #2563eb; outline-offset:-4px; background:#e8f2ff; }
-    .trial-board-toolbar { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 10px; border-bottom:1px solid #dbe5ef; background:#eef3f8; }
-    .trial-board-title { color:#0f172a; font-size:.86rem; font-weight:950; letter-spacing:.025em; }
+    .planning-backlog-dropzone.drag-over { outline:2px dashed var(--ui-accent); outline-offset:-4px; background:var(--ui-subtle); }
+    .trial-board-toolbar { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 10px; border-bottom:1px solid var(--ui-border); background:var(--ui-subtle); }
+    .trial-board-title { color:var(--ui-text); font-size:.86rem; font-weight:950; letter-spacing:.025em; }
     .trial-board-actions { display:flex; align-items:center; gap:7px; }
-    .trial-board-status { color:#64748b; font-size:.68rem; font-weight:750; }
-    #planningTab .trial-board-action { min-height:31px; padding:6px 11px; border:1px solid #cbd5e1; border-radius:8px; background:#fff; color:#164f91; font-size:.72rem; font-weight:900; cursor:pointer; }
-    #planningTab .trial-board-action.primary { border-color:#0f64bd; background:#0f64bd; color:#fff; }
-    .trial-board-table-wrap { min-height:0; flex:1 1 auto; overflow:auto; padding:6px; background:#fff; }
-    .trial-board-table { width:100%; min-width:900px; height:100%; border-collapse:separate; border-spacing:0; table-layout:fixed; border:1px solid #cbd5e1; border-radius:8px; overflow:hidden; }
-    .trial-board-table th { position:sticky; z-index:2; top:0; padding:9px 8px; border-right:1px solid #cbd5e1; border-bottom:2px solid #94a3b8; background:#e8eef5; color:#334155; font-size:.68rem; font-weight:950; letter-spacing:.025em; text-align:center; text-transform:uppercase; }
-    .trial-board-table td { height:46px; padding:4px; border-right:1px solid #d7e0e9; border-bottom:1px solid #d7e0e9; background:#fff; vertical-align:middle; }
+    .trial-board-status { color:var(--ui-muted); font-size:.68rem; font-weight:750; }
+    #planningTab .trial-board-action { min-height:31px; padding:6px 11px; border:1px solid var(--ui-border); border-radius:8px; background:var(--ui-surface); color:var(--ui-link); font-size:.72rem; font-weight:900; cursor:pointer; }
+    #planningTab .trial-board-action.primary { border-color:var(--ui-accent); background:var(--ui-accent); color:var(--ui-on-accent); }
+    .trial-board-table-wrap { min-height:0; flex:1 1 auto; overflow:auto; padding:6px; background:var(--ui-surface); }
+    .trial-board-table { width:100%; min-width:900px; height:100%; border-collapse:separate; border-spacing:0; table-layout:fixed; border:1px solid var(--ui-border); border-radius:8px; overflow:hidden; }
+    .trial-board-table th { position:sticky; z-index:2; top:0; padding:9px 8px; border-right:1px solid var(--ui-border); border-bottom:2px solid var(--ui-border); background:var(--ui-subtle); color:var(--ui-text); font-size:.68rem; font-weight:950; letter-spacing:.025em; text-align:center; text-transform:uppercase; }
+    .trial-board-table td { height:46px; padding:4px; border-right:1px solid var(--ui-border); border-bottom:1px solid var(--ui-border); background:var(--ui-surface); vertical-align:middle; }
     .trial-board-table th:last-child,.trial-board-table td:last-child { border-right:0; }
     .trial-board-table tbody tr:last-child td { border-bottom:0; }
-    #planningTab .trial-board-input { width:100%; height:100%; min-height:36px; box-sizing:border-box; border:0; border-radius:6px; padding:6px 7px; background:transparent; color:#0f172a; font-family:inherit; font-size:.75rem; font-weight:750; box-shadow:none; resize:none; }
-    #planningTab .trial-board-input:focus { outline:2px solid #93c5fd; background:#eff6ff; }
+    #planningTab .trial-board-input { width:100%; height:100%; min-height:36px; box-sizing:border-box; border:0; border-radius:6px; padding:6px 7px; background:transparent; color:var(--ui-text); font-family:inherit; font-size:.75rem; font-weight:750; box-shadow:none; resize:none; }
+    #planningTab .trial-board-input:focus { outline:2px solid var(--ui-accent); background:var(--ui-subtle); }
     #planningTab .trial-board-delete { width:29px; height:29px; display:inline-flex; align-items:center; justify-content:center; padding:0; border:0; border-radius:50%; background:#fee2e2; color:#b91c1c; font-size:1rem; line-height:1; cursor:pointer; }
     .trial-board-action-cell { text-align:center; }
-    .planning-activity-toolbar { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:9px 12px; border-bottom:1px solid #dbe5ef; background:#eef3f8; }
-    .planning-activity-title { color:#0f172a; font-size:.88rem; font-weight:950; letter-spacing:.025em; }
-    .planning-activity-status { margin-top:2px; color:#64748b; font-size:.68rem; font-weight:750; }
-    #planningTab .planning-activity-refresh { min-height:31px; padding:6px 12px; border:1px solid #bfdbfe; border-radius:8px; background:#eff6ff; color:#1d4ed8; font-family:inherit; font-size:.72rem; font-weight:900; cursor:pointer; }
-    .planning-activity-filters { flex:0 0 auto; display:grid; grid-template-columns:minmax(240px,1fr) 150px 180px 145px; gap:7px; padding:8px 10px; border-bottom:1px solid #dbe5ef; background:#f8fafc; }
-    #planningTab .planning-activity-filters input,#planningTab .planning-activity-filters select { width:100%; min-width:0; height:34px; box-sizing:border-box; border:1px solid #d5e1ed; border-radius:8px; padding:5px 9px; background:#eef3f8; color:#334155; font-family:inherit; font-size:.72rem; font-weight:750; box-shadow:inset 3px 3px 7px #d9e1ea,inset -3px -3px 7px #fff; }
-    .planning-activity-table-wrap { min-height:0; flex:1 1 auto; overflow:auto; padding:6px; background:#fff; }
-    .planning-activity-table { width:100%; min-width:980px; border-collapse:separate; border-spacing:0; table-layout:fixed; border:1px solid #d5e1ed; border-radius:9px; overflow:hidden; }
-    .planning-activity-table th { position:sticky; z-index:2; top:0; padding:9px 8px; border-right:1px solid #d5e1ed; border-bottom:2px solid #94a3b8; background:#e8eef5; color:#334155; font-size:.64rem; font-weight:950; letter-spacing:.025em; text-align:left; text-transform:uppercase; }
-    .planning-activity-table td { padding:9px 8px; border-right:1px solid #e1e7ee; border-bottom:1px solid #e1e7ee; color:#334155; font-size:.7rem; line-height:1.3; font-weight:700; vertical-align:middle; overflow-wrap:anywhere; }
+    .planning-activity-toolbar { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:9px 12px; border-bottom:1px solid var(--ui-border); background:var(--ui-subtle); }
+    .planning-activity-title { color:var(--ui-text); font-size:.88rem; font-weight:950; letter-spacing:.025em; }
+    .planning-activity-status { margin-top:2px; color:var(--ui-muted); font-size:.68rem; font-weight:750; }
+    #planningTab .planning-activity-refresh { min-height:31px; padding:6px 12px; border:1px solid var(--ui-accent-soft); border-radius:8px; background:var(--ui-subtle); color:var(--ui-link); font-family:inherit; font-size:.72rem; font-weight:900; cursor:pointer; }
+    .planning-activity-filters { flex:0 0 auto; display:grid; grid-template-columns:minmax(240px,1fr) 150px 180px 145px; gap:7px; padding:8px 10px; border-bottom:1px solid var(--ui-border); background:var(--ui-surface); }
+    #planningTab .planning-activity-filters input,#planningTab .planning-activity-filters select { width:100%; min-width:0; height:34px; box-sizing:border-box; border:1px solid var(--ui-border); border-radius:8px; padding:5px 9px; background:var(--ui-subtle); color:var(--ui-text); font-family:inherit; font-size:.72rem; font-weight:750; box-shadow:inset 3px 3px 7px #d9e1ea,inset -3px -3px 7px #fff; }
+    .planning-activity-table-wrap { min-height:0; flex:1 1 auto; overflow:auto; padding:6px; background:var(--ui-surface); }
+    .planning-activity-table { width:100%; min-width:980px; border-collapse:separate; border-spacing:0; table-layout:fixed; border:1px solid var(--ui-border); border-radius:9px; overflow:hidden; }
+    .planning-activity-table th { position:sticky; z-index:2; top:0; padding:9px 8px; border-right:1px solid var(--ui-border); border-bottom:2px solid var(--ui-border); background:var(--ui-subtle); color:var(--ui-text); font-size:.64rem; font-weight:950; letter-spacing:.025em; text-align:left; text-transform:uppercase; }
+    .planning-activity-table td { padding:9px 8px; border-right:1px solid var(--ui-border); border-bottom:1px solid var(--ui-border); color:var(--ui-text); font-size:.7rem; line-height:1.3; font-weight:700; vertical-align:middle; overflow-wrap:anywhere; }
     .planning-activity-table th:last-child,.planning-activity-table td:last-child { border-right:0; }
     .planning-activity-table tbody tr:last-child td { border-bottom:0; }
-    .planning-activity-table tbody tr:hover td { background:#f8fbff; }
-    .planning-activity-item { color:#0f172a; font-weight:900; }
-    .planning-activity-sub { margin-top:2px; color:#64748b; font-size:.62rem; font-weight:700; }
-    .planning-action-chip { display:inline-flex; align-items:center; justify-content:center; border-radius:999px; padding:4px 8px; background:#dbeafe; color:#1d4ed8; font-size:.6rem; font-weight:950; white-space:nowrap; }
+    .planning-activity-table tbody tr:hover td { background:var(--ui-surface); }
+    .planning-activity-item { color:var(--ui-text); font-weight:900; }
+    .planning-activity-sub { margin-top:2px; color:var(--ui-muted); font-size:.62rem; font-weight:700; }
+    .planning-action-chip { display:inline-flex; align-items:center; justify-content:center; border-radius:999px; padding:4px 8px; background:var(--ui-subtle); color:var(--ui-link); font-size:.6rem; font-weight:950; white-space:nowrap; }
     .planning-action-chip.queued,.planning-action-chip.assigned { background:#dcfce7; color:#047857; }
     .planning-action-chip.removed { background:#fee2e2; color:#b91c1c; }
     .planning-action-chip.linked { background:#ede9fe; color:#6d28d9; }
     .planning-action-chip.reordered { background:#fef3c7; color:#92400e; }
     .planning-action-chip.started { background:#dcfce7; color:#047857; }
     .planning-mismatch-alerts { position:fixed; z-index:190; top:78px; right:16px; width:min(370px,calc(100vw - 28px)); display:grid; gap:9px; pointer-events:none; }
-    .planning-mismatch-alert { width:100%; box-sizing:border-box; border:2px solid #ef4444; border-radius:13px; padding:11px 13px; background:#fff1f2; color:#7f1d1d; box-shadow:0 12px 30px rgba(185,28,28,.3); font-family:"Poppins",sans-serif; text-align:left; cursor:pointer; pointer-events:auto; animation:planningMismatchPulse 1.05s ease-in-out infinite; }
+    .planning-mismatch-alert { width:100%; box-sizing:border-box; border:2px solid #ef4444; border-radius:13px; padding:11px 13px; background:var(--ui-subtle); color:#7f1d1d; box-shadow:0 12px 30px rgba(185,28,28,.3); font-family:"Poppins",sans-serif; text-align:left; cursor:pointer; pointer-events:auto; animation:planningMismatchPulse 1.05s ease-in-out infinite; }
     .planning-mismatch-alert-title { display:flex; align-items:center; gap:8px; font-size:.82rem; font-weight:950; }
-    .planning-mismatch-alert-title::before { content:"!"; width:22px; height:22px; flex:0 0 22px; display:inline-flex; align-items:center; justify-content:center; border-radius:50%; background:#dc2626; color:#fff; font-size:.76rem; }
+    .planning-mismatch-alert-title::before { content:"!"; width:22px; height:22px; flex:0 0 22px; display:inline-flex; align-items:center; justify-content:center; border-radius:50%; background:#dc2626; color:var(--ui-on-accent); font-size:.76rem; }
     .planning-mismatch-alert-line { margin-top:5px; color:#991b1b; font-size:.7rem; line-height:1.3; font-weight:750; }
     .planning-mismatch-alert-line strong { color:#7f1d1d; font-weight:950; }
     .planning-mismatch-alert-hint { margin-top:6px; color:#b91c1c; font-size:.61rem; font-weight:850; }
     .planning-machine-grid .planning-card.queue-mismatch-highlight { z-index:3; border-color:#dc2626 !important; animation:planningQueueMismatchFocus 6s ease-out 1; }
     @keyframes planningMismatchPulse { 0%,100% { transform:scale(1); box-shadow:0 10px 25px rgba(185,28,28,.22); } 50% { transform:scale(1.018); box-shadow:0 14px 34px rgba(220,38,38,.48),0 0 0 4px rgba(248,113,113,.2); } }
-    @keyframes planningQueueMismatchFocus { 0%,18%,36% { border-color:#dc2626; background:#fee2e2; box-shadow:0 0 0 4px rgba(239,68,68,.32),0 12px 28px rgba(185,28,28,.3); } 9%,27%,48% { border-color:#fca5a5; background:#fff; box-shadow:0 0 0 1px rgba(239,68,68,.12); } 100% { border-color:#dbe5ef; background:#f2f6fa; box-shadow:none; } }
+    @keyframes planningQueueMismatchFocus { 0%,18%,36% { border-color:#dc2626; background:#fee2e2; box-shadow:0 0 0 4px rgba(239,68,68,.32),0 12px 28px rgba(185,28,28,.3); } 9%,27%,48% { border-color:#fca5a5; background:var(--ui-surface); box-shadow:0 0 0 1px rgba(239,68,68,.12); } 100% { border-color:var(--ui-border); background:var(--ui-subtle); box-shadow:none; } }
     @media (max-width:900px){ .planning-activity-filters { grid-template-columns:1fr 1fr; } }
-    .plan-overview-empty { color:#94a3b8; font-weight:650; }
-    .planning-queue-close { flex:0 0 auto; width:34px; height:34px; border:1px solid #dbe5ef; border-radius:10px; background:#eef3f8; color:#475569; box-shadow:3px 3px 7px #d4dde7,-3px -3px 7px #fff; font-size:1.25rem; line-height:1; font-weight:900; cursor:pointer; }
-    #planningQueuePanel .planning-live-queue-head { position:sticky; z-index:3; top:0; padding:18px 20px; background:rgba(255,255,255,.97); border-bottom:1px solid #e6edf5; }
+    .plan-overview-empty { color:var(--ui-muted); font-weight:650; }
+    .planning-queue-close { flex:0 0 auto; width:34px; height:34px; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-subtle); color:var(--ui-muted); box-shadow:3px 3px 7px #d4dde7,-3px -3px 7px #fff; font-size:1.25rem; line-height:1; font-weight:900; cursor:pointer; }
+    #planningQueuePanel .planning-live-queue-head { position:sticky; z-index:3; top:0; padding:18px 20px; background:color-mix(in srgb, var(--ui-surface) 97%, transparent); border-bottom:1px solid var(--ui-border); }
     #planningQueuePanel .planning-live-queue-title { font-size:1.2rem; font-weight:900; }
     #planningQueuePanel .job-queue-summary { margin:16px 18px 14px; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
-    #planningQueuePanel .jq-summary-card { min-width:0; min-height:82px; display:grid; grid-template-columns:42px minmax(0,1fr); gap:11px; align-items:center; padding:12px 14px; box-sizing:border-box; border:1px solid #e1e9f2; border-radius:12px; background:#fff; box-shadow:0 5px 14px rgba(15,23,42,.035); }
-    #planningQueuePanel .jq-summary-icon { width:36px; height:36px; display:flex; align-items:center; justify-content:center; border-radius:9px; color:#2563eb; background:#eaf2ff; }
-    #planningQueuePanel .jq-summary-icon.green { color:#16a34a; background:#e6f7ed; }
-    #planningQueuePanel .jq-summary-icon.red { color:#ef4444; background:#feecec; }
+    #planningQueuePanel .jq-summary-card { min-width:0; min-height:82px; display:grid; grid-template-columns:42px minmax(0,1fr); gap:11px; align-items:center; padding:12px 14px; box-sizing:border-box; border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); box-shadow:0 5px 14px rgba(15,23,42,.035); }
+    #planningQueuePanel .jq-summary-icon { width:36px; height:36px; display:flex; align-items:center; justify-content:center; border-radius:9px; color:var(--ui-link); background:var(--ui-subtle); }
+    #planningQueuePanel .jq-summary-icon.green { color:#16a34a; background:var(--ui-subtle); }
+    #planningQueuePanel .jq-summary-icon.red { color:#ef4444; background:var(--ui-subtle); }
     #planningQueuePanel .jq-summary-icon.purple { color:#7c3aed; background:#f1eaff; }
     #planningQueuePanel .jq-summary-icon svg { width:19px; height:19px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
-    #planningQueuePanel .jq-summary-card .k { color:#64748b; font-size:.65rem; line-height:1.1; font-weight:900; letter-spacing:.045em; text-transform:uppercase; }
-    #planningQueuePanel .jq-summary-card .v { margin-top:4px; color:#0f172a; font-size:1.28rem; line-height:1; font-weight:900; }
-    #planningQueuePanel .jq-summary-card .sub { margin-top:5px; color:#64748b; font-size:.64rem; line-height:1.15; }
-    #planningQueuePanel .table-wrap { margin:0 18px 18px; border:1px solid #e2e8f0; border-radius:12px; overflow:auto; background:#fff; }
+    #planningQueuePanel .jq-summary-card .k { color:var(--ui-muted); font-size:.65rem; line-height:1.1; font-weight:900; letter-spacing:.045em; text-transform:uppercase; }
+    #planningQueuePanel .jq-summary-card .v { margin-top:4px; color:var(--ui-text); font-size:1.28rem; line-height:1; font-weight:900; }
+    #planningQueuePanel .jq-summary-card .sub { margin-top:5px; color:var(--ui-muted); font-size:.64rem; line-height:1.15; }
+    #planningQueuePanel .table-wrap { margin:0 18px 18px; border:1px solid var(--ui-border); border-radius:12px; overflow:auto; background:var(--ui-surface); }
     #planningQueuePanel .planning-job-queue-table { width:100%; min-width:920px; border-collapse:separate; border-spacing:0; table-layout:fixed; }
-    #planningQueuePanel .planning-job-queue-table th { padding:12px 10px; border-bottom:1px solid #e5edf5; background:#f8fafc; color:#475569; font-size:.61rem; line-height:1.1; font-weight:900; letter-spacing:.035em; text-transform:uppercase; text-align:left; }
-    #planningQueuePanel .planning-job-queue-table td { padding:15px 10px; border-bottom:1px solid #e8eef5; color:#0f172a; font-size:.69rem; line-height:1.35; vertical-align:top; overflow-wrap:anywhere; }
+    #planningQueuePanel .planning-job-queue-table th { padding:12px 10px; border-bottom:1px solid var(--ui-border); background:var(--ui-surface); color:var(--ui-muted); font-size:.61rem; line-height:1.1; font-weight:900; letter-spacing:.035em; text-transform:uppercase; text-align:left; }
+    #planningQueuePanel .planning-job-queue-table td { padding:15px 10px; border-bottom:1px solid var(--ui-border); color:var(--ui-text); font-size:.69rem; line-height:1.35; vertical-align:top; overflow-wrap:anywhere; }
     #planningQueuePanel .planning-job-queue-table tbody tr:last-child td { border-bottom:0; }
     .jq-machine-cell { display:grid; grid-template-columns:27px minmax(0,1fr); gap:8px; }
-    .jq-machine-icon { width:25px; height:25px; display:flex; align-items:center; justify-content:center; border-radius:7px; background:#eaf2ff; color:#2563eb; font-size:.78rem; font-weight:900; }
-    .jq-primary { color:#0f172a; font-weight:900; }
-    .jq-secondary { margin-top:3px; color:#64748b; font-size:.64rem; }
+    .jq-machine-icon { width:25px; height:25px; display:flex; align-items:center; justify-content:center; border-radius:7px; background:var(--ui-subtle); color:var(--ui-link); font-size:.78rem; font-weight:900; }
+    .jq-primary { color:var(--ui-text); font-weight:900; }
+    .jq-secondary { margin-top:3px; color:var(--ui-muted); font-size:.64rem; }
     .jq-activity { display:flex; align-items:flex-start; gap:5px; }
     .jq-activity-dot { flex:0 0 auto; width:6px; height:6px; margin-top:4px; border-radius:50%; background:#22c55e; }
     .jq-activity-dot.offline { background:#ef4444; }
     .jq-progress-head { display:flex; justify-content:space-between; gap:8px; font-weight:900; }
-    .jq-progress-track { height:5px; margin-top:7px; overflow:hidden; border-radius:999px; background:#e8edf3; }
+    .jq-progress-track { height:5px; margin-top:7px; overflow:hidden; border-radius:999px; background:var(--ui-subtle); }
     .jq-progress-fill { display:block; height:100%; border-radius:inherit; background:#22c55e; }
     .jq-progress-fill.offline { background:#94a3b8; }
-    .jq-inline-icon { display:inline-block; margin-right:5px; color:#2563eb; font-weight:900; }
+    .jq-inline-icon { display:inline-block; margin-right:5px; color:var(--ui-link); font-weight:900; }
     .jq-cycle-icon { color:#7c3aed; }
-    .jq-queue-footer { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 12px; border-top:1px solid #e8eef5; color:#64748b; font-size:.65rem; }
-    .jq-auto-refresh { color:#475569; }
-    .jq-auto-refresh::before { content:"Γå╗"; margin-right:5px; color:#2563eb; font-size:.9rem; }
+    .jq-queue-footer { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:11px 12px; border-top:1px solid var(--ui-border); color:var(--ui-muted); font-size:.65rem; }
+    .jq-auto-refresh { color:var(--ui-muted); }
+    .jq-auto-refresh::before { content:"\21BB"; margin-right:5px; color:var(--ui-link); font-size:.9rem; }
     #planningTab { font-family:"Poppins",sans-serif; }
-    #planningTab .planning-shell { background:#eef3f8; border:1px solid rgba(255,255,255,.82); box-shadow:12px 12px 28px #d6dee8,-10px -10px 24px rgba(255,255,255,.92),inset 0 1px 0 #fff; }
-    #planningTab .planning-ops-metric { border:1px solid rgba(255,255,255,.78); background:#eef3f8; color:#0f172a; box-shadow:7px 7px 15px #d4dde7,-7px -7px 15px #fff; }
-    #planningTab .planning-ops-metric.warn { background:#fff7ed; }
-    #planningTab .planning-ops-metric.good { background:#ecfdf5; }
-    #planningTab .planning-ops-metric .k { color:#64748b; }
-    #planningTab .planning-ops-metric .v { color:#0f172a; }
-    #planningTab .planning-ops-metric .s { color:#64748b; }
+    #planningTab .planning-shell { background:var(--ui-subtle); border:1px solid color-mix(in srgb, var(--ui-surface) 82%, transparent); box-shadow:12px 12px 28px #d6dee8,-10px -10px 24px color-mix(in srgb, var(--ui-surface) 92%, transparent),inset 0 1px 0 #fff; }
+    #planningTab .planning-ops-metric { border:1px solid color-mix(in srgb, var(--ui-surface) 78%, transparent); background:var(--ui-subtle); color:var(--ui-text); box-shadow:7px 7px 15px #d4dde7,-7px -7px 15px #fff; }
+    #planningTab .planning-ops-metric.warn { background:var(--ui-subtle); }
+    #planningTab .planning-ops-metric.good { background:var(--ui-subtle); }
+    #planningTab .planning-ops-metric .k { color:var(--ui-muted); }
+    #planningTab .planning-ops-metric .v { color:var(--ui-text); }
+    #planningTab .planning-ops-metric .s { color:var(--ui-muted); }
     #planningTab .planning-lane,
-    #planningTab .planning-live-queue { border:1px solid rgba(255,255,255,.86); background:#eef3f8; box-shadow:8px 8px 18px #d5dee8,-7px -7px 16px rgba(255,255,255,.95); }
+    #planningTab .planning-live-queue { border:1px solid color-mix(in srgb, var(--ui-surface) 86%, transparent); background:var(--ui-subtle); box-shadow:8px 8px 18px #d5dee8,-7px -7px 16px color-mix(in srgb, var(--ui-surface) 95%, transparent); }
     #planningTab .planning-lane-head,
-    #planningTab .planning-live-queue-head { border-bottom-color:#dce5ee; background:rgba(248,251,255,.48); }
+    #planningTab .planning-live-queue-head { border-bottom-color:var(--ui-border); background:color-mix(in srgb, var(--ui-subtle) 48%, transparent); }
     #planningTab .planning-card,
-    #planningTab .stock-rec-card { border:1px solid rgba(255,255,255,.92); background:#f2f6fa; box-shadow:5px 5px 11px #d4dde7,-5px -5px 11px #fff; }
-    #planningTab .planning-card.live { border-color:#bbf7d0; background:#effcf5; box-shadow:5px 5px 11px #d1dfd7,-5px -5px 11px #fff; }
-    #planningTab .planning-card.next-job { border-color:#bfdbfe; background:#eff6ff; }
-    #planningTab .planning-card.queue-job { background:#f2f6fa; }
+    #planningTab .stock-rec-card { border:1px solid color-mix(in srgb, var(--ui-surface) 92%, transparent); background:var(--ui-subtle); box-shadow:5px 5px 11px #d4dde7,-5px -5px 11px #fff; }
+    #planningTab .planning-card.live { border-color:#bbf7d0; background:var(--ui-subtle); box-shadow:5px 5px 11px #d1dfd7,-5px -5px 11px #fff; }
+    #planningTab .planning-card.next-job { border-color:var(--ui-accent-soft); background:var(--ui-subtle); }
+    #planningTab .planning-card.queue-job { background:var(--ui-subtle); }
     #planningTab .planning-controls input,
     #planningTab .planning-stock-search-row input,
     #planningTab .planning-recommend-actions input,
-    #planningTab .planning-recommend-actions select { border:1px solid rgba(255,255,255,.9); background:#eef3f8; box-shadow:inset 4px 4px 8px #d6dee8,inset -4px -4px 8px #fff; }
+    #planningTab .planning-recommend-actions select { border:1px solid color-mix(in srgb, var(--ui-surface) 90%, transparent); background:var(--ui-subtle); box-shadow:inset 4px 4px 8px #d6dee8,inset -4px -4px 8px #fff; }
     #planningTab .planning-controls button,
     #planningTab .planning-recommend-actions button { box-shadow:5px 5px 11px rgba(37,99,235,.2),-4px -4px 9px #fff; }
-    #planningTab .planning-controls button.secondary { background:#eef3f8; border-color:rgba(255,255,255,.9); box-shadow:5px 5px 11px #d4dde7,-5px -5px 11px #fff; }
-    #planningTab .planning-recommend { background:#eef3f8; border-top-color:#dce5ee; }
-    #planningTab .planning-recommend-head { border-bottom-color:#dce5ee; }
-    #planningTab .planning-dropzone.drag-over { outline-color:#60a5fa; background:#e8f2ff; }
-    .planning-live-operator { margin-top:5px; min-width:0; overflow:hidden; color:#475569; font-size:.68rem; line-height:1.2; font-weight:750; white-space:nowrap; text-overflow:ellipsis; }
+    #planningTab .planning-controls button.secondary { background:var(--ui-subtle); border-color:color-mix(in srgb, var(--ui-surface) 90%, transparent); box-shadow:5px 5px 11px #d4dde7,-5px -5px 11px #fff; }
+    #planningTab .planning-recommend { background:var(--ui-subtle); border-top-color:var(--ui-border); }
+    #planningTab .planning-recommend-head { border-bottom-color:var(--ui-border); }
+    #planningTab .planning-dropzone.drag-over { outline-color:var(--ui-accent); background:var(--ui-subtle); }
+    .planning-live-operator { margin-top:5px; min-width:0; overflow:hidden; color:var(--ui-muted); font-size:.68rem; line-height:1.2; font-weight:750; white-space:nowrap; text-overflow:ellipsis; }
     .planning-live-progress { display:grid; gap:3px; margin-top:7px; padding-top:6px; border-top:1px solid rgba(148,163,184,.22); }
-    .planning-live-progress-head { display:flex; align-items:center; justify-content:space-between; gap:7px; color:#64748b; font-size:.56rem; line-height:1; font-weight:900; text-transform:uppercase; letter-spacing:.03em; }
-    .planning-live-progress-head strong { color:#0f64bd; font-size:.62rem; }
-    .planning-live-progress-track { height:6px; overflow:hidden; border-radius:999px; background:#dbe5ef; box-shadow:inset 2px 2px 4px #c6d0db,inset -2px -2px 4px #fff; }
-    .planning-live-progress-fill { display:block; height:100%; border-radius:inherit; background:linear-gradient(90deg,#0ea5e9,#2563eb); transition:width .35s ease; }
-    .planning-live-progress-caption { min-width:0; overflow:hidden; color:#64748b; font-size:.52rem; line-height:1.15; font-weight:800; white-space:nowrap; text-overflow:ellipsis; }
+    .planning-live-progress-head { display:flex; align-items:center; justify-content:space-between; gap:7px; color:var(--ui-muted); font-size:.56rem; line-height:1; font-weight:900; text-transform:uppercase; letter-spacing:.03em; }
+    .planning-live-progress-head strong { color:var(--ui-link); font-size:.62rem; }
+    .planning-live-progress-track { height:6px; overflow:hidden; border-radius:999px; background:var(--ui-subtle); box-shadow:inset 2px 2px 4px #c6d0db,inset -2px -2px 4px #fff; }
+    .planning-live-progress-fill { display:block; height:100%; border-radius:inherit; background:linear-gradient(90deg,#0ea5e9,var(--ui-accent)); transition:width .35s ease; }
+    .planning-live-progress-caption { min-width:0; overflow:hidden; color:var(--ui-muted); font-size:.52rem; line-height:1.15; font-weight:800; white-space:nowrap; text-overflow:ellipsis; }
     .planning-machine-grid .planning-card.live { height:112px; max-height:112px; }
     @media (min-width: 901px) {
       body.planning-tab-active { height:100vh; min-height:0; overflow-y:hidden; }
@@ -8404,33 +9986,33 @@ DASHBOARD_HTML = r"""
       body.planning-tab-active #planningTab .planning-workspace { flex:1 1 auto; height:auto; min-height:0; }
     }
     .table-actions { display: flex; gap: 8px; }
-    .mini-btn { border: 1px solid #cbd5e1; background: #fff; color: #1f2937; border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; cursor: pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
+    .mini-btn { border: 1px solid var(--ui-border); background: var(--ui-surface); color: var(--ui-text); border-radius: 8px; padding: 6px 10px; font-size: 0.82rem; cursor: pointer; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
     .mini-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 12px rgba(15,23,42,0.08); }
     .mini-btn:active { transform: translateY(0) scale(0.985); }
-    .mini-btn.primary { background: #eff6ff; border-color: #bfdbfe; color: #1d4ed8; }
+    .mini-btn.primary { background: var(--ui-subtle); border-color: var(--ui-accent-soft); color: var(--ui-accent); }
     .finished-wrap { margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); gap: 14px; }
-    .job-progress-bar { height:14px; margin:12px 0 5px; border:1px solid #cbd5e1; border-radius:999px; background:#e8eef5; overflow:hidden; }
-    .job-progress-fill { height:100%; min-width:0; border-radius:999px; background:linear-gradient(90deg,#2563eb,#22c55e); transition:width .25s ease; }
-    .job-progress-caption { display:flex; justify-content:space-between; gap:10px; color:#64748b; font-size:.76rem; font-weight:800; }
+    .job-progress-bar { height:14px; margin:12px 0 5px; border:1px solid var(--ui-border); border-radius:999px; background:var(--ui-subtle); overflow:hidden; }
+    .job-progress-fill { height:100%; min-width:0; border-radius:999px; background:linear-gradient(90deg,var(--ui-accent),#22c55e); transition:width .25s ease; }
+    .job-progress-caption { display:flex; justify-content:space-between; gap:10px; color:var(--ui-muted); font-size:.76rem; font-weight:800; }
     .finished-view-toolbar { margin-top: 4px; display: flex; align-items: center; justify-content: flex-start; gap: 8px; }
-    .finished-view-label { color: #64748b; font-size: .82rem; font-weight: 700; }
+    .finished-view-label { color: var(--ui-muted); font-size: .82rem; font-weight: 700; }
     .finish-review-selector { display:flex; align-items:center; gap:8px; margin-top:8px; margin-bottom:8px; }
-    .finish-review-selector label { color:#475569; font-size:.72rem; font-weight:900; text-transform:uppercase; letter-spacing:.035em; }
-    #finishShiftTab .finish-review-selector select { width:auto; min-width:184px; min-height:36px; padding:7px 32px 7px 11px; border:1px solid #cbd5e1; border-radius:10px; background:#eef3f8; color:#0f172a; font-family:inherit; font-size:.82rem; line-height:1.1; font-weight:850; box-shadow:0 4px 12px rgba(15,23,42,.06); cursor:pointer; }
+    .finish-review-selector label { color:var(--ui-muted); font-size:.72rem; font-weight:900; text-transform:uppercase; letter-spacing:.035em; }
+    #finishShiftTab .finish-review-selector select { width:auto; min-width:184px; min-height:36px; padding:7px 32px 7px 11px; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-subtle); color:var(--ui-text); font-family:inherit; font-size:.82rem; line-height:1.1; font-weight:850; box-shadow:0 4px 12px rgba(15,23,42,.06); cursor:pointer; }
     .finish-review-pane-head { margin:12px clamp(12px, 1.4vw, 22px) 0; }
     .finish-review-pane-head h3 { margin:0 0 4px; }
-    .finished-view-switch { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid #cbd5e1; border-radius: 10px; background: #eef3f8; box-shadow:0 4px 12px rgba(15,23,42,.06); }
-    .finished-view-btn { border: 0; border-radius: 7px; padding: 6px 11px; background: transparent; color: #475569; font: inherit; font-size: .78rem; font-weight: 850; cursor: pointer; }
-    .finished-view-btn.active { background: #0b2f73; color: #fff; box-shadow: 0 2px 6px rgba(11,47,115,.22); }
-    #finishShiftTab .finished-view-switch .finished-view-btn { width:32px; height:32px; display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:7px; padding:0; background:transparent; color:#475569; box-shadow:none; }
-    #finishShiftTab .finished-view-switch .finished-view-btn.active { background:#0f64bd; color:#fff; box-shadow:0 2px 6px rgba(15,100,189,.22); }
+    .finished-view-switch { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid var(--ui-border); border-radius: 10px; background: var(--ui-subtle); box-shadow:0 4px 12px rgba(15,23,42,.06); }
+    .finished-view-btn { border: 0; border-radius: 7px; padding: 6px 11px; background: transparent; color: var(--ui-muted); font: inherit; font-size: .78rem; font-weight: 850; cursor: pointer; }
+    .finished-view-btn.active { background: #0b2f73; color: var(--ui-on-accent); box-shadow: 0 2px 6px rgba(11,47,115,.22); }
+    #finishShiftTab .finished-view-switch .finished-view-btn { width:32px; height:32px; display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:7px; padding:0; background:transparent; color:var(--ui-muted); box-shadow:none; }
+    #finishShiftTab .finished-view-switch .finished-view-btn.active { background:var(--ui-accent); color:var(--ui-on-accent); box-shadow:0 2px 6px rgba(15,100,189,.22); }
     #finishShiftTab .finished-view-switch .finished-view-btn svg { width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
-    .finished-list-wrap { margin-top: 12px; border: 1px solid #d7e3f4; border-radius: 12px; overflow-x: auto; background: #fff; }
+    .finished-list-wrap { margin-top: 12px; border: 1px solid var(--ui-border); border-radius: 12px; overflow-x: auto; background: var(--ui-surface); }
     .finished-list-table { width: 100%; min-width: 980px; border-collapse: collapse; }
-    .finished-list-table th { padding: 10px 12px; background: #eef4fb; color: #334e78; border-bottom: 1px solid #d7e3f4; text-align: left; font-size: .74rem; text-transform: uppercase; letter-spacing: .025em; white-space: nowrap; }
-    .finished-list-table td { padding: 10px 12px; border-bottom: 1px solid #e7edf6; color: #1e293b; font-size: .82rem; vertical-align: middle; }
+    .finished-list-table th { padding: 10px 12px; background: var(--ui-subtle); color: var(--ui-muted); border-bottom: 1px solid var(--ui-border); text-align: left; font-size: .74rem; text-transform: uppercase; letter-spacing: .025em; white-space: nowrap; }
+    .finished-list-table td { padding: 10px 12px; border-bottom: 1px solid var(--ui-border); color: var(--ui-text); font-size: .82rem; vertical-align: middle; }
     .finished-list-table tbody tr:last-child td { border-bottom: 0; }
-    .finished-list-table tbody tr:hover { background: #f8fbff; }
+    .finished-list-table tbody tr:hover { background: var(--ui-surface); }
     .finished-list-job { min-width: 190px; font-weight: 800; color: #12233f; }
     .finished-list-output { white-space: nowrap; }
     .finished-list-action { text-align: right; white-space: nowrap; }
@@ -8492,35 +10074,35 @@ DASHBOARD_HTML = r"""
       box-shadow: none;
     }
     .finished-item {
-      border: 1px solid #d7e3f4;
+      border: 1px solid var(--ui-border);
       border-radius: 14px;
       padding: 14px;
-      background: linear-gradient(160deg, #ffffff 0%, #f6f9ff 62%, #eef4ff 100%);
+      background: linear-gradient(160deg, var(--ui-surface) 0%, var(--ui-surface) 62%, var(--ui-subtle) 100%);
       box-shadow: 0 5px 14px rgba(22, 45, 90, 0.10);
     }
     .finished-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
     .finished-item h4 { margin: 0; font-size: 1rem; color: #12233f; overflow-wrap: anywhere; word-break: break-word; }
-    .finished-badge { font-size: 0.72rem; font-weight: 700; color: #1e40af; background: #dbeafe; border: 1px solid #93c5fd; border-radius: 999px; padding: 4px 9px; white-space: nowrap; }
+    .finished-badge { font-size: 0.72rem; font-weight: 700; color: var(--ui-accent); background: var(--ui-subtle); border: 1px solid var(--ui-accent); border-radius: 999px; padding: 4px 9px; white-space: nowrap; }
     .finished-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-    .finished-grid div { font-size: 0.82rem; background: rgba(255,255,255,0.92); border: 1px solid #e6edf8; border-radius: 8px; padding: 7px 9px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
-    .raw-list { margin-top: 10px; font-size: 0.81rem; background: #fff; border: 1px solid #e6edf8; border-radius: 8px; padding: 8px; max-height: 130px; overflow: auto; white-space: pre-wrap; }
+    .finished-grid div { font-size: 0.82rem; background: color-mix(in srgb, var(--ui-surface) 92%, transparent); border: 1px solid var(--ui-border); border-radius: 8px; padding: 7px 9px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+    .raw-list { margin-top: 10px; font-size: 0.81rem; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 8px; padding: 8px; max-height: 130px; overflow: auto; white-space: pre-wrap; }
     .finished-actions { margin-top: 10px; display: flex; justify-content: flex-end; }
     .job-queue-summary { margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
-    .job-queue-metric { border: 1px solid #dbe4f0; border-radius: 12px; padding: 12px; background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%); }
-    .job-queue-metric .k { font-size: 0.76rem; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: #64748b; }
-    .job-queue-metric .v { margin-top: 6px; font-size: 1.2rem; font-weight: 800; color: #0f172a; }
+    .job-queue-metric { border: 1px solid var(--ui-border); border-radius: 12px; padding: 12px; background: linear-gradient(180deg, var(--ui-surface) 0%, var(--ui-surface) 100%); }
+    .job-queue-metric .k { font-size: 0.76rem; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: var(--ui-muted); }
+    .job-queue-metric .v { margin-top: 6px; font-size: 1.2rem; font-weight: 800; color: var(--ui-text); }
     .queue-status-badge { display: inline-flex; align-items: center; border-radius: 999px; padding: 4px 9px; font-size: 0.74rem; font-weight: 800; letter-spacing: .02em; white-space: nowrap; }
     .queue-status-badge.running { background: #dcfce7; color: #166534; border: 1px solid #86efac; }
-    .queue-status-badge.done { background: #dbeafe; color: #1d4ed8; border: 1px solid #93c5fd; }
+    .queue-status-badge.done { background: var(--ui-subtle); color: var(--ui-accent); border: 1px solid var(--ui-accent); }
     .queue-status-badge.disconnected { background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5; }
     .queue-status-badge.no-target, .queue-status-badge.no-cycle { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
-    .queue-target-warning { display:inline-block; margin-top:5px; padding:4px 7px; border-radius:7px; background:#fff7ed; color:#c2410c; border:1px solid #fdba74; font-size:.72rem; font-weight:900; line-height:1.25; white-space:nowrap; }
-    .queue-target-warning.excess { background:#fef2f2; color:#b91c1c; border-color:#fca5a5; }
+    .queue-target-warning { display:inline-block; margin-top:5px; padding:4px 7px; border-radius:7px; background:var(--ui-subtle); color:#c2410c; border:1px solid #fdba74; font-size:.72rem; font-weight:900; line-height:1.25; white-space:nowrap; }
+    .queue-target-warning.excess { background:var(--ui-subtle); color:#b91c1c; border-color:#fca5a5; }
     .approve-print-btn {
       border: none;
       border-radius: 10px;
-      background: linear-gradient(135deg, #1f8ef1 0%, #1d4ed8 100%);
-      color: #fff;
+      background: linear-gradient(135deg, #1f8ef1 0%, var(--ui-accent) 100%);
+      color: var(--ui-on-accent);
       font-weight: 600;
       font-size: 0.82rem;
       padding: 8px 12px;
@@ -8532,16 +10114,16 @@ DASHBOARD_HTML = r"""
     .approve-print-btn:active { transform: translateY(0) scale(0.985); }
     .overlay-backdrop { position: fixed; inset: 0; background: rgba(104, 120, 143, 0.52); backdrop-filter: blur(8px); display: none; align-items: center; justify-content: center; padding: 14px; z-index: 999; }
     .overlay-backdrop.active { display: flex; }
-    .overlay-card { width: min(1120px, calc(100vw - 160px)); max-height: calc(100vh - 36px); background: #f4f5f7; border: 1px solid #cfd4dc; border-radius: 20px; box-shadow: 0 22px 56px rgba(15, 23, 42, 0.20); position: relative; overflow: hidden; display: flex; flex-direction: column; }
-    .overlay-head { padding: 18px 24px 14px; border-bottom: 1px solid #d7dbe1; display: flex; align-items: center; justify-content: space-between; }
-    .overlay-title { font-weight: 800; font-size: 1.08rem; color: #1d273c; letter-spacing: .01em; }
-    .overlay-close { border: 1px solid #cfd4dc; background: #dde1e7; color: #2d3342; border-radius: 14px; width: 44px; height: 44px; padding: 0; cursor: pointer; font-size: 0; position: relative; }
+    .overlay-card { width: min(1120px, calc(100vw - 160px)); max-height: calc(100vh - 36px); background: var(--ui-subtle); border: 1px solid var(--ui-border); border-radius: 20px; box-shadow: 0 22px 56px rgba(15, 23, 42, 0.20); position: relative; overflow: hidden; display: flex; flex-direction: column; }
+    .overlay-head { padding: 18px 24px 14px; border-bottom: 1px solid var(--ui-border); display: flex; align-items: center; justify-content: space-between; }
+    .overlay-title { font-weight: 800; font-size: 1.08rem; color: var(--ui-text); letter-spacing: .01em; }
+    .overlay-close { border: 1px solid var(--ui-border); background: var(--ui-subtle); color: var(--ui-text); border-radius: 14px; width: 44px; height: 44px; padding: 0; cursor: pointer; font-size: 0; position: relative; }
     .overlay-close::before { content: "\00D7"; font-size: 22px; line-height: 1; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
     .overlay-body { padding: 10px 18px 8px; display: grid; gap: 6px; min-height: 0; overflow: hidden; flex: 1 1 auto; }
     .overlay-row { display: grid; grid-template-columns: 180px 1fr; gap: 12px; align-items: center; }
     .overlay-row > * { min-width: 0; }
-    .overlay-row label { font-weight: 600; color: #40485a; font-size: 0.95rem; }
-    .overlay-row select, .overlay-row input, .overlay-row textarea { width: 100%; max-width: 100%; box-sizing: border-box; border: 1px solid #c9d0db; border-radius: 14px; padding: 11px 14px; font-family: inherit; font-size: 0.98rem; background: #f7f8fa; color: #1f2937; }
+    .overlay-row label { font-weight: 600; color: var(--ui-text); font-size: 0.95rem; }
+    .overlay-row select, .overlay-row input, .overlay-row textarea { width: 100%; max-width: 100%; box-sizing: border-box; border: 1px solid var(--ui-border); border-radius: 14px; padding: 11px 14px; font-family: inherit; font-size: 0.98rem; background: var(--ui-subtle); color: var(--ui-text); }
     .overlay-row textarea { min-height: 64px; resize: none; line-height: 1.34; overflow: hidden; }
     .overlay-input-wrap { position: relative; width: 100%; }
     .overlay-suggest {
@@ -8550,8 +10132,8 @@ DASHBOARD_HTML = r"""
       left: 0;
       right: 0;
       z-index: 25;
-      background: #fff;
-      border: 1px solid #cbd5e1;
+      background: var(--ui-surface);
+      border: 1px solid var(--ui-border);
       border-radius: 10px;
       box-shadow: 0 10px 24px rgba(15, 23, 42, 0.16);
       max-height: 220px;
@@ -8562,8 +10144,8 @@ DASHBOARD_HTML = r"""
     .overlay-suggest-item {
       width: 100%;
       border: none;
-      border-bottom: 1px solid #eef2f7;
-      background: #fff;
+      border-bottom: 1px solid var(--ui-border);
+      background: var(--ui-surface);
       text-align: left;
       padding: 8px 10px;
       cursor: pointer;
@@ -8571,21 +10153,21 @@ DASHBOARD_HTML = r"""
       font-size: 0.88rem;
     }
     .overlay-suggest-item:last-child { border-bottom: none; }
-    .overlay-suggest-item:hover, .overlay-suggest-item.active { background: #eff6ff; }
+    .overlay-suggest-item:hover, .overlay-suggest-item.active { background: var(--ui-subtle); }
     #overlayQrPayload { font-family: "Consolas", "Courier New", monospace; font-size: 0.78rem; line-height: 1.35; overflow-wrap: anywhere; word-break: break-all; }
-    .overlay-preview { display: flex; align-items: center; justify-content: center; background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 10px; padding: 10px; min-height: 170px; }
-    .overlay-preview img { width: 320px; max-width: 100%; height: auto; object-fit: contain; background: #fff; border: 1px solid #dbe4f0; border-radius: 8px; }
-    .overlay-actions { padding: 10px 18px 14px; border-top: 1px solid #d7dbe1; display: flex; justify-content: flex-end; gap: 10px; flex: 0 0 auto; }
-    .btn-secondary { border: 1px solid #c7cdd8; background: #f3f4f6; color: #202737; border-radius: 14px; padding: 9px 20px; cursor: pointer; font-size: 0.94rem; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
-    .btn-secondary:hover { background: #f8f9fb; transform: translateY(-1px); box-shadow: 0 8px 18px rgba(15,23,42,0.08); }
+    .overlay-preview { display: flex; align-items: center; justify-content: center; background: var(--ui-surface); border: 1px dashed var(--ui-border); border-radius: 10px; padding: 10px; min-height: 170px; }
+    .overlay-preview img { width: 320px; max-width: 100%; height: auto; object-fit: contain; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 8px; }
+    .overlay-actions { padding: 10px 18px 14px; border-top: 1px solid var(--ui-border); display: flex; justify-content: flex-end; gap: 10px; flex: 0 0 auto; }
+    .btn-secondary { border: 1px solid var(--ui-border); background: var(--ui-subtle); color: var(--ui-text); border-radius: 14px; padding: 9px 20px; cursor: pointer; font-size: 0.94rem; transition: transform .12s ease, box-shadow .16s ease, background-color .16s ease; }
+    .btn-secondary:hover { background: var(--ui-subtle); transform: translateY(-1px); box-shadow: 0 8px 18px rgba(15,23,42,0.08); }
     .btn-secondary:active { transform: translateY(0) scale(0.985); }
-    .btn-primary { border: none; background: linear-gradient(180deg, #3961dc 0%, #2d52cb 100%); color: #fff; border-radius: 14px; padding: 9px 20px; cursor: pointer; font-size: 0.94rem; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.10); transition: transform .12s ease, box-shadow .16s ease, filter .16s ease; }
-    .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 10px 22px rgba(45,82,203,0.28), inset 0 0 0 1px rgba(255,255,255,0.10); filter: brightness(1.03); }
+    .btn-primary { border: none; background: linear-gradient(180deg, var(--ui-accent) 0%, var(--ui-accent) 100%); color: var(--ui-on-accent); border-radius: 14px; padding: 9px 20px; cursor: pointer; font-size: 0.94rem; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ui-surface) 10%, transparent); transition: transform .12s ease, box-shadow .16s ease, filter .16s ease; }
+    .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 10px 22px rgba(45,82,203,0.28), inset 0 0 0 1px color-mix(in srgb, var(--ui-surface) 10%, transparent); filter: brightness(1.03); }
     .btn-primary:active { transform: translateY(0) scale(0.985); }
     .review-slide-toolbar { display:flex; align-items:center; justify-content:center; gap:10px; margin: 0 0 10px; min-height: 42px; }
-    .review-slide-status { font-size: 0.92rem; color: #4b5567; font-weight: 700; margin: 0; flex:1; text-align:center; }
-    .review-slide-arrow { border: 1px solid rgba(199, 207, 219, 0.95); background: rgba(242,245,249,0.96); border-radius: 999px; width: 42px; height: 42px; cursor: pointer; font-size: 18px; box-shadow: 0 8px 22px rgba(15,23,42,0.11); color: #2f3a4d; transition: box-shadow .16s ease, background-color .16s ease, opacity .16s ease; }
-    .review-slide-arrow:hover:not(:disabled) { box-shadow: 0 10px 22px rgba(15,23,42,0.13); background: rgba(248,250,252,0.98); }
+    .review-slide-status { font-size: 0.92rem; color: var(--ui-muted); font-weight: 700; margin: 0; flex:1; text-align:center; }
+    .review-slide-arrow { border: 1px solid rgba(199, 207, 219, 0.95); background: color-mix(in srgb, var(--ui-subtle) 96%, transparent); border-radius: 999px; width: 42px; height: 42px; cursor: pointer; font-size: 18px; box-shadow: 0 8px 22px rgba(15,23,42,0.11); color: var(--ui-text); transition: box-shadow .16s ease, background-color .16s ease, opacity .16s ease; }
+    .review-slide-arrow:hover:not(:disabled) { box-shadow: 0 10px 22px rgba(15,23,42,0.13); background: color-mix(in srgb, var(--ui-subtle) 98%, transparent); }
     .review-slide-arrow:active:not(:disabled) { box-shadow: 0 7px 16px rgba(15,23,42,0.12); }
     .review-slide-arrow:disabled { opacity: 0.45; cursor: not-allowed; }
     .review-edge-arrow { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; }
@@ -8595,53 +10177,53 @@ DASHBOARD_HTML = r"""
     .review-subslide.active { display: grid; grid-template-columns: 1fr; gap: 10px; align-items: start; }
     #overlayReviewStep { padding: 0 58px; width: 100%; box-sizing: border-box; margin: 0 auto; min-height: 0; overflow-y: auto; max-height: calc(100vh - 190px); }
     #overlayReviewStep .overlay-row { grid-template-columns: 190px 1fr; }
-    #overlayReviewStep .overlay-row input[readonly] { background: #fff; }
-    #overlayReviewStep .overlay-row textarea[readonly] { background: #fff; }
+    #overlayReviewStep .overlay-row input[readonly] { background: var(--ui-surface); }
+    #overlayReviewStep .overlay-row textarea[readonly] { background: var(--ui-surface); }
     .review-panel {
-      background: #f7f8fb;
-      border: 1px solid #d0d5de;
+      background: var(--ui-subtle);
+      border: 1px solid var(--ui-border);
       border-radius: 16px;
       overflow: hidden;
       margin-bottom: 0;
       min-width: 0;
     }
     .review-panel-title {
-      background: #dfe3e8;
-      color: #222a3a;
+      background: var(--ui-subtle);
+      color: var(--ui-text);
       font-weight: 700;
       padding: 9px 14px;
       font-size: 0.92rem;
-      border-bottom: 1px solid #d0d5de;
+      border-bottom: 1px solid var(--ui-border);
     }
     .review-panel-body {
-      background: #f7f8fb;
+      background: var(--ui-subtle);
       padding: 9px 12px;
-      color: #1f2937;
+      color: var(--ui-text);
       font-size: 0.88rem;
       line-height: 1.24;
       max-height: none;
       overflow: hidden;
     }
     .review-line-list { margin: 0; padding-left: 24px; display: grid; gap: 6px; }
-    .review-line-list li { font-size: 0.92rem; color: #1f2937; }
+    .review-line-list li { font-size: 0.92rem; color: var(--ui-text); }
     .review-inline-metrics { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
-    .review-inline-metrics .dot { color: #8b93a1; }
+    .review-inline-metrics .dot { color: var(--ui-muted); }
     .review-inline-metrics .reject-emph { color: #d63b45; font-weight: 700; }
-    .review-form-card { background: #f7f8fb; border: 1px solid #d0d5de; border-radius: 16px; padding: 10px; width: min(760px, 100%); margin: 0 auto; }
+    .review-form-card { background: var(--ui-subtle); border: 1px solid var(--ui-border); border-radius: 16px; padding: 10px; width: min(760px, 100%); margin: 0 auto; }
     #approvePrintOverlay.approved-shift-report .overlay-card { width:min(860px, calc(100vw - 24px)); height:min(850px, calc(100vh - 20px)); max-height:calc(100vh - 20px); border-radius:12px; }
     #approvePrintOverlay.approved-shift-report.linked-shift-report .overlay-card { width:min(1660px, calc(100vw - 24px)); }
     #approvePrintOverlay.approved-shift-report .overlay-head { padding:8px 12px; }
-    #approvePrintOverlay.approved-shift-report .overlay-body { padding:8px; overflow:auto; background:#e8edf3; }
+    #approvePrintOverlay.approved-shift-report .overlay-body { padding:8px; overflow:auto; background:var(--ui-subtle); }
     #approvePrintOverlay.approved-shift-report #overlayReviewStep { padding:0; max-height:none; overflow:visible; }
     #approvePrintOverlay.approved-shift-report #reviewSubslide1 > .review-panel:nth-of-type(2),
     #approvePrintOverlay.approved-shift-report #reviewSubslide1 > input,
     #approvePrintOverlay.approved-shift-report #reviewSubslide1 > textarea { display:none !important; }
-    #approvePrintOverlay.approved-shift-report #reviewSubslide1 > .review-panel:first-child { border:0; border-radius:0; background:#fff; }
+    #approvePrintOverlay.approved-shift-report #reviewSubslide1 > .review-panel:first-child { border:0; border-radius:0; background:var(--ui-surface); }
     #approvePrintOverlay.approved-shift-report #reviewSubslide1 > .review-panel:first-child > .review-panel-title { display:none; }
-    #approvePrintOverlay.approved-shift-report #reviewSubslide1 > .review-panel:first-child > .review-panel-body { padding:0; background:#fff; overflow:visible; }
-    #approvePrintOverlay.approved-shift-report #reviewSubslide3 > .review-panel { border:0; border-radius:0; background:#fff; }
+    #approvePrintOverlay.approved-shift-report #reviewSubslide1 > .review-panel:first-child > .review-panel-body { padding:0; background:var(--ui-surface); overflow:visible; }
+    #approvePrintOverlay.approved-shift-report #reviewSubslide3 > .review-panel { border:0; border-radius:0; background:var(--ui-surface); }
     #approvePrintOverlay.approved-shift-report #reviewSubslide3 > .review-panel > .review-panel-title { display:none; }
-    #approvePrintOverlay.approved-shift-report #reviewSubslide3 > .review-panel > .review-panel-body { padding:0; background:#fff; overflow:visible; }
+    #approvePrintOverlay.approved-shift-report #reviewSubslide3 > .review-panel > .review-panel-body { padding:0; background:var(--ui-surface); overflow:visible; }
     #approvePrintOverlay.approved-shift-report #reviewSubslide3 .pdr-sheet { width:min(820px,100%); min-height:680px; margin:0 auto; padding:10px; box-sizing:border-box; box-shadow:0 8px 26px rgba(15,23,42,.12); }
     #approvePrintOverlay.approved-shift-report #reviewSubslide3 .pdr-topbar { grid-template-columns:1fr; gap:8px; min-height:72px; padding:12px 16px; box-sizing:border-box; }
     #approvePrintOverlay.approved-shift-report #reviewSubslide3 .pdr-topbar h2 { font-size:28px; }
@@ -8649,27 +10231,27 @@ DASHBOARD_HTML = r"""
     #approvePrintOverlay.approved-shift-report #reviewSubslide3 .consumption-report-layout { grid-template-columns:150px minmax(0,1fr); }
     #approvePrintOverlay.approved-shift-report #reviewSubslide3 .consumption-content-grid { grid-template-columns:1fr; }
     #approvePrintOverlay.approved-shift-report #reviewSubslide3 .consumption-content-grid .balance-panel { grid-column:auto; }
-    #approvePrintOverlay.approved-shift-report #reviewSubslide3 .consumption-content-grid .review-group-card:nth-child(2) { border-right:0; border-bottom:1px solid #b9c7da; }
-    #approvePrintOverlay.approved-shift-report #reviewSubslide5 > .review-panel:first-child { border:0; border-radius:0; background:#fff; }
+    #approvePrintOverlay.approved-shift-report #reviewSubslide3 .consumption-content-grid .review-group-card:nth-child(2) { border-right:0; border-bottom:1px solid var(--ui-border); }
+    #approvePrintOverlay.approved-shift-report #reviewSubslide5 > .review-panel:first-child { border:0; border-radius:0; background:var(--ui-surface); }
     #approvePrintOverlay.approved-shift-report #reviewSubslide5 > .review-panel:first-child > .review-panel-title { display:none; }
-    #approvePrintOverlay.approved-shift-report #reviewSubslide5 > .review-panel:first-child > .review-panel-body { padding:0; background:#fff; overflow:visible; }
+    #approvePrintOverlay.approved-shift-report #reviewSubslide5 > .review-panel:first-child > .review-panel-body { padding:0; background:var(--ui-surface); overflow:visible; }
     #approvePrintOverlay.approved-shift-report #reviewSubslide5 > .review-panel:nth-of-type(2) { display:none; }
     #approvePrintOverlay.approved-shift-report #reviewSubslide5 > .review-panel:first-child { width:min(820px,100%); min-height:680px; margin:0 auto; padding:10px; box-sizing:border-box; box-shadow:0 8px 26px rgba(15,23,42,.12); }
     #approvePrintOverlay.approved-shift-report .overlay-actions .review-edge-arrow { position:static; transform:none; width:auto; height:auto; border-radius:14px; padding:9px 20px; font-size:.9rem; font-weight:900; }
     #approvePrintOverlay.approved-shift-report .overlay-actions .review-slide-status { flex:0 0 auto; margin:0 auto 0 0; color:#09266a; font-size:13px; font-weight:950; text-align:left; white-space:nowrap; }
-    #approvePrintOverlay.portrait-shift-report .overlay-body { background:#e8edf3; }
-    .pdr-sheet { color:#071d50; background:#fff; font-size:12px; line-height:1.2; }
+    #approvePrintOverlay.portrait-shift-report .overlay-body { background:var(--ui-subtle); }
+    .pdr-sheet { color:#071d50; background:var(--ui-surface); font-size:12px; line-height:1.2; }
     .pdr-sheet.pdr-portrait { width:min(820px,100%); min-height:680px; margin:0 auto; padding:10px; box-sizing:border-box; box-shadow:0 8px 26px rgba(15,23,42,.12); }
     .linked-shift-layout { width:100%; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; align-items:start; }
     .linked-shift-layout > .pdr-sheet { width:100%; min-width:0; margin:0; }
     .linked-shift-shell { width:100%; }
     .linked-shift-toolbar { width:min(820px,100%); margin:0 auto 10px; display:flex; justify-content:space-between; align-items:center; gap:10px; }
-    .same-job-shift-picker { display:flex; align-items:center; gap:8px; color:#334155; font-size:.8rem; font-weight:900; }
-    .same-job-shift-picker select { min-width:300px; max-width:520px; border:1px solid #b9c7da; border-radius:10px; background:#fff; color:#0f172a; padding:8px 10px; font:inherit; cursor:pointer; }
+    .same-job-shift-picker { display:flex; align-items:center; gap:8px; color:var(--ui-text); font-size:.8rem; font-weight:900; }
+    .same-job-shift-picker select { min-width:300px; max-width:520px; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); color:var(--ui-text); padding:8px 10px; font:inherit; cursor:pointer; }
     .linked-shift-layout.linked-hidden { grid-template-columns:minmax(0,820px); justify-content:center; }
     .linked-shift-layout.linked-hidden .linked-job-sheet { display:none; }
     .linked-shift-layout .linked-job-sheet .pdr-info { grid-template-columns:repeat(3,minmax(0,1fr)); }
-    .linked-shift-layout .linked-job-sheet .pdr-info-item { grid-column:auto !important; border-right:1px solid #d8e0eb !important; }
+    .linked-shift-layout .linked-job-sheet .pdr-info-item { grid-column:auto !important; border-right:1px solid var(--ui-border) !important; }
     .linked-shift-layout .linked-job-sheet .pdr-info-item:nth-child(3n) { border-right:0 !important; }
     @media (max-width:1100px) {
       .linked-shift-layout { grid-template-columns:1fr; }
@@ -8678,7 +10260,7 @@ DASHBOARD_HTML = r"""
     .pdr-portrait .pdr-topbar h2 { font-size:28px; }
     .pdr-portrait .pdr-top-meta { justify-content:flex-start; gap:18px; }
     .pdr-portrait .pdr-info { grid-template-columns:repeat(5,minmax(0,1fr)); }
-    .pdr-portrait .pdr-info-item { min-height:64px; border-right:1px solid #d8e0eb; }
+    .pdr-portrait .pdr-info-item { min-height:64px; border-right:1px solid var(--ui-border); }
     .pdr-portrait .pdr-info-item:not(.pdr-time-item) { grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); }
     .pdr-portrait .pdr-time-item { grid-column:span 2; }
     .pdr-portrait .pdr-info-item:nth-child(11),
@@ -8686,11 +10268,11 @@ DASHBOARD_HTML = r"""
     .pdr-portrait .pdr-info-item:nth-child(4),
     .pdr-portrait .pdr-info-item:nth-child(9),
     .pdr-portrait .pdr-info-item:nth-child(12) { border-right:0; }
-    .pdr-portrait .pdr-info-k { align-items:center; min-height:25px; padding:5px 9px; box-sizing:border-box; color:#09266a; background:#edf4fc; font-size:10px; letter-spacing:.025em; text-transform:uppercase; }
-    .pdr-portrait .pdr-info-v { align-items:center; padding:7px 9px; color:#071d50; background:#fff; font-size:12px; font-weight:850; }
-    .pdr-portrait .pdr-info-item:first-child .pdr-info-v { color:#0756a6; font-size:15px; font-weight:950; }
+    .pdr-portrait .pdr-info-k { align-items:center; min-height:25px; padding:5px 9px; box-sizing:border-box; color:#09266a; background:var(--ui-subtle); font-size:10px; letter-spacing:.025em; text-transform:uppercase; }
+    .pdr-portrait .pdr-info-v { align-items:center; padding:7px 9px; color:#071d50; background:var(--ui-surface); font-size:12px; font-weight:850; }
+    .pdr-portrait .pdr-info-item:first-child .pdr-info-v { color:var(--ui-link); font-size:15px; font-weight:950; }
     .pdr-portrait .pdr-kpis { grid-template-columns:repeat(6,minmax(0,1fr)); }
-    .pdr-portrait .pdr-kpi { border-right:1px solid #cbd5e1; }
+    .pdr-portrait .pdr-kpi { border-right:1px solid var(--ui-border); }
     .pdr-portrait .pdr-kpi:nth-child(6n) { border-right:0; }
     .pdr-portrait .pdr-kpi .k { min-height:28px; display:flex; align-items:center; justify-content:center; padding:5px 3px; box-sizing:border-box; font-size:8.5px; line-height:1.1; }
     .pdr-portrait .pdr-kpi .v { min-height:42px; display:flex; align-items:center; justify-content:center; padding:6px 3px; box-sizing:border-box; font-size:24px; }
@@ -8703,43 +10285,43 @@ DASHBOARD_HTML = r"""
     .pdr-portrait .pdr-person:nth-child(3n) { border-right:0; }
     .pdr-portrait .pdr-person .k { font-size:11px; line-height:1.2; }
     .pdr-portrait .pdr-person .v { margin-top:6px; font-size:14px; line-height:1.2; font-weight:900; }
-    .pdr-topbar { display:grid; grid-template-columns:minmax(360px,1fr) auto; align-items:center; gap:18px; padding:12px 18px; color:#fff; background:linear-gradient(90deg,#031c56,#062c73); border-radius:4px; }
+    .pdr-topbar { display:grid; grid-template-columns:minmax(360px,1fr) auto; align-items:center; gap:18px; padding:12px 18px; color:var(--ui-on-accent); background:linear-gradient(90deg,#031c56,#062c73); border-radius:4px; }
     .pdr-topbar h2 { margin:0; font-size:clamp(22px,2.2vw,34px); letter-spacing:.02em; }
     .pdr-top-meta { display:flex; gap:18px; font-size:13px; font-weight:800; white-space:nowrap; }
-    .pdr-info { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); border:1px solid #cbd5e1; border-bottom:0; margin-top:8px; }
-    .pdr-info-item { display:grid; grid-template-columns:minmax(115px,.9fr) 1.25fr; min-height:38px; border-right:1px solid #d8e0eb; border-bottom:1px solid #d8e0eb; }
+    .pdr-info { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); border:1px solid var(--ui-border); border-bottom:0; margin-top:8px; }
+    .pdr-info-item { display:grid; grid-template-columns:minmax(115px,.9fr) 1.25fr; min-height:38px; border-right:1px solid var(--ui-border); border-bottom:1px solid var(--ui-border); }
     .pdr-info-item:nth-child(4n) { border-right:0; }
     .pdr-info-k, .pdr-info-v { display:flex; align-items:center; padding:7px 10px; min-width:0; overflow-wrap:anywhere; }
-    .pdr-info-k { font-weight:900; color:#09266a; background:#f8fafc; }
+    .pdr-info-k { font-weight:900; color:#09266a; background:var(--ui-surface); }
     .pdr-info-v { color:#102451; }
     .pdr-time-item { display:grid; grid-template-columns:1fr 1fr; }
-    .pdr-time-box { min-width:0; padding:6px 9px; border-right:1px solid #d8e0eb; }
+    .pdr-time-box { min-width:0; padding:6px 9px; border-right:1px solid var(--ui-border); }
     .pdr-time-box:last-child { border-right:0; }
     .pdr-time-box .k { color:#09266a; font-size:9px; font-weight:900; text-transform:uppercase; }
     .pdr-time-box .v { margin-top:4px; color:#102451; overflow-wrap:anywhere; }
-    .pdr-kpis { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); border:1px solid #b9c7da; margin-top:8px; }
-    .pdr-kpi { text-align:center; border-right:1px solid #cbd5e1; }
+    .pdr-kpis { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); border:1px solid var(--ui-border); margin-top:8px; }
+    .pdr-kpi { text-align:center; border-right:1px solid var(--ui-border); }
     .pdr-kpi:last-child { border-right:0; }
-    .pdr-kpi .k { padding:8px 5px; color:#fff; background:#052762; font-size:11px; font-weight:900; }
+    .pdr-kpi .k { padding:8px 5px; color:var(--ui-on-accent); background:#052762; font-size:11px; font-weight:900; }
     .pdr-kpi .v { padding:12px 5px; font-size:clamp(20px,2vw,30px); font-weight:950; color:#0a296f; }
-    .pdr-kpi.good .v { color:#079455; } .pdr-kpi.butal .v { color:#2563eb; } .pdr-kpi.bad .v { color:#ef1010; } .pdr-kpi.warn .v { color:#f08a00; }
-    .consumption-report-layout { display:grid; grid-template-columns:220px minmax(0,1fr); gap:0; align-items:stretch; margin-top:8px; border:1px solid #b9c7da; border-radius:10px; overflow:hidden; background:#fff; }
-    .consumption-kpis { display:grid; grid-template-columns:1fr; grid-template-rows:repeat(3,minmax(112px,1fr)); margin:0; border:0; border-right:1px solid #b9c7da; min-width:0; }
-    .consumption-kpis .pdr-kpi { display:flex; flex-direction:column; border-right:0; border-bottom:1px solid #cbd5e1; }
+    .pdr-kpi.good .v { color:#079455; } .pdr-kpi.butal .v { color:var(--ui-link); } .pdr-kpi.bad .v { color:#ef1010; } .pdr-kpi.warn .v { color:#f08a00; }
+    .consumption-report-layout { display:grid; grid-template-columns:220px minmax(0,1fr); gap:0; align-items:stretch; margin-top:8px; border:1px solid var(--ui-border); border-radius:10px; overflow:hidden; background:var(--ui-surface); }
+    .consumption-kpis { display:grid; grid-template-columns:1fr; grid-template-rows:repeat(3,minmax(112px,1fr)); margin:0; border:0; border-right:1px solid var(--ui-border); min-width:0; }
+    .consumption-kpis .pdr-kpi { display:flex; flex-direction:column; border-right:0; border-bottom:1px solid var(--ui-border); }
     .consumption-kpis .pdr-kpi:last-child { border-bottom:0; }
     .consumption-kpis .pdr-kpi .k { display:flex; align-items:center; justify-content:center; min-height:42px; padding:9px 8px; }
     .consumption-kpis .pdr-kpi .v { display:flex; flex:1; align-items:center; justify-content:center; padding:14px 8px; font-size:clamp(25px,2.4vw,38px); }
     .consumption-content-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:0; min-width:0; align-content:stretch; }
-    .consumption-content-grid .balance-panel { grid-column:auto; border-bottom:1px solid #b9c7da !important; }
-    .consumption-content-grid .review-group-card { min-width:0; border:0; border-radius:0; background:#fff; box-shadow:none; }
-    .consumption-content-grid .review-group-card:not(:last-child) { border-bottom:1px solid #b9c7da; }
+    .consumption-content-grid .balance-panel { grid-column:auto; border-bottom:1px solid var(--ui-border) !important; }
+    .consumption-content-grid .review-group-card { min-width:0; border:0; border-radius:0; background:var(--ui-surface); box-shadow:none; }
+    .consumption-content-grid .review-group-card:not(:last-child) { border-bottom:1px solid var(--ui-border); }
     .consumption-content-grid .review-group-body { overflow:auto; }
-    .consumption-data-panel .review-group-head { padding:10px 14px; background:linear-gradient(90deg,#edf4fc,#f8fbff); color:#102a67; font-size:.75rem; letter-spacing:.045em; }
+    .consumption-data-panel .review-group-head { padding:10px 14px; background:linear-gradient(90deg,var(--ui-subtle),var(--ui-surface)); color:#102a67; font-size:.75rem; letter-spacing:.045em; }
     .consumption-data-panel .review-data-table { width:100%; table-layout:fixed; border-collapse:separate; border-spacing:0; }
-    .consumption-data-panel .review-data-table th { position:sticky; top:0; z-index:2; padding:9px 10px; border-bottom:2px solid #bfd0e5; background:#f1f6fc; color:#536b91; font-size:.64rem; line-height:1.2; font-weight:950; vertical-align:middle; }
-    .consumption-data-panel .review-data-table td { padding:11px 10px; border-bottom:1px solid #dfe8f2; color:#102451; font-size:.76rem; line-height:1.3; font-weight:800; vertical-align:middle; }
-    .consumption-data-panel .review-data-table tbody tr:nth-child(even) td { background:#f7faff; }
-    .consumption-data-panel .review-data-table tbody tr:hover td { background:#eaf3ff; }
+    .consumption-data-panel .review-data-table th { position:sticky; top:0; z-index:2; padding:9px 10px; border-bottom:2px solid var(--ui-border); background:var(--ui-subtle); color:var(--ui-muted); font-size:.64rem; line-height:1.2; font-weight:950; vertical-align:middle; }
+    .consumption-data-panel .review-data-table td { padding:11px 10px; border-bottom:1px solid var(--ui-border); color:#102451; font-size:.76rem; line-height:1.3; font-weight:800; vertical-align:middle; }
+    .consumption-data-panel .review-data-table tbody tr:nth-child(even) td { background:var(--ui-surface); }
+    .consumption-data-panel .review-data-table tbody tr:hover td { background:var(--ui-subtle); }
     .consumption-data-panel .review-data-table tbody tr:last-child td { border-bottom:0; }
     .consumption-data-panel .review-data-table th:not(:first-child),
     .consumption-data-panel .review-data-table td:not(:first-child) { text-align:right; font-variant-numeric:tabular-nums; }
@@ -8754,145 +10336,221 @@ DASHBOARD_HTML = r"""
     .actual-consumption-panel .review-data-table th:nth-child(4), .actual-consumption-panel .review-data-table td:nth-child(4) { width:17%; }
     .actual-consumption-panel .review-data-table th:nth-child(5), .actual-consumption-panel .review-data-table td:nth-child(5) { width:15%; }
     .actual-consumption-panel .review-data-table th:nth-child(6), .actual-consumption-panel .review-data-table td:nth-child(6) { width:20%; }
-    .report-sku-hover { position:relative; display:inline-flex; max-width:100%; border:0 !important; border-radius:0 !important; background:transparent !important; color:#1d4ed8 !important; font:inherit; font-weight:950 !important; cursor:help !important; text-align:left; text-decoration:underline dotted rgba(29,78,216,.55); text-underline-offset:3px; box-shadow:none !important; }
-    .report-sku-hover:hover, .report-sku-hover:focus { color:#1e40af !important; outline:none; transform:none !important; }
+    .report-sku-hover { position:relative; display:inline-flex; max-width:100%; border:0 !important; border-radius:0 !important; background:transparent !important; color:var(--ui-link) !important; font:inherit; font-weight:950 !important; cursor:help !important; text-align:left; text-decoration:underline dotted rgba(29,78,216,.55); text-underline-offset:3px; box-shadow:none !important; }
+    .report-sku-hover:hover, .report-sku-hover:focus { color:var(--ui-link) !important; outline:none; transform:none !important; }
     .report-sku-hover .pack-item-name-tooltip { text-align:left; font-variant-numeric:normal; }
-    .report-sku-tooltip-label { display:block; margin-bottom:3px; color:#93c5fd; font-size:.56rem; font-weight:950; letter-spacing:.05em; text-transform:uppercase; }
+    .report-sku-tooltip-label { display:block; margin-bottom:3px; color:var(--ui-link); font-size:.56rem; font-weight:950; letter-spacing:.05em; text-transform:uppercase; }
     .scanned-shift-panel .review-group-body { overflow:hidden; }
     .scan-history-list { width:100%; min-width:0; }
     .scan-history-head, .scan-history-summary { display:grid; grid-template-columns:28px minmax(110px,1.5fr) minmax(66px,.62fr) minmax(92px,1fr) minmax(105px,1fr) 18px; gap:6px; align-items:center; min-width:0; }
-    .scan-history-head { padding:8px 6px; border-bottom:1px solid #dbe4f0; color:#64748b; font-size:.64rem; font-weight:900; letter-spacing:.02em; text-transform:uppercase; }
-    .scan-history-item { border-bottom:1px solid #e2e8f0; }
+    .scan-history-head { padding:8px 6px; border-bottom:1px solid var(--ui-border); color:var(--ui-muted); font-size:.64rem; font-weight:900; letter-spacing:.02em; text-transform:uppercase; }
+    .scan-history-item { border-bottom:1px solid var(--ui-border); }
     .scan-history-item:last-child { border-bottom:0; }
-    .scan-history-summary { padding:10px 6px; cursor:pointer; list-style:none; color:#0f172a; font-size:.74rem; font-weight:850; }
+    .scan-history-summary { padding:10px 6px; cursor:pointer; list-style:none; color:var(--ui-text); font-size:.74rem; font-weight:850; }
     .scan-history-head > span, .scan-history-summary > span { min-width:0; overflow-wrap:anywhere; word-break:break-word; }
     .scan-history-summary::-webkit-details-marker { display:none; }
-    .scan-history-summary:hover { background:#f8fbff; }
+    .scan-history-summary:hover { background:var(--ui-surface); }
     .scan-history-summary .material { overflow-wrap:anywhere; }
-    .scan-history-count { display:inline-flex; margin-top:4px; max-width:100%; padding:2px 6px; border-radius:999px; background:#dbeafe; color:#1d4ed8; font-size:.61rem; line-height:1.2; font-weight:900; white-space:normal; }
-    .scan-history-arrow { color:#2563eb; font-size:1rem; text-align:center; transition:transform .18s ease; }
+    .scan-history-count { display:inline-flex; margin-top:4px; max-width:100%; padding:2px 6px; border-radius:999px; background:var(--ui-subtle); color:var(--ui-link); font-size:.61rem; line-height:1.2; font-weight:900; white-space:normal; }
+    .scan-history-arrow { color:var(--ui-link); font-size:1rem; text-align:center; transition:transform .18s ease; }
     .scan-history-item[open] .scan-history-arrow { transform:rotate(180deg); }
     .scan-history-body { padding:0 10px 10px 48px; animation:reviewSlideIn .16s ease; }
-    .scan-history-body .review-data-table { margin:0; border:1px solid #dbe4f0; border-radius:8px; overflow:hidden; }
+    .scan-history-body .review-data-table { margin:0; border:1px solid var(--ui-border); border-radius:8px; overflow:hidden; }
     .pdr-detail-grid { display:grid; grid-template-columns:minmax(280px,.75fr) minmax(420px,2fr); gap:10px; margin-top:10px; }
     .pdr-detail-grid.single { grid-template-columns:1fr; }
-    .pdr-section { border:1px solid #cbd5e1; min-width:0; }
-    .pdr-section-title { padding:8px 12px; color:#fff; background:#052762; font-size:13px; font-weight:950; text-transform:uppercase; }
+    .pdr-section { border:1px solid var(--ui-border); min-width:0; }
+    .pdr-section-title { padding:8px 12px; color:var(--ui-on-accent); background:#052762; font-size:13px; font-weight:950; text-transform:uppercase; }
     .pdr-reject-grid { display:flex; flex-wrap:wrap; gap:6px; padding:6px; }
-    .pdr-reject-item { display:inline-flex; align-items:center; justify-content:space-between; gap:14px; min-width:110px; padding:5px 9px; border:1px solid #d8e0eb; border-radius:7px; background:#f8fafc; }
+    .pdr-reject-item { display:inline-flex; align-items:center; justify-content:space-between; gap:14px; min-width:110px; padding:5px 9px; border:1px solid var(--ui-border); border-radius:7px; background:var(--ui-surface); }
     .pdr-reject-item strong { color:#e11d48; }
-    .pdr-empty { padding:12px; color:#64748b; text-align:center; }
+    .pdr-empty { padding:12px; color:var(--ui-muted); text-align:center; }
     .pdr-downtime-table { width:100%; border-collapse:collapse; }
-    .pdr-downtime-table th, .pdr-downtime-table td { padding:8px 10px; border-bottom:1px solid #e0e7f0; text-align:left; }
-    .pdr-downtime-table th { color:#09266a; background:#f8fafc; font-size:10px; text-transform:uppercase; }
-    .pdr-personnel { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); margin-top:10px; border:1px solid #cbd5e1; border-top:0; }
-    .pdr-person { min-height:54px; padding:8px 10px; text-align:center; border-right:1px solid #d8e0eb; border-top:1px solid #d8e0eb; }
+    .pdr-downtime-table th, .pdr-downtime-table td { padding:8px 10px; border-bottom:1px solid var(--ui-border); text-align:left; }
+    .pdr-downtime-table th { color:#09266a; background:var(--ui-surface); font-size:10px; text-transform:uppercase; }
+    .pdr-personnel { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); margin-top:10px; border:1px solid var(--ui-border); border-top:0; }
+    .pdr-person { min-height:54px; padding:8px 10px; text-align:center; border-right:1px solid var(--ui-border); border-top:1px solid var(--ui-border); }
     .pdr-person:last-child { border-right:0; }
     .pdr-person .k { font-size:9px; font-weight:900; text-transform:uppercase; color:#09266a; }
     .pdr-person .v { margin-top:8px; color:#102451; font-weight:800; overflow-wrap:anywhere; }
     .scan-capture-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,0.35); display: none; align-items: center; justify-content: center; z-index: 1200; }
     .scan-capture-backdrop.active { display: flex; }
-    .scan-capture-card { width: min(460px, calc(100vw - 32px)); background: #f8fafc; border: 1px solid #cfd8e3; border-radius: 16px; box-shadow: 0 20px 40px rgba(15,23,42,0.20); padding: 16px; }
-    .scan-capture-title { font-weight: 700; color: #1f2937; font-size: 1rem; margin-bottom: 6px; }
-    .scan-capture-sub { color: #64748b; font-size: 0.88rem; margin-bottom: 12px; }
-    .scan-capture-input { width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 12px; padding: 11px 12px; font-size: 0.95rem; }
+    .scan-capture-card { width: min(460px, calc(100vw - 32px)); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 16px; box-shadow: 0 20px 40px rgba(15,23,42,0.20); padding: 16px; }
+    .scan-capture-title { font-weight: 700; color: var(--ui-text); font-size: 1rem; margin-bottom: 6px; }
+    .scan-capture-sub { color: var(--ui-muted); font-size: 0.88rem; margin-bottom: 12px; }
+    .scan-capture-input { width: 100%; box-sizing: border-box; border: 1px solid var(--ui-border); border-radius: 12px; padding: 11px 12px; font-size: 0.95rem; }
     .scan-capture-actions { margin-top: 12px; display: flex; justify-content: flex-end; gap: 8px; }
     .settings-overlay { position: fixed; inset: 0; background: rgba(15,23,42,0.30); backdrop-filter: blur(6px); display: none; align-items: center; justify-content: center; z-index: 1100; padding: 14px; }
     .settings-overlay.active { display: flex; }
-    .settings-card { width: min(840px, calc(100vw - 36px)); background: #f5f7fb; border: 1px solid #d8e0ea; border-radius: 18px; box-shadow: 0 24px 48px rgba(15,23,42,0.20); overflow: hidden; }
-    .settings-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid #dde5ef; }
-    .settings-head-title { font-weight: 800; color: #1f2937; }
+    .settings-card { width: min(840px, calc(100vw - 36px)); background: var(--ui-subtle); border: 1px solid var(--ui-border); border-radius: 18px; box-shadow: 0 24px 48px rgba(15,23,42,0.20); overflow: hidden; }
+    .settings-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--ui-border); }
+    .settings-head-title { font-weight: 800; color: var(--ui-text); }
     .settings-body { display: grid; grid-template-columns: 210px 1fr; min-height: 400px; }
-    .settings-nav { background: #eef2f7; border-right: 1px solid #dde5ef; padding: 12px; display: grid; gap: 8px; align-content: start; }
-    .settings-nav-btn { border: 1px solid #d5dde8; background: #fff; color: #334155; border-radius: 12px; padding: 10px 12px; text-align: left; cursor: pointer; font-weight: 600; transition: background-color .14s ease, transform .1s ease; }
-    .settings-nav-btn.active { background: #dbeafe; border-color: #bfdbfe; color: #1d4ed8; }
+    .settings-nav { background: var(--ui-subtle); border-right: 1px solid var(--ui-border); padding: 12px; display: grid; gap: 8px; align-content: start; }
+    .settings-nav-btn { border: 1px solid var(--ui-border); background: var(--ui-surface); color: var(--ui-text); border-radius: 12px; padding: 10px 12px; text-align: left; cursor: pointer; font-weight: 600; transition: background-color .14s ease, transform .1s ease; }
+    .settings-nav-btn.active { background: var(--ui-subtle); border-color: var(--ui-accent-soft); color: var(--ui-accent); }
     .settings-nav-btn:hover { transform: translateY(-1px); }
     .settings-content { padding: 14px; }
+    #serverSettingsOverlay .settings-card { height:min(820px, calc(100dvh - 28px)); max-height:calc(100dvh - 28px); display:flex; flex-direction:column; }
+    #serverSettingsOverlay .settings-head { flex:0 0 auto; }
+    #serverSettingsOverlay .settings-body { flex:1 1 auto; min-height:0; overflow:hidden; }
+    #serverSettingsOverlay .settings-nav { min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-color:#a5afbd transparent; }
+    #serverSettingsOverlay .settings-content { min-width:0; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-color:#929bab transparent; }
+    #serverSettingsOverlay .settings-nav::-webkit-scrollbar, #serverSettingsOverlay .settings-content::-webkit-scrollbar { width:8px; }
+    #serverSettingsOverlay .settings-nav::-webkit-scrollbar-thumb, #serverSettingsOverlay .settings-content::-webkit-scrollbar-thumb { border-radius:999px; background:#a5afbd; }
+    #serverSettingsOverlay .settings-nav::-webkit-scrollbar-track, #serverSettingsOverlay .settings-content::-webkit-scrollbar-track { background:transparent; }
     .settings-page { display: none; }
     .settings-page.active { display: block; }
     .settings-form { display: grid; gap: 10px; }
     .settings-row { display: grid; gap: 6px; }
-    .settings-row label { font-size: 0.86rem; font-weight: 700; color: #475569; }
-    .settings-row input, .settings-row select { width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 10px; padding: 9px 10px; font: inherit; background: #fff; }
+    .settings-row label { font-size: 0.86rem; font-weight: 700; color: var(--ui-muted); }
+    .settings-row input, .settings-row select { width: 100%; box-sizing: border-box; border: 1px solid var(--ui-border); border-radius: 10px; padding: 9px 10px; font: inherit; background: var(--ui-surface); }
     .settings-actions { margin-top: 12px; display: flex; justify-content: flex-end; gap: 8px; }
-    .settings-note { font-size: 0.85rem; color: #64748b; line-height: 1.35; }
+    .settings-note { font-size: 0.85rem; color: var(--ui-muted); line-height: 1.35; }
     .test-machine-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:8px; }
-    .test-machine-action-card { border:1px solid #dbe4f0; border-radius:12px; background:#fff; padding:12px; display:grid; gap:9px; }
-    .test-machine-action-card h4 { margin:0; color:#334155; }
-    .test-machine-warning { border:1px solid #f59e0b; background:#fffbeb; color:#92400e; border-radius:10px; padding:9px 10px; font-size:.84rem; line-height:1.4; }
+    .test-machine-action-card { border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); padding:12px; display:grid; gap:9px; }
+    .test-machine-action-card h4 { margin:0; color:var(--ui-text); }
+    .test-machine-warning { border:1px solid #f59e0b; background:var(--ui-subtle); color:#92400e; border-radius:10px; padding:9px 10px; font-size:.84rem; line-height:1.4; }
     .machine-test-only-pill { display:inline-flex; align-items:center; border:1px solid #7c3aed; background:#ede9fe; color:#5b21b6; border-radius:999px; padding:3px 7px; font-size:.48rem; font-weight:950; letter-spacing:.06em; }
+    .machine-mixing-jobs-pill { display:inline-flex; align-items:center; border:1px solid #c4b5fd; background:var(--ui-subtle); color:#6d28d9; border-radius:999px; padding:3px 7px; font-size:.48rem; font-weight:950; letter-spacing:.04em; }
     .card.test-machine { border-color:#8b5cf6 !important; box-shadow:0 0 0 2px rgba(139,92,246,.16),0 8px 20px rgba(76,29,149,.12); }
     .machine-picker-actions { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
     .machine-picker-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(145px, 1fr)); gap:8px; max-height:420px; overflow:auto; padding:4px; }
-    .machine-picker-item { display:flex; align-items:center; gap:8px; border:1px solid #dbe4f0; border-radius:10px; background:#fff; padding:8px 10px; cursor:pointer; user-select:none; }
+    .machine-picker-item { display:flex; align-items:center; gap:8px; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); padding:8px 10px; cursor:pointer; user-select:none; }
     .machine-picker-item input { width:auto; margin:0; }
-    .machine-picker-item span { min-width:0; color:#0f172a; font-size:.86rem; font-weight:850; overflow-wrap:anywhere; }
-    .machine-picker-item small { color:#64748b; font-weight:750; }
-    .people-role-list { margin-top: 10px; border: 1px solid #dbe4f0; border-radius: 12px; background: #fff; overflow: hidden; }
-    .people-role-row { display: grid; grid-template-columns: 1.15fr .75fr .9fr .9fr .9fr; gap: 8px; padding: 8px 10px; border-bottom: 1px solid #eef2f7; font-size: 0.84rem; align-items: center; }
+    .machine-picker-item span { min-width:0; color:var(--ui-text); font-size:.86rem; font-weight:850; overflow-wrap:anywhere; }
+    .machine-picker-item small { color:var(--ui-muted); font-weight:750; }
+    .people-role-list { margin-top: 10px; border: 1px solid var(--ui-border); border-radius: 12px; background: var(--ui-surface); overflow: hidden; }
+    .people-role-row { display: grid; grid-template-columns: 1.15fr .75fr .9fr .9fr .9fr; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--ui-border); font-size: 0.84rem; align-items: center; }
     .people-role-row:last-child { border-bottom: none; }
-    .people-role-row.head { background: #f8fafc; font-weight: 700; color: #475569; }
-    .people-role-pill { display: inline-block; border-radius: 999px; padding: 3px 8px; font-size: 0.76rem; font-weight: 700; background: #e2e8f0; color: #334155; }
-    .operator-directory-card { width: min(1020px, calc(100vw - 36px)); background: #f8fafc; border: 1px solid #d8e0ea; border-radius: 18px; box-shadow: 0 24px 48px rgba(15,23,42,0.20); overflow: hidden; }
-    .operator-directory-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid #dde5ef; }
-    .operator-directory-title { font-weight:800; color:#1f2937; }
-    .operator-directory-sub { font-size:.83rem; color:#64748b; margin-top:4px; }
+    .people-role-row.head { background: var(--ui-surface); font-weight: 700; color: var(--ui-muted); }
+    .people-role-pill { display: inline-block; border-radius: 999px; padding: 3px 8px; font-size: 0.76rem; font-weight: 700; background: var(--ui-subtle); color: var(--ui-text); }
+    .operator-directory-card { width: min(1020px, calc(100vw - 36px)); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 18px; box-shadow: 0 24px 48px rgba(15,23,42,0.20); overflow: hidden; }
+    .operator-directory-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid var(--ui-border); }
+    .operator-directory-title { font-weight:800; color:var(--ui-text); }
+    .operator-directory-sub { font-size:.83rem; color:var(--ui-muted); margin-top:4px; }
     .operator-directory-grid { display:grid; gap:0; padding:0; max-height:min(72vh, 760px); overflow:auto; }
-    .operator-directory-row { display:grid; grid-template-columns: 1.35fr 1fr 1fr .95fr 120px; gap:12px; align-items:center; padding:12px 16px; border-bottom:1px solid #e5edf5; background:rgba(255,255,255,.94); cursor:pointer; transition: background-color .14s ease; }
-    .operator-directory-row:hover:not(.header) { background:#f8fbff; }
-    .operator-directory-row.header { position:sticky; top:0; z-index:2; background:#f8fafc; font-size:.76rem; font-weight:800; text-transform:uppercase; letter-spacing:.04em; color:#64748b; }
+    .operator-directory-row { display:grid; grid-template-columns: 1.35fr 1fr 1fr .95fr 120px; gap:12px; align-items:center; padding:12px 16px; border-bottom:1px solid var(--ui-border); background:color-mix(in srgb, var(--ui-surface) 94%, transparent); cursor:pointer; transition: background-color .14s ease; }
+    .operator-directory-row:hover:not(.header) { background:var(--ui-surface); }
+    .operator-directory-row.header { position:sticky; top:0; z-index:2; background:var(--ui-surface); font-size:.76rem; font-weight:800; text-transform:uppercase; letter-spacing:.04em; color:var(--ui-muted); }
     .operator-directory-row:last-child { border-bottom:none; }
     .operator-directory-name { display:grid; gap:3px; min-width:0; }
-    .operator-directory-name strong { font-size:.92rem; color:#0f172a; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .operator-directory-meta { font-size:.78rem; color:#64748b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .operator-directory-name strong { font-size:.92rem; color:var(--ui-text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .operator-directory-meta { font-size:.78rem; color:var(--ui-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .operator-directory-cell { min-width:0; }
-    .operator-directory-label { display:none; font-size:.68rem; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:#64748b; margin-bottom:2px; }
-    .operator-directory-value { font-size:.83rem; color:#0f172a; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .operator-directory-subvalue { font-size:.74rem; color:#64748b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:2px; }
-    .operator-directory-badge { display:inline-flex; align-items:center; justify-content:center; border-radius:999px; padding:5px 9px; font-size:.72rem; font-weight:800; background:#e2e8f0; color:#334155; white-space:nowrap; }
+    .operator-directory-label { display:none; font-size:.68rem; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:var(--ui-muted); margin-bottom:2px; }
+    .operator-directory-value { font-size:.83rem; color:var(--ui-text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .operator-directory-subvalue { font-size:.74rem; color:var(--ui-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:2px; }
+    .operator-directory-badge { display:inline-flex; align-items:center; justify-content:center; border-radius:999px; padding:5px 9px; font-size:.72rem; font-weight:800; background:var(--ui-subtle); color:var(--ui-text); white-space:nowrap; }
     .operator-directory-badge.live { background:#dcfce7; color:#166534; }
-    .operator-directory-empty { padding:24px 18px; color:#64748b; font-size:.9rem; }
-    .operator-detail-card { width:min(860px, calc(100vw - 36px)); background:#f8fafc; border:1px solid #d8e0ea; border-radius:18px; box-shadow:0 24px 48px rgba(15,23,42,0.20); overflow:hidden; }
-    .operator-detail-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid #dde5ef; }
-    .operator-detail-title { font-weight:800; color:#1f2937; }
-    .operator-detail-sub { font-size:.83rem; color:#64748b; margin-top:4px; }
+    .operator-directory-empty { padding:24px 18px; color:var(--ui-muted); font-size:.9rem; }
+    .operator-detail-card { width:min(860px, calc(100vw - 36px)); background:var(--ui-surface); border:1px solid var(--ui-border); border-radius:18px; box-shadow:0 24px 48px rgba(15,23,42,0.20); overflow:hidden; }
+    .operator-detail-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid var(--ui-border); }
+    .operator-detail-title { font-weight:800; color:var(--ui-text); }
+    .operator-detail-sub { font-size:.83rem; color:var(--ui-muted); margin-top:4px; }
     .operator-detail-body { padding:16px; display:grid; gap:14px; max-height:min(78vh, 780px); overflow:auto; }
     .operator-detail-grid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
-    .operator-detail-item { border:1px solid #dbe4f0; border-radius:12px; background:#fff; padding:10px 12px; }
-    .operator-detail-item .k { font-size:.72rem; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:#64748b; margin-bottom:4px; }
-    .operator-detail-item .v { font-size:.86rem; color:#0f172a; overflow-wrap:anywhere; }
-    .operator-detail-section { border:1px solid #dbe4f0; border-radius:14px; background:#fff; padding:12px; }
-    .operator-detail-section h4 { margin:0 0 10px; font-size:.92rem; color:#0f172a; }
+    .operator-detail-item { border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); padding:10px 12px; }
+    .operator-detail-item .k { font-size:.72rem; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:var(--ui-muted); margin-bottom:4px; }
+    .operator-detail-item .v { font-size:.86rem; color:var(--ui-text); overflow-wrap:anywhere; }
+    .operator-detail-section { border:1px solid var(--ui-border); border-radius:14px; background:var(--ui-surface); padding:12px; }
+    .operator-detail-section h4 { margin:0 0 10px; font-size:.92rem; color:var(--ui-text); }
     .operator-detail-list { display:grid; gap:8px; }
-    .operator-detail-list-item { border-left:3px solid #93c5fd; padding-left:10px; }
-    .operator-detail-list-item strong { display:block; font-size:.82rem; color:#0f172a; }
-    .operator-detail-list-item span { display:block; font-size:.77rem; color:#64748b; }
-    .operator-status-toolbar { display:flex; gap:8px; flex-wrap:wrap; padding:12px 16px; border-bottom:1px solid #dde5ef; background:#f8fafc; }
-    .operator-status-filter { border:1px solid #cbd5e1; background:#fff; color:#334155; border-radius:999px; padding:7px 11px; font-size:.75rem; font-weight:900; cursor:pointer; }
-    .operator-status-filter.active { background:#0f64bd; border-color:#0f64bd; color:#fff; }
+    .operator-detail-list-item { border-left:3px solid var(--ui-accent); padding-left:10px; }
+    .operator-detail-list-item strong { display:block; font-size:.82rem; color:var(--ui-text); }
+    .operator-detail-list-item span { display:block; font-size:.77rem; color:var(--ui-muted); }
+    .operator-status-toolbar { display:flex; gap:8px; flex-wrap:wrap; padding:12px 16px; border-bottom:1px solid var(--ui-border); background:var(--ui-surface); }
+    .operator-status-filter { border:1px solid var(--ui-border); background:var(--ui-surface); color:var(--ui-text); border-radius:999px; padding:7px 11px; font-size:.75rem; font-weight:900; cursor:pointer; }
+    .operator-status-filter.active { background:var(--ui-accent); border-color:var(--ui-accent); color:var(--ui-on-accent); }
     .operator-card-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(178px,1fr)); gap:14px; padding:16px; max-height:min(72vh,760px); overflow:auto; }
-    .operator-status-card { border:1px solid #dbe4f0; border-radius:8px; background:#fff; min-height:242px; padding:14px 12px; text-align:center; cursor:pointer; box-shadow:0 10px 24px rgba(15,23,42,.08); transition:transform .14s ease,border-color .14s ease,box-shadow .14s ease; }
-    .operator-status-card:hover { transform:translateY(-2px); border-color:#93c5fd; box-shadow:0 14px 30px rgba(15,23,42,.12); }
-    .operator-status-photo { width:68px; height:68px; border-radius:50%; margin:0 auto 10px; background:#e2e8f0; display:flex; align-items:center; justify-content:center; color:#334155; font-weight:950; font-size:1.25rem; overflow:hidden; }
+    .operator-status-card { border:1px solid var(--ui-border); border-radius:8px; background:var(--ui-surface); min-height:242px; padding:14px 12px; text-align:center; cursor:pointer; box-shadow:0 10px 24px rgba(15,23,42,.08); transition:transform .14s ease,border-color .14s ease,box-shadow .14s ease; }
+    .operator-status-card:hover { transform:translateY(-2px); border-color:var(--ui-accent); box-shadow:0 14px 30px rgba(15,23,42,.12); }
+    .operator-status-photo { width:68px; height:68px; border-radius:50%; margin:0 auto 10px; background:var(--ui-subtle); display:flex; align-items:center; justify-content:center; color:var(--ui-text); font-weight:950; font-size:1.25rem; overflow:hidden; }
     .operator-status-photo img { width:100%; height:100%; object-fit:cover; display:block; }
-    .operator-status-name { min-height:34px; display:flex; align-items:flex-end; justify-content:center; font-size:.86rem; line-height:1.2; font-weight:950; color:#0f172a; overflow-wrap:anywhere; }
-    .operator-status-role { margin-top:4px; font-size:.72rem; color:#64748b; font-weight:800; min-height:18px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .operator-status-name { min-height:34px; display:flex; align-items:flex-end; justify-content:center; font-size:.86rem; line-height:1.2; font-weight:950; color:var(--ui-text); overflow-wrap:anywhere; }
+    .operator-status-role { margin-top:4px; font-size:.72rem; color:var(--ui-muted); font-weight:800; min-height:18px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .operator-status-pill { display:inline-flex; align-items:center; justify-content:center; margin-top:10px; border-radius:999px; padding:5px 9px; font-size:.68rem; font-weight:950; letter-spacing:.02em; }
-    .operator-status-pill.offline { background:#e5e7eb; color:#374151; }
-    .operator-status-pill.working { background:#dbeafe; color:#1d4ed8; }
+    .operator-status-pill.offline { background:var(--ui-subtle); color:var(--ui-text); }
+    .operator-status-pill.working { background:var(--ui-subtle); color:var(--ui-link); }
     .operator-status-pill.on-break { background:#fef3c7; color:#92400e; }
-    .operator-status-meta { margin-top:10px; min-height:48px; display:grid; align-content:start; gap:3px; color:#475569; font-size:.72rem; font-weight:800; line-height:1.25; }
+    .operator-status-meta { margin-top:10px; min-height:48px; display:grid; align-content:start; gap:3px; color:var(--ui-muted); font-size:.72rem; font-weight:800; line-height:1.25; }
     .operator-break-table { display:grid; gap:7px; }
-    .operator-break-row { display:grid; grid-template-columns:1fr 1fr 86px 1fr; gap:8px; border:1px solid #e2e8f0; border-radius:8px; padding:8px; background:#f8fafc; font-size:.78rem; color:#334155; }
-    .operator-break-row.head { background:#eef2f7; color:#475569; font-size:.7rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; }
-    .linkage-pill { display:inline-block; margin-left:8px; padding:2px 8px; border-radius:999px; font-size:.72rem; font-weight:800; background:#fff7ed; color:#c2410c; border:1px solid #fdba74; }
+    .operator-break-row { display:grid; grid-template-columns:1fr 1fr 86px 1fr; gap:8px; border:1px solid var(--ui-border); border-radius:8px; padding:8px; background:var(--ui-surface); font-size:.78rem; color:var(--ui-text); }
+    .operator-break-row.head { background:var(--ui-subtle); color:var(--ui-muted); font-size:.7rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; }
+    .linkage-pill { display:inline-block; margin-left:8px; padding:2px 8px; border-radius:999px; font-size:.72rem; font-weight:800; background:var(--ui-subtle); color:#c2410c; border:1px solid #fdba74; }
     .machine-linkage-flag { display:inline-block; margin-bottom:6px; padding:3px 8px; border-radius:999px; font-size:.72rem; font-weight:800; background:#ffedd5; color:#9a3412; border:1px solid #fdba74; box-shadow:0 0 0 0 rgba(251,146,60,.45); animation: linkagePulse 1.1s ease-in-out infinite; }
     @keyframes linkagePulse { 0%,100% { box-shadow:0 0 0 0 rgba(251,146,60,.25);} 50% { box-shadow:0 0 0 8px rgba(251,146,60,0);} }
-    .finished-linkage-note { margin-top:8px; font-size:.82rem; color:#7c2d12; background:#fff7ed; border:1px solid #fed7aa; border-radius:10px; padding:8px 10px; }
-    .settings-table-wrap { border: 1px solid #dbe4f0; border-radius: 12px; background: #fff; overflow: auto; }
+    .finished-linkage-note { margin-top:8px; font-size:.82rem; color:#7c2d12; background:var(--ui-subtle); border:1px solid #fed7aa; border-radius:10px; padding:8px 10px; }
+    .pdr-excel-note { margin:12px 0; padding:10px 12px; border:1px solid var(--ui-accent-soft); border-radius:10px; background:var(--ui-subtle); color:var(--ui-link); font-size:.8rem; font-weight:750; }
+    .pdr-excel-note input { width:52px; margin:0 3px; padding:4px 5px; border:1px solid var(--ui-accent); border-radius:6px; font:inherit; }
+    .pdr-date-group { margin:16px 0 24px; padding:0 0 4px; border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); overflow:hidden; }
+    .pdr-date-group-head { display:flex; flex-wrap:wrap; align-items:baseline; gap:12px; padding:9px 14px; background:var(--ui-subtle); color:#17365d; border-bottom:1px solid var(--ui-border); }
+    .pdr-date-group-head strong { font-size:1rem; }
+    .pdr-date-group-head span { color:var(--ui-muted); font-size:.72rem; font-weight:800; }
+    .pdr-excel-group { margin:14px 0 20px; }
+    .pdr-date-group .pdr-excel-group { margin:12px; }
+    .pdr-date-group .pdr-excel-group:last-child { margin-bottom:8px; }
+    .pdr-excel-group-head { display:flex; gap:12px; align-items:baseline; padding:9px 12px; border-radius:10px 10px 0 0; background:var(--ui-accent); color:var(--ui-on-accent); }
+    .pdr-excel-group-head strong { font-size:.92rem; }
+    .pdr-excel-group-head span { font-size:.72rem; opacity:.86; }
+    .pdr-excel-scroll { max-width:100%; overflow:auto; border:1px solid var(--ui-border); background:var(--ui-surface); }
+    .pdr-excel-table { width:max-content; min-width:100%; border-collapse:separate; border-spacing:0; table-layout:auto; }
+    .pdr-excel-table th,.pdr-excel-table td { width:auto; min-width:70px; max-width:none; padding:7px 8px; border-right:1px solid var(--ui-border); border-bottom:1px solid var(--ui-border); color:var(--ui-text); font-size:.7rem; line-height:1.3; text-align:left; vertical-align:top; white-space:normal; overflow-wrap:anywhere; }
+    .pdr-excel-table th,.pdr-excel-table td { white-space:nowrap; overflow-wrap:normal; word-break:normal; }
+    .pdr-excel-table th { position:sticky; top:0; z-index:3; background:var(--ui-subtle); color:#17365d; font-size:.64rem; font-weight:950; }
+    .pdr-excel-table th:nth-child(5),.pdr-excel-table td:nth-child(5) { position:sticky; left:0; z-index:2; min-width:115px; background:var(--ui-surface); font-weight:900; box-shadow:2px 0 3px rgba(15,23,42,.08); }
+    .pdr-excel-table th:nth-child(5) { z-index:4; background:var(--ui-subtle); }
+    .pdr-excel-table td.pdr-alert-value { background:#fee2e2; color:#b91c1c; font-weight:700; }
+    /* Workbook palette for the identity, material, weight and crew columns. */
+    .pdr-excel-table th:nth-child(-n+34),.pdr-excel-table td:nth-child(-n+34) { border-color:var(--ui-border); color:var(--ui-text); padding:2px 4px; font-family:Arial,sans-serif; line-height:1.2; }
+    .pdr-excel-table th:nth-child(-n+34) { background:#bfbfbf; font-weight:700; vertical-align:bottom; padding-top:5px; padding-bottom:5px; }
+    .pdr-excel-table td:nth-child(-n+34) { background:var(--ui-subtle); font-weight:400; }
+    .pdr-excel-table td:nth-child(-n+6) { background:var(--ui-subtle); }
+    .pdr-excel-table td:nth-child(-n+3) { color:#0000cc; text-align:center; }
+    .pdr-excel-table td:nth-child(7) { background:#e2efda; }
+    .pdr-excel-table td:nth-child(8) { background:#ffff00; }
+    .pdr-excel-table td:nth-child(n+11):nth-child(-n+17),.pdr-excel-table td:nth-child(24),.pdr-excel-table td:nth-child(32) { background:#f6b66b; }
+    .pdr-excel-table th:nth-child(n+18):nth-child(-n+23) { background:#32a852; }
+    .pdr-excel-table td:nth-child(n+20):nth-child(-n+23) { background:#f8cfa3; }
+    .pdr-excel-table td:nth-child(4).pdr-status-running { background:#32b85a; }
+    .pdr-excel-table td:nth-child(4).pdr-status-idle { background:#bfbfbf; }
+    .pdr-excel-table td:nth-child(4).pdr-status-repair { background:#f6b66b; }
+    .pdr-excel-table td:nth-child(4).pdr-status-stopped { background:#f3a6a6; }
+    .pdr-excel-table th { font-size:12px; }
+    .pdr-excel-table td { font-size:14px; }
+    .pdr-excel-table td:nth-child(-n+3) { font-size:16px; font-weight:700; }
+    .pdr-excel-table th:nth-child(n+35):nth-child(-n+77),.pdr-excel-table td:nth-child(n+35):nth-child(-n+77) { border-color:var(--ui-border); color:var(--ui-text); padding:2px 4px; font-family:Arial,sans-serif; line-height:1.2; }
+    .pdr-excel-table th:nth-child(n+35):nth-child(-n+40) { background:#bfbfbf; }
+    .pdr-excel-table th:nth-child(41) { background:#e99c94; }
+    .pdr-excel-table th:nth-child(n+42):nth-child(-n+61) { background:#d9806b; }
+    .pdr-excel-table th:nth-child(n+62):nth-child(-n+77) { background:var(--ui-accent); }
+    .pdr-excel-table th:nth-child(n+35):nth-child(-n+77) { font-weight:700; vertical-align:bottom; padding-top:5px; padding-bottom:5px; }
+    .pdr-excel-table td:nth-child(n+35):nth-child(-n+41) { background:var(--ui-subtle); text-align:right; }
+    .pdr-excel-table td:nth-child(36) { background:#f6b66b; }
+    .pdr-excel-table td:nth-child(37),.pdr-excel-table td:nth-child(39),.pdr-excel-table td:nth-child(40) { background:#f2b084; }
+    .pdr-excel-table td:nth-child(n+42):nth-child(-n+61) { background:var(--ui-subtle); text-align:right; }
+    .pdr-excel-table td:nth-child(n+62):nth-child(-n+77) { background:#e2efda; text-align:right; }
+    .pdr-excel-table td.pdr-alert-value:nth-child(n+40):nth-child(-n+77) { background:#fee2e2; color:#b91c1c; font-weight:700; }
+    /* Personnel and performance columns use the remaining workbook colors. */
+    .pdr-excel-table th:nth-child(n+78),.pdr-excel-table td:nth-child(n+78) { border-color:var(--ui-border); color:var(--ui-text); padding:2px 4px; font-family:Arial,sans-serif; line-height:1.2; }
+    .pdr-excel-table th:nth-child(n+78) { font-weight:700; vertical-align:bottom; padding-top:5px; padding-bottom:5px; }
+    .pdr-excel-table th:nth-child(n+78):nth-child(-n+83) { background:#e99432; }
+    .pdr-excel-table td:nth-child(n+78):nth-child(-n+83) { background:#fff2cc; }
+    .pdr-excel-table td:nth-child(80),.pdr-excel-table td:nth-child(82),.pdr-excel-table td:nth-child(83) { background:#e2efda; }
+    .pdr-excel-table th:nth-child(n+84):nth-child(-n+88) { background:#fce4d6; color:var(--ui-muted); }
+    .pdr-excel-table th:nth-child(n+89):nth-child(-n+93) { background:#93c47d; }
+    .pdr-excel-table th:nth-child(n+94):nth-child(-n+100) { background:#b6d7a8; }
+    .pdr-excel-table td:nth-child(n+84):nth-child(-n+100) { background:#f2b084; text-align:right; font-variant-numeric:tabular-nums; }
+    .pdr-excel-table td:nth-child(n+84):nth-child(-n+96) { font-style:italic; }
+    .pdr-excel-table td:nth-child(n+89):nth-child(-n+96) { font-weight:700; }
+    .pdr-excel-table th:nth-child(89),.pdr-excel-table td:nth-child(89) { color:var(--ui-link); }
+    .pdr-excel-table th:nth-child(90),.pdr-excel-table td:nth-child(90) { color:#9c420b; }
+    .pdr-excel-table th:nth-child(91) { color:#375623; }
+    .pdr-excel-table th:nth-child(97),.pdr-excel-table td:nth-child(97),.pdr-excel-table th:nth-child(99),.pdr-excel-table td:nth-child(99) { color:var(--ui-muted); }
+    .pdr-excel-table th:nth-child(101),.pdr-excel-table td:nth-child(101) { background:#f2b084; min-width:360px; }
+    .settings-table-wrap { border: 1px solid var(--ui-border); border-radius: 12px; background: var(--ui-surface); overflow: auto; }
     .settings-table { width: 100%; border-collapse: collapse; min-width: 520px; }
-    .settings-table th, .settings-table td { border-bottom: 1px solid #edf2f7; padding: 8px 10px; text-align: left; font-size: 0.84rem; }
-    .settings-table th { background: #f8fafc; color: #475569; font-weight: 700; }
+    .settings-table th, .settings-table td { border-bottom: 1px solid var(--ui-border); padding: 8px 10px; text-align: left; font-size: 0.84rem; }
+    .settings-table th { background: var(--ui-surface); color: var(--ui-muted); font-weight: 700; }
     #overlayReviewSummary { min-height: 72px; height: 72px; }
     #overlayReviewRejects { min-height: 64px; height: 64px; }
     #overlayRawConsumption { min-height: 88px; height: 88px; }
@@ -8901,35 +10559,35 @@ DASHBOARD_HTML = r"""
     #overlayPeopleSummary { min-height: 62px; height: 62px; }
     #overlayReviewRemarks { min-height: 58px; height: 58px; }
     #editRejectBreakdown { min-height: 58px; height: 58px; }
-    .review-pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 600 12px/1.45 "Consolas", "Courier New", monospace; color: #dbeafe; }
+    .review-pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 600 12px/1.45 "Consolas", "Courier New", monospace; color: var(--ui-muted); }
     .review-group-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 10px; }
-    .review-group-card { border: 1px solid #dbe4f0; border-radius: 12px; background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%); overflow: hidden; }
+    .review-group-card { border: 1px solid var(--ui-border); border-radius: 12px; background: linear-gradient(180deg, var(--ui-surface) 0%, var(--ui-surface) 100%); overflow: hidden; }
     .review-group-card.wide { grid-column: 1 / -1; }
-    .review-group-head { padding: 10px 12px; background: linear-gradient(90deg, #e8f0fb 0%, #f4f8fc 100%); border-bottom: 1px solid #dbe4f0; font-size: .83rem; font-weight: 800; color: #334155; letter-spacing: .04em; text-transform: uppercase; }
+    .review-group-head { padding: 10px 12px; background: linear-gradient(90deg, var(--ui-subtle) 0%, var(--ui-subtle) 100%); border-bottom: 1px solid var(--ui-border); font-size: .83rem; font-weight: 800; color: var(--ui-text); letter-spacing: .04em; text-transform: uppercase; }
     .review-group-body { padding: 10px 12px; }
     .review-kv-table { width: 100%; border-collapse: collapse; table-layout: auto; }
-    .review-data-table th { padding: 6px 8px; border-bottom: 1px solid #d8e3f0; text-align: left; font-size: .72rem; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
-    .review-data-table td { font-size: .82rem; font-weight: 600; color: #0f172a; }
-    .scanned-pack-scroll { max-height: 420px; overflow: auto; border: 1px solid #e2e8f0; border-radius: 10px; background: #fff; }
-    .scanned-pack-scroll .review-data-table th { position: sticky; top: 0; z-index: 1; background: #f8fafc; }
-    .qr-view-btn { border:1px solid #93c5fd; border-radius:8px; background:#eff6ff; color:#1d4ed8; padding:6px 10px; font-size:.74rem; font-weight:900; cursor:pointer; white-space:nowrap; }
-    .qr-view-btn:hover { background:#dbeafe; border-color:#60a5fa; }
-    .qr-view-card { width:min(860px, calc(100vw - 28px)); max-height:calc(100vh - 28px); background:#fff; border:1px solid #cbd5e1; border-radius:18px; box-shadow:0 24px 60px rgba(15,23,42,.28); overflow:hidden; display:flex; flex-direction:column; }
-    .qr-view-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid #e2e8f0; }
-    .qr-view-title { color:#0f172a; font-size:1.02rem; font-weight:900; }
+    .review-data-table th { padding: 6px 8px; border-bottom: 1px solid var(--ui-border); text-align: left; font-size: .72rem; font-weight: 800; color: var(--ui-muted); text-transform: uppercase; letter-spacing: .03em; }
+    .review-data-table td { font-size: .82rem; font-weight: 600; color: var(--ui-text); }
+    .scanned-pack-scroll { max-height: 420px; overflow: auto; border: 1px solid var(--ui-border); border-radius: 10px; background: var(--ui-surface); }
+    .scanned-pack-scroll .review-data-table th { position: sticky; top: 0; z-index: 1; background: var(--ui-surface); }
+    .qr-view-btn { border:1px solid var(--ui-accent); border-radius:8px; background:var(--ui-subtle); color:var(--ui-link); padding:6px 10px; font-size:.74rem; font-weight:900; cursor:pointer; white-space:nowrap; }
+    .qr-view-btn:hover { background:var(--ui-subtle); border-color:var(--ui-accent); }
+    .qr-view-card { width:min(860px, calc(100vw - 28px)); max-height:calc(100vh - 28px); background:var(--ui-surface); border:1px solid var(--ui-border); border-radius:18px; box-shadow:0 24px 60px rgba(15,23,42,.28); overflow:hidden; display:flex; flex-direction:column; }
+    .qr-view-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; border-bottom:1px solid var(--ui-border); }
+    .qr-view-title { color:var(--ui-text); font-size:1.02rem; font-weight:900; }
     .qr-view-body { display:grid; grid-template-columns:minmax(260px, 340px) minmax(0,1fr); gap:18px; align-items:start; padding:18px; overflow:auto; }
-    .qr-view-image { display:flex; align-items:center; justify-content:center; min-height:300px; border:1px solid #dbe4f0; border-radius:14px; background:#fff; padding:12px; }
+    .qr-view-image { display:flex; align-items:center; justify-content:center; min-height:300px; border:1px solid var(--ui-border); border-radius:14px; background:var(--ui-surface); padding:12px; }
     .qr-view-image img { display:block; width:100%; max-width:320px; height:auto; image-rendering:pixelated; }
     .qr-view-image .machine-detail-empty { text-align:center; }
-    .qr-view-details { border:1px solid #dbe4f0; border-radius:14px; overflow:hidden; background:#f8fafc; }
-    .qr-view-details .review-kv-table { background:#fff; }
-    .qr-view-payload { margin:12px; padding:10px; max-height:180px; overflow:auto; border:1px solid #dbe4f0; border-radius:10px; background:#f8fafc; color:#0f172a; font:600 12px/1.45 "Consolas","Courier New",monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
-    .review-kv-table td { padding: 6px 8px; border-bottom: 1px solid #e8eef6; vertical-align: top; }
+    .qr-view-details { border:1px solid var(--ui-border); border-radius:14px; overflow:hidden; background:var(--ui-surface); }
+    .qr-view-details .review-kv-table { background:var(--ui-surface); }
+    .qr-view-payload { margin:12px; padding:10px; max-height:180px; overflow:auto; border:1px solid var(--ui-border); border-radius:10px; background:var(--ui-surface); color:var(--ui-text); font:600 12px/1.45 "Consolas","Courier New",monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .review-kv-table td { padding: 6px 8px; border-bottom: 1px solid var(--ui-border); vertical-align: top; }
     .review-kv-table tr:last-child td { border-bottom: none; }
-    .review-kv-key { width: 150px; min-width: 120px; font-size: .76rem; font-weight: 800; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
-    .review-kv-value { font-size: .9rem; font-weight: 600; color: #0f172a; word-break: normal; overflow-wrap: break-word; }
-    .review-more-note { margin-top: 8px; font-size: .78rem; font-weight: 700; color: #64748b; }
-    .review-json-block { margin: 0; white-space: pre-wrap; word-break: break-word; font: 600 12px/1.45 "Consolas", "Courier New", monospace; color: #0f172a; background: #f8fafc; border: 1px solid #dbe4f0; border-radius: 10px; padding: 10px; max-height: 42vh; overflow: auto; }
+    .review-kv-key { width: 150px; min-width: 120px; font-size: .76rem; font-weight: 800; color: var(--ui-muted); text-transform: uppercase; letter-spacing: .03em; }
+    .review-kv-value { font-size: .9rem; font-weight: 600; color: var(--ui-text); word-break: normal; overflow-wrap: break-word; }
+    .review-more-note { margin-top: 8px; font-size: .78rem; font-weight: 700; color: var(--ui-muted); }
+    .review-json-block { margin: 0; white-space: pre-wrap; word-break: break-word; font: 600 12px/1.45 "Consolas", "Courier New", monospace; color: var(--ui-text); background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 10px; padding: 10px; max-height: 42vh; overflow: auto; }
     @keyframes reviewSlideIn { from { opacity: .45; transform: translateX(6px); } to { opacity: 1; transform: translateX(0); } }
     @keyframes cardPulseGreen {
       0% { box-shadow: 0 2px 8px rgba(0,0,0,0.08), 0 0 0 0 rgba(76,175,80,0.30); }
@@ -8990,62 +10648,101 @@ DASHBOARD_HTML = r"""
       100% { transform:translateX(0); opacity:1; }
     }
     .overlay-head-actions { display:flex; align-items:center; gap:8px; }
-    .machine-detail-finish-shifts-btn { width:auto; min-width:0; height:38px; display:inline-flex; align-items:center; justify-content:center; gap:5px; padding:0 11px; border:1px solid #bfd3ee; border-radius:12px; background:#f4f8fd; color:#1559a6; font:inherit; font-size:.68rem; line-height:1; font-weight:900; white-space:nowrap; cursor:pointer; box-shadow:0 3px 10px rgba(15,23,42,.05); }
-    .machine-detail-finish-shifts-btn:hover { border-color:#7fb0e8; background:#eaf3ff; box-shadow:0 6px 14px rgba(15,23,42,.08); }
-    .machine-detail-finish-shifts-btn.attention { border-color:#f4c96b; background:#fffbeb; color:#a65508; }
+    .machine-detail-finish-shifts-btn { width:auto; min-width:0; height:38px; display:inline-flex; align-items:center; justify-content:center; gap:5px; padding:0 11px; border:1px solid var(--ui-accent-soft); border-radius:12px; background:var(--ui-subtle); color:var(--ui-link); font:inherit; font-size:.68rem; line-height:1; font-weight:900; white-space:nowrap; cursor:pointer; box-shadow:0 3px 10px rgba(15,23,42,.05); }
+    .machine-detail-finish-shifts-btn:hover { border-color:var(--ui-accent); background:var(--ui-subtle); box-shadow:0 6px 14px rgba(15,23,42,.08); }
+    .machine-detail-finish-shifts-btn.attention { border-color:#f4c96b; background:var(--ui-subtle); color:#a65508; }
     .machine-detail-finish-shifts-btn[hidden] { display:none; }
     .machine-detail-finish-shifts-btn .partial-clock { font-size:.78rem; }
     .machine-detail-finish-shifts-btn .finish-shifts-caret { margin-left:1px; font-size:.66rem; transition:transform .15s ease; }
     .machine-detail-finish-shifts-btn[aria-expanded="true"] .finish-shifts-caret { transform:rotate(180deg); }
-    .machine-detail-finish-shifts-menu { position:fixed; z-index:1120; width:min(390px,calc(100vw - 24px)); max-height:min(430px,calc(100vh - 90px)); overflow:auto; padding:7px; border:1px solid #cbd9ea; border-radius:14px; background:#fff; box-shadow:0 20px 46px rgba(15,23,42,.24); }
+    .machine-detail-finish-shifts-menu { position:fixed; z-index:1120; width:min(390px,calc(100vw - 24px)); max-height:min(430px,calc(100vh - 90px)); overflow:auto; padding:7px; border:1px solid var(--ui-border); border-radius:14px; background:var(--ui-surface); box-shadow:0 20px 46px rgba(15,23,42,.24); }
     .machine-detail-finish-shifts-menu[hidden] { display:none; }
-    .machine-detail-supervisor-btn { width:auto; min-width:0; height:38px; display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:0 11px; border:1px solid #86efac; border-radius:12px; background:#ecfdf5; color:#047857; font:inherit; font-size:.68rem; line-height:1; font-weight:900; white-space:nowrap; cursor:pointer; box-shadow:0 3px 10px rgba(22,163,74,.08); }
+    .machine-detail-mixing-jobs-btn { width:auto; min-width:0; height:38px; display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:0 11px; border:1px solid #c4b5fd; border-radius:12px; background:var(--ui-subtle); color:#6d28d9; font:inherit; font-size:.68rem; line-height:1; font-weight:900; white-space:nowrap; cursor:pointer; box-shadow:0 3px 10px rgba(109,40,217,.08); }
+    .machine-detail-mixing-jobs-btn:hover { border-color:#8b5cf6; background:#ede9fe; box-shadow:0 6px 14px rgba(109,40,217,.12); }
+    .machine-detail-mixing-jobs-btn[hidden] { display:none; }
+    .machine-detail-mixing-jobs-btn .mixing-jobs-dot { width:8px; height:8px; border-radius:999px; background:#8b5cf6; box-shadow:0 0 0 3px rgba(139,92,246,.14); }
+    .machine-detail-mixing-jobs-btn .mixing-jobs-caret { margin-left:1px; font-size:.66rem; transition:transform .15s ease; }
+    .machine-detail-mixing-jobs-btn[aria-expanded="true"] .mixing-jobs-caret { transform:rotate(180deg); }
+    .machine-detail-mixing-jobs-menu { position:fixed; z-index:1122; width:min(390px,calc(100vw - 24px)); max-height:min(430px,calc(100vh - 90px)); overflow:auto; padding:7px; border:1px solid #ddd6fe; border-radius:14px; background:var(--ui-surface); box-shadow:0 20px 46px rgba(15,23,42,.24); }
+    .machine-detail-mixing-jobs-menu[hidden] { display:none; }
+    .machine-mixing-job-option { width:100%; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:4px 10px; align-items:center; padding:10px 11px; border:0; border-radius:10px; background:transparent; color:var(--ui-text); font:inherit; text-align:left; cursor:pointer; }
+    .machine-mixing-job-option + .machine-mixing-job-option { margin-top:3px; }
+    .machine-mixing-job-option:hover,.machine-mixing-job-option:focus-visible { outline:none; background:var(--ui-subtle); }
+    .machine-mixing-job-option.active { background:#ede9fe; }
+    .machine-mixing-job-option .mixing-job-name { min-width:0; overflow:hidden; font-size:.74rem; font-weight:900; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-mixing-job-option .mixing-job-state { justify-self:end; padding:3px 6px; border-radius:999px; background:#ede9fe; color:#6d28d9; font-size:.52rem; line-height:1; font-weight:950; text-transform:uppercase; }
+    .machine-mixing-job-option.active .mixing-job-state { background:#dcfce7; color:#047857; }
+    .machine-mixing-job-option .mixing-job-code { grid-column:1/-1; color:var(--ui-muted); font-size:.61rem; line-height:1.3; font-weight:750; }
+    .machine-detail-supervisor-btn { width:auto; min-width:0; height:38px; display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:0 11px; border:1px solid #86efac; border-radius:12px; background:var(--ui-subtle); color:#047857; font:inherit; font-size:.68rem; line-height:1; font-weight:900; white-space:nowrap; cursor:pointer; box-shadow:0 3px 10px rgba(22,163,74,.08); }
     .machine-detail-supervisor-btn:hover { border-color:#4ade80; background:#dcfce7; box-shadow:0 6px 14px rgba(22,163,74,.12); }
     .machine-detail-supervisor-btn[hidden] { display:none; }
     .machine-detail-supervisor-btn .supervisor-check-dot { width:8px; height:8px; border-radius:999px; background:#22c55e; box-shadow:0 0 0 3px rgba(34,197,94,.13); }
+    [data-supervisor-state="overdue"] { border-color:#fca5a5; background:var(--ui-subtle); color:#b91c1c; }
+    [data-supervisor-state="rotation-only"] { border-color:#fdba74; background:var(--ui-subtle); color:#c2410c; }
+    [data-supervisor-state="review-only"] { border-color:#86efac; background:var(--ui-subtle); color:#047857; }
+    [data-supervisor-state="pending"] { border-color:var(--ui-border); background:var(--ui-surface); color:var(--ui-muted); }
+    [data-supervisor-state="overdue"] .machine-supervisor-rotation-dot,
+    .machine-detail-supervisor-btn[data-supervisor-state="overdue"] .supervisor-check-dot { background:#ef4444; box-shadow:0 0 0 3px #fee2e2; animation:supervisor-overdue-blink 1s ease-in-out infinite; }
+    [data-supervisor-state="rotation-only"] .machine-supervisor-rotation-dot,
+    .machine-detail-supervisor-btn[data-supervisor-state="rotation-only"] .supervisor-check-dot { background:#f97316; box-shadow:0 0 0 3px #ffedd5; }
+    [data-supervisor-state="review-only"] .machine-supervisor-rotation-dot,
+    .machine-detail-supervisor-btn[data-supervisor-state="review-only"] .supervisor-check-dot { animation:supervisor-review-only-blink 1.15s steps(1,end) infinite; }
+    [data-supervisor-state="pending"] .machine-supervisor-rotation-dot,
+    .machine-detail-supervisor-btn[data-supervisor-state="pending"] .supervisor-check-dot { background:#94a3b8; box-shadow:none; }
+    @keyframes supervisor-overdue-blink { 0%,100% { opacity:1; } 50% { opacity:.2; } }
+    @keyframes supervisor-review-only-blink {
+      0%,100% { background:#22c55e; box-shadow:0 0 0 3px rgba(34,197,94,.16); }
+      50% { background:#f97316; box-shadow:0 0 0 3px #ffedd5; }
+    }
+    @media (prefers-reduced-motion:reduce) {
+      [data-supervisor-state="overdue"] .machine-supervisor-rotation-dot,
+      .machine-detail-supervisor-btn[data-supervisor-state="overdue"] .supervisor-check-dot,
+      [data-supervisor-state="review-only"] .machine-supervisor-rotation-dot,
+      .machine-detail-supervisor-btn[data-supervisor-state="review-only"] .supervisor-check-dot { animation:none; }
+    }
     .machine-detail-supervisor-btn .supervisor-caret { margin-left:1px; font-size:.66rem; transition:transform .15s ease; }
     .machine-detail-supervisor-btn[aria-expanded="true"] .supervisor-caret { transform:rotate(180deg); }
-    .machine-detail-supervisor-menu { position:fixed; z-index:1121; width:min(460px,calc(100vw - 24px)); max-height:min(520px,calc(100vh - 90px)); overflow:auto; padding:10px; border:1px solid #bbf7d0; border-radius:16px; background:#fff; box-shadow:0 20px 46px rgba(15,23,42,.24); }
+    .machine-detail-supervisor-menu { position:fixed; z-index:1121; width:min(460px,calc(100vw - 24px)); max-height:min(520px,calc(100vh - 90px)); overflow:auto; padding:10px; border:1px solid #bbf7d0; border-radius:16px; background:var(--ui-surface); box-shadow:0 20px 46px rgba(15,23,42,.24); }
     .machine-detail-supervisor-menu[hidden] { display:none; }
     .supervisor-activity-summary { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; margin-bottom:9px; }
-    .supervisor-activity-stat { min-width:0; padding:9px; border:1px solid #d1fae5; border-radius:11px; background:#f0fdf4; }
-    .supervisor-activity-stat .k { color:#64748b; font-size:.52rem; line-height:1; font-weight:900; text-transform:uppercase; letter-spacing:.035em; }
+    .supervisor-activity-stat { min-width:0; padding:9px; border:1px solid #d1fae5; border-radius:11px; background:var(--ui-subtle); }
+    .supervisor-activity-stat .k { color:var(--ui-muted); font-size:.52rem; line-height:1; font-weight:900; text-transform:uppercase; letter-spacing:.035em; }
     .supervisor-activity-stat .v { margin-top:5px; color:#065f46; font-size:.78rem; line-height:1.15; font-weight:950; overflow-wrap:anywhere; }
     .supervisor-activity-log { display:grid; gap:6px; }
-    .supervisor-activity-row { display:grid; grid-template-columns:10px minmax(0,1fr) auto; gap:8px; align-items:start; padding:9px 8px; border:1px solid #e2e8f0; border-radius:11px; background:#f8fafc; }
+    .supervisor-activity-row { display:grid; grid-template-columns:10px minmax(0,1fr) auto; gap:8px; align-items:start; padding:9px 8px; border:1px solid var(--ui-border); border-radius:11px; background:var(--ui-surface); }
     .supervisor-activity-row-dot { width:8px; height:8px; margin-top:4px; border-radius:999px; background:#22c55e; }
-    .supervisor-activity-row.review .supervisor-activity-row-dot { background:#2563eb; }
+    .supervisor-activity-row.review .supervisor-activity-row-dot { background:var(--ui-accent); }
     .supervisor-activity-row-main { min-width:0; }
-    .supervisor-activity-row-title { color:#172338; font-size:.70rem; line-height:1.2; font-weight:950; }
-    .supervisor-activity-row-meta { margin-top:3px; color:#64748b; font-size:.59rem; line-height:1.35; font-weight:750; overflow-wrap:anywhere; }
+    .supervisor-activity-row-title { color:var(--ui-text); font-size:.70rem; line-height:1.2; font-weight:950; }
+    .supervisor-activity-row-meta { margin-top:3px; color:var(--ui-muted); font-size:.59rem; line-height:1.35; font-weight:750; overflow-wrap:anywhere; }
     .supervisor-activity-row-time { color:#065f46; font-size:.62rem; line-height:1.25; font-weight:950; text-align:right; white-space:nowrap; }
-    .supervisor-activity-empty { padding:14px 10px; color:#64748b; font-size:.70rem; font-weight:800; text-align:center; }
-    .machine-finish-shift-option { width:100%; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:5px 10px; align-items:center; padding:10px 11px; border:0; border-radius:10px; background:transparent; color:#172338; font:inherit; text-align:left; cursor:pointer; }
+    .supervisor-activity-empty { padding:14px 10px; color:var(--ui-muted); font-size:.70rem; font-weight:800; text-align:center; }
+    .machine-finish-shift-option { width:100%; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:5px 10px; align-items:center; padding:10px 11px; border:0; border-radius:10px; background:transparent; color:var(--ui-text); font:inherit; text-align:left; cursor:pointer; }
     .machine-finish-shift-option + .machine-finish-shift-option { margin-top:3px; }
-    .machine-finish-shift-option:hover,.machine-finish-shift-option:focus-visible { outline:none; background:#edf5ff; }
+    .machine-finish-shift-option:hover,.machine-finish-shift-option:focus-visible { outline:none; background:var(--ui-subtle); }
     .machine-finish-shift-option .shift-main { min-width:0; overflow:hidden; font-size:.74rem; font-weight:900; white-space:nowrap; text-overflow:ellipsis; }
     .machine-finish-shift-option .shift-status { justify-self:end; padding:3px 6px; border-radius:999px; background:#dcfce7; color:#047857; font-size:.52rem; line-height:1; font-weight:950; text-transform:uppercase; }
     .machine-finish-shift-option .shift-status.pending { background:#fef3c7; color:#92400e; }
-    .machine-finish-shift-option .shift-meta { grid-column:1/-1; min-width:0; overflow:hidden; color:#64748b; font-size:.61rem; line-height:1.35; font-weight:750; white-space:nowrap; text-overflow:ellipsis; }
+    .machine-finish-shift-option .shift-meta { grid-column:1/-1; min-width:0; overflow:hidden; color:var(--ui-muted); font-size:.61rem; line-height:1.35; font-weight:750; white-space:nowrap; text-overflow:ellipsis; }
     .icon-btn {
-      width: 38px; height: 38px; border-radius: 12px; border: 1px solid #c7d0dd; background: #f8fafc;
-      color: #334155; cursor: pointer; font-size: 18px; font-weight: 700;
+      width: 38px; height: 38px; border-radius: 12px; border: 1px solid var(--ui-border); background: var(--ui-surface);
+      color: var(--ui-text); cursor: pointer; font-size: 18px; font-weight: 700;
     }
-    .icon-btn:hover { background:#fff; box-shadow:0 6px 14px rgba(15,23,42,.08); }
+    .icon-btn:hover { background:var(--ui-surface); box-shadow:0 6px 14px rgba(15,23,42,.08); }
     .machine-history-overlay { z-index:1100; }
-    .machine-history-card { width:min(1080px, calc(100vw - 28px)); height:min(82vh, 820px); max-height:calc(100vh - 28px); border-radius:20px; background:#f8fafc; }
-    .machine-history-card .overlay-head { min-height:58px; padding:10px 16px; background:#fff; border-bottom:1px solid #e2e8f0; }
-    .machine-history-tools { display:flex; align-items:center; gap:12px; padding:12px 16px; background:#f8fafc; border-bottom:1px solid #e2e8f0; }
-    .machine-history-search { flex:1; min-width:0; height:42px; padding:0 14px; border:1px solid #cbd5e1; border-radius:11px; background:#fff; color:#0f172a; font:inherit; outline:none; }
-    .machine-history-search:focus { border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,.12); }
-    .shift-history-filter { flex:0 0 auto; min-width:145px; height:42px; padding:0 34px 0 12px; border:1px solid #cbd5e1; border-radius:11px; background:#fff; color:#0f172a; font:inherit; font-size:.82rem; font-weight:750; outline:none; }
-    .shift-history-filter:focus { border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,.12); }
-    .machine-history-count { flex:0 0 auto; color:#64748b; font-size:.78rem; font-weight:800; }
-    .machine-history-body { min-height:0; flex:1; overflow:auto; padding:0 16px 16px; background:#f8fafc; }
-    .machine-history-table-wrap { min-width:0; overflow-x:hidden; border:1px solid #dbe4f0; border-radius:12px; background:#fff; }
+    .machine-history-card { width:min(1080px, calc(100vw - 28px)); height:min(82vh, 820px); max-height:calc(100vh - 28px); border-radius:20px; background:var(--ui-surface); }
+    .machine-history-card .overlay-head { min-height:58px; padding:10px 16px; background:var(--ui-surface); border-bottom:1px solid var(--ui-border); }
+    .machine-history-tools { display:flex; align-items:center; gap:12px; padding:12px 16px; background:var(--ui-surface); border-bottom:1px solid var(--ui-border); }
+    .machine-history-search { flex:1; min-width:0; height:42px; padding:0 14px; border:1px solid var(--ui-border); border-radius:11px; background:var(--ui-surface); color:var(--ui-text); font:inherit; outline:none; }
+    .machine-history-search:focus { border-color:var(--ui-accent); box-shadow:0 0 0 3px rgba(37,99,235,.12); }
+    .shift-history-filter { flex:0 0 auto; min-width:145px; height:42px; padding:0 34px 0 12px; border:1px solid var(--ui-border); border-radius:11px; background:var(--ui-surface); color:var(--ui-text); font:inherit; font-size:.82rem; font-weight:750; outline:none; }
+    .shift-history-filter:focus { border-color:var(--ui-accent); box-shadow:0 0 0 3px rgba(37,99,235,.12); }
+    .machine-history-count { flex:0 0 auto; color:var(--ui-muted); font-size:.78rem; font-weight:800; }
+    .machine-history-body { min-height:0; flex:1; overflow:auto; padding:0 16px 16px; background:var(--ui-surface); }
+    .machine-history-table-wrap { min-width:0; overflow-x:hidden; border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); }
     .machine-history-table { width:100%; table-layout:fixed; border-collapse:collapse; }
-    .machine-history-table th { position:sticky; top:0; z-index:2; padding:10px 8px; border-bottom:1px solid #cbd5e1; background:#eef4fb; color:#64748b; font-size:.68rem; letter-spacing:.035em; text-align:left; text-transform:uppercase; }
-    .machine-history-table td { padding:10px 8px; border-bottom:1px solid #e2e8f0; color:#1e293b; font-size:.78rem; line-height:1.35; font-weight:700; vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
+    .machine-history-table th { position:sticky; top:0; z-index:2; padding:10px 8px; border-bottom:1px solid var(--ui-border); background:var(--ui-subtle); color:var(--ui-muted); font-size:.68rem; letter-spacing:.035em; text-align:left; text-transform:uppercase; }
+    .machine-history-table td { padding:10px 8px; border-bottom:1px solid var(--ui-border); color:var(--ui-text); font-size:.78rem; line-height:1.35; font-weight:700; vertical-align:top; overflow-wrap:anywhere; word-break:break-word; }
     .machine-history-table tr:last-child td { border-bottom:0; }
     .machine-history-series { width:38px; padding-left:4px !important; padding-right:4px !important; text-align:center !important; }
     .machine-history-time { width:126px; }
@@ -9053,55 +10750,55 @@ DASHBOARD_HTML = r"""
     .machine-history-source { width:88px; }
     .machine-history-actor { width:170px; }
     .machine-history-message { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:3; overflow:hidden; }
-    .machine-history-empty { display:grid; place-items:center; min-height:180px; padding:24px; color:#64748b; text-align:center; }
+    .machine-history-empty { display:grid; place-items:center; min-height:180px; padding:24px; color:var(--ui-muted); text-align:center; }
     @media (max-width:760px) {
       .machine-history-tools { flex-wrap:wrap; }
       .machine-history-search { flex:1 1 100%; }
       .shift-history-filter { flex:1 1 145px; min-width:0; }
     }
-    .machine-detail-status-panel { background:#f8fbff; border:1px solid #d9e6f6; border-radius:12px; padding:10px; display:grid; gap:8px; }
+    .machine-detail-status-panel { background:var(--ui-surface); border:1px solid var(--ui-border); border-radius:12px; padding:10px; display:grid; gap:8px; }
     .machine-detail-status-panel .row { display:grid; grid-template-columns: 160px 1fr auto; gap:8px; align-items:center; }
-    .machine-detail-status-panel label { font-weight:700; color:#475569; font-size:.86rem; }
-    .machine-detail-status-panel select { border:1px solid #cbd5e1; border-radius:10px; padding:8px 10px; font:inherit; background:#fff; }
-    .machine-detail-status-panel textarea { border:1px solid #cbd5e1; border-radius:10px; padding:8px 10px; font:inherit; background:#fff; min-height:54px; resize:vertical; }
-    .machine-detail-status-panel .hint { color:#64748b; font-size:.82rem; }
+    .machine-detail-status-panel label { font-weight:700; color:var(--ui-muted); font-size:.86rem; }
+    .machine-detail-status-panel select { border:1px solid var(--ui-border); border-radius:10px; padding:8px 10px; font:inherit; background:var(--ui-surface); }
+    .machine-detail-status-panel textarea { border:1px solid var(--ui-border); border-radius:10px; padding:8px 10px; font:inherit; background:var(--ui-surface); min-height:54px; resize:vertical; }
+    .machine-detail-status-panel .hint { color:var(--ui-muted); font-size:.82rem; }
     .machine-status-save-feedback { display:none; align-items:center; gap:8px; }
     .machine-status-save-feedback.active { display:flex; }
-    .machine-status-save-track { flex:1; height:10px; border-radius:999px; border:1px solid #cbd5e1; background:#fff; overflow:hidden; }
+    .machine-status-save-track { flex:1; height:10px; border-radius:999px; border:1px solid var(--ui-border); background:var(--ui-surface); overflow:hidden; }
     .machine-status-save-bar { height:100%; width:0%; background: linear-gradient(90deg, #f97316, #22c55e); transition: width .10s linear; }
-    .machine-status-save-check { width:22px; height:22px; border-radius:999px; border:2px solid #16a34a; color:#16a34a; display:flex; align-items:center; justify-content:center; font-weight:900; opacity:.15; transform:scale(.92); transition: all .16s ease; background:#fff; }
-    .machine-status-save-check.done { opacity:1; transform:scale(1); background:#ecfdf5; }
-    .machine-detail-card { width:min(1180px, calc(100vw - 28px)); max-width:calc(100vw - 28px); max-height:min(92vh, 940px); display:flex; flex-direction:column; border-radius:20px; background:#f8fafc; }
-    .machine-detail-card .overlay-head { min-height:58px; padding:10px 16px; border-bottom:1px solid #e7edf5; background:rgba(255,255,255,.96); }
+    .machine-status-save-check { width:22px; height:22px; border-radius:999px; border:2px solid #16a34a; color:#16a34a; display:flex; align-items:center; justify-content:center; font-weight:900; opacity:.15; transform:scale(.92); transition: all .16s ease; background:var(--ui-surface); }
+    .machine-status-save-check.done { opacity:1; transform:scale(1); background:var(--ui-subtle); }
+    .machine-detail-card { width:min(1180px, calc(100vw - 28px)); max-width:calc(100vw - 28px); max-height:min(92vh, 940px); display:flex; flex-direction:column; border-radius:20px; background:var(--ui-surface); }
+    .machine-detail-card .overlay-head { min-height:58px; padding:10px 16px; border-bottom:1px solid var(--ui-border); background:color-mix(in srgb, var(--ui-surface) 96%, transparent); }
     .machine-detail-head-title { display:flex; align-items:center; gap:10px; }
-    .machine-detail-menu-icon { display:grid; place-items:center; width:34px; height:34px; border:1px solid #e2e8f0; border-radius:999px; background:#fff; color:#1d4ed8; box-shadow:0 5px 14px rgba(15,23,42,.08); font-size:.9rem; }
-    .machine-detail-body { padding:16px; overflow-y:auto; overflow-x:hidden; display:grid; grid-template-columns:minmax(0,1fr); grid-auto-rows:max-content; align-content:start; gap:12px; min-width:0; background:linear-gradient(145deg,#fbfdff,#f7f9fd); }
+    .machine-detail-menu-icon { display:grid; place-items:center; width:34px; height:34px; border:1px solid var(--ui-border); border-radius:999px; background:var(--ui-surface); color:var(--ui-link); box-shadow:0 5px 14px rgba(15,23,42,.08); font-size:.9rem; }
+    .machine-detail-body { padding:16px; overflow-y:auto; overflow-x:hidden; display:grid; grid-template-columns:minmax(0,1fr); grid-auto-rows:max-content; align-content:start; gap:12px; min-width:0; background:linear-gradient(145deg,var(--ui-surface),var(--ui-surface)); }
     .machine-detail-body > * { width: 100%; max-width: 100%; min-width: 0; }
     .machine-detail-layout { min-width:0; display:grid; grid-template-columns:270px minmax(0,1fr); gap:18px; align-items:start; }
-    .machine-detail-sidebar { min-width:0; position:sticky; top:0; display:grid; gap:13px; padding:16px; border:1px solid #e7edf5; border-radius:16px; background:rgba(255,255,255,.98); box-shadow:0 10px 28px rgba(30,64,175,.07); }
+    .machine-detail-sidebar { min-width:0; position:sticky; top:0; display:grid; gap:13px; padding:16px; border:1px solid var(--ui-border); border-radius:16px; background:color-mix(in srgb, var(--ui-surface) 98%, transparent); box-shadow:0 10px 28px rgba(30,64,175,.07); }
     .machine-detail-side-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-    .machine-detail-eyebrow { color:#1e3a8a; font-size:.62rem; line-height:1; font-weight:950; letter-spacing:.06em; text-transform:uppercase; }
-    .machine-detail-status-chip { display:inline-flex; align-items:center; gap:5px; padding:6px 9px; border:1px solid #dbe4f0; border-radius:999px; background:#f8fafc; color:#64748b; font-size:.58rem; font-weight:950; text-transform:uppercase; box-shadow:0 5px 14px rgba(15,23,42,.06); }
+    .machine-detail-eyebrow { color:var(--ui-link); font-size:.62rem; line-height:1; font-weight:950; letter-spacing:.06em; text-transform:uppercase; }
+    .machine-detail-status-chip { display:inline-flex; align-items:center; gap:5px; padding:6px 9px; border:1px solid var(--ui-border); border-radius:999px; background:var(--ui-surface); color:var(--ui-muted); font-size:.58rem; font-weight:950; text-transform:uppercase; box-shadow:0 5px 14px rgba(15,23,42,.06); }
     .machine-detail-status-chip::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; }
-    .machine-detail-status-chip.active { border-color:#bbf7d0; background:#ecfdf5; color:#10b981; }
-    .machine-detail-status-chip.disconnected { border-color:#fecaca; background:#fef2f2; color:#ef4444; }
-    .machine-detail-status-chip.inactive { border-color:#cbd5e1; background:#f1f5f9; color:#64748b; }
-    .machine-detail-status-chip.manual { border-color:#fed7aa; background:#fff7ed; color:#f97316; }
+    .machine-detail-status-chip.active { border-color:#bbf7d0; background:var(--ui-subtle); color:#10b981; }
+    .machine-detail-status-chip.disconnected { border-color:#fecaca; background:var(--ui-subtle); color:#ef4444; }
+    .machine-detail-status-chip.inactive { border-color:var(--ui-border); background:var(--ui-subtle); color:var(--ui-muted); }
+    .machine-detail-status-chip.manual { border-color:#fed7aa; background:var(--ui-subtle); color:#f97316; }
     .machine-detail-machine-identity { display:grid; grid-template-columns:82px minmax(0,1fr); gap:12px; align-items:center; padding:4px 0 2px; }
     .machine-detail-machine-image { display:grid; place-items:center; min-width:0; min-height:68px; }
     .machine-detail-machine-image img { display:block; width:100%; height:auto; object-fit:contain; }
     .machine-detail-machine-name { min-width:0; color:#0f2a68; font-size:1.25rem; line-height:1.1; font-weight:950; overflow-wrap:anywhere; }
-    .machine-detail-machine-code { margin-top:6px; color:#64748b; font-size:.72rem; font-weight:800; overflow-wrap:anywhere; }
+    .machine-detail-machine-code { margin-top:6px; color:var(--ui-muted); font-size:.72rem; font-weight:800; overflow-wrap:anywhere; }
     .machine-detail-side-metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; }
-    .machine-detail-side-metric { min-width:0; min-height:66px; display:grid; align-content:space-between; gap:6px; padding:11px; border:1px solid #edf1f7; border-radius:12px; background:#fff; box-shadow:0 7px 18px rgba(30,64,175,.06); }
-    .machine-detail-side-metric .k { color:#64748b; font-size:.59rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
+    .machine-detail-side-metric { min-width:0; min-height:66px; display:grid; align-content:space-between; gap:6px; padding:11px; border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); box-shadow:0 7px 18px rgba(30,64,175,.06); }
+    .machine-detail-side-metric .k { color:var(--ui-muted); font-size:.59rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
     .machine-detail-side-metric .v { color:#172554; font-size:1.14rem; line-height:1; font-weight:950; }
     .machine-detail-side-metric.good .k,.machine-detail-side-metric.good .v { color:#10b981; }
     .machine-detail-side-metric.butal .k,.machine-detail-side-metric.butal .v { color:#0ea5e9; }
     .machine-detail-side-metric.reject .k,.machine-detail-side-metric.reject .v { color:#ef4444; }
     .machine-detail-side-metric.total .k,.machine-detail-side-metric.total .v { color:#7c3aed; }
     .machine-detail-good-metric { position:relative; outline:none; cursor:help; }
-    .machine-detail-good-bubble { position:fixed; left:12px; top:12px; z-index:1400; display:none; width:190px; max-width:calc(100vw - 24px); gap:7px; padding:12px; border:1px solid #bbf7d0; border-radius:13px; background:#fff; color:#334155; box-shadow:0 14px 34px rgba(15,23,42,.18); }
+    .machine-detail-good-bubble { position:fixed; left:12px; top:12px; z-index:1400; display:none; width:190px; max-width:calc(100vw - 24px); gap:7px; padding:12px; border:1px solid #bbf7d0; border-radius:13px; background:var(--ui-surface); color:var(--ui-text); box-shadow:0 14px 34px rgba(15,23,42,.18); }
     .machine-detail-good-bubble-title { color:#047857; font-size:.66rem; font-weight:950; text-transform:uppercase; letter-spacing:.04em; }
     .machine-detail-good-bubble-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding-top:7px; border-top:1px solid #d1fae5; font-size:.68rem; line-height:1.25; font-weight:850; }
     .machine-detail-good-bubble-row strong { flex:0 0 auto; color:#047857; }
@@ -9109,7 +10806,7 @@ DASHBOARD_HTML = r"""
     .machine-detail-good-metric:focus .machine-detail-good-bubble,
     .machine-detail-good-metric:focus-within .machine-detail-good-bubble { display:grid; }
     .machine-detail-reject-metric { position:relative; outline:none; cursor:help; }
-    .machine-detail-reject-bubble { position:fixed; left:12px; top:50%; z-index:1200; width:190px; max-width:calc(100vw - 24px); display:none; gap:7px; padding:12px; border:1px solid #fecaca; border-radius:13px; background:#fff; color:#334155; box-shadow:0 14px 34px rgba(15,23,42,.18); transform:translateY(-50%); }
+    .machine-detail-reject-bubble { position:fixed; left:12px; top:50%; z-index:1200; width:190px; max-width:calc(100vw - 24px); display:none; gap:7px; padding:12px; border:1px solid #fecaca; border-radius:13px; background:var(--ui-surface); color:var(--ui-text); box-shadow:0 14px 34px rgba(15,23,42,.18); transform:translateY(-50%); }
     .machine-detail-reject-bubble::after { content:""; position:absolute; left:100%; top:50%; border:7px solid transparent; border-left-color:#fecaca; transform:translateY(-50%); }
     .machine-detail-reject-bubble.right-side::after { left:auto; right:100%; border-left-color:transparent; border-right-color:#fecaca; }
     .machine-detail-reject-metric:hover .machine-detail-reject-bubble,.machine-detail-reject-metric:focus .machine-detail-reject-bubble,.machine-detail-reject-metric:focus-within .machine-detail-reject-bubble { display:grid; }
@@ -9118,62 +10815,62 @@ DASHBOARD_HTML = r"""
     .machine-detail-reject-bubble-row span:first-child { min-width:0; overflow-wrap:anywhere; }
     .machine-detail-reject-bubble-row strong { flex:0 0 auto; color:#b91c1c; }
     .machine-detail-side-list { display:grid; }
-    .machine-detail-side-row { min-width:0; display:grid; grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr); gap:8px; padding:9px 0; border-top:1px solid #edf1f7; }
-    .machine-detail-side-row .k { color:#7890bd; font-size:.59rem; font-weight:900; text-transform:uppercase; }
-    .machine-detail-side-row .v { color:#17306d; font-size:.66rem; font-weight:900; text-align:right; overflow-wrap:anywhere; }
-    .machine-detail-side-callout { display:grid; gap:4px; padding:11px 12px; border-radius:11px; background:linear-gradient(135deg,#f8faff,#fff); box-shadow:0 6px 16px rgba(30,64,175,.05); }
-    .machine-detail-side-callout .k { color:#7890bd; font-size:.58rem; font-weight:900; text-transform:uppercase; }
+    .machine-detail-side-row { min-width:0; display:grid; grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr); gap:8px; padding:9px 0; border-top:1px solid var(--ui-border); }
+    .machine-detail-side-row .k { color:var(--ui-muted); font-size:.59rem; font-weight:900; text-transform:uppercase; }
+    .machine-detail-side-row .v { color:var(--ui-link); font-size:.66rem; font-weight:900; text-align:right; overflow-wrap:anywhere; }
+    .machine-detail-side-callout { display:grid; gap:4px; padding:11px 12px; border-radius:11px; background:linear-gradient(135deg,var(--ui-surface),var(--ui-surface)); box-shadow:0 6px 16px rgba(30,64,175,.05); }
+    .machine-detail-side-callout .k { color:var(--ui-muted); font-size:.58rem; font-weight:900; text-transform:uppercase; }
     .machine-detail-side-callout .v { color:#172554; font-size:.68rem; font-weight:900; overflow-wrap:anywhere; }
     .machine-detail-main { min-width:0; display:grid; gap:12px; }
     .machine-detail-main-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; padding:4px 10px 2px; }
     .machine-detail-main-title { margin:0; color:#102a67; font-size:1.42rem; line-height:1.1; font-weight:950; }
     .machine-detail-chip-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:11px; }
-    .machine-detail-chip { display:inline-flex; align-items:center; gap:6px; max-width:100%; padding:7px 11px; border:1px solid #e6ebf4; border-radius:999px; background:#fff; color:#2563eb; font-size:.61rem; line-height:1; font-weight:950; text-transform:uppercase; box-shadow:0 6px 16px rgba(30,64,175,.06); }
-    .machine-detail-chip.active { border-color:#d1fae5; background:#ecfdf5; color:#10b981; }
-    .machine-detail-chip.disconnected { border-color:#fecaca; background:#fef2f2; color:#ef4444; }
-    .machine-detail-chip.inactive { border-color:#cbd5e1; background:#f1f5f9; color:#64748b; }
-    .machine-detail-chip.manual { border-color:#fed7aa; background:#fff7ed; color:#f97316; }
-    .machine-detail-chip.purple { border-color:#ede9fe; background:#f5f3ff; color:#7c3aed; }
-    .machine-detail-info-panel { min-width:0; overflow:hidden; border:1px solid #e8edf5; border-radius:16px; background:rgba(255,255,255,.98); box-shadow:0 9px 24px rgba(30,64,175,.06); }
-    .machine-detail-info-title { padding:15px 18px 12px; color:#17306d; font-size:.68rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; border-bottom:1px solid #edf1f7; }
+    .machine-detail-chip { display:inline-flex; align-items:center; gap:6px; max-width:100%; padding:7px 11px; border:1px solid var(--ui-border); border-radius:999px; background:var(--ui-surface); color:var(--ui-link); font-size:.61rem; line-height:1; font-weight:950; text-transform:uppercase; box-shadow:0 6px 16px rgba(30,64,175,.06); }
+    .machine-detail-chip.active { border-color:#d1fae5; background:var(--ui-subtle); color:#10b981; }
+    .machine-detail-chip.disconnected { border-color:#fecaca; background:var(--ui-subtle); color:#ef4444; }
+    .machine-detail-chip.inactive { border-color:var(--ui-border); background:var(--ui-subtle); color:var(--ui-muted); }
+    .machine-detail-chip.manual { border-color:#fed7aa; background:var(--ui-subtle); color:#f97316; }
+    .machine-detail-chip.purple { border-color:#ede9fe; background:var(--ui-subtle); color:#7c3aed; }
+    .machine-detail-info-panel { min-width:0; overflow:hidden; border:1px solid var(--ui-border); border-radius:16px; background:color-mix(in srgb, var(--ui-surface) 98%, transparent); box-shadow:0 9px 24px rgba(30,64,175,.06); }
+    .machine-detail-info-title { padding:15px 18px 12px; color:var(--ui-link); font-size:.68rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; border-bottom:1px solid var(--ui-border); }
     .machine-detail-info-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); }
     .product-weight-info-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
     .downtime-summary-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
     .product-weight-info-grid .machine-detail-info-item:nth-child(3n) { border-right:0; }
-    .downtime-summary-grid .machine-detail-info-item:nth-child(3n) { border-right:1px solid #edf1f7; }
+    .downtime-summary-grid .machine-detail-info-item:nth-child(3n) { border-right:1px solid var(--ui-border); }
     .downtime-summary-grid .machine-detail-info-item:nth-child(4n) { border-right:0; }
-    .product-weight-info-grid .machine-detail-info-item { border-bottom:1px solid #edf1f7; }
+    .product-weight-info-grid .machine-detail-info-item { border-bottom:1px solid var(--ui-border); }
     .product-weight-info-grid .machine-detail-info-item:nth-last-child(-n+3) { border-bottom:0; }
     .downtime-summary-grid .machine-detail-info-item { border-bottom:0; }
-    .machine-detail-info-item { min-width:0; min-height:70px; padding:13px 18px; border-right:1px solid #edf1f7; border-bottom:1px solid #edf1f7; }
+    .machine-detail-info-item { min-width:0; min-height:70px; padding:13px 18px; border-right:1px solid var(--ui-border); border-bottom:1px solid var(--ui-border); }
     .machine-detail-info-item:nth-child(3n) { border-right:0; }
     .machine-detail-info-item:nth-last-child(-n+3) { border-bottom:0; }
-    .machine-detail-info-item .k { color:#7890bd; font-size:.58rem; font-weight:900; letter-spacing:.035em; text-transform:uppercase; }
+    .machine-detail-info-item .k { color:var(--ui-muted); font-size:.58rem; font-weight:900; letter-spacing:.035em; text-transform:uppercase; }
     .machine-detail-info-item .v { margin-top:8px; color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; overflow-wrap:anywhere; }
-    .machine-detail-info-item.weight-good { background:#f0fdf4; box-shadow:inset 0 0 0 1px #86efac; }
+    .machine-detail-info-item.weight-good { background:var(--ui-subtle); box-shadow:inset 0 0 0 1px #86efac; }
     .machine-detail-info-item.weight-good .k,.machine-detail-info-item.weight-good .v { color:#15803d; }
-    .machine-detail-info-item.weight-warning { background:#fff7ed; box-shadow:inset 0 0 0 1px #fdba74; }
+    .machine-detail-info-item.weight-warning { background:var(--ui-subtle); box-shadow:inset 0 0 0 1px #fdba74; }
     .machine-detail-info-item.weight-warning .k,.machine-detail-info-item.weight-warning .v { color:#c2410c; }
-    .machine-detail-info-item.weight-danger { background:#fef2f2; box-shadow:inset 0 0 0 1px #fca5a5; }
+    .machine-detail-info-item.weight-danger { background:var(--ui-subtle); box-shadow:inset 0 0 0 1px #fca5a5; }
     .machine-detail-info-item.weight-danger .k,.machine-detail-info-item.weight-danger .v { color:#b91c1c; }
-    .machine-detail-records-title { margin-top:4px; padding:3px 2px; color:#17306d; font-size:.75rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
+    .machine-detail-records-title { margin-top:4px; padding:3px 2px; color:var(--ui-link); font-size:.75rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
     .machine-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-    .machine-detail-item { min-width: 0; background: #f8fbff; border: 1px solid #d9e6f6; border-radius: 10px; padding: 9px 10px; }
-    .machine-detail-item .k { font-size: .76rem; color: #64748b; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .03em; }
-    .machine-detail-item .v { font-size: .92rem; font-weight: 600; color: #0f172a; overflow-wrap: anywhere; }
-    .machine-detail-section { min-width: 0; max-width: 100%; background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px; }
-    .machine-detail-section h4 { margin: 0 0 10px; color: #0f172a; font-size: .98rem; }
+    .machine-detail-item { min-width: 0; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 10px; padding: 9px 10px; }
+    .machine-detail-item .k { font-size: .76rem; color: var(--ui-muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .03em; }
+    .machine-detail-item .v { font-size: .92rem; font-weight: 600; color: var(--ui-text); overflow-wrap: anywhere; }
+    .machine-detail-section { min-width: 0; max-width: 100%; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 12px; padding: 12px; }
+    .machine-detail-section h4 { margin: 0 0 10px; color: var(--ui-text); font-size: .98rem; }
     #machineDetailOverlay .review-kv-table { width: 100%; max-width: 100%; table-layout: fixed; }
     #machineDetailOverlay .review-kv-table th,
     #machineDetailOverlay .review-kv-table td { min-width: 0; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
     .job-parts-panel { overflow:visible; }
-    .job-parts-panel .machine-detail-info-title { border-radius:16px 16px 0 0; background:rgba(255,255,255,.98); }
-    .job-parts-panel-body { min-width:0; padding:10px 12px 12px; border-radius:0 0 16px 16px; background:rgba(255,255,255,.98); }
+    .job-parts-panel .machine-detail-info-title { border-radius:16px 16px 0 0; background:color-mix(in srgb, var(--ui-surface) 98%, transparent); }
+    .job-parts-panel-body { min-width:0; padding:10px 12px 12px; border-radius:0 0 16px 16px; background:color-mix(in srgb, var(--ui-surface) 98%, transparent); }
     .job-parts-table { min-width:0; overflow:visible; }
     .job-parts-table > .review-data-table { width:100%; table-layout:fixed; }
     .job-parts-table > .review-data-table > thead > tr > th,
     .job-parts-table > .review-data-table > tbody > tr > td { padding-left:8px; padding-right:8px; }
-    .job-parts-table > .review-data-table > thead > tr > th { color:#7890bd; font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
+    .job-parts-table > .review-data-table > thead > tr > th { color:var(--ui-muted); font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
     .job-parts-table > .review-data-table > tbody > tr > td { color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; font-family:inherit; }
     .job-parts-table > .review-data-table > thead > tr > th:nth-child(1),
     .job-parts-table > .review-data-table > tbody > tr > td:nth-child(1) { width:34px; padding-left:3px; padding-right:3px; text-align:center; }
@@ -9181,28 +10878,28 @@ DASHBOARD_HTML = r"""
     .job-parts-table > .review-data-table > tbody > tr > td:nth-child(2) { width:22%; }
     .job-parts-table > .review-data-table > thead > tr > th:nth-child(3),
     .job-parts-table > .review-data-table > tbody > tr > td:nth-child(3) { width:20%; }
-    .job-part-sku { position:relative; display:inline-flex; align-items:center; gap:5px; max-width:100%; padding:0; border:0; background:transparent; color:#1d4ed8; font:inherit; text-align:left; cursor:pointer; outline:none; overflow-wrap:anywhere; }
+    .job-part-sku { position:relative; display:inline-flex; align-items:center; gap:5px; max-width:100%; padding:0; border:0; background:transparent; color:var(--ui-link); font:inherit; text-align:left; cursor:pointer; outline:none; overflow-wrap:anywhere; }
     .job-part-sku-caret { flex:0 0 auto; font-size:.58rem; transition:transform .22s ease; }
     .job-part-sku[aria-expanded="true"] .job-part-sku-caret { transform:rotate(90deg); }
-    .job-part-sku-tooltip { position:absolute; left:0; bottom:calc(100% + 8px); z-index:1250; display:none; width:max-content; max-width:min(300px, 70vw); padding:8px 10px; border:1px solid #bfdbfe; border-radius:9px; background:#0f2a68; color:#fff; font-size:.72rem; line-height:1.35; font-weight:800; box-shadow:0 10px 24px rgba(15,23,42,.20); overflow-wrap:anywhere; }
+    .job-part-sku-tooltip { position:absolute; left:0; bottom:calc(100% + 8px); z-index:1250; display:none; width:max-content; max-width:min(300px, 70vw); padding:8px 10px; border:1px solid var(--ui-accent-soft); border-radius:9px; background:#0f2a68; color:var(--ui-on-accent); font-size:.72rem; line-height:1.35; font-weight:800; box-shadow:0 10px 24px rgba(15,23,42,.20); overflow-wrap:anywhere; }
     .job-part-sku-tooltip::after { content:""; position:absolute; top:100%; left:14px; border:6px solid transparent; border-top-color:#0f2a68; }
     .job-part-sku:hover .job-part-sku-tooltip,
     .job-part-sku:focus .job-part-sku-tooltip { display:block; }
     .job-part-sku.tooltip-dismissed .job-part-sku-tooltip { display:none !important; }
     .job-part-scan-cell { width:auto !important; padding:0 !important; border-bottom:0 !important; text-align:left !important; }
-    .job-part-scan-drawer { max-height:0; overflow:hidden; opacity:0; padding:0 12px; border-left:3px solid transparent; background:#f8fbff; transition:max-height .28s ease, opacity .2s ease, padding .28s ease, border-color .2s ease; }
-    .job-part-scan-drawer.open { max-height:720px; overflow:auto; opacity:1; padding:12px; border-left-color:#3b82f6; border-bottom:1px solid #dbe4f0; }
-    .job-part-scan-title { margin-bottom:9px; color:#17306d; font-size:.64rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; }
-    .job-part-scan-drawer .review-data-table { table-layout:fixed; background:#fff; border:1px solid #dbe4f0; border-radius:10px; }
-    .job-part-scan-drawer .review-data-table th { color:#7890bd; font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
+    .job-part-scan-drawer { max-height:0; overflow:hidden; opacity:0; padding:0 12px; border-left:3px solid transparent; background:var(--ui-surface); transition:max-height .28s ease, opacity .2s ease, padding .28s ease, border-color .2s ease; }
+    .job-part-scan-drawer.open { max-height:720px; overflow:auto; opacity:1; padding:12px; border-left-color:var(--ui-accent); border-bottom:1px solid var(--ui-border); }
+    .job-part-scan-title { margin-bottom:9px; color:var(--ui-link); font-size:.64rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; }
+    .job-part-scan-drawer .review-data-table { table-layout:fixed; background:var(--ui-surface); border:1px solid var(--ui-border); border-radius:10px; }
+    .job-part-scan-drawer .review-data-table th { color:var(--ui-muted); font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
     .job-part-scan-drawer .review-data-table td { color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; font-family:inherit; }
     .job-part-scan-drawer .review-data-table th:first-child,
     .job-part-scan-drawer .review-data-table td:first-child { width:34px; text-align:center; }
     .job-part-scan-drawer .review-data-table th:nth-child(4),
     .job-part-scan-drawer .review-data-table td:nth-child(4) { width:54px; text-align:center; }
-    .material-qr-link { position:relative; display:inline; max-width:100%; padding:0; border:0; border-radius:0; background:transparent; color:#1d4ed8; font:inherit; font-weight:900; text-align:left; white-space:normal; cursor:pointer; overflow-wrap:anywhere; }
-    .material-qr-link:hover { border:0; background:transparent; color:#1e40af; text-decoration:underline; box-shadow:none; }
-    .material-qr-name-tooltip { position:absolute; left:0; bottom:calc(100% + 8px); z-index:1260; display:none; width:max-content; max-width:min(300px,70vw); padding:8px 10px; border:1px solid #bfdbfe; border-radius:9px; background:#0f2a68; color:#fff; font-size:.72rem; line-height:1.35; font-weight:800; text-decoration:none; box-shadow:0 10px 24px rgba(15,23,42,.20); overflow-wrap:anywhere; }
+    .material-qr-link { position:relative; display:inline; max-width:100%; padding:0; border:0; border-radius:0; background:transparent; color:var(--ui-link); font:inherit; font-weight:900; text-align:left; white-space:normal; cursor:pointer; overflow-wrap:anywhere; }
+    .material-qr-link:hover { border:0; background:transparent; color:var(--ui-link); text-decoration:underline; box-shadow:none; }
+    .material-qr-name-tooltip { position:absolute; left:0; bottom:calc(100% + 8px); z-index:1260; display:none; width:max-content; max-width:min(300px,70vw); padding:8px 10px; border:1px solid var(--ui-accent-soft); border-radius:9px; background:#0f2a68; color:var(--ui-on-accent); font-size:.72rem; line-height:1.35; font-weight:800; text-decoration:none; box-shadow:0 10px 24px rgba(15,23,42,.20); overflow-wrap:anywhere; }
     .material-qr-name-tooltip::after { content:""; position:absolute; top:100%; left:14px; border:6px solid transparent; border-top-color:#0f2a68; }
     .material-qr-link:hover .material-qr-name-tooltip,
     .material-qr-link:focus .material-qr-name-tooltip { display:block; }
@@ -9210,15 +10907,15 @@ DASHBOARD_HTML = r"""
     .product-pack-panel-body { min-width:0; padding:10px 12px 12px; }
     .machine-detail-record-panel-body { min-width:0; padding:10px 12px 12px; }
     .machine-detail-record-panel-body .review-data-table { width:100%; table-layout:fixed; }
-    .machine-detail-record-panel-body .review-data-table th { color:#7890bd; font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
+    .machine-detail-record-panel-body .review-data-table th { color:var(--ui-muted); font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
     .machine-detail-record-panel-body .review-data-table td { color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; font-family:inherit; }
     .machine-detail-record-panel-body .review-data-table th:first-child,
     .machine-detail-record-panel-body .review-data-table td:first-child { width:34px; padding-left:3px; padding-right:3px; text-align:center; }
-    .machine-detail-record-panel-body .machine-detail-empty { padding:3px 0; color:#64748b; font-size:.72rem; line-height:1.35; font-weight:800; }
-    .machine-detail-downtime-history { border-top:1px solid #edf1f7; }
+    .machine-detail-record-panel-body .machine-detail-empty { padding:3px 0; color:var(--ui-muted); font-size:.72rem; line-height:1.35; font-weight:800; }
+    .machine-detail-downtime-history { border-top:1px solid var(--ui-border); }
     .product-pack-table { min-width:0; overflow:hidden; }
     .product-pack-table > .review-data-table { width:100%; table-layout:fixed; }
-    .product-pack-table > .review-data-table > thead > tr > th { color:#7890bd; font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
+    .product-pack-table > .review-data-table > thead > tr > th { color:var(--ui-muted); font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
     .product-pack-table > .review-data-table > tbody > tr > td { color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; font-family:inherit; }
     .product-pack-table > .review-data-table > thead > tr > th:first-child,
     .product-pack-table > .review-data-table > tbody > tr > td:first-child { width:34px; padding-left:3px; padding-right:3px; text-align:center; }
@@ -9233,22 +10930,22 @@ DASHBOARD_HTML = r"""
     .product-pack-table > .review-data-table > thead > tr > th:nth-child(6),
     .product-pack-table > .review-data-table > tbody > tr > td:nth-child(6) { width:148px; }
     .product-pack-latest { display:grid; gap:2px; color:#172554; }
-    .product-pack-latest strong { color:#1d4ed8; font-size:.68rem; font-weight:950; }
-    .product-pack-latest small { color:#64748b; font-size:.62rem; line-height:1.25; font-weight:800; }
-    .pack-item-link { position:relative; display:inline-flex; align-items:center; gap:5px; max-width:100%; padding:0; border:0; border-radius:0; background:transparent; color:#1d4ed8; font:inherit; font-weight:900; text-align:left; white-space:normal; cursor:pointer; overflow-wrap:anywhere; }
-    .pack-item-link:hover { border:0; background:transparent; color:#1e40af; text-decoration:underline; box-shadow:none; }
+    .product-pack-latest strong { color:var(--ui-link); font-size:.68rem; font-weight:950; }
+    .product-pack-latest small { color:var(--ui-muted); font-size:.62rem; line-height:1.25; font-weight:800; }
+    .pack-item-link { position:relative; display:inline-flex; align-items:center; gap:5px; max-width:100%; padding:0; border:0; border-radius:0; background:transparent; color:var(--ui-link); font:inherit; font-weight:900; text-align:left; white-space:normal; cursor:pointer; overflow-wrap:anywhere; }
+    .pack-item-link:hover { border:0; background:transparent; color:var(--ui-link); text-decoration:underline; box-shadow:none; }
     .pack-item-caret { flex:0 0 auto; font-size:.58rem; transition:transform .22s ease; }
     .pack-item-link[aria-expanded="true"] .pack-item-caret { transform:rotate(90deg); }
-    .pack-item-name-tooltip { position:fixed; left:12px; top:12px; z-index:1400; display:none; width:max-content; max-width:min(300px,70vw); padding:8px 10px; border:1px solid #bfdbfe; border-radius:9px; background:#0f2a68; color:#fff; font-size:.72rem; line-height:1.35; font-weight:800; text-decoration:none; box-shadow:0 10px 24px rgba(15,23,42,.20); overflow-wrap:anywhere; pointer-events:none; }
+    .pack-item-name-tooltip { position:fixed; left:12px; top:12px; z-index:1400; display:none; width:max-content; max-width:min(300px,70vw); padding:8px 10px; border:1px solid var(--ui-accent-soft); border-radius:9px; background:#0f2a68; color:var(--ui-on-accent); font-size:.72rem; line-height:1.35; font-weight:800; text-decoration:none; box-shadow:0 10px 24px rgba(15,23,42,.20); overflow-wrap:anywhere; pointer-events:none; }
     .pack-item-link:hover .pack-item-name-tooltip,
     .pack-item-link:focus .pack-item-name-tooltip { display:block; }
     .pack-item-link.tooltip-dismissed .pack-item-name-tooltip { display:none !important; }
     .product-pack-scan-cell { width:auto !important; padding:0 !important; border-bottom:0 !important; text-align:left !important; }
-    .product-pack-scan-drawer { max-height:0; overflow:hidden; opacity:0; padding:0 12px; border-left:3px solid transparent; background:#f8fbff; transition:max-height .28s ease, opacity .2s ease, padding .28s ease, border-color .2s ease; }
-    .product-pack-scan-drawer.open { max-height:720px; overflow:auto; opacity:1; padding:12px; border-left-color:#3b82f6; border-bottom:1px solid #dbe4f0; }
-    .product-pack-scan-title { margin-bottom:9px; color:#17306d; font-size:.64rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; }
-    .product-pack-scan-drawer .review-data-table { table-layout:fixed; background:#fff; border:1px solid #dbe4f0; border-radius:10px; }
-    .product-pack-scan-drawer .review-data-table th { color:#7890bd; font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
+    .product-pack-scan-drawer { max-height:0; overflow:hidden; opacity:0; padding:0 12px; border-left:3px solid transparent; background:var(--ui-surface); transition:max-height .28s ease, opacity .2s ease, padding .28s ease, border-color .2s ease; }
+    .product-pack-scan-drawer.open { max-height:720px; overflow:auto; opacity:1; padding:12px; border-left-color:var(--ui-accent); border-bottom:1px solid var(--ui-border); }
+    .product-pack-scan-title { margin-bottom:9px; color:var(--ui-link); font-size:.64rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; }
+    .product-pack-scan-drawer .review-data-table { table-layout:fixed; background:var(--ui-surface); border:1px solid var(--ui-border); border-radius:10px; }
+    .product-pack-scan-drawer .review-data-table th { color:var(--ui-muted); font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
     .product-pack-scan-drawer .review-data-table td { color:#172554; font-size:.72rem; line-height:1.35; font-weight:900; font-family:inherit; }
     .product-pack-scan-drawer .review-data-table th:first-child,
     .product-pack-scan-drawer .review-data-table td:first-child { width:34px; text-align:center; }
@@ -9264,232 +10961,112 @@ DASHBOARD_HTML = r"""
     .product-pack-scan-drawer .review-data-table td:nth-child(5) { width:16%; }
     .product-pack-scan-drawer .review-data-table th:nth-child(7),
     .product-pack-scan-drawer .review-data-table td:nth-child(7) { width:138px; }
-    .pack-scan-qr-link { position:relative; display:inline; padding:0; border:0; border-radius:0; background:transparent; color:#1d4ed8; font:inherit; font-weight:900; cursor:pointer; }
-    .pack-scan-qr-link:hover { border:0; background:transparent; color:#1e40af; text-decoration:underline; box-shadow:none; }
+    .pack-scan-qr-link { position:relative; display:inline; padding:0; border:0; border-radius:0; background:transparent; color:var(--ui-link); font:inherit; font-weight:900; cursor:pointer; }
+    .pack-scan-qr-link:hover { border:0; background:transparent; color:var(--ui-link); text-decoration:underline; box-shadow:none; }
     .pack-scan-qr-link:hover .pack-item-name-tooltip,
     .pack-scan-qr-link:focus .pack-item-name-tooltip { display:block; }
     .product-pack-missing-value { color:#b45309; font-weight:950; overflow-wrap:anywhere; }
     .product-pack-missing-value.none { color:#16a34a; }
-    .shift-job-tabs { background:#fff; border:1px solid #dbe4f0; border-radius:12px; overflow:hidden; }
-    .shift-job-tabs-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:11px 12px; border-bottom:1px solid #e5edf5; background:#f8fafc; }
-    .shift-job-tabs-title { font-size:.92rem; font-weight:900; color:#0f172a; }
-    .shift-job-tabs-meta { font-size:.76rem; font-weight:800; color:#64748b; text-transform:uppercase; letter-spacing:.04em; }
-    .shift-job-tabbar { display:flex; gap:7px; padding:10px 12px; overflow-x:auto; border-bottom:1px solid #edf2f7; }
-    .shift-job-tab-button { flex:0 0 auto; border:1px solid #cbd5e1; border-radius:999px; background:#fff; color:#334155; padding:7px 11px; font-size:.78rem; font-weight:900; cursor:pointer; max-width:220px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .shift-job-tab-button.active { background:#1d4ed8; border-color:#1d4ed8; color:#fff; }
+    .shift-job-tabs { background:var(--ui-surface); border:1px solid var(--ui-border); border-radius:12px; overflow:hidden; }
+    .shift-job-tabs-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:11px 12px; border-bottom:1px solid var(--ui-border); background:var(--ui-surface); }
+    .shift-job-tabs-title { font-size:.92rem; font-weight:900; color:var(--ui-text); }
+    .shift-job-tabs-meta { font-size:.76rem; font-weight:800; color:var(--ui-muted); text-transform:uppercase; letter-spacing:.04em; }
+    .shift-job-tabbar { display:flex; gap:7px; padding:10px 12px; overflow-x:auto; border-bottom:1px solid var(--ui-border); }
+    .shift-job-tab-button { flex:0 0 auto; border:1px solid var(--ui-border); border-radius:999px; background:var(--ui-surface); color:var(--ui-text); padding:7px 11px; font-size:.78rem; font-weight:900; cursor:pointer; max-width:220px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .shift-job-tab-button.active { background:var(--ui-accent); border-color:var(--ui-accent); color:var(--ui-on-accent); }
     .shift-job-tab-panel { display:none; padding:12px; }
     .shift-job-tab-panel.active { display:grid; gap:10px; }
     .shift-job-summary-line { display:flex; flex-wrap:wrap; gap:7px; }
-    .shift-job-pill { display:inline-flex; align-items:center; border:1px solid #dbe4f0; border-radius:999px; background:#f8fafc; color:#475569; padding:4px 8px; font-size:.72rem; font-weight:800; }
-    .shift-job-pill.change { border-color:#fdba74; background:#fff7ed; color:#9a3412; }
-    .machine-detail-code { font-family: "Consolas","Courier New",monospace; font-size: .82rem; white-space: pre-wrap; overflow-wrap: anywhere; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px; max-height: 220px; overflow: auto; }
+    .shift-job-pill { display:inline-flex; align-items:center; border:1px solid var(--ui-border); border-radius:999px; background:var(--ui-surface); color:var(--ui-muted); padding:4px 8px; font-size:.72rem; font-weight:800; }
+    .shift-job-pill.change { border-color:#fdba74; background:var(--ui-subtle); color:#9a3412; }
+    .machine-detail-code { font-family: "Consolas","Courier New",monospace; font-size: .82rem; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--ui-surface); border: 1px solid var(--ui-border); border-radius: 10px; padding: 10px; max-height: 220px; overflow: auto; }
     .machine-detail-list { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
-    .machine-detail-list li { font-size: .88rem; color: #1f2937; }
-    .machine-detail-empty { color: #64748b; font-size: .88rem; }
-    .archive-detail-hero { display:grid; grid-template-columns: 1.35fr .9fr; gap:12px; align-items:stretch; background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 58%,#155e75 100%); color:#fff; border-radius:14px; padding:14px; }
+    .machine-detail-list li { font-size: .88rem; color: var(--ui-text); }
+    .machine-detail-empty { color: var(--ui-muted); font-size: .88rem; }
+    .archive-detail-hero { display:grid; grid-template-columns: 1.35fr .9fr; gap:12px; align-items:stretch; background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 58%,#155e75 100%); color:var(--ui-on-accent); border-radius:14px; padding:14px; }
     .archive-detail-hero h3 { margin:0; font-size:1.24rem; letter-spacing:0; }
-    .archive-detail-hero .sub { margin-top:5px; font-size:.86rem; color:#dbeafe; overflow-wrap:anywhere; }
+    .archive-detail-hero .sub { margin-top:5px; font-size:.86rem; color:var(--ui-muted); overflow-wrap:anywhere; }
     .archive-detail-hero .archive-pill-row { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; }
-    .archive-pill { display:inline-flex; align-items:center; border-radius:999px; padding:5px 9px; font-size:.72rem; font-weight:800; letter-spacing:.02em; text-transform:uppercase; background:rgba(255,255,255,.14); border:1px solid rgba(255,255,255,.22); color:#eff6ff; }
+    .archive-pill { display:inline-flex; align-items:center; border-radius:999px; padding:5px 9px; font-size:.72rem; font-weight:800; letter-spacing:.02em; text-transform:uppercase; background:color-mix(in srgb, var(--ui-surface) 14%, transparent); border:1px solid color-mix(in srgb, var(--ui-surface) 22%, transparent); color:var(--ui-on-accent); }
     .archive-detail-hero-side { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
-    .archive-hero-stat { background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.20); border-radius:10px; padding:9px 10px; min-width:0; }
-    .archive-hero-stat .k { color:#bfdbfe; font-size:.68rem; font-weight:800; text-transform:uppercase; letter-spacing:.05em; }
+    .archive-hero-stat { background:color-mix(in srgb, var(--ui-surface) 12%, transparent); border:1px solid color-mix(in srgb, var(--ui-surface) 20%, transparent); border-radius:10px; padding:9px 10px; min-width:0; }
+    .archive-hero-stat .k { color:var(--ui-accent-soft); font-size:.68rem; font-weight:800; text-transform:uppercase; letter-spacing:.05em; }
     .archive-hero-stat .v { margin-top:3px; font-size:1.08rem; font-weight:900; overflow-wrap:anywhere; }
     .archive-metric-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
-    .archive-metric { border:1px solid #dbe4f0; background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%); border-radius:10px; padding:10px 11px; min-width:0; }
-    .archive-metric .k { font-size:.72rem; color:#64748b; text-transform:uppercase; font-weight:800; letter-spacing:.04em; }
-    .archive-metric .v { margin-top:4px; font-size:1.1rem; font-weight:900; color:#0f172a; overflow-wrap:anywhere; }
-    .archive-metric.good { border-color:#bbf7d0; background:#f0fdf4; }
-    .archive-metric.warn { border-color:#fed7aa; background:#fff7ed; }
-    .archive-metric.bad { border-color:#fecaca; background:#fef2f2; }
+    .archive-metric { border:1px solid var(--ui-border); background:linear-gradient(180deg,var(--ui-surface) 0%,var(--ui-surface) 100%); border-radius:10px; padding:10px 11px; min-width:0; }
+    .archive-metric .k { font-size:.72rem; color:var(--ui-muted); text-transform:uppercase; font-weight:800; letter-spacing:.04em; }
+    .archive-metric .v { margin-top:4px; font-size:1.1rem; font-weight:900; color:var(--ui-text); overflow-wrap:anywhere; }
+    .archive-metric.good { border-color:#bbf7d0; background:var(--ui-subtle); }
+    .archive-metric.warn { border-color:#fed7aa; background:var(--ui-subtle); }
+    .archive-metric.bad { border-color:#fecaca; background:var(--ui-subtle); }
     .archive-raw-details { margin-top:10px; }
-    .archive-raw-details summary { cursor:pointer; font-size:.82rem; font-weight:800; color:#334155; }
+    .archive-raw-details summary { cursor:pointer; font-size:.82rem; font-weight:800; color:var(--ui-text); }
     .detail-chart-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:10px; }
-    .detail-chart-card { border:1px solid #dbe4f0; border-radius:12px; background:#fff; padding:11px 12px; min-width:0; }
+    .detail-chart-card { border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); padding:11px 12px; min-width:0; }
     .detail-chart-card .head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
-    .detail-chart-card .title { font-size:.78rem; font-weight:900; letter-spacing:.04em; text-transform:uppercase; color:#334155; }
-    .detail-chart-card .value { font-size:.82rem; font-weight:900; color:#0f172a; }
-    .detail-bar { height:13px; border-radius:999px; background:#e5edf5; overflow:hidden; display:flex; border:1px solid #dbe4f0; }
+    .detail-chart-card .title { font-size:.78rem; font-weight:900; letter-spacing:.04em; text-transform:uppercase; color:var(--ui-text); }
+    .detail-chart-card .value { font-size:.82rem; font-weight:900; color:var(--ui-text); }
+    .detail-bar { height:13px; border-radius:999px; background:var(--ui-subtle); overflow:hidden; display:flex; border:1px solid var(--ui-border); }
     .detail-bar-seg { min-width:0; height:100%; }
     .detail-bar-seg.good { background:#22c55e; }
     .detail-bar-seg.butal { background:#f59e0b; }
     .detail-bar-seg.reject { background:#ef4444; }
     .detail-bar-seg.noshot { background:#64748b; }
     .detail-bar-legend { display:flex; flex-wrap:wrap; gap:7px 10px; margin-top:8px; }
-    .detail-legend-item { display:inline-flex; align-items:center; gap:5px; font-size:.72rem; font-weight:800; color:#475569; }
+    .detail-legend-item { display:inline-flex; align-items:center; gap:5px; font-size:.72rem; font-weight:800; color:var(--ui-muted); }
     .detail-dot { width:9px; height:9px; border-radius:999px; display:inline-block; }
     .detail-dot.good { background:#22c55e; }
     .detail-dot.butal { background:#f59e0b; }
     .detail-dot.reject { background:#ef4444; }
     .detail-dot.noshot { background:#64748b; }
     .detail-progress { display:grid; gap:7px; }
-    .detail-progress-row { display:grid; grid-template-columns:110px 1fr 52px; align-items:center; gap:8px; font-size:.76rem; font-weight:800; color:#475569; }
-    .detail-progress-track { height:9px; border-radius:999px; background:#e5edf5; overflow:hidden; border:1px solid #dbe4f0; }
-    .detail-progress-fill { height:100%; border-radius:999px; background:#2563eb; }
+    .detail-progress-row { display:grid; grid-template-columns:110px 1fr 52px; align-items:center; gap:8px; font-size:.76rem; font-weight:800; color:var(--ui-muted); }
+    .detail-progress-track { height:9px; border-radius:999px; background:var(--ui-subtle); overflow:hidden; border:1px solid var(--ui-border); }
+    .detail-progress-fill { height:100%; border-radius:999px; background:var(--ui-accent); }
     .detail-progress-fill.warn { background:#f59e0b; }
     .detail-progress-fill.bad { background:#ef4444; }
     .raw-material-stat-panel-body { min-width:0; padding:12px; }
-    .raw-stat-note { margin:0 0 10px; color:#64748b; font-size:.68rem; font-weight:750; line-height:1.4; }
-    .raw-stat-table { min-width:0; overflow:hidden; border:1px solid #dbe4f0; border-radius:12px; background:#fff; }
+    .raw-stat-note { margin:0 0 10px; color:var(--ui-muted); font-size:.68rem; font-weight:750; line-height:1.4; }
+    .raw-stat-carryover { display:block; margin-top:3px; color:var(--ui-muted); font-size:.61rem; font-weight:750; white-space:nowrap; }
+    .raw-stat-table { min-width:0; overflow:hidden; border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); }
     .raw-stat-table .review-data-table { width:100%; table-layout:fixed; }
-    .raw-stat-table .review-data-table th { color:#7890bd; font-size:.56rem; line-height:1.25; font-weight:900; }
+    .raw-stat-table .review-data-table th { color:var(--ui-muted); font-size:.56rem; line-height:1.25; font-weight:900; }
     .raw-stat-table .review-data-table td { color:#172554; font-size:.68rem; line-height:1.35; font-weight:850; vertical-align:middle; }
     .raw-stat-table .review-data-table th:first-child,
     .raw-stat-table .review-data-table td:first-child { width:32px; text-align:center; }
     .raw-stat-table .review-data-table th:nth-child(2),
     .raw-stat-table .review-data-table td:nth-child(2) { width:25%; }
     .raw-stat-material { color:#172554; font-weight:900; overflow-wrap:anywhere; }
-    .raw-stat-sku { margin-top:3px; color:#2563eb; font-size:.62rem; font-weight:900; overflow-wrap:anywhere; }
+    .raw-stat-sku { margin-top:3px; color:var(--ui-link); font-size:.62rem; font-weight:900; overflow-wrap:anywhere; }
     .raw-insight-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; margin-bottom:12px; }
-    .raw-insight-card { position:relative; overflow:hidden; border:1px solid #dbe4f0; border-radius:13px; background:linear-gradient(145deg,#ffffff 0%,#f6f9ff 100%); padding:12px 13px; min-width:0; box-shadow:0 6px 16px rgba(30,64,175,.05); }
-    .raw-insight-card::before { content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:#60a5fa; }
-    .raw-insight-card .k { font-size:.58rem; font-weight:950; color:#7890bd; text-transform:uppercase; letter-spacing:.04em; }
+    .raw-insight-card { position:relative; overflow:hidden; border:1px solid var(--ui-border); border-radius:13px; background:linear-gradient(145deg,var(--ui-surface) 0%,var(--ui-surface) 100%); padding:12px 13px; min-width:0; box-shadow:0 6px 16px rgba(30,64,175,.05); }
+    .raw-insight-card::before { content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--ui-accent); }
+    .raw-insight-card .k { font-size:.58rem; font-weight:950; color:var(--ui-muted); text-transform:uppercase; letter-spacing:.04em; }
     .raw-insight-card .v { margin-top:7px; font-size:1.16rem; line-height:1; font-weight:950; color:#172554; overflow-wrap:anywhere; }
-    .raw-insight-card .u { margin-top:6px; color:#64748b; font-size:.61rem; line-height:1.2; font-weight:800; }
-    .raw-insight-card.warn { border-color:#fed7aa; background:#fff7ed; }
-    .raw-insight-card.good { border-color:#bbf7d0; background:#f0fdf4; }
-    .raw-insight-card.bad { border-color:#fecaca; background:#fef2f2; }
+    .raw-insight-card .u { margin-top:6px; color:var(--ui-muted); font-size:.61rem; line-height:1.2; font-weight:800; }
+    .raw-insight-card.warn { border-color:#fed7aa; background:var(--ui-subtle); }
+    .raw-insight-card.good { border-color:#bbf7d0; background:var(--ui-subtle); }
+    .raw-insight-card.bad { border-color:#fecaca; background:var(--ui-subtle); }
     .raw-insight-card.good::before { background:#22c55e; }
     .raw-insight-card.warn::before { background:#f59e0b; }
     .raw-insight-card.bad::before { background:#ef4444; }
-    .raw-coverage-panel { overflow:hidden; border:1px solid #dbe4f0; border-radius:13px; background:#f8fbff; }
-    .raw-coverage-title { padding:10px 12px; border-bottom:1px solid #dbe4f0; color:#17306d; font-size:.62rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
+    .raw-coverage-panel { overflow:hidden; border:1px solid var(--ui-border); border-radius:13px; background:var(--ui-surface); }
+    .raw-coverage-title { padding:10px 12px; border-bottom:1px solid var(--ui-border); color:var(--ui-link); font-size:.62rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
     .raw-coverage-body { padding:10px 12px; }
     .raw-match-list { display:grid; gap:8px; }
-    .raw-match-item { border:1px solid #dbe4f0; border-radius:12px; background:#fff; padding:11px 12px; box-shadow:0 4px 12px rgba(30,64,175,.04); }
+    .raw-match-item { border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); padding:11px 12px; box-shadow:0 4px 12px rgba(30,64,175,.04); }
     .raw-match-top { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
     .raw-match-name { font-size:.76rem; font-weight:950; color:#172554; overflow-wrap:anywhere; }
-    .raw-match-status { border-radius:999px; padding:4px 8px; font-size:.7rem; font-weight:900; text-transform:uppercase; white-space:nowrap; background:#e2e8f0; color:#334155; }
+    .raw-match-status { border-radius:999px; padding:4px 8px; font-size:.7rem; font-weight:900; text-transform:uppercase; white-space:nowrap; background:var(--ui-subtle); color:var(--ui-text); }
     .raw-match-status.good { background:#dcfce7; color:#166534; }
     .raw-match-status.warn { background:#ffedd5; color:#9a3412; }
     .raw-match-status.bad { background:#fee2e2; color:#991b1b; }
-    .raw-match-meta { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; font-size:.65rem; font-weight:850; color:#475569; }
-    .raw-match-meta span { padding:4px 7px; border-radius:999px; background:#f1f5f9; }
-    .raw-match-progress { height:7px; margin-top:9px; overflow:hidden; border-radius:999px; background:#e2e8f0; }
-    .raw-match-progress-fill { height:100%; border-radius:999px; background:linear-gradient(90deg,#3b82f6,#22c55e); }
+    .raw-match-meta { margin-top:8px; display:flex; flex-wrap:wrap; gap:6px; font-size:.65rem; font-weight:850; color:var(--ui-muted); }
+    .raw-match-meta span { padding:4px 7px; border-radius:999px; background:var(--ui-subtle); }
+    .raw-match-progress { height:7px; margin-top:9px; overflow:hidden; border-radius:999px; background:var(--ui-subtle); }
+    .raw-match-progress-fill { height:100%; border-radius:999px; background:linear-gradient(90deg,var(--ui-accent),#22c55e); }
     .raw-match-progress-fill.warn { background:linear-gradient(90deg,#f59e0b,#fb923c); }
     .raw-match-progress-fill.bad { background:#ef4444; }
-    body[data-theme="Soft Gray"] { background: #eef1f4; color: #243041; }
-    body[data-theme="Soft Gray"] .diag-item,
-    body[data-theme="Soft Gray"] .card,
-    body[data-theme="Soft Gray"] .panel { background: #f8fafc; border-color: #d7dee8; }
-    body[data-theme="Soft Gray"] .card.active { border-color: #7bbf9a; animation: cardPulseGreenMuted 1.5s ease-in-out infinite; }
-    body[data-theme="Soft Gray"] .card.disconnected { border-color: #d28b8b; }
-    body[data-theme="Soft Gray"] .card.maintenance { border-color: #d6a56a; animation: cardPulseOrange 1.5s ease-in-out infinite; }
-    body[data-theme="Soft Gray"] .main-tab-button.active { background: #64748b; color: #fff; }
-    body[data-theme="Soft Gray"] .main-tab-content { background: linear-gradient(180deg, rgba(248,250,252,.92), rgba(241,245,249,.82)); border-radius: 16px; }
-    body[data-theme="Soft Gray"] .sub-tab-button { background:#fff; color:#475569; border-color:#dbe2eb; }
-    body[data-theme="Soft Gray"] .sub-tab-button.active { background:#64748b; color:#fff; border-color:#64748b; }
-    body[data-theme="Soft Gray"] .finished-item { background: linear-gradient(160deg, #ffffff 0%, #f8fafc 60%, #eef2f7 100%); border-color: #dbe2eb; box-shadow: 0 5px 14px rgba(51,65,85,.10); }
-    body[data-theme="Soft Gray"] .finished-item h4 { color: #1f2937; }
-    body[data-theme="Soft Gray"] .finished-grid div { background: #fff; border-color: #e5e7eb; color: #334155; }
-    body[data-theme="Soft Gray"] .raw-list { background: #fff; border-color: #e5e7eb; color: #475569; }
-    body[data-theme="Soft Gray"] .approve-print-btn { background: linear-gradient(135deg, #64748b 0%, #475569 100%); }
-    body[data-theme="Dark"] { background: #0b1220; color: #e5e7eb; }
-    body[data-theme="Dark"] .diag-item { background: #111827; color: #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
-    body[data-theme="Dark"] .diag-item .value { color: #f8fafc; }
-    body[data-theme="Dark"] .main-tab-button { background: #1f2937; color: #d1d5db; }
-    body[data-theme="Dark"] .main-tab-button.active { background: #2563eb; color: #fff; }
-    body[data-theme="Dark"] .main-tab-content { background: linear-gradient(180deg, rgba(2,6,23,.42), rgba(2,6,23,.22)); border-radius: 16px; }
-    body[data-theme="Dark"] .sub-tab-button { background:#0f172a; color:#d1d5db; border-color:#334155; }
-    body[data-theme="Dark"] .sub-tab-button.active { background:#2563eb; color:#fff; border-color:#3b82f6; }
-    body[data-theme="Dark"] .card,
-    body[data-theme="Dark"] .panel,
-    body[data-theme="Dark"] .table-wrap { background: #111827; color: #e5e7eb; border-color: #334155; }
-    body[data-theme="Dark"] .card.active { border-color: #22ff88; animation: cardPulseGreenDark 1.5s ease-in-out infinite; }
-    body[data-theme="Dark"] .card.disconnected { border-color: #ff4d6d; box-shadow: 0 2px 8px rgba(0,0,0,0.22), 0 0 0 1px rgba(255,77,109,.12) inset; }
-    body[data-theme="Dark"] .card.maintenance { border-color:#f59e0b; animation: cardPulseOrange 1.5s ease-in-out infinite; }
-    body[data-theme="Dark"] .card h3 { border-bottom-color: #334155; }
-    body[data-theme="Dark"] .muted { color: #94a3b8; }
-    body[data-theme="Dark"] .placeholder { background: #0f172a; border-color: #334155; color: #94a3b8; }
-    body[data-theme="Dark"] .finished-item { background: linear-gradient(160deg, #0f172a 0%, #111827 60%, #0b1220 100%); border-color: #334155; box-shadow: 0 10px 22px rgba(0,0,0,.30); }
-    body[data-theme="Dark"] .finished-item h4 { color: #e5e7eb; }
-    body[data-theme="Dark"] .finished-badge { color: #bfdbfe; background: rgba(30,64,175,.25); border-color: #3b82f6; }
-    body[data-theme="Dark"] .finished-grid div { background: rgba(15,23,42,.85); border-color: #334155; color: #d1d5db; }
-    body[data-theme="Dark"] .raw-list { background: #0f172a; border-color: #334155; color: #cbd5e1; }
-    body[data-theme="Dark"] .finished-linkage-note { background: rgba(60,20,10,.35); border-color: #fdba74; color: #fed7aa; }
-    body[data-theme="Dark"] .approve-print-btn { background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); box-shadow: inset 0 0 0 1px rgba(147,197,253,.18); }
-    body[data-theme="Dark"] .approve-print-btn:hover { box-shadow: 0 10px 24px rgba(37,99,235,.35), inset 0 0 0 1px rgba(147,197,253,.18); }
-    body[data-theme="Dark"] .data-table th { background: #1f2937; color: #e5e7eb; }
-    body[data-theme="Dark"] .data-table td { border-bottom-color: #253041; }
-    body[data-theme="Dark"] .data-table tr:hover td { background: #172033; }
-    body[data-theme="Dark"] .mini-btn { background: #0f172a; color: #e5e7eb; border-color: #334155; }
-    body[data-theme="Dark"] .settings-overlay { background: rgba(2,6,23,0.46); }
-    body[data-theme="Dark"] .settings-card { background: #0f172a; border-color: #334155; box-shadow: 0 24px 48px rgba(0,0,0,0.38); }
-    body[data-theme="Dark"] .settings-head { border-bottom-color: #334155; }
-    body[data-theme="Dark"] .settings-head-title { color: #e5e7eb; }
-    body[data-theme="Dark"] .settings-nav { background: #111827; border-right-color: #334155; }
-    body[data-theme="Dark"] .settings-nav-btn { background: #0f172a; color: #d1d5db; border-color: #334155; }
-    body[data-theme="Dark"] .settings-nav-btn.active { background: #1e3a8a; border-color: #3b82f6; color: #dbeafe; }
-    body[data-theme="Dark"] .settings-row label { color: #cbd5e1; }
-    body[data-theme="Dark"] .settings-row input, body[data-theme="Dark"] .settings-row select { background: #111827; color: #e5e7eb; border-color: #334155; }
-    body[data-theme="Dark"] .settings-note { color: #94a3b8; }
-    body[data-theme="Dark"] .test-machine-action-card { background:#111827; border-color:#334155; }
-    body[data-theme="Dark"] .test-machine-action-card h4 { color:#e5e7eb; }
-    body[data-theme="Dark"] .people-role-list, body[data-theme="Dark"] .settings-table-wrap { background: #111827; border-color: #334155; }
-    body[data-theme="Dark"] .people-role-row { border-bottom-color: #253041; color: #d1d5db; }
-    body[data-theme="Dark"] .people-role-row.head { background: #1f2937; color: #cbd5e1; }
-    body[data-theme="Dark"] .settings-table th { background: #1f2937; color: #cbd5e1; }
-    body[data-theme="Dark"] .settings-table td { border-bottom-color: #253041; color: #e5e7eb; }
-    body[data-theme="Dark"] .operator-directory-card { background:#0f172a; border-color:#334155; box-shadow:0 24px 48px rgba(0,0,0,0.38); }
-    body[data-theme="Dark"] .operator-directory-head { border-bottom-color:#334155; }
-    body[data-theme="Dark"] .operator-directory-title, body[data-theme="Dark"] .operator-directory-name strong, body[data-theme="Dark"] .operator-directory-value { color:#e5e7eb; }
-    body[data-theme="Dark"] .operator-directory-sub, body[data-theme="Dark"] .operator-directory-meta, body[data-theme="Dark"] .operator-directory-subvalue, body[data-theme="Dark"] .operator-directory-empty, body[data-theme="Dark"] .operator-directory-row.header, body[data-theme="Dark"] .operator-directory-label { color:#94a3b8; }
-    body[data-theme="Dark"] .operator-directory-row { background:#111827; border-bottom-color:#253041; }
-    body[data-theme="Dark"] .operator-directory-row.header { background:#1f2937; }
-    body[data-theme="Dark"] .operator-directory-row:hover:not(.header) { background:#172033; }
-    body[data-theme="Dark"] .operator-detail-card { background:#0f172a; border-color:#334155; box-shadow:0 24px 48px rgba(0,0,0,0.38); }
-    body[data-theme="Dark"] .operator-detail-head { border-bottom-color:#334155; }
-    body[data-theme="Dark"] .operator-detail-title, body[data-theme="Dark"] .operator-detail-item .v, body[data-theme="Dark"] .operator-detail-section h4, body[data-theme="Dark"] .operator-detail-list-item strong { color:#e5e7eb; }
-    body[data-theme="Dark"] .operator-detail-sub, body[data-theme="Dark"] .operator-detail-item .k, body[data-theme="Dark"] .operator-detail-list-item span { color:#94a3b8; }
-    body[data-theme="Dark"] .operator-detail-item, body[data-theme="Dark"] .operator-detail-section { background:#111827; border-color:#334155; }
-    body[data-theme="Red"] { background: #fff4f4; color: #3b0a0a; }
-    body[data-theme="Red"] .diag-item,
-    body[data-theme="Red"] .card,
-    body[data-theme="Red"] .panel { background: #fff; border-color: #fecaca; }
-    body[data-theme="Red"] .card.active { border-color: #8fd3b1; animation: cardPulseGreenPastel 1.5s ease-in-out infinite; }
-    body[data-theme="Red"] .card.disconnected { border-color: #f3a6b3; }
-    body[data-theme="Red"] .card.maintenance { border-color:#fb923c; animation: cardPulseOrange 1.5s ease-in-out infinite; }
-    body[data-theme="Red"] .main-tab-button { background: #fee2e2; color: #7f1d1d; }
-    body[data-theme="Red"] .main-tab-button.active { background: #dc2626; color: #fff; }
-    body[data-theme="Red"] .main-tab-content { background: linear-gradient(180deg, rgba(254,242,242,.95), rgba(255,255,255,.88)); border-radius: 16px; }
-    body[data-theme="Red"] .sub-tab-button { background:#fff; color:#7f1d1d; border-color:#fecaca; }
-    body[data-theme="Red"] .sub-tab-button.active { background:#dc2626; color:#fff; border-color:#dc2626; }
-    body[data-theme="Red"] .finished-item { border-color: #fecaca; background: linear-gradient(160deg, #fff 0%, #fff1f2 66%, #ffe4e6 100%); }
-    body[data-theme="Red"] .operator-directory-row { border-bottom-color:#fee2e2; }
-    body[data-theme="Red"] .operator-directory-row.header { background:#fef2f2; color:#991b1b; }
-    body[data-theme="Red"] .operator-detail-card, body[data-theme="Red"] .operator-detail-item, body[data-theme="Red"] .operator-detail-section { border-color:#fecaca; }
-    body[data-theme="Red"] .finished-item h4 { color: #7f1d1d; }
-    body[data-theme="Red"] .finished-grid div { border-color: #fecdd3; background: rgba(255,255,255,.95); color: #7f1d1d; }
-    body[data-theme="Red"] .raw-list { border-color: #fecdd3; background: #fff; color: #7f1d1d; }
-    body[data-theme="Red"] .approve-print-btn { background: linear-gradient(135deg, #ef4444 0%, #b91c1c 100%); }
-    body[data-theme="Red"] .table-wrap { border-color: #fecaca; }
-    body[data-theme="Red"] .data-table th { background: #fef2f2; color: #7f1d1d; }
-    body[data-theme="Red"] .settings-overlay { background: rgba(127,29,29,0.18); }
-    body[data-theme="Red"] .settings-card { background: #fff7f7; border-color: #fecaca; }
-    body[data-theme="Red"] .settings-head { border-bottom-color: #fecaca; }
-    body[data-theme="Red"] .settings-head-title { color: #7f1d1d; }
-    body[data-theme="Red"] .settings-nav { background: #fef2f2; border-right-color: #fecaca; }
-    body[data-theme="Red"] .settings-nav-btn { background: #fff; color: #7f1d1d; border-color: #fecaca; }
-    body[data-theme="Red"] .settings-nav-btn.active { background: #fee2e2; border-color: #fca5a5; color: #b91c1c; }
-    body[data-theme="Red"] .settings-row label { color: #7f1d1d; }
-    body[data-theme="Red"] .settings-row input, body[data-theme="Red"] .settings-row select { border-color: #fecaca; background: #fff; color: #7f1d1d; }
-    body[data-theme="Red"] .settings-note { color: #991b1b; }
-    body[data-theme="Red"] .people-role-list, body[data-theme="Red"] .settings-table-wrap { border-color: #fecaca; background: #fff; }
-    body[data-theme="Red"] .people-role-row { border-bottom-color: #fee2e2; color: #7f1d1d; }
-    body[data-theme="Red"] .people-role-row.head { background: #fef2f2; color: #991b1b; }
-    body[data-theme="Red"] .settings-table th { background: #fef2f2; color: #991b1b; }
-    body[data-theme="Red"] .settings-table td { border-bottom-color: #fee2e2; color: #7f1d1d; }
-    body[data-theme="Soft Gray"] .settings-card { background: #f8fafc; border-color: #dbe2eb; }
-    body[data-theme="Soft Gray"] .settings-head { border-bottom-color: #dbe2eb; }
-    body[data-theme="Soft Gray"] .settings-head-title { color: #334155; }
-    body[data-theme="Soft Gray"] .settings-nav { background: #eef2f7; border-right-color: #dbe2eb; }
-    body[data-theme="Soft Gray"] .settings-nav-btn { background: #fff; color: #475569; border-color: #dbe2eb; }
-    body[data-theme="Soft Gray"] .settings-nav-btn.active { background: #e2e8f0; border-color: #cbd5e1; color: #334155; }
-    body[data-theme="Soft Gray"] .settings-row input, body[data-theme="Soft Gray"] .settings-row select { border-color: #dbe2eb; background: #fff; color: #334155; }
-    body[data-theme="Soft Gray"] .people-role-list, body[data-theme="Soft Gray"] .settings-table-wrap { border-color: #dbe2eb; }
-    body[data-theme="Soft Gray"] .people-role-row { border-bottom-color: #e5e7eb; color: #475569; }
-    body[data-theme="Soft Gray"] .people-role-row.head { background: #f8fafc; color: #475569; }
     /* Shared full-width, borderless tab layout with a readable data gutter. */
     #machinesTab.main-tab-content,
     #planningTab.main-tab-content,
@@ -9547,29 +11124,30 @@ DASHBOARD_HTML = r"""
       .planning-workspace { grid-template-columns:minmax(450px, 490px) minmax(0,1fr); }
       .planning-lane.backlog { height:100%; min-height:0; }
       .planning-ops-summary { grid-template-columns:repeat(3, minmax(140px,1fr)); }
-      .user-kpi-card-grid { grid-template-columns:repeat(3,minmax(180px,1fr)); }
+      .user-kpi-card-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
     }
     @media (max-width: 1200px) {
       .diagnostics { grid-template-columns: repeat(4, 48px) repeat(2, minmax(150px, 1fr)); }
-      #machineGrid, #additionalMachineGrid { grid-template-columns:repeat(4, minmax(0, 1fr)); }
+      #machineGrid, #additionalMachineGrid, #mixingMachineGrid { grid-template-columns:repeat(4, minmax(0, 1fr)); }
       .maintenance-summary { grid-template-columns:repeat(2, minmax(0, 1fr)); }
       #maintenanceTab .maintenance-person { grid-template-columns:64px minmax(0,1fr); }
-      #maintenanceTab .maintenance-stats { grid-column:1 / -1; border-left:none; border-top:1px solid #e5ecf4; }
+      #maintenanceTab .maintenance-stats { grid-column:1 / -1; border-left:none; border-top:1px solid var(--ui-border); }
       .archive-metric-grid, .raw-insight-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
       #userKpiTab .job-queue-summary { grid-template-columns:repeat(3,minmax(150px,1fr)); }
       .user-kpi-body { grid-template-columns:1fr; }
+      .user-kpi-card-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
       .user-kpi-side { grid-template-columns:repeat(2,minmax(0,1fr)); }
       .planning-workspace { grid-template-columns:minmax(410px, 440px) minmax(0,1fr); }
     }
     @media (max-width: 900px) {
       .diagnostics { grid-template-columns: repeat(4, 48px) minmax(0, 1fr); }
-      #machineGrid, #additionalMachineGrid { grid-template-columns:repeat(3, minmax(0, 1fr)); }
+      #machineGrid, #additionalMachineGrid, #mixingMachineGrid { grid-template-columns:repeat(3, minmax(0, 1fr)); }
       .machine-detail-layout { grid-template-columns:1fr; }
       .machine-detail-sidebar { position:static; }
       .machine-detail-info-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
-      .machine-detail-info-item:nth-child(3n) { border-right:1px solid #edf1f7; }
+      .machine-detail-info-item:nth-child(3n) { border-right:1px solid var(--ui-border); }
       .machine-detail-info-item:nth-child(2n) { border-right:0; }
-      .machine-detail-info-item:nth-last-child(-n+3) { border-bottom:1px solid #edf1f7; }
+      .machine-detail-info-item:nth-last-child(-n+3) { border-bottom:1px solid var(--ui-border); }
       .machine-detail-info-item:nth-last-child(-n+2) { border-bottom:0; }
       .main-tab-button { flex:1 1 140px; }
       .planning-head { display:grid; grid-template-columns:1fr; }
@@ -9585,15 +11163,24 @@ DASHBOARD_HTML = r"""
       .archive-detail-hero { grid-template-columns:1fr; }
       .archive-detail-hero-side, .planning-left-grid, .detail-chart-grid { grid-template-columns:1fr; }
       .settings-body { grid-template-columns:1fr; }
-      .settings-nav { display:grid; grid-template-columns:repeat(auto-fit, minmax(130px, 1fr)); border-right:0; border-bottom:1px solid #dde6f0; }
+      .settings-nav { display:grid; grid-template-columns:repeat(auto-fit, minmax(130px, 1fr)); border-right:0; border-bottom:1px solid var(--ui-border); }
+      #serverSettingsOverlay .settings-body { grid-template-rows:auto minmax(0,1fr); }
+      #serverSettingsOverlay .settings-nav { max-height:180px; }
       .operator-directory-row { grid-template-columns:1fr 1fr; }
       .operator-directory-row.header { display:none; }
       .operator-directory-label { display:block; }
       .user-kpi-head { display:grid; }
       .user-kpi-actions { justify-content:flex-start; }
-      .user-kpi-card-grid { grid-template-columns:repeat(2,minmax(180px,1fr)); }
+      .user-kpi-card-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
       .user-kpi-side { grid-template-columns:1fr; }
-      .user-kpi-detail-body { grid-template-columns:1fr; }
+      .user-kpi-detail-body { grid-template-columns:1fr; overflow:auto; }
+      .user-kpi-detail-summary { height:auto; position:static; overflow:visible; }
+      .user-kpi-detail-main { height:auto; grid-template-rows:auto; overflow:visible; }
+      .user-kpi-detail-tab-panel { overflow:visible; }
+      #userKpiJobsPanel { overflow:visible; }
+      .user-kpi-detail-jobs { height:auto; overflow:visible; }
+      .user-kpi-detail-jobs-head { position:static; padding-top:10px; }
+      .user-kpi-jobs-layout { grid-template-columns:1fr; }
     }
     @media (max-width: 640px) {
       body { font-size:14px; }
@@ -9608,7 +11195,8 @@ DASHBOARD_HTML = r"""
       .job-queue-metric .k { font-size:.68rem; line-height:1.15; }
       .job-queue-metric .v { font-size:1.05rem; overflow-wrap:anywhere; }
       .kpi-issue-list { min-width:0; }
-      .user-kpi-shell { padding:14px 10px; border-radius:12px; }
+      #userKpiTab.main-tab-content { padding:18px 10px 28px !important; }
+      .user-kpi-shell { padding:0; border-radius:0; }
       .user-kpi-head h3 { font-size:1.35rem; }
       #userKpiTab .job-queue-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
       #userKpiTab .job-queue-metric { grid-template-columns:42px minmax(0,1fr); padding:10px; min-height:72px; }
@@ -9616,19 +11204,24 @@ DASHBOARD_HTML = r"""
       .user-kpi-panel-head { display:grid; }
       .user-kpi-tools { width:100%; }
       .user-kpi-search { width:100%; }
-      .user-kpi-card-grid { grid-template-columns:1fr; padding:10px; gap:10px; }
+      .user-kpi-card-grid { grid-template-columns:1fr; padding:0; gap:12px; }
       .user-kpi-donut-row { grid-template-columns:1fr; justify-items:center; }
       .user-kpi-footer { justify-content:center; flex-wrap:wrap; gap:10px; }
       .user-kpi-detail-head { padding:12px; }
       .user-kpi-detail-body { padding:10px; }
       .user-kpi-job-grid { grid-template-columns:1fr 1fr; }
+      .user-kpi-detail-card { width:100vw; max-height:100vh; height:100%; border-radius:0; }
+      .user-kpi-detail-person { grid-template-columns:46px minmax(0,1fr); gap:10px; }
+      .user-kpi-detail-avatar { width:46px; height:46px; }
+      .user-kpi-detail-sub { gap:4px; }
+      .user-kpi-detail-chip { padding:1px 7px; }
       .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px; }
       .machine-detail-main-head { padding:2px; }
       .machine-detail-info-grid { grid-template-columns:1fr; }
-      .machine-detail-info-item,.machine-detail-info-item:nth-child(2n),.machine-detail-info-item:nth-child(3n) { border-right:0; border-bottom:1px solid #edf1f7; }
+      .machine-detail-info-item,.machine-detail-info-item:nth-child(2n),.machine-detail-info-item:nth-child(3n) { border-right:0; border-bottom:1px solid var(--ui-border); }
       .machine-detail-info-item:last-child { border-bottom:0; }
       #machineGrid { grid-template-columns:repeat(2, minmax(0, 1fr)); }
-      #additionalMachineGrid { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+      #additionalMachineGrid, #mixingMachineGrid { grid-template-columns:repeat(2, minmax(0, 1fr)); }
       .card p { font-size:.78rem; }
       .panel, .planning-shell, #maintenanceTab .maintenance-shell { padding:10px; border-radius:12px; }
       .finished-wrap, .finished-grid, .planning-controls, .planning-machine-grid, .machine-detail-grid, .archive-metric-grid, .raw-insight-grid, .maintenance-summary, .maintenance-list, .maintenance-person, #maintenanceTab .maintenance-person, .operator-detail-grid, .review-subslide.active, .review-group-list { grid-template-columns:1fr; }
@@ -9644,12 +11237,12 @@ DASHBOARD_HTML = r"""
       .pdr-kpis { grid-template-columns:repeat(2,minmax(0,1fr)); }
       .consumption-report-layout { grid-template-columns:1fr; }
       .consumption-kpis { grid-template-columns:repeat(3,minmax(0,1fr)); grid-template-rows:1fr; }
-      .consumption-kpis { border-right:0; border-bottom:1px solid #b9c7da; }
-      .consumption-kpis .pdr-kpi { border-right:1px solid #cbd5e1; border-bottom:0; }
+      .consumption-kpis { border-right:0; border-bottom:1px solid var(--ui-border); }
+      .consumption-kpis .pdr-kpi { border-right:1px solid var(--ui-border); border-bottom:0; }
       .consumption-kpis .pdr-kpi:last-child { border-right:0; }
       .consumption-content-grid { grid-template-columns:1fr; }
       .consumption-content-grid .balance-panel { grid-column:auto; }
-      .consumption-content-grid .review-group-card:nth-child(2) { border-right:0; border-bottom:1px solid #b9c7da; }
+      .consumption-content-grid .review-group-card:nth-child(2) { border-right:0; border-bottom:1px solid var(--ui-border); }
       #overlayReviewStep { padding:0 42px; max-height:calc(100vh - 170px); }
       #overlayReviewStep, .review-form-card { width:100%; }
       .review-edge-arrow.left { left:6px; }
@@ -9659,18 +11252,73 @@ DASHBOARD_HTML = r"""
       .operator-directory-label { display:block; }
       .maintenance-topbar { flex-direction:column; }
       .maintenance-date { text-align:left; white-space:normal; }
-      .maintenance-avatar-wrap { border-right:none; border-bottom:1px solid #e5ecf4; }
-      .maintenance-stats { border-left:none; border-top:1px solid #e5ecf4; }
+      .maintenance-avatar-wrap { border-right:none; border-bottom:1px solid var(--ui-border); }
+      .maintenance-stats { border-left:none; border-top:1px solid var(--ui-border); }
     }
     @media (max-width: 420px) {
       .grid { grid-template-columns:1fr; }
       #machineGrid { grid-template-columns:1fr; }
-      #additionalMachineGrid { grid-template-columns:1fr; }
+      #additionalMachineGrid, #mixingMachineGrid { grid-template-columns:1fr; }
       .main-tab-button { flex-basis:100%; }
       .data-table { min-width:720px; }
       .maintenance-performance-wrap .data-table { min-width:640px; }
       #overlayReviewStep { padding:0 34px; }
     }
+
+    /* Shared palette: layout and semantic status colors stay independent. */
+    body {
+      --ui-page:#edf2f7; --ui-surface:#ffffff; --ui-subtle:#f5f7fb;
+      --ui-border:#cbd5e1; --ui-text:#1e293b; --ui-muted:#526277;
+      --ui-accent:#1d4ed8; --ui-accent-soft:#e5edff;
+      --ui-link:var(--ui-accent); --ui-success:#166534;
+      --ui-on-accent:#ffffff; --ui-shadow:rgba(15,23,42,.16);
+      color-scheme:light; background-color:var(--ui-page); color:var(--ui-text);
+    }
+    body[data-theme="Soft Gray"] {
+      --ui-page:#e8ebef; --ui-surface:#f9fafb; --ui-subtle:#eef1f4;
+      --ui-border:#bac3cf; --ui-text:#253140; --ui-muted:#526171;
+      --ui-accent:#475569; --ui-accent-soft:#e1e7ef;
+    }
+    body[data-theme="Blue Accent"] {
+      --ui-page:#e8f0fc; --ui-surface:#ffffff; --ui-subtle:#eff5ff;
+      --ui-border:#b6cbe9; --ui-text:#172e50; --ui-muted:#456287;
+      --ui-accent:#174fc9; --ui-accent-soft:#dce9ff;
+    }
+    body[data-theme="Red"] {
+      --ui-page:#f6ecee; --ui-surface:#fffafa; --ui-subtle:#f8eff1;
+      --ui-border:#ddbec5; --ui-text:#3e252c; --ui-muted:#79545d;
+      --ui-accent:#a31d3b; --ui-accent-soft:#f8dfe5;
+    }
+    body[data-theme="Dark"] {
+      --ui-page:#0e1522; --ui-surface:#182334; --ui-subtle:#202e43;
+      --ui-border:#42536a; --ui-text:#edf3fc; --ui-muted:#b0bfd3;
+      --ui-accent:#2861c9; --ui-accent-soft:#243e63;
+      --ui-link:#8ab4ff; --ui-success:#86efac;
+      --ui-shadow:rgba(0,0,0,.38); color-scheme:dark;
+    }
+    body :is(input,select,textarea) {
+      background-color:var(--ui-surface); color:var(--ui-text);
+      border-color:var(--ui-border); accent-color:var(--ui-accent);
+    }
+    body :is(input,textarea)::placeholder { color:var(--ui-muted); opacity:1; }
+    body :is(button,input,select,textarea,a):focus-visible {
+      outline:3px solid var(--ui-accent); outline-offset:3px;
+    }
+    body ::selection { background:var(--ui-accent); color:var(--ui-on-accent); }
+    body { scrollbar-color:var(--ui-border) var(--ui-subtle); }
+    button { color:inherit; }
+    .person-menu-icon::before, .person-menu-icon::after { border-color:var(--ui-muted); }
+    body[data-theme="Dark"] .menu-ico-img { filter:brightness(0) invert(1); }
+    .main-tab-button.active { background:var(--ui-accent); color:var(--ui-on-accent); }
+    @media print {
+      body, body[data-theme] {
+        --ui-page:#fff; --ui-surface:#fff; --ui-subtle:#f5f7fb;
+        --ui-text:#1e293b; --ui-muted:#526277; --ui-border:#cbd5e1;
+        --ui-accent:#1d4ed8; --ui-accent-soft:#e5edff;
+        --ui-link:#1d4ed8; --ui-success:#166534; color-scheme:light;
+      }
+    }
+
   </style>
 </head>
 <body>
@@ -9700,7 +11348,7 @@ DASHBOARD_HTML = r"""
     <button class="main-tab-button" data-target="archivedJobsTab">Archived Jobs</button>
     <button class="main-tab-button" data-target="machineArchiveTab">Machine Archive</button>
     <button class="main-tab-button" data-target="maintenanceTab">Maintenance</button>
-    <button class="main-tab-button" data-target="userKpiTab">User KPIs</button>
+    <button id="productionCardsTabBtn" class="main-tab-button" data-target="userKpiTab">Production Cards<span id="productionCardsNotifBadge" class="production-cards-notif-badge" hidden>0</span></button>
     <button class="main-tab-button" data-target="pdrTab">PDR Reports</button>
     <div class="machine-filter-wrap" id="machineFilterWrap">
       <button class="machine-filter-btn machine-todo-btn" id="machineTodoBtn" type="button" aria-label="Open production to-do list" aria-expanded="false" title="Production To-Do List">
@@ -9737,6 +11385,10 @@ DASHBOARD_HTML = r"""
     <div class="additional-machines-section">
       <div class="additional-machines-title">Factory 4 Machines</div>
       <div class="grid" id="additionalMachineGrid"></div>
+    </div>
+    <div class="additional-machines-section mixing-machines-section">
+      <div class="additional-machines-title">Mixing Machines</div>
+      <div class="grid" id="mixingMachineGrid"></div>
     </div>
   </div>
 
@@ -9843,6 +11495,7 @@ DASHBOARD_HTML = r"""
         <label for="finishShiftViewSelect">View</label>
         <select id="finishShiftViewSelect">
           <option value="finishShiftQueuePane">Finished Shifts</option>
+          <option value="mixingShiftQueuePane">Mixing Shift Review</option>
           <option value="finishShiftProgressPane">Job Progress</option>
           <option value="finishShiftJobsPane">Finished Jobs</option>
         </select>
@@ -9855,6 +11508,13 @@ DASHBOARD_HTML = r"""
           </div>
         </div>
         <div id="finishedShiftQueueList" class="finished-wrap"></div>
+      </div>
+      <div id="mixingShiftQueuePane" class="sub-tab-content">
+        <div class="finish-review-pane-head">
+          <h3>Mixing Shift Review</h3>
+          <div class="muted">Finish Shift records from MT mixing machines are reviewed separately here.</div>
+        </div>
+        <div id="mixingShiftQueueList" class="finished-wrap"></div>
       </div>
       <div id="finishShiftProgressPane" class="sub-tab-content">
         <div id="finishedShiftJobProgress" class="finished-wrap"></div>
@@ -9931,23 +11591,27 @@ DASHBOARD_HTML = r"""
         <div class="user-kpi-title-row">
           <div class="user-kpi-mark">03<br><span>20</span></div>
           <div>
-            <h3>User KPIs</h3>
-            <div class="muted">Monitor operator performance and follow up on issues that need attention.</div>
+            <h3>Production Cards</h3>
+            <div class="muted">Performance snapshots for every role, based only on owned activity.</div>
           </div>
         </div>
         <div class="user-kpi-actions">
-          <button class="user-kpi-date" type="button">June 23, 2025</button>
+          <button id="userKpiDateBtn" class="user-kpi-date" type="button">Today</button>
           <button id="userKpiRefreshBtn" class="user-kpi-refresh" type="button">Refresh</button>
+          <button id="userKpiThemeBtn" class="user-kpi-theme" type="button">Theme</button>
         </div>
       </div>
       <div class="kpi-filter-row">
-        <button class="kpi-filter-btn" type="button" data-user-kpi-role="all">All Users</button>
-        <button class="kpi-filter-btn active" type="button" data-user-kpi-role="operator">Operators</button>
+        <button class="kpi-filter-btn active" type="button" data-user-kpi-role="all">All People</button>
+        <button class="kpi-filter-btn" type="button" data-user-kpi-role="operator">Operators</button>
         <button class="kpi-filter-btn" type="button" data-user-kpi-role="supervisor">Supervisors</button>
+        <button class="kpi-filter-btn" type="button" data-user-kpi-role="maintenance">Maintenance</button>
+        <button class="kpi-filter-btn" type="button" data-user-kpi-role="qa/qc">QA/QC</button>
+        <button class="kpi-filter-btn" type="button" data-user-kpi-role="material loader">Material Loaders</button>
       </div>
       <div id="userKpiSummary" class="job-queue-summary"></div>
       <div id="userKpiTableWrap" class="user-kpi-body">
-        <div class="placeholder">Open this tab to load user KPIs.</div>
+        <div class="placeholder">Open this tab to load Production Cards.</div>
       </div>
     </div>
   </div>
@@ -9955,15 +11619,16 @@ DASHBOARD_HTML = r"""
   <div id="pdrTab" class="main-tab-content">
     <div class="panel">
       <h3>Production Daily Reports</h3>
-      <div class="placeholder">PDR table and print-preview placeholder</div>
+      <div class="finished-view-toolbar"><label for="pdrMonthFilter">Production month</label><select id="pdrMonthFilter"></select><button id="pdrRefreshBtn" type="button">Refresh</button><span id="pdrDetailLoadStatus" class="muted"></span></div>
+      <div id="finishedShiftPdrView"></div>
     </div>
   </div>
 
   <div id="userKpiDetailOverlay" class="settings-overlay">
-    <div class="user-kpi-detail-card">
+    <div class="user-kpi-detail-card" role="dialog" aria-modal="true" aria-labelledby="userKpiDetailName">
       <div class="user-kpi-detail-head">
         <div id="userKpiDetailPerson" class="user-kpi-detail-person"></div>
-        <button id="userKpiDetailCloseBtn" class="overlay-close" type="button">Close</button>
+        <button id="userKpiDetailCloseBtn" class="overlay-close" type="button" aria-label="Close operator profile">Close</button>
       </div>
       <div id="userKpiDetailBody" class="user-kpi-detail-body"></div>
     </div>
@@ -10182,6 +11847,29 @@ DASHBOARD_HTML = r"""
     </div>
   </div>
 
+  <div id="machineTimeOverlay" class="overlay-backdrop" role="dialog" aria-modal="true" aria-labelledby="machineTimeTitle">
+    <div class="overlay-card machine-time-card">
+      <div class="overlay-head">
+        <div>
+          <div class="overlay-title" id="machineTimeTitle">Machine Runtime</div>
+          <div class="sub">Machine operating-window time, separate from Raspberry Pi uptime.</div>
+        </div>
+        <button id="machineTimeCloseBtn" class="overlay-close" type="button" aria-label="Close machine runtime">Close</button>
+      </div>
+      <div class="machine-time-body">
+        <div id="machineTimeMachine" class="machine-time-machine">Machine</div>
+        <div class="machine-time-metrics">
+          <div class="machine-time-metric total"><span class="k">Total uptime</span><span id="machineTimeTotal" class="v">00:00:00</span></div>
+          <div class="machine-time-metric utilized"><span class="k">Utilized</span><span id="machineTimeUtilized" class="v">00:00:00</span></div>
+          <div class="machine-time-metric downtime"><span class="k">PDR downtime</span><span id="machineTimeDowntime" class="v">00:00:00</span></div>
+          <div class="machine-time-metric rpi"><span class="k">Raspberry Pi uptime</span><span id="machineTimeRpi" class="v">Waiting for client</span></div>
+        </div>
+        <div class="machine-time-equation">Total uptime = Utilized time + PDR downtime</div>
+        <div id="machineTimeNote" class="machine-time-note">PDR downtime is included in total uptime because the machine remains up, but it is deducted from utilized time.</div>
+      </div>
+    </div>
+  </div>
+
   <div id="machineDetailOverlay" class="overlay-backdrop">
     <div class="overlay-card machine-detail-card">
       <div class="overlay-head">
@@ -10190,6 +11878,7 @@ DASHBOARD_HTML = r"""
           <div class="overlay-title" id="machineDetailTitle">Machine Details</div>
         </div>
         <div class="overlay-head-actions">
+          <button id="machineDetailMixingJobsBtn" class="machine-detail-mixing-jobs-btn" type="button" title="Switch between open mixing jobs" aria-haspopup="menu" aria-expanded="false" aria-controls="machineDetailMixingJobsMenu" hidden><span class="mixing-jobs-dot" aria-hidden="true"></span><span>Mixing Jobs 0</span><span class="mixing-jobs-caret" aria-hidden="true">&#9662;</span></button>
           <button id="machineDetailSupervisorBtn" class="machine-detail-supervisor-btn" type="button" title="Supervisor checks and reviews" aria-haspopup="menu" aria-expanded="false" aria-controls="machineDetailSupervisorMenu"><span class="supervisor-check-dot" aria-hidden="true"></span><span>Supervisor 0</span><span class="supervisor-caret" aria-hidden="true">&#9662;</span></button>
           <button id="machineDetailFinishShiftsBtn" class="machine-detail-finish-shifts-btn" type="button" title="Choose a same-job shift to review" aria-haspopup="menu" aria-expanded="false" aria-controls="machineDetailFinishShiftsMenu" hidden><span class="partial-clock" aria-hidden="true">&#9687;</span><span>Finish shifts</span><span class="finish-shifts-caret" aria-hidden="true">&#9662;</span></button>
           <button id="machineDetailHistoryBtn" class="icon-btn" type="button" title="Machine history" aria-label="Machine history">&#128337;</button>
@@ -10229,6 +11918,7 @@ DASHBOARD_HTML = r"""
       </div>
       <div class="machine-detail-body" id="machineDetailBody"></div>
     </div>
+    <div id="machineDetailMixingJobsMenu" class="machine-detail-mixing-jobs-menu" role="menu" aria-label="Open mixing jobs" hidden></div>
     <div id="machineDetailSupervisorMenu" class="machine-detail-supervisor-menu" role="menu" aria-label="Supervisor checks and reviews" hidden></div>
     <div id="machineDetailFinishShiftsMenu" class="machine-detail-finish-shifts-menu" role="menu" aria-label="Finished shifts for the current job" hidden></div>
   </div>
@@ -10332,7 +12022,7 @@ DASHBOARD_HTML = r"""
                   <option value="Red">Red</option>
                 </select>
               </div>
-              <div class="settings-note">Theme setting is saved on the server and can be used for future dashboard styling variants.</div>
+              <div class="settings-note">Preview applies immediately. Save settings to keep this palette across dashboard panels and the profile creator.</div>
             </div>
           </div>
           <div id="settingsPageMachines" class="settings-page">
@@ -10623,6 +12313,7 @@ DASHBOARD_HTML = r"""
   const machineCountEl = document.getElementById("machine-count");
   const machineGrid = document.getElementById("machineGrid");
   const additionalMachineGrid = document.getElementById("additionalMachineGrid");
+  const mixingMachineGrid = document.getElementById("mixingMachineGrid");
   const machineFilterWrap = document.getElementById("machineFilterWrap");
   const machineTodoBtn = document.getElementById("machineTodoBtn");
   const machineTodoCount = document.getElementById("machineTodoCount");
@@ -10638,6 +12329,15 @@ DASHBOARD_HTML = r"""
   const machinePartialSubtitle = document.getElementById("machinePartialSubtitle");
   const machinePartialBody = document.getElementById("machinePartialBody");
   const machinePartialCloseBtn = document.getElementById("machinePartialCloseBtn");
+  const machineTimeOverlay = document.getElementById("machineTimeOverlay");
+  const machineTimeCloseBtn = document.getElementById("machineTimeCloseBtn");
+  const machineTimeMachine = document.getElementById("machineTimeMachine");
+  const machineTimeTotal = document.getElementById("machineTimeTotal");
+  const machineTimeUtilized = document.getElementById("machineTimeUtilized");
+  const machineTimeDowntime = document.getElementById("machineTimeDowntime");
+  const machineTimeRpi = document.getElementById("machineTimeRpi");
+  const machineTimeNote = document.getElementById("machineTimeNote");
+  let activeMachineTimeCode = "";
   let machineTodoQuery = "";
   let machineTodoWaitingOverHour = false;
   const machineFilterBtn = document.getElementById("machineFilterBtn");
@@ -10683,10 +12383,17 @@ DASHBOARD_HTML = r"""
   const planningLowStockList = document.getElementById("planningLowStockList");
   const planningMismatchAlerts = document.getElementById("planningMismatchAlerts");
   const finishedShiftQueueList = document.getElementById("finishedShiftQueueList");
+  const mixingShiftQueueList = document.getElementById("mixingShiftQueueList");
   const finishShiftViewSelect = document.getElementById("finishShiftViewSelect");
   const finishedShiftGridViewBtn = document.getElementById("finishedShiftGridViewBtn");
   const finishedShiftListViewBtn = document.getElementById("finishedShiftListViewBtn");
   const finishedShiftJobProgress = document.getElementById("finishedShiftJobProgress");
+  const finishedShiftPdrView = document.getElementById("finishedShiftPdrView");
+  const pdrAmStartHour = document.getElementById("pdrAmStartHour");
+  const pdrNightStartHour = document.getElementById("pdrNightStartHour");
+  const pdrMonthFilter = document.getElementById("pdrMonthFilter");
+  const pdrRefreshBtn = document.getElementById("pdrRefreshBtn");
+  const pdrDetailLoadStatus = document.getElementById("pdrDetailLoadStatus");
   const finishedJobsList = document.getElementById("finishedJobsList");
   const archivedJobsTableWrap = document.getElementById("archivedJobsTableWrap");
   const machineStatusArchiveTableWrap = document.getElementById("machineStatusArchiveTableWrap");
@@ -10700,6 +12407,10 @@ DASHBOARD_HTML = r"""
   const userKpiSummary = document.getElementById("userKpiSummary");
   const userKpiTableWrap = document.getElementById("userKpiTableWrap");
   const userKpiRefreshBtn = document.getElementById("userKpiRefreshBtn");
+  const userKpiDateBtn = document.getElementById("userKpiDateBtn");
+  const userKpiThemeBtn = document.getElementById("userKpiThemeBtn");
+  const productionCardsTabBtn = document.getElementById("productionCardsTabBtn");
+  const productionCardsNotifBadge = document.getElementById("productionCardsNotifBadge");
   const userKpiDetailOverlay = document.getElementById("userKpiDetailOverlay");
   const userKpiDetailCloseBtn = document.getElementById("userKpiDetailCloseBtn");
   const userKpiDetailPerson = document.getElementById("userKpiDetailPerson");
@@ -10771,6 +12482,8 @@ DASHBOARD_HTML = r"""
   const overlayLotNumber = document.getElementById("overlayLotNumber");
   const overlayPoNumberRow = overlayPoNumber ? overlayPoNumber.closest(".overlay-row") : null;
   const machineDetailOverlay = document.getElementById("machineDetailOverlay");
+  const machineDetailMixingJobsBtn = document.getElementById("machineDetailMixingJobsBtn");
+  const machineDetailMixingJobsMenu = document.getElementById("machineDetailMixingJobsMenu");
   const machineDetailSupervisorBtn = document.getElementById("machineDetailSupervisorBtn");
   const machineDetailSupervisorMenu = document.getElementById("machineDetailSupervisorMenu");
   const machineDetailFinishShiftsBtn = document.getElementById("machineDetailFinishShiftsBtn");
@@ -10838,12 +12551,19 @@ DASHBOARD_HTML = r"""
     "M00142": "IMM 442",
     "M00143": "IMM 443",
     "M00144": "IMM 444",
+    "MT-301": "MT-301",
+    "MT-302": "MT-302",
+    "MT-303": "MT-303",
   };
   const ADDITIONAL_MACHINE_CODES = new Set([
     "M00111", "M00112", "M00113", "M00114", "M00115", "M00116", "M00117", "M00118",
     "M00121", "M00122", "M00123", "M00124", "M00125", "M00126",
     "M00141", "M00142", "M00143", "M00144",
   ]);
+  const MIXING_MACHINE_CODES = new Set(["MT-301", "MT-302", "MT-303"]);
+  function isMixingMachine(code){
+    return MIXING_MACHINE_CODES.has(String(code || "").trim().toUpperCase());
+  }
   function isFactory4Machine(code, session = null){
     const machineCode = String(code || "").trim().toUpperCase();
     if(ADDITIONAL_MACHINE_CODES.has(machineCode)) return true;
@@ -10921,6 +12641,11 @@ DASHBOARD_HTML = r"""
   });
   let finishedJobsState = [];
   let finishedShiftState = [];
+  let mixingFinishedShiftState = [];
+  let pdrSummaryState = [];
+  let pdrAvailableMonths = [];
+  let pdrLoadedMonth = "";
+  let pdrMonthLoading = false;
   let completeFinishedHistoryState = null;
   let completeFinishedHistoryLoading = false;
   let finishedShiftViewMode = (() => {
@@ -10973,10 +12698,12 @@ DASHBOARD_HTML = r"""
     catch(_err) { return false; }
   })();
   let activeMachineDetailCode = "";
+  let activeMachineDetailMixingJobKey = "";
+  let activeMachineDetailClientMixingJobKey = "";
   let machineHistoryItems = [];
   let machineHistoryMachineCode = "";
   let shiftActionHistoryItems = [];
-  let userKpiRoleState = "operator";
+  let userKpiRoleState = "all";
   let userKpiLoading = false;
   let userKpiItemsState = [];
   const dashboardSectionSignatures = new Map();
@@ -12160,7 +13887,13 @@ DASHBOARD_HTML = r"""
       ? priorPartialTotals.rows.filter(x => x && typeof x === "object")
       : [];
     const currentScannedRows = currentMaterialRows.filter(x => !String(x.source || "").toUpperCase().includes("CARRYOVER"));
-    const materialRows = [...priorMaterialRows, ...currentScannedRows];
+    const carryoverRows = currentMaterialRows.filter(x => String(x.source || "").toUpperCase().includes("CARRYOVER"));
+    // Prior full scans supersede the remainder-only carryover rows. For an
+    // older record without hydrated prior history, keep the carryover in the
+    // balance instead of displaying it while calculating as though it were 0.
+    const materialRows = priorMaterialRows.length
+      ? [...priorMaterialRows, ...currentScannedRows]
+      : currentMaterialRows;
     const partMap = new Map();
     allJobPartRows(item).forEach(part => {
       if(!part || typeof part !== "object") return;
@@ -12178,6 +13911,12 @@ DASHBOARD_HTML = r"""
       matchedRows.forEach(materialRow => matchedMaterialRows.add(materialRow));
       const scanned = matchedRows.reduce((sum, materialRow) => sum + Math.max(0, Number(materialRow.qty || materialRow.quantity || 0)), 0);
       const scanCount = matchedRows.reduce((sum, materialRow) => sum + Math.max(1, Number(materialRow.scan_count || 1)), 0);
+      const currentSessionRows = rawLogsForPart(currentMaterialRows, part, Math.max(2, parts.length));
+      const currentSessionScanCount = currentSessionRows.reduce((sum, materialRow) => sum + Math.max(1, Number(materialRow.scan_count || 1)), 0);
+      const currentSessionScannedQty = currentSessionRows.reduce((sum, materialRow) => sum + Math.max(0, Number(materialRow.qty || materialRow.quantity || 0)), 0);
+      const matchedCarryoverRows = rawLogsForPart(carryoverRows, part, Math.max(2, parts.length));
+      const carryoverCount = matchedCarryoverRows.reduce((sum, materialRow) => sum + Math.max(1, Number(materialRow.scan_count || 1)), 0);
+      const carryoverQty = matchedCarryoverRows.reduce((sum, materialRow) => sum + Math.max(0, Number(materialRow.qty || materialRow.quantity || 0)), 0);
       const sku = String(firstValue(part.sku, part.part_sku, part.product_sku, part.part_code, part.product_code, part.code, "")).trim().toUpperCase();
       const name = String(materialLabel(part)).trim().toUpperCase();
       const isRawMaterial = sku.startsWith("Z-RM") || /KGS?/.test(name);
@@ -12202,6 +13941,10 @@ DASHBOARD_HTML = r"""
         unit: isRawMaterial ? "kg" : "pcs",
         scans: scanCount,
         scanned,
+        currentSessionScanCount,
+        currentSessionScannedQty,
+        carryoverCount,
+        carryoverQty,
         currentUsed,
         totalUsed,
         balance,
@@ -12227,17 +13970,24 @@ DASHBOARD_HTML = r"""
     const quantity = (value, unit) => value === null || value === undefined
       ? "-"
       : `${formatMaterialStat(value)} ${unit}`;
+    const jobShortages = Array.isArray(item.product_part_job_shortage_details)
+      ? item.product_part_job_shortage_details.filter(detail => Number(detail?.shortage_qty || 0) > 0)
+      : [];
+    const historicalShortageNote = jobShortages.length && !Number(item.product_part_shortage_count || 0)
+      ? `<div class="raw-stat-note">This job still has a material deficit carried from earlier shifts: ${jobShortages.map(detail => `${esc(detail.name || detail.sku || "Material")}: ${esc(quantity(detail.shortage_qty, detail.unit || "kg"))}`).join("; ")}. The current shift is covered.</div>`
+      : "";
     return `
-      <div class="raw-stat-note">Same-job saved partials plus the current shift. Quantities are calculated separately for each material.</div>
+      <div class="raw-stat-note">Scans and scanned qty show QR records available in this shift, including carried-over scans. Balance and status use saved same-job history plus new scans, without adding carryover twice.</div>
+      ${historicalShortageNote}
       <div class="raw-stat-table">
         <table class="review-kv-table review-data-table">
-          <thead><tr><th>#</th><th>Material</th><th>Scans</th><th>Scanned Qty</th><th>Current Used</th><th>Total Used</th><th>Balance</th><th>Status</th></tr></thead>
+          <thead><tr><th>#</th><th>Material</th><th>Scans in Shift</th><th>Qty in Shift</th><th>Current Used</th><th>Total Used</th><th>Balance</th><th>Status</th></tr></thead>
           <tbody>${statisticsRows.map((stat, index) => `
             <tr>
               <td>${esc(index + 1)}</td>
               <td><div class="raw-stat-material">${esc(stat.material)}</div><div class="raw-stat-sku">${esc(stat.sku)}</div></td>
-              <td>${esc(stat.scans)}</td>
-              <td>${esc(quantity(stat.scanned, stat.unit))}</td>
+              <td>${esc(stat.currentSessionScanCount ?? stat.scans)}${stat.carryoverCount ? `<span class="raw-stat-carryover">includes ${esc(stat.carryoverCount)} carryover</span>` : ""}</td>
+              <td>${esc(quantity(stat.currentSessionScannedQty ?? stat.scanned, stat.unit))}${stat.carryoverQty ? `<span class="raw-stat-carryover">includes ${esc(quantity(stat.carryoverQty, stat.unit))} carryover</span>` : ""}</td>
               <td>${esc(quantity(stat.currentUsed, stat.unit))}</td>
               <td>${esc(quantity(stat.totalUsed, stat.unit))}</td>
               <td>${esc(quantity(stat.balance, stat.unit))}</td>
@@ -12292,6 +14042,8 @@ DASHBOARD_HTML = r"""
     const reviewLogs = Array.isArray(row.reject_review_logs) ? row.reject_review_logs : [];
     const approvedBy = row.supervisor_name || row.qc_name || (reviewLogs.find(x => x?.actor_name)?.actor_name) || "-";
     machineDetailTitle.textContent = `${session.machine_name || session.machine_code || "Archived Job"} Archive`;
+    setMachineDetailMixingJobsMenuOpen(false);
+    if(machineDetailMixingJobsBtn) machineDetailMixingJobsBtn.hidden = true;
     setMachineDetailSupervisorMenuOpen(false);
     if(machineDetailSupervisorBtn) machineDetailSupervisorBtn.hidden = true;
     setMachineDetailFinishShiftsMenuOpen(false);
@@ -12499,7 +14251,7 @@ DASHBOARD_HTML = r"""
     machineHistoryBody.innerHTML = '<div class="machine-history-empty">Loading machine history...</div>';
     machineHistoryOverlay.classList.add("active");
     try{
-      const response = await fetch(`/api/machines/${encodeURIComponent(machineCode)}/activity?limit=400`, {cache:"no-store"});
+      const response = await fetch(`/api/machines/${encodeURIComponent(machineCode)}/activity?limit=10000&current_shift=true`, {cache:"no-store"});
       const body = await response.json();
       if(!response.ok || !body?.ok) throw new Error(body?.error || `HTTP ${response.status}`);
       if(machineHistoryMachineCode !== machineCode) return;
@@ -12669,8 +14421,16 @@ DASHBOARD_HTML = r"""
       renderArchivedMachineDetail(session);
       return;
     }
+    const nextMachineCode = String(session.machine_code || "").trim();
+    if(activeMachineDetailCode && activeMachineDetailCode !== nextMachineCode){
+      activeMachineDetailMixingJobKey = "";
+      activeMachineDetailClientMixingJobKey = "";
+    }
+    activeMachineDetailCode = nextMachineCode;
+    session = machineDetailSessionForMixingJob(session, activeMachineDetailMixingJobKey);
     const supervisorMenuWasOpen = machineDetailSupervisorMenu?.hidden === false;
-    activeMachineDetailCode = String(session.machine_code || "").trim();
+    const mixingJobsMenuWasOpen = machineDetailMixingJobsMenu?.hidden === false;
+    syncMachineDetailMixingJobs(session);
     syncMachineDetailSupervisorActivity(session);
     syncMachineDetailFinishShifts(activeMachineDetailCode);
     if(machineDetailHistoryBtn) machineDetailHistoryBtn.style.display = "";
@@ -12719,7 +14479,7 @@ DASHBOARD_HTML = r"""
         duration: fmtDowntimeSeconds(row.duration_seconds || 0),
         maintenance: row.maintenance || "-",
         confirmed_by: row.confirmed_by || "-",
-        period: `${fmtTimeOnly(row.started_at_utc || "")} ΓåÆ ${fmtTimeOnly(row.finished_at_utc || "")}`,
+        period: `${fmtTimeOnly(row.started_at_utc || "")} \u2192 ${fmtTimeOnly(row.finished_at_utc || "")}`,
       };
     });
     const counterOverwriteRows = (Array.isArray(session.machine_counter_overwrite_logs)
@@ -12865,7 +14625,7 @@ DASHBOARD_HTML = r"""
           <section class="machine-detail-info-panel">
             <div class="machine-detail-info-title">Product Weight Information</div>
             <div class="machine-detail-info-grid product-weight-info-grid">
-              ${machineDetailInfoItem("Standard Weight (SKU API)", standardWeight)}
+              ${machineDetailInfoItem("Standard Weight (Job API)", standardWeight)}
               ${machineDetailInfoItem("Average Weight", averageWeight, weightDeviationTone)}
               ${machineDetailInfoItem("Difference vs Standard", weightDifferenceLabel)}
               ${machineDetailInfoItem("Weight Sender", session.external_average_weight_sender || "-")}
@@ -12945,19 +14705,24 @@ DASHBOARD_HTML = r"""
       goodMetric.addEventListener("focus", () => positionMachineGoodBubble(goodMetric));
     }
     if(supervisorMenuWasOpen) setMachineDetailSupervisorMenuOpen(true);
+    if(mixingJobsMenuWasOpen) setMachineDetailMixingJobsMenuOpen(true);
   }
 
   function closeMachineDetail(){
     closeMachineHistory();
+    setMachineDetailMixingJobsMenuOpen(false);
     setMachineDetailSupervisorMenuOpen(false);
     setMachineDetailFinishShiftsMenuOpen(false);
     machineDetailOverlay.classList.remove("active");
     activeMachineDetailCode = "";
+    activeMachineDetailMixingJobKey = "";
+    activeMachineDetailClientMixingJobKey = "";
     if(machineDetailStatusPanel) machineDetailStatusPanel.style.display = "none";
     if(machineStatusSaveFeedback) machineStatusSaveFeedback.classList.remove("active");
     if(machineStatusSaveBar) machineStatusSaveBar.style.width = "0%";
     if(machineStatusSaveCheck) machineStatusSaveCheck.classList.remove("done");
     if(machineDetailSupervisorBtn) machineDetailSupervisorBtn.hidden = true;
+    if(machineDetailMixingJobsBtn) machineDetailMixingJobsBtn.hidden = true;
     if(machineDetailFinishShiftsBtn) machineDetailFinishShiftsBtn.hidden = true;
     if(machineDetailHistoryBtn) machineDetailHistoryBtn.style.display = "";
     if(machineDetailSettingsBtn) machineDetailSettingsBtn.style.display = "";
@@ -13003,7 +14768,7 @@ DASHBOARD_HTML = r"""
 
   function applyDashboardTheme(themeName){
     const t = String(themeName || "Default").trim() || "Default";
-    if(t === "Default" || t === "Blue Accent"){
+    if(t === "Default"){
       delete document.body.dataset.theme;
     } else {
       document.body.dataset.theme = t;
@@ -13036,8 +14801,9 @@ DASHBOARD_HTML = r"""
   function renderMachinePicker(){
     if(!settingsMachinePickerGrid) return;
     const selected = new Set((Array.isArray(visibleMachineCodesState) ? visibleMachineCodesState : DEFAULT_MACHINE_CODES).map(x => String(x || "").trim()));
-    const standardCodes = DEFAULT_MACHINE_CODES.filter(code => !ADDITIONAL_MACHINE_CODES.has(code));
+    const standardCodes = DEFAULT_MACHINE_CODES.filter(code => !ADDITIONAL_MACHINE_CODES.has(code) && !MIXING_MACHINE_CODES.has(code));
     const additionalCodes = DEFAULT_MACHINE_CODES.filter(code => ADDITIONAL_MACHINE_CODES.has(code));
+    const mixingCodes = DEFAULT_MACHINE_CODES.filter(code => MIXING_MACHINE_CODES.has(code));
     const renderItems = codes => codes.map(code => {
       const name = MACHINE_NAME_MAP[code] || code;
       const checked = selected.has(code) ? "checked" : "";
@@ -13049,10 +14815,12 @@ DASHBOARD_HTML = r"""
       `;
     }).join("");
     settingsMachinePickerGrid.innerHTML = `
-      <div style="grid-column:1/-1;font-weight:900;color:#334155;">IMM 301ΓÇô321</div>
+      <div style="grid-column:1/-1;font-weight:900;color:var(--ui-text);">IMM 301-321</div>
       ${renderItems(standardCodes)}
-      <div style="grid-column:1/-1;margin-top:8px;padding-top:10px;border-top:1px solid #dbe4f0;font-weight:900;color:#334155;">Factory 4 Machines</div>
+      <div style="grid-column:1/-1;margin-top:8px;padding-top:10px;border-top:1px solid var(--ui-border);font-weight:900;color:var(--ui-text);">Factory 4 Machines</div>
       ${renderItems(additionalCodes)}
+      <div style="grid-column:1/-1;margin-top:8px;padding-top:10px;border-top:1px solid var(--ui-border);font-weight:900;color:var(--ui-text);">Mixing Machines</div>
+      ${renderItems(mixingCodes)}
     `;
   }
 
@@ -13161,7 +14929,7 @@ DASHBOARD_HTML = r"""
       const option = document.createElement("option");
       option.value = code;
       option.dataset.clientId = String(s.client_id || "").trim();
-      option.textContent = `${name} (${code})${job ? ` ΓÇö Job ${job}` : " ΓÇö No job"}`;
+      option.textContent = `${name} (${code})${job ? ` \u2022 Job ${job}` : " \u2022 No job"}`;
       settingsMachineClearSelect.appendChild(option);
     });
     if(previous && rows.some(s => String(s.machine_code || "").trim() === previous)){
@@ -13225,8 +14993,8 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         let statusLabel = "Offline";
         if(online && job) statusLabel = `Running Job ${job}`;
         else if(online) statusLabel = "Active";
-        else if(row.active_session && job) statusLabel = `Offline ΓÇö Job ${job} saved`;
-        else if(row.active_session) statusLabel = "Offline ΓÇö Data saved";
+        else if(row.active_session && job) statusLabel = `Offline \u2022 Job ${job} saved`;
+        else if(row.active_session) statusLabel = "Offline \u2022 Data saved";
         return `<tr>
           <td>${esc(row.client_id || "UNKNOWN")}</td>
           <td>${esc(row.remote_host || "-")}</td>
@@ -13257,9 +15025,9 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       const qtyLabel = Number.isFinite(qty)
         ? qty.toLocaleString(undefined, {maximumFractionDigits: 6})
         : String(row.qty || "0");
-      const job = [row.job_code, row.job_name].filter(Boolean).join(" ΓÇö ") || "-";
-      const machine = [row.machine_code, row.machine_name].filter(Boolean).join(" ΓÇö ") || "-";
-      const operator = [row.operator_name, row.operator_id].filter(Boolean).join(" ΓÇö ") || "-";
+      const job = [row.job_code, row.job_name].filter(Boolean).join(" \u2022 ") || "-";
+      const machine = [row.machine_code, row.machine_name].filter(Boolean).join(" \u2022 ") || "-";
+      const operator = [row.operator_name, row.operator_id].filter(Boolean).join(" \u2022 ") || "-";
       return `<tr>
         <td>${esc(fmtDateLocal(row.transferred_at_utc || ""))}</td>
         <td>${esc(row.part_name || "-")}</td>
@@ -14402,6 +16170,9 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
 
   function shiftProductPartsConsumptionHtml(row){
     const item = (row && typeof row === "object") ? row : {};
+    const mixingPartTotals = Array.isArray(item.mixing_cumulative_part_totals)
+      ? item.mixing_cumulative_part_totals.filter(entry => entry && typeof entry === "object")
+      : [];
     const payload = (item.job_payload && typeof item.job_payload === "object") ? item.job_payload : {};
     const data = (payload.data && typeof payload.data === "object") ? payload.data : {};
     const details = (data.job_details && typeof data.job_details === "object") ? data.job_details : {};
@@ -14437,6 +16208,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       return sourceDetails.part_ids && typeof sourceDetails.part_ids === "object" ? [sourceDetails.part_ids] : [];
     };
     addFinishedProductParts(productParts.length ? productParts : targetParts);
+    addFinishedProductParts(mixingPartTotals);
     addFinishedProductParts(partsFromPayload(item.linkage_job_payload));
     (Array.isArray(item.linkage_jobs) ? item.linkage_jobs : []).forEach(linked =>
       addFinishedProductParts(partsFromPayload(linked?.job_payload))
@@ -14628,7 +16400,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       );
       const hookedProduced = isHookedProducedPart(part);
       const issuedQty = hookedProduced ? consumedQty : scannedIssuedQty;
-      const difference = issuedQty - consumedQty;
+      const mixingTotal = mixingPartTotals.find(total => matchesConsumptionPart(part, total));
+      const explicitMixingBalance = mixingTotal == null
+        ? null
+        : Number(mixingTotal.balance_qty ?? mixingTotal.remaining_balance_qty);
+      const difference = Number.isFinite(explicitMixingBalance)
+        ? Math.max(0, explicitMixingBalance)
+        : issuedQty - consumedQty;
       const unit = partConsumptionRows[0]?.unit || (
         String(firstValue(part.unit, part.uom, part.part_unit, "")).toLowerCase().includes("kg") ? "kg" : "pc"
       );
@@ -14638,8 +16416,16 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         consumed_qty: consumedQty,
         difference,
         unit,
+        cumulative_scanned_qty: mixingTotal == null
+          ? null
+          : Math.max(0, Number(mixingTotal.cumulative_scanned_qty || 0)),
+        mixing_request_part_qty: mixingTotal == null
+          ? null
+          : Math.max(0, Number(mixingTotal.request_part_qty || 0)),
         hooked_produced: hookedProduced,
-        balance_status: hookedProduced
+        balance_status: Number.isFinite(explicitMixingBalance)
+          ? `BALANCE ${Math.max(0, explicitMixingBalance).toFixed(4)} ${unit}`
+          : hookedProduced
           ? `HOOKED - BALANCE 0.0000 ${unit}`
           : (
               difference < 0
@@ -14661,7 +16447,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
             <details class="scan-history-item">
               <summary class="scan-history-summary">
                 <span>${esc(item.index)}</span>
-                <span class="material">${esc(item.material)}<br><span class="scan-history-count">${esc(item.scans.length)} scan${item.scans.length === 1 ? "" : "s"} ΓÇö click to view</span></span>
+                <span class="material">${esc(item.material)}<br><span class="scan-history-count">${esc(item.scans.length)} scan${item.scans.length === 1 ? "" : "s"} &bull; click to view</span></span>
                 <span>${esc(item.scanned_qty)}</span>
                 <span>${esc(item.lots)}</span>
                 <span>${esc(fmtDateLocal(item.last_scanned_at || "") || "-")}</span>
@@ -14701,9 +16487,15 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
                 x.part_name || x.product_name || x.name || x.material_name || x.description || "Name unavailable"
               ) },
               { label:"Required Qty", value:x => x.request_part_qty || x.required_qty || x.qty || x.quantity || "-" },
+              ...(mixingPartTotals.length ? [{
+                label:"Cumulative Scanned",
+                value:x => x.cumulative_scanned_qty == null
+                  ? "-"
+                  : `${Number(x.cumulative_scanned_qty || 0).toFixed(4)} ${x.unit}`,
+              }] : []),
               { label:"Produced / Issued", value:x => `${Number(x.issued_qty || 0).toFixed(4)} ${x.unit}` },
               { label:"Consumed Qty", value:x => `${Number(x.consumed_qty || 0).toFixed(4)} ${x.unit}` },
-              { label:"Difference / Lacking", value:x => x.balance_status },
+              { label:mixingPartTotals.length ? "Remaining Balance" : "Difference / Lacking", value:x => x.balance_status },
             ], "No product parts recorded.", Math.max(1, partBalanceRows.length))}</div>
           </div>
           <div class="review-group-card consumption-data-panel actual-consumption-panel">
@@ -15155,19 +16947,20 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     });
   }
 
-  function renderFinishedShiftQueue(rows){
+  function renderFinishedShiftQueue(rows, targetList = finishedShiftQueueList, emptyText = "No finished shifts yet."){
     const items = Array.isArray(rows) ? rows : [];
-    if(!finishedShiftQueueList) return;
+    if(!targetList) return;
+    const mixingList = targetList === mixingShiftQueueList;
     syncFinishedShiftViewButtons();
     if(!items.length){
-      finishedShiftQueueList.className = "finished-wrap";
-      finishedShiftQueueList.innerHTML = '<div class="placeholder">No finished shifts yet.</div>';
+      targetList.className = "finished-wrap";
+      targetList.innerHTML = `<div class="placeholder">${esc(emptyText)}</div>`;
       return;
     }
     const sorted = [...items].reverse();
     if(finishedShiftViewMode === "list"){
-      finishedShiftQueueList.className = "finished-list-wrap";
-      finishedShiftQueueList.innerHTML = `
+      targetList.className = "finished-list-wrap";
+      targetList.innerHTML = `
         <table class="finished-list-table">
           <thead>
             <tr>
@@ -15175,8 +16968,8 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
               <th>Machine</th>
               <th>Shift End</th>
               <th>Operator</th>
-              <th>Pack</th>
-              <th>Total Good</th>
+              <th>${mixingList ? "Sack" : "Pack"}</th>
+              <th>${mixingList ? "Shift KG" : "Total Good"}</th>
               <th>Reject</th>
               <th>Downtime</th>
               <th>Status</th>
@@ -15193,8 +16986,8 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
                   <td>${esc(machineName)}</td>
                   <td>${esc(fmtDateLocal(r.finished_at_utc || r.ended_at_utc || ""))}</td>
                   <td>${esc(displayNameForId(r.operator_id || "-"))}</td>
-                  <td class="finished-list-output">${esc(r.pack_count ?? 0)}</td>
-                  <td class="finished-list-output">${esc(r.total_good ?? r.partial_qty ?? 0)}</td>
+                  <td class="finished-list-output">${esc(mixingList ? (r.mixing_sack_count ?? r.pack_count ?? 0) : (r.pack_count ?? 0))}</td>
+                  <td class="finished-list-output">${esc(mixingList ? (r.mixing_kg_produced_shift ?? r.good_total ?? 0) : (r.total_good ?? r.partial_qty ?? 0))}</td>
                   <td class="finished-list-output">${esc(r.reject_total ?? 0)}</td>
                   <td class="finished-list-output">${esc(fmtDowntimeSeconds(r.downtime_last_seconds))}</td>
                   <td><span class="finished-badge">${esc(r.review_status || "PENDING")}</span></td>
@@ -15207,14 +17000,20 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       `;
       return;
     }
-    finishedShiftQueueList.className = "finished-wrap";
-    finishedShiftQueueList.innerHTML = sorted.map((r, idx) => {
+    targetList.className = "finished-wrap";
+    targetList.innerHTML = sorted.map((r, idx) => {
       const machineCode = String(r.machine_code || "").trim();
       const machineName = r.machine_name || MACHINE_NAME_MAP[machineCode] || machineCode || "-";
       const rawLogs = Array.isArray(r.raw_material_logs) ? r.raw_material_logs : [];
       const rawText = rawLogs.length
         ? rawLogs.map((x, rowIdx) => `${rowIdx+1}. ${x.material_name || x.material || "-"} | qty=${x.qty || 0}`).join("\n")
         : "No raw materials scanned.";
+      const isMixing = String(r.client_mode || "").trim().toUpperCase() === "MIXING"
+        || /^MT-?\d+/i.test(machineCode);
+      const sackCycle = Number(r.mixing_sack_cycle_time_seconds);
+      const sackCycleText = Number.isFinite(sackCycle) && sackCycle > 0
+        ? `${sackCycle.toFixed(2)} sec`
+        : "-";
       return `
         <div class="finished-item">
           <div class="finished-head">
@@ -15226,8 +17025,10 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
             <div><strong>Operator:</strong> ${esc(displayNameForId(r.operator_id || "-"))}</div>
             <div><strong>Approved By:</strong> ${esc(r.approved_by || "-")}${r.approved_by_code ? ` (${esc(r.approved_by_code)})` : ""}</div>
             <div><strong>Approved At:</strong> ${esc(fmtDateLocal(r.approved_at_utc || ""))}</div>
-            <div><strong>Pack:</strong> ${esc(r.pack_count ?? 0)}</div>
-            <div><strong>Total Good:</strong> ${esc(r.total_good ?? r.partial_qty ?? 0)}</div>
+            <div><strong>${isMixing ? "Sack" : "Pack"}:</strong> ${esc(isMixing ? (r.mixing_sack_count ?? r.pack_count ?? 0) : (r.pack_count ?? 0))}</div>
+            <div><strong>${isMixing ? "Shift KG" : "Total Good"}:</strong> ${esc(isMixing ? (r.mixing_kg_produced_shift ?? r.good_total ?? 0) : (r.total_good ?? r.partial_qty ?? 0))}</div>
+            ${isMixing ? `<div><strong>KG Counter:</strong> ${esc(r.mixing_kg_counter_start ?? 0)} → ${esc(r.mixing_kg_counter_end ?? r.mixing_total_kg ?? 0)}</div>` : ""}
+            ${isMixing ? `<div><strong>Sack Cycle Time:</strong> ${esc(sackCycleText)}</div>` : ""}
             <div><strong>Reject:</strong> ${esc(r.reject_total ?? 0)}</div>
             <div><strong>Downtime:</strong> ${esc(fmtDowntimeSeconds(r.downtime_last_seconds))}</div>
           </div>
@@ -15409,9 +17210,20 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       return stamp >= "2026-06-01";
     });
     const finalItems = allItems.filter(r => !isShiftPartialRecord(r));
-    finishedShiftState = shiftItems;
-    renderFinishedShiftQueue(shiftItems);
-    renderFinishedShiftJobProgress(shiftItems);
+    const isMixingShift = row => (
+      String(row?.client_mode || "").trim().toUpperCase() === "MIXING"
+      || /^MT-?\d+/i.test(String(row?.machine_code || "").trim())
+    );
+    mixingFinishedShiftState = shiftItems.filter(isMixingShift);
+    finishedShiftState = shiftItems.filter(row => !isMixingShift(row));
+    renderFinishedShiftQueue(finishedShiftState);
+    renderFinishedShiftQueue(
+      mixingFinishedShiftState,
+      mixingShiftQueueList,
+      "No mixing shifts are waiting for review."
+    );
+    renderFinishedShiftJobProgress(finishedShiftState);
+    renderFinishedShiftPdr(pdrSummaryState);
     const items = finalItems;
     if(finishedJobsInteractionLock){
       pendingFinishedJobsRows = items;
@@ -16195,9 +18007,9 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
                 <td><div class="jq-machine-cell"><div class="jq-machine-icon">M</div><div><div class="jq-primary">${esc(machineName)} | ${esc(row?.machine_code || "-")}</div><div class="jq-secondary">Job ${esc(jobName)}</div><div class="jq-secondary">${esc(jobSub)}</div></div></div></td>
                 <td><div class="jq-primary">${esc(startText)}</div></td>
                 <td><div class="jq-progress-head"><span>${esc(produced.toLocaleString())} / ${esc(target.toLocaleString())}</span><span>${esc(progressPct.toFixed(1))}%</span></div><div class="jq-progress-track"><span class="jq-progress-fill ${isDisconnected ? "offline" : ""}" style="width:${esc(progressPct.toFixed(2))}%"></span></div><div class="jq-secondary">Pack ${esc(row?.pack_count ?? 0)} &nbsp;|&nbsp; Cavity ${esc(cavity)}</div>${targetWarning}</td>
-                <td><span class="jq-inline-icon">Γùë</span><span class="jq-primary">${esc(remainingText)}</span></td>
-                <td><span class="jq-inline-icon">Γûú</span><span class="jq-primary">${esc(endText)}</span></td>
-                <td><span class="jq-inline-icon jq-cycle-icon">Γù╖</span><span class="jq-primary">${esc(cycleText)}</span>${hourlyRate ? `<div class="jq-secondary">${esc(hourlyRate.toLocaleString())} / hr</div>` : '<div class="jq-secondary">-</div>'}</td>
+                <td><span class="jq-inline-icon">&#9673;</span><span class="jq-primary">${esc(remainingText)}</span></td>
+                <td><span class="jq-inline-icon">&#9658;</span><span class="jq-primary">${esc(endText)}</span></td>
+                <td><span class="jq-inline-icon jq-cycle-icon">&#9687;</span><span class="jq-primary">${esc(cycleText)}</span>${hourlyRate ? `<div class="jq-secondary">${esc(hourlyRate.toLocaleString())} / hr</div>` : '<div class="jq-secondary">-</div>'}</td>
               </tr>
             `;
           }).join("")}
@@ -16217,6 +18029,16 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       unassigned_pending_shift_approval: "Unassigned pending approval",
       unassigned_supervisor_reject_review: "Unassigned reject review",
       unassigned_waiting_supervisor: "Unassigned waiting supervisor",
+      wrong_voided_scan: "Wrong or voided scan",
+      missing_component_part: "Missing component part",
+      operator_job_not_closed: "Operator job not closed",
+      late_supervisor_review: "Late supervisor review",
+      missing_supervisor_rotation: "Missing rotation check",
+      unresolved_production_followup: "Unresolved production follow-up",
+      supervisor_job_not_closed: "Supervisor job/shift not closed",
+      unassigned_qc_weight: "Unassigned missing QC weight",
+      unassigned_raw_material: "Unassigned missing raw material",
+      unassigned_planning_mismatch: "Unassigned planning mismatch",
     };
     return labels[String(type || "")] || String(type || "Issue").replaceAll("_", " ");
   }
@@ -16257,12 +18079,46 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   }
 
   function kpiStatus(row){
-    const active = Number(row?.active_records || 0) + Number(row?.active_supervisor_records || 0);
-    const missed = Number(row?.missed_total || 0);
-    const wrong = Number(row?.wrong_or_voided_scans || 0);
-    if(active > 0 || missed >= 10) return { cls: "busy", label: "STATUS: BUSY" };
-    if(wrong > 0 || missed > 0) return { cls: "break", label: "STATUS: ON BREAK" };
-    return { cls: "available", label: "STATUS: AVAILABLE" };
+    const rating = Number(row?.kpi_rating_percent);
+    if(row?.kpi_rating_percent == null || !Number.isFinite(rating)) return { cls: "rating-building", label: "BUILDING DATA" };
+    if(rating >= 90) return { cls: "rating-excellent", label: "EXCELLENT" };
+    if(rating >= 80) return { cls: "rating-strong", label: "STRONG" };
+    if(rating >= 70) return { cls: "rating-on-track", label: "ON TRACK" };
+    return { cls: "rating-coaching", label: "COACHING SUPPORT" };
+  }
+
+  function kpiAvailability(row){
+    const status = String(row?.availability_status || "NOT_AVAILABLE").trim().toUpperCase();
+    const activityStatus = String(row?.activity_status || "OFFLINE").trim().toUpperCase();
+    const map = {
+      AVAILABLE: { cls: "availability-available", label: "Available" },
+      ON_BREAK: { cls: "availability-on-break", label: "On break" },
+      OVERBREAK: { cls: "availability-overbreak", label: "Overbreak" },
+      NOT_AVAILABLE: { cls: "availability-not-available", label: "Not available" },
+    };
+    if(!["ON_BREAK", "OVERBREAK"].includes(status) && ["ONLINE", "WORKING", "RELIEVER"].includes(activityStatus)) return map.AVAILABLE;
+    return map[status] || map.NOT_AVAILABLE;
+  }
+
+  function kpiActivity(row){
+    const availabilityStatus = String(row?.availability_status || "").trim().toUpperCase();
+    const baseStatus = String(row?.activity_status || "OFFLINE").trim().toUpperCase();
+    const status = ["ON_BREAK", "OVERBREAK"].includes(availabilityStatus) ? availabilityStatus : baseStatus;
+    const label = status === "ON_BREAK" ? "On Break"
+      : status === "OVERBREAK" ? "Overbreak"
+      : String(row?.activity_label || "Offline").trim() || "Offline";
+    const detail = ["ON_BREAK", "OVERBREAK"].includes(status)
+      ? (String(row?.activity_label || "").trim() || String(row?.activity_detail || "").trim())
+      : String(row?.activity_detail || "").trim();
+    const classes = {
+      ONLINE: "online",
+      WORKING: "working",
+      RELIEVER: "reliever",
+      ON_BREAK: "on-break",
+      OVERBREAK: "overbreak",
+      OFFLINE: "offline",
+    };
+    return {status, label, detail, cls: classes[status] || "offline"};
   }
 
   function kpiTopIssueRows(items, unassigned){
@@ -16292,50 +18148,72 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   }
 
   function userKpiSuccessRate(row){
+    if(row?.kpi_rating_percent == null) return null;
+    const savedRating = Number(row.kpi_rating_percent);
+    if(Number.isFinite(savedRating)) return Math.max(0, Math.min(100, savedRating));
     const missed = Number(row?.missed_total || 0);
     const handled = Number(row?.handled_records || 0);
     return handled + missed > 0 ? Math.max(0, Math.round((handled / Math.max(1, handled + missed)) * 100)) : 100;
   }
 
+  function userKpiFriendlyCase(value){
+    return String(value || "")
+      .toLowerCase()
+      .replace(/\b\w/g, letter => letter.toUpperCase());
+  }
+
   function renderKpiOperatorCard(row, index){
-    const missed = Number(row?.missed_total || 0);
-    const handled = Number(row?.handled_records || 0);
-    const rate = Number(row?.issue_rate_percent ?? 0);
+    const activity = Number(row?.rating_activity_records ?? row?.activity_records ?? 0);
+    const rate = Number(row?.follow_up_rate_percent ?? row?.issue_rate_percent ?? 0);
     const success = userKpiSuccessRate(row);
     const status = kpiStatus(row);
+    const availability = kpiAvailability(row);
+    const presence = kpiActivity(row);
     const rateWidth = Math.max(8, Math.min(100, rate));
+    const ratingWidth = success == null ? 0 : Math.max(0, Math.min(100, success));
+    const role = String(row?.role || "Role not set").trim();
+    const department = String(row?.department || "Department not set").trim();
     const photo = String(row?.photo_data_url || "").trim();
     const avatar = photo
       ? `<img src="${esc(photo)}" alt="${esc(row?.name || row?.id_number || 'Profile photo')}" />`
       : esc(kpiInitials(row?.name, row?.id_number));
     return `
-      <div class="user-kpi-card ${esc(status.cls)}" data-user-kpi-index="${esc(index)}" role="button" tabindex="0">
+      <div class="user-kpi-card ${esc(status.cls)} ${esc(availability.cls)}" data-user-kpi-index="${esc(index)}" data-user-id="${esc(row?.id_number || '')}" role="button" tabindex="0">
         <div class="user-kpi-card-head">
-          <div class="user-kpi-avatar">${avatar}</div>
+          <div class="user-kpi-avatar" title="${esc(availability.label)}" aria-label="${esc(availability.label)}">${avatar}</div>
           <div>
             <div class="user-kpi-card-name">${esc(row?.name || row?.id_number || "-")}</div>
             <div class="user-kpi-card-id">${esc(row?.id_number || "-")}</div>
           </div>
         </div>
+        <div class="user-kpi-card-profile">
+          <span class="user-kpi-profile-pill">${esc(role)}</span>
+          <span class="user-kpi-profile-pill department">${esc(department)}</span>
+        </div>
+        <div class="user-kpi-activity ${esc(presence.cls)}" data-kpi-activity title="${esc([presence.detail, row?.activity_at_utc ? fmtDateLocal(row.activity_at_utc) : ''].filter(Boolean).join(' · '))}">
+          <strong>${esc(presence.label)}</strong>
+          <span>${esc(presence.detail || (row?.activity_at_utc ? fmtDateLocal(row.activity_at_utc) : "No recorded machine activity"))}</span>
+          <time>${row?.activity_at_utc ? esc(fmtDateLocal(row.activity_at_utc)) : ""}</time>
+        </div>
         <div class="user-kpi-stat">
-          <div>KPI Rate:</div>
+          <div>Follow-up Rate:</div>
           <div>
             <span class="user-kpi-stat-value">${esc(rate.toFixed(2))}%</span>
             <div class="user-kpi-bar"><span style="width:${esc(rateWidth)}%;"></span></div>
           </div>
         </div>
         <div class="user-kpi-stat">
-          <div>Jobs Handled:</div>
-          <div><span class="user-kpi-stat-value">${esc(handled)}</span></div>
+          <div>Activity:</div>
+          <div><span class="user-kpi-stat-value">${esc(activity)}</span></div>
         </div>
         <div class="user-kpi-stat">
-          <div>Success Rate:</div>
+          <div>Performance:</div>
           <div>
-            <span class="user-kpi-stat-value">${esc(success)}%</span>
-            <div class="user-kpi-bar good"><span style="width:${esc(success)}%;"></span></div>
+            <span class="user-kpi-stat-value">${success == null ? "Building data" : `${esc(Number(success).toFixed(2))}%`}</span>
+            <div class="user-kpi-bar good"><span style="width:${esc(ratingWidth)}%;"></span></div>
           </div>
         </div>
-        <div class="user-kpi-status">${esc(status.label)}</div>
+        <div class="user-kpi-status">${esc(userKpiFriendlyCase(status.label))} &middot; ${esc(userKpiFriendlyCase(row?.rating_confidence || "LOW"))} confidence</div>
       </div>
     `;
   }
@@ -16350,157 +18228,276 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     if(!job){
       return '<div class="user-kpi-job-detail"><h4>Select a job</h4><div class="muted">Click a handled job to view its result, problems, and notable activity.</div></div>';
     }
-    const statusClass = Number(job.issue_count || 0) > 0 ? "bad" : (job.active ? "warn" : "");
+    const statusText = String(job.status || "").trim();
+    const normalizedStatus = statusText.toLowerCase();
+    const statusClass = /void|cancel|reject|failed/.test(normalizedStatus) ? "bad" : (/hold|pause|waiting/.test(normalizedStatus) ? "warn" : "");
     const problems = Array.isArray(job.problems) ? job.problems : [];
     const notable = Array.isArray(job.notable_acts) ? job.notable_acts : [];
-    const productMold = jobProductMoldLabel(job);
+    const productName = firstValue(job.product_name, job.product, job.product_sku, job.sku, job.product_id, "");
+    const jobTime = job.finished_at_utc ? fmtDateLocal(job.finished_at_utc) : (job.started_at_utc ? fmtDateLocal(job.started_at_utc) : "-");
+    const meta = [job.machine_name || job.machine_code || "-", jobTime, productName].filter(Boolean).join(" · ");
     return `
       <div class="user-kpi-job-detail">
-        <h4>${esc(jobDisplayName(job, job.job_code || "Job"))}</h4>
-        <div class="user-kpi-job-meta">${esc(job.machine_name || job.machine_code || "-")} | ${esc(job.finished_at_utc ? fmtDateLocal(job.finished_at_utc) : (job.started_at_utc ? fmtDateLocal(job.started_at_utc) : "-"))}</div>
-        ${productMold ? `<div class="user-kpi-job-meta product">${esc(productMold)}</div>` : ""}
-        <div style="margin-top:10px;"><span class="user-kpi-job-badge ${esc(statusClass)}">${esc(job.status || "-")}</span></div>
+        <div class="user-kpi-job-detail-head">
+          <div>
+            <h4>${esc(jobDisplayName(job, job.job_code || "Job"))}</h4>
+            <div class="user-kpi-job-meta">${esc(meta)}</div>
+          </div>
+          <span class="user-kpi-job-badge ${esc(statusClass)}">${esc(statusText || "-")}</span>
+        </div>
         <div class="user-kpi-job-grid">
-          <div class="user-kpi-job-metric"><div class="k">Success Rate</div><div class="v">${esc(job.success_rate ?? 0)}%</div></div>
-          <div class="user-kpi-job-metric"><div class="k">Problems</div><div class="v">${esc(job.issue_count ?? 0)}</div></div>
-          <div class="user-kpi-job-metric"><div class="k">Wrong / Voided</div><div class="v">${esc(job.wrong_or_voided_scans ?? 0)}</div></div>
-          <div class="user-kpi-job-metric"><div class="k">Pack</div><div class="v">${esc(job.pack_count ?? 0)}</div></div>
-          <div class="user-kpi-job-metric"><div class="k">Good</div><div class="v">${esc(job.good_total ?? 0)}</div></div>
-          <div class="user-kpi-job-metric"><div class="k">Reject</div><div class="v">${esc(job.reject_total ?? 0)}</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Success Rate</div><div class="v">${esc(job.success_rate ?? 0)}%</div><div class="sub">Good ÷ total scans</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Problems</div><div class="v">${esc(job.issue_count ?? 0)}</div><div class="sub">Open flags</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Wrong / Voided</div><div class="v">${esc(job.wrong_or_voided_scans ?? 0)}</div><div class="sub">Scans discarded</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Pack</div><div class="v">${esc(job.pack_count ?? 0)}</div><div class="sub">QR scans</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Good</div><div class="v">${esc(job.good_total ?? 0)}</div><div class="sub">Units passed</div></div>
+          <div class="user-kpi-job-metric"><div class="k">Reject</div><div class="v">${esc(job.reject_total ?? 0)}</div><div class="sub">Units failed</div></div>
         </div>
         <div class="user-kpi-detail-section-title">Problems</div>
-        <div class="user-kpi-detail-list">
-          ${problems.length ? problems.map(issue => `<div><strong>${esc(kpiIssueLabel(issue?.type))}</strong><br>${esc(issue?.detail || "-")}</div>`).join("") : '<div>No problem recorded for this job.</div>'}
+        <div class="user-kpi-problem-list">
+          ${problems.length ? problems.map(issue => `<div class="user-kpi-problem-item"><span class="user-kpi-problem-icon">&#9888;</span><div><strong>${esc(kpiIssueLabel(issue?.type))}</strong>${esc(issue?.detail || "-")}</div></div>`).join("") : '<div class="user-kpi-notable-item">No problem recorded for this job.</div>'}
         </div>
         <div class="user-kpi-detail-section-title">Notable Acts</div>
-        <div class="user-kpi-detail-list">
-          ${notable.length ? notable.map(item => `<div>${esc(item)}</div>`).join("") : '<div>No notable activity recorded.</div>'}
+        <div class="user-kpi-notable-list">
+          ${notable.length ? notable.map(item => `<div class="user-kpi-notable-item">${esc(item)}</div>`).join("") : '<div class="user-kpi-notable-item">No notable activity recorded.</div>'}
         </div>
       </div>
     `;
+  }
+
+  function renderKpiRatingComponents(row){
+    const components = Array.isArray(row?.rating_components) ? row.rating_components : [];
+    if(!components.length){
+      return '<div class="placeholder">No measurable role components are assigned yet.</div>';
+    }
+    return `
+      <div class="user-kpi-rating-card">
+        <h4>Role Rating Breakdown</h4>
+        <div class="muted" style="margin-top:6px;">${esc(row?.rating_basis || "Role-specific recorded activity.")}</div>
+        <div class="user-kpi-rating-list">
+          ${components.map(component => {
+            const score = component?.score_percent;
+            const scoreText = score == null ? "Building data" : `${Number(score).toFixed(1)}%`;
+            const scoreWidth = score == null ? 0 : Math.max(0, Math.min(100, Number(score) || 0));
+            const earnedText = component?.earned_percent == null ? "-" : `${Number(component.earned_percent).toFixed(1)} / ${Number(component.weight_percent || 0).toFixed(0)}%`;
+            return `<div class="user-kpi-rating-item"><div class="user-kpi-rating-top"><span>${esc(component?.label || "Metric")}</span><span>${esc(scoreText)}</span></div><div class="user-kpi-rating-bar"><span style="width:${esc(scoreWidth)}%;"></span></div><div class="user-kpi-rating-meta">${esc(earnedText)} &middot; ${esc(component?.passed ?? 0)}/${esc(component?.total ?? 0)} checks</div><div class="user-kpi-rating-detail">${esc(component?.detail || "")}</div></div>`;
+          }).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderSupervisorActivityHistory(row){
+    const history = Array.isArray(row?.supervisor_activity_history) ? row.supervisor_activity_history : [];
+    if(!row?.is_supervisor && !history.length) return "";
+    return `
+      <div class="user-kpi-rating-card">
+        <h4>Supervisor Check &amp; Review History</h4>
+        <div class="muted" style="margin-top:6px;">Machine and scan time for every recorded rotation check or review.</div>
+        <div class="user-kpi-detail-list" style="margin-top:12px;">
+          ${history.length ? history.map(item => `<div><strong>${esc(String(item?.type || "ACTIVITY").toUpperCase() === "CHECK" ? "Rotation Check" : "Review")} · ${esc(item?.machine || item?.machine_code || "-")}</strong><br>${esc(item?.at_utc ? fmtDateLocal(item.at_utc) : "Timestamp unavailable")}</div>`).join("") : '<div>No supervisor rotation check or review has been recorded.</div>'}
+        </div>
+      </div>
+    `;
+  }
+
+  function fitUserKpiDetailModalToSummary(){
+    if(!userKpiDetailOverlay || !userKpiDetailBody || window.matchMedia("(max-width: 900px)").matches) return;
+    const card = userKpiDetailOverlay.querySelector(".user-kpi-detail-card");
+    const head = userKpiDetailOverlay.querySelector(".user-kpi-detail-head");
+    const summary = userKpiDetailBody.querySelector(".user-kpi-detail-summary");
+    if(!card || !head || !summary) return;
+    const bodyStyle = window.getComputedStyle(userKpiDetailBody);
+    const verticalPadding = (parseFloat(bodyStyle.paddingTop) || 0) + (parseFloat(bodyStyle.paddingBottom) || 0);
+    const summaryHeight = Math.ceil(summary.scrollHeight);
+    const summaryBreathingRoom = 80;
+    const requiredHeight = Math.ceil(head.offsetHeight + verticalPadding + summaryHeight + summaryBreathingRoom);
+    card.style.height = `${Math.max(680, requiredHeight)}px`;
   }
 
   function openUserKpiDetail(index){
     const row = Array.isArray(userKpiItemsState) ? userKpiItemsState[index] : null;
     if(!row || !userKpiDetailOverlay || !userKpiDetailPerson || !userKpiDetailBody) return;
+    const detailCard = userKpiDetailOverlay.querySelector(".user-kpi-detail-card");
+    if(detailCard) detailCard.style.height = "";
     const status = kpiStatus(row);
     const jobs = Array.isArray(row.handled_jobs) ? row.handled_jobs : [];
     const firstJob = jobs[0] || null;
+    const performanceScore = userKpiSuccessRate(row);
+    const performanceLabel = performanceScore == null ? "--" : `${Number(performanceScore).toFixed(1)}%`;
+    const performanceDetail = performanceScore == null ? "Building data" : `${Number(performanceScore).toFixed(2)}%`;
+    const performanceDegrees = performanceScore == null ? 0 : Math.max(0, Math.min(100, Number(performanceScore))) * 3.6;
+    const presence = kpiActivity(row);
+    const hasSupervisorHistory = Boolean(row?.is_supervisor || (Array.isArray(row?.supervisor_activity_history) && row.supervisor_activity_history.length));
     userKpiDetailPerson.innerHTML = `
       ${userKpiAvatarHtml(row, "user-kpi-detail-avatar")}
       <div>
-        <div class="user-kpi-detail-name">${esc(row.name || row.id_number || "-")}</div>
-        <div class="user-kpi-detail-sub">${esc(row.id_number || "-")} | ${esc(row.role || "Operator")} | ${esc(status.label.replace("STATUS: ", ""))}</div>
+        <div id="userKpiDetailName" class="user-kpi-detail-name">${esc(row.name || row.id_number || "-")}</div>
+        <div class="user-kpi-detail-sub">
+          <span class="user-kpi-detail-chip">${esc(row.id_number || "-")}</span>
+          <span class="user-kpi-detail-chip">${esc(row.role || "Role not set")}</span>
+          <span class="user-kpi-detail-chip">${esc(row.department || "Department not set")}</span>
+          <span class="user-kpi-detail-chip status">${esc(userKpiFriendlyCase(status.label))}</span>
+        </div>
       </div>
     `;
     userKpiDetailBody.innerHTML = `
       <div class="user-kpi-detail-summary">
-        <div class="user-kpi-detail-metric"><span>KPI Rate</span><strong>${esc(row.issue_rate_percent ?? 0)}%</strong></div>
-        <div class="user-kpi-detail-metric"><span>Success Rate</span><strong>${esc(userKpiSuccessRate(row))}%</strong></div>
+        <div class="user-kpi-score">
+          <div class="user-kpi-score-ring" data-score="${esc(performanceLabel)}" style="--score-deg:${esc(performanceDegrees)}deg;"></div>
+          <div class="user-kpi-score-copy"><span>Performance snapshot</span><strong>${esc(performanceDetail)}</strong></div>
+        </div>
+        <div class="user-kpi-summary-heading">Overview</div>
+        <div class="user-kpi-detail-metric"><span>Role</span><strong>${esc(row.role || "-")}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Department</span><strong>${esc(row.department || "-")}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Follow-up Rate</span><strong>${esc(row.follow_up_rate_percent ?? row.issue_rate_percent ?? 0)}%</strong></div>
+        <div class="user-kpi-detail-metric"><span>Data Confidence</span><strong>${esc(row.rating_confidence || "LOW")}</strong></div>
+        <div class="user-kpi-summary-heading">Activity</div>
+        <div class="user-kpi-detail-metric"><span>Latest Activity</span><strong>${esc(row.activity_type ? userKpiFriendlyCase(row.activity_type) : presence.label)}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Machine</span><strong>${esc(row.activity_machine_name || row.activity_machine_code || "-")}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Timestamp</span><strong>${esc(row.activity_at_utc ? fmtDateLocal(row.activity_at_utc) : "-")}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Tracked Activity</span><strong>${esc(row.activity_records ?? 0)}</strong></div>
         <div class="user-kpi-detail-metric"><span>Jobs Handled</span><strong>${esc(row.handled_records ?? 0)}</strong></div>
         <div class="user-kpi-detail-metric"><span>Active Jobs</span><strong>${esc((Number(row.active_records || 0) + Number(row.active_supervisor_records || 0)))}</strong></div>
-        <div class="user-kpi-detail-metric"><span>Missed Items</span><strong>${esc(row.missed_total ?? 0)}</strong></div>
+        <div class="user-kpi-detail-metric"><span>Follow-ups</span><strong>${esc(row.missed_total ?? 0)}</strong></div>
+        <div class="user-kpi-summary-heading">Scans</div>
         <div class="user-kpi-detail-metric"><span>Wrong / Voided</span><strong>${esc(row.wrong_or_voided_scans ?? 0)}</strong></div>
         <div class="user-kpi-detail-metric"><span>Raw Scans</span><strong>${esc(row.raw_material_scans ?? 0)}</strong></div>
         <div class="user-kpi-detail-metric"><span>Pack QR</span><strong>${esc(row.pack_qr_scans ?? 0)}</strong></div>
         <div class="user-kpi-detail-metric"><span>Reject Scans</span><strong>${esc(row.reject_scans ?? 0)}</strong></div>
       </div>
-      <div>
-        <div class="user-kpi-detail-jobs">
-          <div class="user-kpi-detail-jobs-head"><h4>Jobs Handled</h4><span class="muted">${esc(jobs.length)} record(s)</span></div>
-          <div class="user-kpi-job-list">
-            ${jobs.length ? jobs.map((job, jobIndex) => {
-              const badgeClass = Number(job.issue_count || 0) > 0 ? "bad" : (job.active ? "warn" : "");
-              const productMold = jobProductMoldLabel(job);
-              return `
-                <div class="user-kpi-job-row ${jobIndex === 0 ? "active" : ""}" data-user-kpi-job-index="${esc(jobIndex)}">
-                  <div class="user-kpi-job-top">
-                    <div>
-                      <div class="user-kpi-job-name">${esc(jobDisplayName(job, job.job_code || "Job"))}</div>
-                      <div class="user-kpi-job-meta">${esc(job.machine_name || job.machine_code || "-")} | Pack ${esc(job.pack_count ?? 0)} | Good ${esc(job.good_total ?? 0)} | Reject ${esc(job.reject_total ?? 0)}</div>
-                      ${productMold ? `<div class="user-kpi-job-meta product">${esc(productMold)}</div>` : ""}
-                    </div>
-                    <span class="user-kpi-job-badge ${esc(badgeClass)}">${esc(job.status || "-")}</span>
+      <div class="user-kpi-detail-main">
+        <div class="user-kpi-detail-tabs ${hasSupervisorHistory ? "" : "two-tabs"}" role="tablist" aria-label="Profile details">
+          <button class="user-kpi-detail-tab active" type="button" role="tab" aria-selected="true" aria-controls="userKpiJobsPanel" data-user-kpi-detail-tab="jobs">Jobs Handled</button>
+          <button class="user-kpi-detail-tab" type="button" role="tab" aria-selected="false" aria-controls="userKpiRatingPanel" data-user-kpi-detail-tab="rating">Role Rating</button>
+          ${hasSupervisorHistory ? '<button class="user-kpi-detail-tab" type="button" role="tab" aria-selected="false" aria-controls="userKpiHistoryPanel" data-user-kpi-detail-tab="history">Check &amp; Review History</button>' : ""}
+        </div>
+        <div id="userKpiJobsPanel" class="user-kpi-detail-tab-panel" role="tabpanel" data-user-kpi-detail-panel="jobs">
+          <div class="user-kpi-detail-jobs">
+            <div class="user-kpi-detail-jobs-head"><h4>Jobs Handled</h4><span class="muted">${esc(jobs.length)} record${jobs.length === 1 ? "" : "s"}</span></div>
+            <div class="user-kpi-jobs-layout">
+              <div class="user-kpi-job-list">
+              ${jobs.length ? jobs.map((job, jobIndex) => {
+                const jobName = firstValue(job.job_name, job.job_code, "Job");
+                const itemLabel = [firstValue(job.product_sku, job.sku, ""), firstValue(job.product_name, job.product, "")].filter(Boolean).join(" · ") || firstValue(job.product_id, "Item not set");
+                return `
+                  <div class="user-kpi-job-row ${jobIndex === 0 ? "active" : ""}" data-user-kpi-job-index="${esc(jobIndex)}">
+                    <div class="user-kpi-job-name">${esc(jobName)}</div>
+                    <div class="user-kpi-job-item">${esc(itemLabel)}</div>
                   </div>
-                </div>
-              `;
-            }).join("") : '<div class="placeholder">No handled job records found for this operator.</div>'}
+                `;
+              }).join("") : '<div class="placeholder">No tracked production records found for this person.</div>'}
+              </div>
+              <div id="userKpiJobDetailPane">${renderUserKpiJobDetail(firstJob)}</div>
+            </div>
           </div>
         </div>
-        <div id="userKpiJobDetailPane">${renderUserKpiJobDetail(firstJob)}</div>
+        <div id="userKpiRatingPanel" class="user-kpi-detail-tab-panel" role="tabpanel" data-user-kpi-detail-panel="rating" hidden>
+          ${renderKpiRatingComponents(row)}
+        </div>
+        ${hasSupervisorHistory ? `<div id="userKpiHistoryPanel" class="user-kpi-detail-tab-panel" role="tabpanel" data-user-kpi-detail-panel="history" hidden>${renderSupervisorActivityHistory(row)}</div>` : ""}
       </div>
     `;
     userKpiDetailOverlay.setAttribute("data-open-user-index", String(index));
     userKpiDetailOverlay.classList.add("active");
+    window.requestAnimationFrame(fitUserKpiDetailModalToSummary);
+  }
+
+  function updateProductionCardsNotificationBadge(count){
+    if(!productionCardsNotifBadge) return;
+    const total = Math.max(0, Number(count || 0));
+    productionCardsNotifBadge.textContent = total > 99 ? "99+" : String(total);
+    productionCardsNotifBadge.hidden = total <= 0;
+    if(productionCardsTabBtn){
+      productionCardsTabBtn.title = total > 0
+        ? `${total} unregistered Breaktime user notification${total === 1 ? "" : "s"}`
+        : "";
+    }
   }
 
   function renderUserKpis(payload){
     const data = (payload && typeof payload === "object") ? payload : {};
     const items = Array.isArray(data.items) ? data.items : [];
+    const breaktimeNotifications = Array.isArray(data.breaktime_notifications) ? data.breaktime_notifications : [];
+    updateProductionCardsNotificationBadge(breaktimeNotifications.length);
     userKpiItemsState = items.slice();
-    const unassigned = Array.isArray(data.unassigned_supervisor_issues) ? data.unassigned_supervisor_issues : [];
+    const unassigned = Array.isArray(data.unassigned_followups)
+      ? data.unassigned_followups
+      : (Array.isArray(data.unassigned_supervisor_issues) ? data.unassigned_supervisor_issues : []);
     const summary = (data.summary && typeof data.summary === "object") ? data.summary : {};
     const operators = items.filter(row => row?.is_operator).length;
     const supervisors = items.filter(row => row?.is_supervisor).length;
+    const maintenance = items.filter(row => row?.is_maintenance).length;
     const handled = items.reduce((sum, row) => sum + Number(row?.handled_records || 0), 0);
     const approved = items.reduce((sum, row) => sum + Number(row?.approved_records || 0), 0);
+    const rated = items.filter(row => row?.kpi_rating_percent != null).length;
 
     if(userKpiSummary){
       userKpiSummary.innerHTML = `
-        <div class="job-queue-metric"><div class="ico">U</div><div><div class="k">Users</div><div class="v">${esc(summary.users ?? items.length)}</div><div class="sub">Total users</div></div></div>
-        <div class="job-queue-metric"><div class="ico">O</div><div><div class="k">Operators</div><div class="v">${esc(operators)}</div><div class="sub">Active operators</div></div></div>
-        <div class="job-queue-metric"><div class="ico">S</div><div><div class="k">Supervisors</div><div class="v">${esc(supervisors)}</div><div class="sub">Active supervisors</div></div></div>
-        <div class="job-queue-metric"><div class="ico warn">!</div><div><div class="k">Missed Items</div><div class="v">${esc(summary.missed_total ?? 0)}</div><div class="sub">Needs follow-up</div></div></div>
-        <div class="job-queue-metric"><div class="ico bad">X</div><div><div class="k">Wrong / Voided</div><div class="v">${esc(summary.wrong_or_voided_scans ?? 0)}</div><div class="sub">Wrong or voided</div></div></div>
-        <div class="job-queue-metric"><div class="ico good">&#10003;</div><div><div class="k">Handled / Approved</div><div class="v">${esc(handled)}/${esc(approved)}</div><div class="sub">Handled / Approved</div></div></div>
+        <div class="job-queue-metric"><div class="ico">P</div><div><div class="k">People</div><div class="v">${esc(summary.users ?? items.length)}</div><div class="sub">People in view</div></div></div>
+        <div class="job-queue-metric"><div class="ico">O</div><div><div class="k">Operators</div><div class="v">${esc(operators)}</div><div class="sub">Operator profiles</div></div></div>
+        <div class="job-queue-metric"><div class="ico">S</div><div><div class="k">Supervisors</div><div class="v">${esc(supervisors)}</div><div class="sub">Supervisor profiles</div></div></div>
+        <div class="job-queue-metric"><div class="ico">M</div><div><div class="k">Maintenance</div><div class="v">${esc(maintenance)}</div><div class="sub">Maintenance profiles</div></div></div>
+        <div class="job-queue-metric"><div class="ico warn">!</div><div><div class="k">Follow-ups</div><div class="v">${esc(summary.missed_total ?? 0)}</div><div class="sub">Follow-ups to coach or check</div></div></div>
+        <div class="job-queue-metric"><div class="ico good">&#10003;</div><div><div class="k">Snapshots</div><div class="v">${esc(rated)}/${esc(items.length)}</div><div class="sub">Snapshots from first activity</div></div></div>
       `;
     }
 
     if(!userKpiTableWrap) return;
-    if(!items.length && !unassigned.length){
-      userKpiTableWrap.innerHTML = '<div class="placeholder">No user KPI records found for this filter.</div>';
+    if(!items.length && !unassigned.length && !breaktimeNotifications.length){
+      userKpiTableWrap.innerHTML = '<div class="placeholder">No Production Card records found for this filter.</div>';
       return;
     }
 
+    const breaktimeAlertHtml = breaktimeNotifications.length ? `
+      <div class="breaktime-alert">
+        <div class="breaktime-alert-head">
+          <div class="breaktime-alert-title">Breaktime users not registered (${esc(breaktimeNotifications.length)})</div>
+          <button id="breaktimeNotificationsAckBtn" type="button">Mark reviewed</button>
+        </div>
+        <div class="breaktime-alert-list">
+          ${breaktimeNotifications.slice(0, 8).map(row => `${esc(row?.id_number || "Missing ID")}${row?.name ? ` - ${esc(row.name)}` : ""}`).join("<br>")}
+        </div>
+      </div>
+    ` : "";
+
     const unassignedHtml = unassigned.length ? `
       <div class="kpi-unassigned">
-        <div class="kpi-unassigned-title">Unassigned supervisor follow-ups</div>
-        <div class="muted">These records are not counted against a specific supervisor because no supervisor/approval owner is saved on the record yet.</div>
+        <div class="kpi-unassigned-title">Unassigned team follow-ups</div>
+        <div class="muted">These are not counted against any person because the responsible supervisor, QC, material loader, or planner is not identified in the saved record.</div>
         ${renderKpiIssues(unassigned)}
       </div>
     ` : "";
 
     const topIssues = kpiTopIssueRows(items, unassigned);
     const maxIssue = Math.max(1, ...topIssues.map(x => Number(x.count || 0)));
-    const highCount = items.filter(row => Number(row?.issue_rate_percent || 0) > 70).length;
-    const mediumCount = items.filter(row => {
-      const rate = Number(row?.issue_rate_percent || 0);
-      return rate >= 30 && rate <= 70;
-    }).length;
-    const lowCount = Math.max(0, items.length - highCount - mediumCount);
+    const excellentCount = items.filter(row => Number(row?.kpi_rating_percent || 0) >= 90).length;
+    const strongCount = items.filter(row => Number(row?.kpi_rating_percent || 0) >= 80 && Number(row?.kpi_rating_percent || 0) < 90).length;
+    const onTrackCount = items.filter(row => Number(row?.kpi_rating_percent) >= 70 && Number(row?.kpi_rating_percent) < 80).length;
+    const coachingCount = items.filter(row => row?.kpi_rating_percent != null && Number(row.kpi_rating_percent) < 70).length;
+    const buildingCount = items.filter(row => row?.kpi_rating_percent == null).length;
     const totalRateRows = Math.max(1, items.length);
-    const highDeg = (highCount / totalRateRows) * 360;
-    const mediumDeg = highDeg + (mediumCount / totalRateRows) * 360;
-    const rowsShown = Math.min(10, items.length);
+    const excellentDeg = (excellentCount / totalRateRows) * 360;
+    const strongDeg = excellentDeg + (strongCount / totalRateRows) * 360;
+    const onTrackDeg = strongDeg + (onTrackCount / totalRateRows) * 360;
+    const coachingDeg = onTrackDeg + (coachingCount / totalRateRows) * 360;
+    const rowsShown = items.length;
 
     userKpiTableWrap.innerHTML = `
+      ${breaktimeAlertHtml}
       ${unassignedHtml}
       <div class="user-kpi-main-panel">
         <div class="user-kpi-panel-head">
-          <h4>Operator Performance</h4>
+          <h4>Production Performance Cards</h4>
           <div class="user-kpi-tools">
-            <input class="user-kpi-search" type="search" placeholder="Search operator..." />
-            <button class="user-kpi-tool-btn" type="button">Filters</button>
+            <input class="user-kpi-search" type="search" placeholder="Search name, ID, role, department..." aria-label="Search Production Cards" />
           </div>
         </div>
         <div class="user-kpi-card-grid">
-          ${items.slice(0, 10).map((row, index) => renderKpiOperatorCard(row, index)).join("")}
+          ${items.map((row, index) => renderKpiOperatorCard(row, index)).join("")}
         </div>
         <div class="user-kpi-footer">
-          <span>Rows per page: <select><option>10</option><option>20</option></select></span>
-          <span>1-${esc(rowsShown)} of ${esc(items.length)}</span>
-          <span>&#8249;</span>
-          <span>&#8250;</span>
+          <span>Showing ${esc(rowsShown)} of ${esc(items.length)} people</span>
         </div>
       </div>
       <div class="user-kpi-side">
@@ -16522,28 +18519,58 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
           }).join("")}
         </div>
         <div class="user-kpi-side-card">
-          <h4>Issue Rate Overview</h4>
+          <h4>Performance Snapshot</h4>
           <div class="user-kpi-donut-row" style="margin-top:16px;">
-            <div class="user-kpi-donut" style="background:conic-gradient(#dc2626 0 ${esc(highDeg)}deg, #d99a16 ${esc(highDeg)}deg ${esc(mediumDeg)}deg, #2ca968 ${esc(mediumDeg)}deg 360deg);">
-              <div class="user-kpi-donut-inner">${esc(items.length)}<span>Operators</span></div>
+            <div class="user-kpi-donut" style="background:conic-gradient(#2ca968 0 ${esc(excellentDeg)}deg, #d64567 ${esc(excellentDeg)}deg ${esc(strongDeg)}deg, #d99a16 ${esc(strongDeg)}deg ${esc(onTrackDeg)}deg, #dc2626 ${esc(onTrackDeg)}deg ${esc(coachingDeg)}deg, #768198 ${esc(coachingDeg)}deg 360deg);">
+              <div class="user-kpi-donut-inner">${esc(items.length)}<span>People</span></div>
             </div>
             <div class="user-kpi-legend">
-              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot"></span><span>High (&gt; 70%)</span><strong>${esc(highCount)}</strong></div>
-              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot mid"></span><span>Medium (30-70%)</span><strong>${esc(mediumCount)}</strong></div>
-              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot low"></span><span>Low (&lt; 20%)</span><strong>${esc(lowCount)}</strong></div>
+              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot low"></span><span>Excellent</span><strong>${esc(excellentCount)}</strong></div>
+              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot blue"></span><span>Strong</span><strong>${esc(strongCount)}</strong></div>
+              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot mid"></span><span>On Track</span><strong>${esc(onTrackCount)}</strong></div>
+              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot"></span><span>Coaching Support</span><strong>${esc(coachingCount)}</strong></div>
+              <div class="user-kpi-legend-row"><span class="user-kpi-legend-dot slate"></span><span>Building Data</span><strong>${esc(buildingCount)}</strong></div>
             </div>
           </div>
-          <div class="user-kpi-note">Issue rate = Missed / (Handled + Missed)</div>
+          <div class="user-kpi-note">Each role uses its own recorded responsibilities and minimum sample size. Unassigned team follow-ups never affect an individual.</div>
         </div>
       </div>
     `;
+    userKpiTableWrap.querySelector("#breaktimeNotificationsAckBtn")?.addEventListener("click", async () => {
+      const response = await fetch("/api/breaktime/notifications/acknowledge", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({}),
+      });
+      const body = await response.json().catch(() => ({}));
+      if(!response.ok || body.ok === false){
+        alert(body.error || `Unable to acknowledge notifications (HTTP ${response.status})`);
+        return;
+      }
+      updateProductionCardsNotificationBadge(body.remaining || 0);
+      loadUserKpis(userKpiRoleState);
+    });
+    const search = userKpiTableWrap.querySelector(".user-kpi-search");
+    search?.addEventListener("input", () => {
+      const needle = String(search.value || "").trim().toLowerCase();
+      let shown = 0;
+      userKpiTableWrap.querySelectorAll(".user-kpi-card[data-user-kpi-index]").forEach(card => {
+        const row = items[Number(card.getAttribute("data-user-kpi-index"))] || {};
+        const haystack = [row.name, row.id_number, row.role, row.department].join(" ").toLowerCase();
+        const visible = !needle || haystack.includes(needle);
+        card.style.display = visible ? "" : "none";
+        if(visible) shown += 1;
+      });
+      const footer = userKpiTableWrap.querySelector(".user-kpi-footer span");
+      if(footer) footer.textContent = `Showing ${shown} of ${items.length} people`;
+    });
   }
 
   async function loadUserKpis(role = userKpiRoleState){
     if(!userKpiTableWrap || userKpiLoading) return;
     userKpiRoleState = role || "all";
     userKpiLoading = true;
-    userKpiTableWrap.innerHTML = '<div class="placeholder">Loading user KPIs...</div>';
+    userKpiTableWrap.innerHTML = '<div class="placeholder">Loading Production Cards...</div>';
     try{
       const r = await fetch(`/api/user-kpis?role=${encodeURIComponent(userKpiRoleState)}`);
       const data = await r.json().catch(() => ({}));
@@ -16552,11 +18579,60 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       }
       renderUserKpis(data);
     }catch(err){
-      userKpiTableWrap.innerHTML = `<div class="placeholder">Failed to load user KPIs: ${esc(err?.message || err)}</div>`;
+      userKpiTableWrap.innerHTML = `<div class="placeholder">Failed to load Production Cards: ${esc(err?.message || err)}</div>`;
     }finally{
       userKpiLoading = false;
     }
   }
+
+  async function refreshBreaktimeCardStatuses(){
+    try{
+      const response = await fetch("/api/breaktime/statuses");
+      const data = await response.json().catch(() => ({}));
+      if(!response.ok || data.ok === false) return;
+      updateProductionCardsNotificationBadge(data.notification_count || 0);
+      const rows = Array.isArray(data.items) ? data.items : [];
+      const byId = new Map(rows.map(row => [String(row?.id_number || "").trim(), row]));
+      userKpiItemsState = userKpiItemsState.map(row => {
+        const fresh = byId.get(String(row?.id_number || "").trim());
+        return fresh ? {...row, ...fresh} : row;
+      });
+      userKpiTableWrap?.querySelectorAll(".user-kpi-card[data-user-id]").forEach(card => {
+        const fresh = byId.get(String(card.getAttribute("data-user-id") || "").trim());
+        if(!fresh) return;
+        const rowIndex = Number(card.getAttribute("data-user-kpi-index"));
+        const current = userKpiItemsState[rowIndex] || fresh;
+        const availability = kpiAvailability(current);
+        const presence = kpiActivity(current);
+        card.classList.remove(
+          "availability-available",
+          "availability-on-break",
+          "availability-overbreak",
+          "availability-not-available"
+        );
+        card.classList.add(availability.cls);
+        const avatar = card.querySelector(".user-kpi-avatar");
+        if(avatar){
+          avatar.title = availability.label;
+          avatar.setAttribute("aria-label", availability.label);
+        }
+        const activity = card.querySelector("[data-kpi-activity]");
+        if(activity){
+          activity.className = `user-kpi-activity ${presence.cls}`;
+          activity.title = presence.detail;
+          const label = activity.querySelector("strong");
+          const detail = activity.querySelector("span");
+          const timestamp = activity.querySelector("time");
+          if(label) label.textContent = presence.label;
+          if(detail) detail.textContent = presence.detail || "No recorded machine activity";
+          if(timestamp) timestamp.textContent = current?.activity_at_utc ? fmtDateLocal(current.activity_at_utc) : "";
+        }
+      });
+    }catch(_err){}
+  }
+
+  window.setInterval(refreshBreaktimeCardStatuses, 5000);
+  refreshBreaktimeCardStatuses();
 
   function normalizePlanningBoard(board){
     const lanes = (board && typeof board.lanes === "object") ? board.lanes : {};
@@ -17307,7 +19383,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         const actionText = String(entry?.action || "MOVED").toUpperCase();
         const fromPosition = Number(entry?.from_position || 0);
         const toPosition = Number(entry?.to_position || 0);
-        const positionText = fromPosition && toPosition ? `${fromPosition} ΓåÆ ${toPosition}` : (toPosition ? `Position ${toPosition}` : (fromPosition ? `Was ${fromPosition}` : "-"));
+        const positionText = fromPosition && toPosition ? `${fromPosition} \u2192 ${toPosition}` : (toPosition ? `Position ${toPosition}` : (fromPosition ? `Was ${fromPosition}` : "-"));
         return `<tr>
           <td><span class="planning-activity-item">${esc(fmtDateLocal(entry?.timestamp_utc))}</span><div class="planning-activity-sub">${esc(entry?.source_ip || "Server")}</div></td>
           <td><span class="planning-action-chip ${esc(actionText.toLowerCase())}">${esc(actionText)}</span></td>
@@ -17389,7 +19465,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   function renderCompactPlanOverview(){
     if(!planOverviewTableWrap) return;
     const factory4 = activePlanOverviewFactory === "F04";
-    const codes = DEFAULT_MACHINE_CODES.filter(code => ADDITIONAL_MACHINE_CODES.has(code) === factory4);
+    const codes = DEFAULT_MACHINE_CODES.filter(code => !MIXING_MACHINE_CODES.has(code) && ADDITIONAL_MACHINE_CODES.has(code) === factory4);
     const sessionsByMachine = new Map((latestState?.sessions || []).map(session => [planningLaneMachineCode(session?.machine_code), session]));
     const queueByMachine = new Map((latestState?.job_queue || []).map(row => [planningLaneMachineCode(row?.machine_code), row]));
     const tonnageMap = latestState?.machine_tonnage || {};
@@ -18396,7 +20472,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   function machineCardAlertMeta(s, code, css){
     const session = (s && typeof s === "object") ? s : {};
     if(css === "inactive") return {className:"", pills:[], speed:0, duration:0, primaryKind:"", supervisorMissing:false, supervisorDueAt:"", supervisorReason:""};
-    const shortageCount = Math.max(0, Number(session.product_part_shortage_count || 0));
+    const shortageDetails = Array.isArray(session.product_part_shortage_details)
+      ? session.product_part_shortage_details.filter(row => Number(row?.shortage_qty || 0) > 0.000001)
+      : null;
+    const shortageCount = shortageDetails !== null
+      ? shortageDetails.length : Math.max(0, Number(session.product_part_shortage_count || 0));
+    const missingDetails = shortageDetails?.filter(row => Number(row.scanned_qty || 0) <= 0.000001) || [];
+    const shortDetails = shortageDetails?.filter(row => Number(row.scanned_qty || 0) > 0.000001) || [];
     const shortageNames = Array.isArray(session.product_part_shortage_names)
       ? session.product_part_shortage_names.map(value => String(value || "").trim()).filter(Boolean)
       : [];
@@ -18460,23 +20542,19 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       ? Math.max(.24, .92 - Math.min(shortageCount, 6) * .11)
       : 0;
     if(shortageCount > 0){
-      pills.push({
+      const addPartPill = (details, kind) => pills.push({
+        kind:"parts",
+        prominence:primaryKind === "parts" ? "primary" : "secondary",
+        label:`${details.length} PART${details.length === 1 ? "" : "S"} ${kind}`,
+        title:details.map(row => `${row.sku || row.name}: ${Number(row.shortage_qty).toLocaleString(undefined, {maximumFractionDigits:6})}${row.unit ? ` ${row.unit}` : ""} ${kind.toLowerCase()}`).join("\n"),
+      });
+      if(shortDetails.length) addPartPill(shortDetails, "SHORT");
+      if(missingDetails.length) addPartPill(missingDetails, "MISSING");
+      if(!shortageDetails?.length) pills.push({
         kind:"parts",
         prominence:primaryKind === "parts" ? "primary" : "secondary",
         label:`${shortageCount} PART${shortageCount === 1 ? "" : "S"} SHORT`,
         title:`Product-part shortage: ${shortageNames.join(", ") || shortageCount}`,
-      });
-    }
-    if(supervisorMissing){
-      pills.push({
-        kind:"supervisor",
-        prominence:primaryKind === "supervisor" ? "primary" : "secondary",
-        label:"SUPERVISOR CHECK",
-        title:session.waiting_supervisor_qr
-          ? "Supervisor QR is required to continue."
-          : missedScheduledCheck
-            ? "This machine has not completed the latest scheduled supervisor check."
-            : "This machine has not completed a supervisor check for the current job.",
       });
     }
     const duration = primaryKind === "status"
@@ -18705,11 +20783,24 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       ${machineTodoSummaryItemHtml("Checks still needed", lists.supervisor)}
       ${machineTodoSummaryItemHtml("Short materials", lists.loader)}
     `;
-    if(machineTodoColumns) machineTodoColumns.innerHTML = [
-      machineTodoSectionHtml("qc", "Machines Without Weight", "QC", lists.qc),
-      machineTodoSectionHtml("supervisor", "Checks Still Needed", "Supervisor", lists.supervisor),
-      machineTodoSectionHtml("loader", "Short Materials", "Material Loader", lists.loader),
-    ].join("");
+    if(machineTodoColumns){
+      const columnScrollTop = machineTodoColumns.scrollTop;
+      const scrollPositions = {};
+      ["qc", "supervisor", "loader"].forEach(kind => {
+        const list = machineTodoColumns.querySelector(`.machine-todo-section.${kind} .machine-todo-list`);
+        scrollPositions[kind] = list ? list.scrollTop : 0;
+      });
+      machineTodoColumns.innerHTML = [
+        machineTodoSectionHtml("qc", "Machines Without Weight", "QC", lists.qc),
+        machineTodoSectionHtml("supervisor", "Checks Still Needed", "Supervisor", lists.supervisor),
+        machineTodoSectionHtml("loader", "Short Materials", "Material Loader", lists.loader),
+      ].join("");
+      machineTodoColumns.scrollTop = columnScrollTop;
+      Object.entries(scrollPositions).forEach(([kind, scrollTop]) => {
+        const list = machineTodoColumns.querySelector(`.machine-todo-section.${kind} .machine-todo-list`);
+        if(list) list.scrollTop = scrollTop;
+      });
+    }
   }
 
   function syncMachineTodoControls(){
@@ -18755,6 +20846,284 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     return flags;
   }
 
+  function machineSupervisorIndicator(session, now = new Date()){
+    const source = session || {};
+    const rows = machineSupervisorActivityRows(source);
+    const rotationCount = Math.max(rows.filter(row => row.kind === "rotation").length, Number(source.supervisor_rotation_count || 0));
+    const reviews = rows.filter(row => row.kind === "review");
+    const started = Date.parse(String(source.job_started_at || ""));
+    const running = Boolean(source.job_code || source.job_name);
+    const checkpoints = [11, 15].map(hour => {
+      const time = new Date(now);
+      time.setHours(hour, 0, 0, 0);
+      return time.getTime();
+    }).filter(time => time <= now.getTime() && (!Number.isFinite(started) || time >= started));
+    const due = checkpoints.length ? Math.max(...checkpoints) : null;
+    const reviewedOnTime = reviews.some(row => Date.parse(String(row.at || "")) >= due);
+    const overdue = running && due !== null && !reviewedOnTime;
+    const hasReview = reviews.length > 0;
+    const state = rotationCount > 0 && hasReview
+      ? "complete"
+      : hasReview
+        ? "review-only"
+        : overdue
+          ? "overdue"
+          : rotationCount > 0
+            ? "rotation-only"
+            : "pending";
+    const description = {overdue:"Supervisor review overdue", complete:"Rotation check and review recorded", "review-only":"Review recorded; rotation check not recorded", "rotation-only":"Rotation checked; review pending", pending:"Supervisor activity pending"}[state];
+    return {rotationCount, reviewCount:reviews.length, state, title:`${rotationCount} rotation checks / ${reviews.length} reviews | ${description}`};
+  }
+
+  // Exact header snapshot from PDR_EXCEL.xlsx; duplicate labels are intentional.
+  let pdrAmBoundaryHour = 7, pdrNightBoundaryHour = 19;
+  const PDR_EXCEL_HEADERS = ["TOTAL SHIFT RUNNING","TOTAL ACTUAL MANPOWER","TOTAL REQ'D MANPOWER","STATUS","MACHINE NO.","MACHINE TONNAGE","DATE","shift","No.of hrs.","WORK ORDER NO.","SKU PART","WORK ORDER QTY","MOLD","COLOR","MATERIAL TYPE-GRADE (1)","MATERIAL TYPE-GRADE (2)","ADDITIVE","NET WT./shot, gm (all cavs.)","SPRUE WT, gm.","ACTUAL GR.WT/ pc, gm.","STD. GR.WT/pc, gm.","WEIGHT VARIATION, gm","WEIGHT VARIATION, %","STD MANPOWER","ACT MANPOWER","Machine Operator","Helper1","Helper2","Helper3","REMARKS","REMARKS","NO. OF CAVITIES","ROBOT UTILIZED          1 = YES                        0 = NO                        ","DOSER UTILIZED          1 = YES                        0 = NO                        ","ACTUAL CYCLE TIME, sec/shot","STD CYCLE TIME, sec/shot","TARGET SHOTS/SHIFT, shots","ACTUAL SHOTS/SHIFT, shots","GOOD OUTPUT, pieces","PRODUCTION REJECT, pieces","START UP REJECT, pcs (color/mold change)","01 BM=BURN MARK","03 CO=CONTAMINATION","02 CS=COLOR STREAK","04 CR=CRACK/BRITTLE","05 DI=DISCOLORATION","06 EM=EJECTOR MARK","07 FL=FLASHES","08 FM=FLOW MARK/ WRINKLE","09 NO= NO SHOT","10 OC=OVER-CUT","11 SC=SCRATCH","12 SS=SHORT SHOT","13 SI=SILICONE MARK","14 SK=SILVER STREAK","15 SM=SINK MARK","16 ST=STUCK","17 VO=VOID","18 WA=WARP","19 WM=WATER MARK","20 WL=WELD LINE","01 Machine Issue/Breakdown/Repair","02 Machine Parameter Adjustment ","03 Material Issue/Delay/Drying","04 Mold Issue/Repair/Cleaning","05 No Manpower/Operator","06 Material Color Change","07 Mold Change","08 Preventive Maintenance","09 No production schedule","10 Start-up/Shutdown","11 No Reliever","12 Mold / Color/Matl Testing","13 Power Interruption","14 Robot Set-up /Adj't/Repair","15 Others:","TOTAL DOWNTIME","Reliever Operator/s","Maintenance - Mold Setter","Material Loader","Machine Operator","Production Supervisor","ENCODED BY:","Shift Time","Planned Downtime","Unplanned Downtime","Planned Operation Time","Actual Operation Time","AVAILABILITY","PERFORMANCE","QUALITY","REJECTION RATE","OEE","CYCLE TIME EFFICIENCY","IDEAL MC OPTR OUTPUT","MC OPERATOR EFFICIENCY","ROBOT UTILIZATION","ROBOT UTILIZATION","DOSER UTILIZATION","DOSER UTILIZATION","GC REPORT"];
+  const PDR_REJECT_CODES = ["BM","CO","CS","CR","DI","EM","FL","FM","NO","OC","SC","SS","SI","SK","SM","ST","VO","WA","WM","WL"];
+  function pdrSingaporeParts(value){
+    const date = new Date(value); if(Number.isNaN(date.getTime())) return null;
+    const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Singapore",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"}).formatToParts(date).filter(x=>x.type!=="literal").map(x=>[x.type,x.value]));
+    return {year:+p.year,month:+p.month,day:+p.day,hour:+p.hour,minute:+p.minute};
+  }
+  function pdrShiftBucket(row){
+    let stamp=String(row?.started_at_utc||"").trim(),fallback=false;
+    if(!stamp){const end=new Date(row?.ended_at_utc||row?.finished_at_utc||"");if(!Number.isNaN(end.getTime())){stamp=new Date(end.getTime()-1).toISOString();fallback=true;}}
+    const p=pdrSingaporeParts(stamp); if(!p)return {key:"Unknown|Unknown",date:"Unknown",shift:"Unknown",order:2,fallback:true};
+    let date=`${p.year}-${String(p.month).padStart(2,"0")}-${String(p.day).padStart(2,"0")}`; const am=p.hour>=pdrAmBoundaryHour&&p.hour<pdrNightBoundaryHour;
+    if(!am&&p.hour<pdrAmBoundaryHour)date=new Date(Date.UTC(p.year,p.month-1,p.day)-86400000).toISOString().slice(0,10);
+    const shift=am?"AM":"PM"; return {key:`${date}|${shift}`,date,shift,order:am?0:1,fallback};
+  }
+  function pdrDistinct(rows,getter){return [...new Set(rows.map(getter).flat().map(v=>String(v??"").trim()).filter(Boolean))].join("; ")||"-";}
+  function pdrSum(rows,getter){const v=rows.map(getter).filter(x=>x!==null&&x!==undefined&&x!==""&&Number.isFinite(Number(x)));return v.length?v.reduce((s,x)=>s+Number(x),0):"-";}
+  function pdrJob(r){return extractJobRecord(r)||r?.job_payload?.data?.job||{};}
+  function pdrDetail(r){return extractJobDetailsRecord(r)||{};}
+  function pdrReject(rows,code){return pdrSum(rows,r=>{if(code==="NO"&&r.no_shot_total!==undefined)return r.no_shot_total;const b=r.reject_breakdown&&typeof r.reject_breakdown==="object"?r.reject_breakdown:{};const hit=Object.entries(b).find(([k])=>String(k).trim().toUpperCase().split(/[^A-Z0-9]+/).includes(code));return hit?hit[1]:null;});}
+  function pdrGroupRows(rows){
+    const unique=new Map();(Array.isArray(rows)?rows:[]).forEach(r=>unique.set(jobKeyOf(r),r));const out=new Map();
+    unique.forEach(r=>{const bucket=pdrShiftBucket(r),machine=String(r.machine_code||r.machine_name||"UNKNOWN").trim()||"UNKNOWN",key=`${bucket.key}|${machine}`;if(!out.has(key))out.set(key,{bucket,machine,rows:[]});out.get(key).rows.push(r);});
+    return [...out.values()].sort((a,b)=>a.bucket.date.localeCompare(b.bucket.date)||a.bucket.order-b.bucket.order||a.machine.localeCompare(b.machine,undefined,{numeric:true}));
+  }
+  function pdrMonthLabel(monthKey){
+    const match=String(monthKey||"").match(/^(\d{4})-(\d{2})$/);if(!match)return String(monthKey||"Unknown");
+    return new Intl.DateTimeFormat("en",{month:"long",year:"numeric",timeZone:"UTC"}).format(new Date(Date.UTC(Number(match[1]),Number(match[2])-1,1)));
+  }
+  function pdrWeightValues(row){
+    if(row._pdr_machine_status) return ["-", "-", "-"];
+    const supplied = Number(row.standard_product_weight_kg);
+    const standardKg = Number.isFinite(supplied) && supplied > 0 ? supplied : rawPartRows(row)
+      .filter(isRawMaterialPart)
+      .reduce((sum, part) => {
+        const rate = Number(standardJobApiPartRate(part));
+        return sum + (Number.isFinite(rate) && rate > 0 ? rate : 0);
+      }, 0);
+    if(!(standardKg > 0)) return ["-", "-", "-"];
+    const standardGrams = standardKg * 1000;
+    const format = value => String(Number(value.toFixed(3)));
+    const actualGrams = Number(row.external_average_weight_grams);
+    if(!Number.isFinite(actualGrams) || actualGrams <= 0) return [format(standardGrams), "-", "-"];
+    const difference = actualGrams - standardGrams;
+    return [format(standardGrams), format(difference), `${format(difference / standardGrams * 100)}%`];
+  }
+  function pdrValues(group){
+    const rows=group.rows,production=rows.filter(r=>!r._pdr_machine_status),physical=production.filter(r=>String(r.linkage_role||"").toUpperCase()!=="LINKED"),metrics=physical.length?physical:production,d=g=>pdrDistinct(rows,g),v=Array(101).fill("-");v[3]=d(r=>r.review_status);v[4]=d(r=>r.machine_name||MACHINE_NAME_MAP[r.machine_code]||r.machine_code);v[5]=d(r=>pdrDetail(r).machine_tons||r.machine_tonnage);v[6]=group.bucket.date;v[7]=group.bucket.shift;
+    v[9]=d(r=>pdrJob(r).ref_no||r.job_code);v[10]=d(r=>r.product_sku||pdrJob(r).product_sku||pdrJob(r).sku);v[11]=d(r=>pdrJob(r).request_qty||pdrJob(r).approve_qty);v[12]=d(r=>pdrDetail(r).mold||pdrDetail(r).mold_no||pdrJob(r).custom_05);v[13]=d(r=>pdrDetail(r).color||pdrJob(r).custom_06);
+    v[19]=d(r=>r.external_average_weight_grams);v[25]=d(r=>r.operator_name||displayNameForId(r.operator_id||""));v[29]=v[30]=""; /* Temporarily hide both Remarks values in the PDR only. */v[31]=d(r=>pdrDetail(r).no_of_cavity||pdrJob(r).custom_04);v[34]=d(r=>r.cycle_time_shift_avg_seconds??r.cycle_time_current);v[35]=d(r=>pdrDetail(r).std_cycle_time);
+    v[38]=pdrSum(metrics,r=>r.good_total??(r.total_good!==undefined&&r.butal_total!==undefined?Number(r.total_good)-Number(r.butal_total):null));v[39]=pdrSum(metrics,r=>r.reject_total);v[40]=pdrSum(metrics,r=>r.startup_reject_total);PDR_REJECT_CODES.forEach((c,i)=>v[41+i]=pdrReject(metrics,c));v[77]=d(r=>r.reliever_name||r.reliever_id);v[78]=d(r=>r.mold_setter_name||r.maintenance_mold_setter_name);v[79]=d(r=>r.material_loader_name||r.loader_name);v[80]=v[25];v[81]=d(r=>r.supervisor_name||r.approved_by);v[82]=d(r=>r.encoded_by);v[83]=group.bucket.shift==="AM"?`${String(pdrAmBoundaryHour).padStart(2,"0")}:00-${String(pdrNightBoundaryHour).padStart(2,"0")}:00`:group.bucket.shift==="PM"?`${String(pdrNightBoundaryHour).padStart(2,"0")}:00-${String(pdrAmBoundaryHour).padStart(2,"0")}:00`:"-";
+    const materialNames = [...new Set(rows.flatMap(r => {
+      const data = r.job_payload?.data || r.job_payload || {};
+      const parts = data.parts || data.job_details?.parts || [];
+      return (Array.isArray(parts) ? parts : []).filter(p => String(p.sku || p.part_sku || "").startsWith("Z-RM"))
+        .map(p => p.name || p.part_name || p.sku).filter(Boolean);
+    }))];
+    v[14] = materialNames[0] || "-";
+    v[15] = materialNames.slice(1).join("; ") || "-";
+    // Report convention: first operator is primary; all other people are helpers.
+    const people = new Map();
+    const addPerson = person => {
+      if(!person || typeof person !== "object") return;
+      const id = String(person.operator_id || person.operator_code || person.code || person.operator || "").trim();
+      const name = String(person.operator_name || person.name || displayNameForId(id) || "").trim();
+      if(!name || name === "-") return;
+      const key = (id ? id.split(" - ")[0] : name).trim().toUpperCase();
+      if(!people.has(key)) people.set(key, name);
+    };
+    rows.forEach(addPerson);
+    rows.forEach(r => (Array.isArray(r.crew_members) ? r.crew_members : []).forEach(addPerson));
+    const names = [...people.values()];
+    v[1] = names.length;
+    v[24] = v[1];
+    v[25] = names[0] || "-";
+    v[80] = v[25];
+    v[26] = names[1] || "-";
+    v[27] = names[2] || "-";
+    v[28] = names.slice(3).join("; ") || "-";
+    const downtimeLogs = new Map();
+    metrics.forEach(r => (Array.isArray(r.pdr_downtime_logs) ? r.pdr_downtime_logs : []).forEach(log => {
+      if(!log || typeof log !== "object") return;
+      const key = JSON.stringify([r.machine_code || group.machine, log.started_at_utc || log.finished_at_utc, log.downtime_index,
+        log.started_at_utc || log.finished_at_utc ? null : log]);
+      downtimeLogs.set(key, log);
+    }));
+    if(downtimeLogs.size || (metrics.length && metrics.every(r => Array.isArray(r.pdr_downtime_logs)))){
+      const secondsByReason = Array(15).fill(0);
+      let totalSeconds = 0;
+      const seconds = value => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
+      downtimeLogs.forEach(log => {
+        const segments = Array.isArray(log.reason_segments) ? log.reason_segments.filter(s => s && typeof s === "object") : [];
+        const parts = segments.length ? segments : [log];
+        parts.forEach(part => {
+          const code = Number(part.reason_code);
+          if(Number.isInteger(code) && code >= 1 && code <= 15) secondsByReason[code - 1] += seconds(part.duration_seconds);
+        });
+        totalSeconds += log.duration_seconds != null ? seconds(log.duration_seconds) : parts.reduce((sum, part) => sum + seconds(part.duration_seconds), 0);
+      });
+      const duration = value => {
+        const t = Math.floor(value);
+        return [Math.floor(t / 3600), Math.floor(t % 3600 / 60), t % 60].map(n => String(n).padStart(2, "0")).join(":");
+      };
+      secondsByReason.forEach((seconds, index) => v[61 + index] = duration(seconds));
+      v[76] = duration(totalSeconds);
+    }
+    const weights = production.map(pdrWeightValues);
+    [20, 21, 22].forEach((column, index) => v[column] = pdrDistinct(weights, values => values[index]));
+    v[37] = pdrSum(metrics, r => r.machine_counter_app_delta);
+    return v;
+  }
+  function pdrDateValues(groups){
+    const values = groups.map(pdrValues);
+    const totalManpower = values.reduce((sum, row) => sum + (Number(row[24]) || 0), 0);
+    const totalShiftRunning = values.filter(row => String(row[3] || "").split(";").some(status => status.trim().toUpperCase() === "APPROVED")).length;
+    values.forEach((row, index) => {
+      row[0] = index === 0 ? totalShiftRunning : "";
+      row[1] = index === 0 ? totalManpower : "";
+    });
+    return values;
+  }
+  function pdrCell(value, index){
+    const text = String(value ?? "").trim();
+    const isRejectOrDowntime = index >= 39 && index <= 76;
+    const duration = /^\d+:\d{2}(?::\d{2})?$/.test(text);
+    const positive = duration ? text.split(":").some(part => Number(part) > 0) : Number(text) > 0;
+    let cellClass = isRejectOrDowntime && positive ? "pdr-alert-value" : "";
+    if(index === 3){
+      const statuses = text.toUpperCase().split(";").map(status => status.trim());
+      if(statuses.includes("NOT WORKING")) cellClass = "pdr-status-stopped";
+      else if(statuses.includes("SCHEDULED FOR FIX")) cellClass = "pdr-status-repair";
+      else if(statuses.includes("APPROVED") || statuses.includes("RUNNING")) cellClass = "pdr-status-running";
+      else if(statuses.includes("NO SCHEDULE")) cellClass = "pdr-status-idle";
+    }
+    return `<td${cellClass ? ` class="${cellClass}"` : ""}>${esc(value)}</td>`;
+  }
+  function pdrMachineStatusRows(archive, overrides, now = Date.now()){
+    const records = [...(Array.isArray(archive) ? archive : [])];
+    Object.entries(overrides || {}).forEach(([machine_code, status]) => {
+      if(status && !records.some(row => row.machine_code === machine_code && !row.ended_at_utc))
+        records.push({...status, machine_code, started_at_utc:status.started_at_utc || status.updated_at_utc});
+    });
+    const result = [];
+    const dayMs = 86400000, offsetMs = 8 * 3600000;
+    const cutoff = Date.parse("2026-06-01T00:00:00+08:00");
+    records.forEach(record => {
+      if(!record || !["No schedule", "Scheduled for fix", "Not working"].includes(record.status) || !record.machine_code) return;
+      const start = Math.max(Date.parse(record.started_at_utc), cutoff);
+      const end = Math.min(record.ended_at_utc ? Date.parse(record.ended_at_utc) : now, now);
+      if(!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+      const firstDay = Math.floor((start + offsetMs) / dayMs) * dayMs - offsetMs - dayMs;
+      for(let day = firstDay; day < end; day += dayMs){
+        const bounds = [day + pdrAmBoundaryHour * 3600000, day + pdrNightBoundaryHour * 3600000, day + dayMs + pdrAmBoundaryHour * 3600000];
+        for(let shift = 0; shift < 2; shift++){
+          const from = Math.max(start, bounds[shift]), to = Math.min(end, bounds[shift + 1]);
+          if(to <= from) continue;
+          result.push({
+            machine_code:record.machine_code, machine_name:record.machine_name || MACHINE_NAME_MAP[record.machine_code] || record.machine_code,
+            started_at_utc:new Date(from).toISOString(), ended_at_utc:new Date(to).toISOString(),
+            finished_at_utc:new Date(to).toISOString(), review_status:record.status,
+            _pdr_machine_status:true, manpower_count:0,
+          });
+        }
+      }
+    });
+    return result;
+  }
+  function renderFinishedShiftPdr(rows){
+    rows = (rows || []).map(row => ({...row, ...(pdrDetailCache.get(jobKeyOf(row)) || {})}));
+    rows = rows.concat(pdrMachineStatusRows(machineStatusArchiveState, machineStatusOverridesState));
+    if(!finishedShiftPdrView)return;const machines=pdrGroupRows(rows),months=new Map();
+    machines.forEach(group=>{const month=group.bucket.date.slice(0,7);if(!months.has(month))months.set(month,new Map());const days=months.get(month);if(!days.has(group.bucket.date))days.set(group.bucket.date,new Map());const shifts=days.get(group.bucket.date);if(!shifts.has(group.bucket.key))shifts.set(group.bucket.key,[]);shifts.get(group.bucket.key).push(group);});
+    if(!machines.length){if(pdrMonthFilter)pdrMonthFilter.innerHTML="";finishedShiftPdrView.innerHTML='<div class="placeholder">No finished shifts yet.</div>';return;}
+    const rowMonthKeys=[...months.keys()].sort(),monthKeys=(pdrAvailableMonths.length?pdrAvailableMonths:rowMonthKeys).filter(key=>/^\d{4}-\d{2}$/.test(key));if(pdrMonthFilter){const latestMonth=monthKeys[monthKeys.length-1]||rowMonthKeys[rowMonthKeys.length-1],selected=monthKeys.includes(pdrLoadedMonth)?pdrLoadedMonth:(monthKeys.includes(pdrMonthFilter.value)?pdrMonthFilter.value:latestMonth);pdrMonthFilter.innerHTML=monthKeys.map(key=>`<option value="${escAttr(key)}" ${key===selected?"selected":""}>${esc(pdrMonthLabel(key))}</option>`).join("");}
+    const selectedMonth=pdrMonthFilter?.value||monthKeys[monthKeys.length-1],days=months.get(selectedMonth)||new Map();
+    finishedShiftPdrView.innerHTML=[...days.entries()].map(([date,shiftMap])=>{
+      const shifts=[...shiftMap.values()].sort((a,b)=>a[0].bucket.order-b[0].bucket.order);
+      const groups=shifts.flat();
+      const dateValues=pdrDateValues(groups);
+      return `<section class="pdr-date-group">
+        <div class="pdr-date-group-head"><strong>${esc(date)}</strong>${shifts.map(shift=>`<span>${esc(shift[0].bucket.shift)} Shift: ${shift.length} machine${shift.length===1?"":"s"}</span>`).join("")}</div>
+        <div class="pdr-excel-scroll"><table class="pdr-excel-table">
+          <thead><tr>${PDR_EXCEL_HEADERS.map((header,index)=>`<th data-column-index="${index}">${esc(header)}</th>`).join("")}</tr></thead>
+          <tbody>${dateValues.map(values=>`<tr>${values.map(pdrCell).join("")}</tr>`).join("")}</tbody>
+        </table></div>
+      </section>`;
+    }).join("");
+  }
+  const pdrDetailCache = new Map();
+  let pdrLoadGeneration = 0;
+  async function loadPdrMonth(month = ""){
+    if(pdrMonthLoading) return;
+    pdrMonthLoading = true;
+    const requestedMonth = String(month || pdrMonthFilter?.value || "");
+    if(pdrRefreshBtn) pdrRefreshBtn.disabled = true;
+    if(pdrDetailLoadStatus) pdrDetailLoadStatus.textContent = "Loading report...";
+    try {
+      const query = requestedMonth ? `?month=${encodeURIComponent(requestedMonth)}` : "";
+      const response = await fetch(`/api/pdr/month${query}`, {cache:"no-store"});
+      const body = await response.json();
+      if(!response.ok || !body?.ok) throw new Error(body?.error || `HTTP ${response.status}`);
+      pdrAvailableMonths = Array.isArray(body.months) ? body.months : [];
+      pdrSummaryState = Array.isArray(body.items) ? body.items : [];
+      pdrLoadedMonth = String(body.month || "");
+      pdrDetailCache.clear();
+      pdrLoadGeneration += 1;
+      renderFinishedShiftPdr(pdrSummaryState);
+      hydrateSelectedPdrMonth();
+    } catch(error) {
+      console.error("Unable to load PDR month", error);
+      if(pdrDetailLoadStatus) pdrDetailLoadStatus.textContent = "Unable to load this report. Use Refresh to try again.";
+    } finally {
+      pdrMonthLoading = false;
+      if(pdrRefreshBtn) pdrRefreshBtn.disabled = false;
+    }
+  }
+  async function hydrateSelectedPdrMonth(){
+    const generation = ++pdrLoadGeneration;
+    const selectedMonth = String(pdrMonthFilter?.value || "");
+    const selectedRows = pdrSummaryState.filter(row => pdrShiftBucket(row).date.slice(0,7) === selectedMonth);
+    let failed = 0;
+    for(let i = 0; i < selectedRows.length; i += 12){
+      const batch = selectedRows.slice(i, i + 12).filter(row => !pdrDetailCache.has(jobKeyOf(row)));
+      try {
+        if(batch.length){
+          const response = await fetch("/api/finished-jobs/details", {
+            method:"POST", headers:{"Content-Type":"application/json"}, cache:"no-store",
+            body:JSON.stringify({job_keys:batch.map(jobKeyOf)}),
+          });
+          const body = await response.json();
+          if(!response.ok || !body?.ok) throw new Error("Details unavailable");
+          const details = Array.isArray(body.items) ? body.items : [];
+          const returned = new Set();
+          details.forEach(entry => { if(entry?.job_key && entry?.item){pdrDetailCache.set(entry.job_key, entry.item);returned.add(entry.job_key);} });
+          failed += batch.filter(row => !returned.has(jobKeyOf(row))).length;
+        }
+      } catch(error) { failed += batch.length; }
+      if(generation !== pdrLoadGeneration) return;
+      if(pdrDetailLoadStatus) pdrDetailLoadStatus.textContent = `Loading ${Math.min(i + 12, selectedRows.length)} / ${selectedRows.length} records`;
+    }
+    if(generation !== pdrLoadGeneration) return;
+    renderFinishedShiftPdr(pdrSummaryState);
+    if(pdrDetailLoadStatus) pdrDetailLoadStatus.textContent = failed
+      ? `${failed} details unavailable; select the month again to retry. Dashes mean unavailable data.`
+      : `${selectedRows.length} records loaded for ${pdrMonthLabel(selectedMonth)}. Dashes mean unavailable data or undefined calculations.`;
+  }
+
   function machineSupervisorActivityRows(session){
     const source = session && typeof session === "object" ? session : {};
     const rotationSource = Array.isArray(source.supervisor_rotation_summary_logs)
@@ -18791,7 +21160,10 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       .map(row => ({
         kind: "review",
         title: "Supervisor review",
-        person: firstValue(row.actor_name, row.actor_code, "Supervisor"),
+        person: String(row.actor_code || "").trim().toLowerCase() === "svisorreview~1"
+          || String(row.actor_name || "").trim().toUpperCase() === "SUPERVISOR REVIEW"
+          ? "Name not recorded"
+          : firstValue(row.actor_name, row.actor_code, "Name not recorded"),
         role: firstValue(row.actor_role, "SUPERVISOR"),
         status: firstValue(row.action, row.status, "Reviewed"),
         at: firstValue(row.closed_at_utc, row.last_updated_at_utc, row.opened_at_utc, ""),
@@ -18802,6 +21174,100 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       const bTime = Date.parse(String(b.at || ""));
       return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
     });
+  }
+
+  function mixingJobKey(row){
+    return String(row?.mixing_job_key || row?.job_code || row?.job_name || "").trim().toUpperCase();
+  }
+
+  function machineMixingJobs(session){
+    const source = session && typeof session === "object" ? session : {};
+    const rows = Array.isArray(source.mixing_open_jobs)
+      ? source.mixing_open_jobs.filter(row => row && typeof row === "object")
+      : [];
+    const unique = [];
+    const seen = new Set();
+    rows.forEach(row => {
+      const key = mixingJobKey(row);
+      if(!key || seen.has(key)) return;
+      seen.add(key);
+      unique.push(row);
+    });
+    return unique;
+  }
+
+  function machineDetailSessionForMixingJob(session, requestedKey = ""){
+    const rows = machineMixingJobs(session);
+    if(!rows.length) return session;
+    let key = String(requestedKey || "").trim().toUpperCase();
+    const clientActive = rows.find(row => Boolean(row.mixing_active)) || null;
+    const clientActiveKey = mixingJobKey(clientActive);
+    // Preserve a server-dashboard manual selection while the client stays on
+    // the same job. As soon as the Mixing client changes ACTIVE, follow it.
+    if(clientActiveKey && clientActiveKey !== activeMachineDetailClientMixingJobKey){
+      key = clientActiveKey;
+      activeMachineDetailClientMixingJobKey = clientActiveKey;
+    }
+    let selected = rows.find(row => mixingJobKey(row) === key) || null;
+    if(!selected){
+      selected = clientActive
+        || rows.find(row => mixingJobKey(row) === mixingJobKey(session))
+        || rows[0];
+      key = mixingJobKey(selected);
+    }
+    activeMachineDetailMixingJobKey = key;
+    return {
+      ...session,
+      ...selected,
+      machine_code: session.machine_code,
+      machine_name: session.machine_name,
+      client_id: session.client_id,
+      last_seen_utc: session.last_seen_utc,
+      mixing_open_jobs: rows,
+      _mixing_job_displayed: true,
+    };
+  }
+
+  function positionMachineDetailMixingJobsMenu(){
+    if(!machineDetailMixingJobsBtn || !machineDetailMixingJobsMenu || machineDetailMixingJobsMenu.hidden) return;
+    const rect = machineDetailMixingJobsBtn.getBoundingClientRect();
+    const menuWidth = Math.min(390, Math.max(270, window.innerWidth - 24));
+    const left = Math.max(12, Math.min(window.innerWidth - menuWidth - 12, rect.right - menuWidth));
+    machineDetailMixingJobsMenu.style.width = `${menuWidth}px`;
+    machineDetailMixingJobsMenu.style.left = `${left}px`;
+    machineDetailMixingJobsMenu.style.top = `${Math.min(window.innerHeight - 70, rect.bottom + 7)}px`;
+  }
+
+  function setMachineDetailMixingJobsMenuOpen(open){
+    if(!machineDetailMixingJobsBtn || !machineDetailMixingJobsMenu) return;
+    const shouldOpen = Boolean(open && !machineDetailMixingJobsBtn.hidden && machineDetailMixingJobsMenu.children.length);
+    machineDetailMixingJobsMenu.hidden = !shouldOpen;
+    machineDetailMixingJobsBtn.setAttribute("aria-expanded", shouldOpen ? "true" : "false");
+    if(shouldOpen) requestAnimationFrame(positionMachineDetailMixingJobsMenu);
+  }
+
+  function syncMachineDetailMixingJobs(session){
+    if(!machineDetailMixingJobsBtn || !machineDetailMixingJobsMenu) return;
+    const rows = machineMixingJobs(session);
+    setMachineDetailMixingJobsMenuOpen(false);
+    if(rows.length < 2){
+      machineDetailMixingJobsBtn.hidden = true;
+      machineDetailMixingJobsMenu.innerHTML = "";
+      return;
+    }
+    machineDetailMixingJobsBtn.hidden = false;
+    machineDetailMixingJobsBtn.innerHTML = `<span class="mixing-jobs-dot" aria-hidden="true"></span><span>Mixing Jobs ${esc(rows.length)}</span><span class="mixing-jobs-caret" aria-hidden="true">&#9662;</span>`;
+    machineDetailMixingJobsMenu.innerHTML = rows.map(row => {
+      const key = mixingJobKey(row);
+      const isActive = key === activeMachineDetailMixingJobKey;
+      const name = firstValue(row.job_name, row.job_code, "Mixing Job");
+      const code = firstValue(row.job_code, key, "-");
+      return `<button class="machine-mixing-job-option${isActive ? " active" : ""}" type="button" role="menuitem" data-mixing-job-key="${esc(key)}">
+        <span class="mixing-job-name">${esc(name)}</span>
+        <span class="mixing-job-state">${isActive ? "Viewing" : "Running"}</span>
+        <span class="mixing-job-code">Job ${esc(code)}</span>
+      </button>`;
+    }).join("");
   }
 
   function positionMachineDetailSupervisorMenu(){
@@ -18870,11 +21336,12 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       : (Array.isArray(source.supervisor_review_logs) ? source.supervisor_review_logs : []))
       .filter(row => row && typeof row === "object");
     const rotationCount = Math.max(rotations.length, Number(source.supervisor_rotation_count || 0));
-    const total = rotationCount + reviews.length;
+    const indicator = machineSupervisorIndicator(source);
     setMachineDetailSupervisorMenuOpen(false);
     machineDetailSupervisorBtn.hidden = false;
-    machineDetailSupervisorBtn.innerHTML = `<span class="supervisor-check-dot" aria-hidden="true"></span><span>Supervisor ${esc(total)}</span><span class="supervisor-caret" aria-hidden="true">&#9662;</span>`;
-    machineDetailSupervisorBtn.title = `${rotationCount} rotation check${rotationCount === 1 ? "" : "s"} | ${reviews.length} review${reviews.length === 1 ? "" : "s"}`;
+    machineDetailSupervisorBtn.dataset.supervisorState = indicator.state;
+    machineDetailSupervisorBtn.innerHTML = `<span class="supervisor-check-dot" aria-hidden="true"></span><span>Supervisor ${esc(indicator.rotationCount)} / ${esc(indicator.reviewCount)}</span><span class="supervisor-caret" aria-hidden="true">&#9662;</span>`;
+    machineDetailSupervisorBtn.title = indicator.title;
     renderMachineDetailSupervisorMenu(source);
   }
 
@@ -19031,12 +21498,94 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     machinePartialCloseBtn?.focus();
   }
 
+  const machineUptimeState = new Map();
+  function machineUptimeStarted(session, code, css, manual, now = Date.now()){
+    const uptimeStopped = isNoScheduleStatus(manual?.status);
+    const storageKey = `machine-uptime-v1:${code}`;
+    if(!machineUptimeState.has(code)){
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(storageKey) || "null"); } catch(error) {}
+      machineUptimeState.set(code, saved);
+    }
+    const previous = machineUptimeState.get(code);
+    let next = previous;
+    if(uptimeStopped) next = {started: null, downtimeSeconds: 0, lastRawDowntimeSeconds: 0, sessionKey: ""};
+    else if(!previous || !Number.isFinite(previous.started)){
+      const candidates = [manual?.started_at_utc, manual?.updated_at_utc, session.job_started_at, session.started_at_utc]
+        .map(value => Date.parse(value || "")).filter(value => Number.isFinite(value) && value <= now);
+      const rawDowntime = Math.max(0, Number(session?.downtime_total_seconds || 0));
+      next = {
+        started: previous ? now : candidates.length ? Math.min(...candidates) : now,
+        downtimeSeconds: rawDowntime,
+        lastRawDowntimeSeconds: rawDowntime,
+        sessionKey: String(session?.production_session_id || session?.job_code || ""),
+      };
+    } else {
+      const hasDowntimeReading = session?.downtime_total_seconds !== undefined && session?.downtime_total_seconds !== null;
+      if(hasDowntimeReading){
+        const rawDowntime = Math.max(0, Number(session.downtime_total_seconds || 0));
+        const previousRaw = Math.max(0, Number(previous.lastRawDowntimeSeconds || 0));
+        const sessionKey = String(session.production_session_id || session.job_code || "");
+        const sessionChanged = Boolean(previous.sessionKey && sessionKey && previous.sessionKey !== sessionKey);
+        next = {
+          ...previous,
+          downtimeSeconds: Math.max(0, Number(previous.downtimeSeconds || 0)) + (sessionChanged ? rawDowntime : Math.max(0, rawDowntime - previousRaw)),
+          lastRawDowntimeSeconds: rawDowntime,
+          sessionKey,
+        };
+      }
+    }
+    if(!previous || JSON.stringify(previous) !== JSON.stringify(next)){
+      machineUptimeState.set(code, next);
+      try { localStorage.setItem(storageKey, JSON.stringify(next)); } catch(error) {}
+    }
+    return uptimeStopped ? "" : new Date(next.started).toISOString();
+  }
+  function machineUptimeBreakdown(code, now = Date.now()){
+    const state = machineUptimeState.get(code) || {};
+    if(!Number.isFinite(state.started)) return null;
+    const totalSeconds = Math.max(0, Math.floor((now - state.started) / 1000));
+    const downtimeSeconds = Math.min(totalSeconds, Math.max(0, Math.floor(Number(state.downtimeSeconds || 0))));
+    return {totalSeconds, downtimeSeconds, utilizedSeconds: Math.max(0, totalSeconds - downtimeSeconds)};
+  }
+  function renderMachineTimeModal(now = Date.now()){
+    if(!activeMachineTimeCode) return;
+    const session = (latestState?.sessions || []).find(row => String(row?.machine_code || "").trim() === activeMachineTimeCode) || {};
+    const machineName = session.machine_name || MACHINE_NAME_MAP[activeMachineTimeCode] || activeMachineTimeCode;
+    const metrics = machineUptimeBreakdown(activeMachineTimeCode, now);
+    if(machineTimeMachine) machineTimeMachine.textContent = `${machineName} (${activeMachineTimeCode})`;
+    if(machineTimeTotal) machineTimeTotal.textContent = metrics ? fmtStatusDuration(metrics.totalSeconds) : "Not running";
+    if(machineTimeUtilized) machineTimeUtilized.textContent = metrics ? fmtStatusDuration(metrics.utilizedSeconds) : "—";
+    if(machineTimeDowntime) machineTimeDowntime.textContent = metrics ? fmtStatusDuration(metrics.downtimeSeconds) : "—";
+    const hasReportedRpiUptime = session.rpi_uptime_seconds !== null && session.rpi_uptime_seconds !== undefined && session.rpi_uptime_seconds !== "";
+    const reportedRpiUptime = Number(session.rpi_uptime_seconds);
+    const reportedRpiAt = Date.parse(session.rpi_uptime_reported_at_utc || session.last_seen_utc || "");
+    const liveRpiUptime = hasReportedRpiUptime && Number.isFinite(reportedRpiUptime) && reportedRpiUptime >= 0
+      ? reportedRpiUptime + (Number.isFinite(reportedRpiAt) ? Math.max(0, Math.floor((now - reportedRpiAt) / 1000)) : 0)
+      : null;
+    if(machineTimeRpi) machineTimeRpi.textContent = liveRpiUptime === null ? "Waiting for client update" : fmtStatusDuration(liveRpiUptime);
+    if(machineTimeNote) machineTimeNote.textContent = metrics
+      ? "PDR downtime is included in total uptime because the machine remains up, but it is deducted from utilized time."
+      : "Machine runtime starts when the machine becomes active and resets after Inactive or No schedule status.";
+  }
+  function openMachineTime(code){
+    activeMachineTimeCode = String(code || "").trim();
+    if(!activeMachineTimeCode || !machineTimeOverlay) return;
+    renderMachineTimeModal();
+    machineTimeOverlay.classList.add("active");
+    machineTimeCloseBtn?.focus();
+  }
+  function closeMachineTime(){
+    machineTimeOverlay?.classList.remove("active");
+    activeMachineTimeCode = "";
+  }
   function machineCardHtml(s, code, css, statusLabel, flipLinkage = false){
     const manual = machineStatusOverrideFor(code);
     const manualStatus = String((manual && manual.status) || "").trim();
     const machineName = s.machine_name || MACHINE_NAME_MAP[code] || s.machine_code || code || "-";
     const linkageDisplay = machineLinkageDisplay(s, code);
     const displayedJob = linkageDisplay.current || {};
+    const mixingJobCount = machineMixingJobs(s).length;
     const hasLinkedJobs = linkageDisplay.total > 1;
     const showLinkedJobButton = hasLinkedJobs;
     const supervisor = firstValue(manual?.set_by_name, manual?.supervisor_name, manual?.set_by_badge, "-");
@@ -19050,6 +21599,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const lastAction = meaningfulMachineAction(s);
     const statusText = statusLabel || css.toUpperCase();
     const tonnage = String((latestState?.machine_tonnage && latestState.machine_tonnage[code]) || "").trim();
+    const uptimeStarted = machineUptimeStarted(s, code, css, manual);
     const operatorText = manualStatus
       ? `${supervisor}${supervisorRole ? ` (${supervisorRole})` : ""}`
       : displayNameForId(s.operator_id || "-");
@@ -19102,9 +21652,10 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       supervisorRotationName ? `Last: ${supervisorRotationName}` : "",
       supervisorRotationLast ? fmtDateLocal(supervisorRotationLast) : "",
     ].filter(Boolean).join(" | ");
-    const supervisorRotationBadge = supervisorRotationCount > 0 ? `
-      <span class="machine-supervisor-rotation" title="${esc(supervisorRotationTitle)}" aria-label="${esc(supervisorRotationTitle)}">
-        <span class="machine-supervisor-rotation-dot" aria-hidden="true"></span>${esc(supervisorRotationCount)}
+    const supervisorIndicator = machineSupervisorIndicator(s);
+    const supervisorRotationBadge = (s.job_code || s.job_name || supervisorIndicator.rotationCount || supervisorIndicator.reviewCount) ? `
+      <span class="machine-supervisor-rotation" data-supervisor-state="${supervisorIndicator.state}" title="${esc(supervisorIndicator.title)}" aria-label="${esc(supervisorIndicator.title)}">
+        <span class="machine-supervisor-rotation-dot" aria-hidden="true"></span>${esc(supervisorIndicator.rotationCount)} / ${esc(supervisorIndicator.reviewCount)}
       </span>
     ` : "";
     const supervisorTooltip = [
@@ -19118,6 +21669,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       </div>
     ` : "";
     const alertMeta = machineCardAlertMeta(s, code, css);
+    const machineTimeButton = `<button class="machine-time-btn" type="button" aria-label="View machine runtime for ${esc(machineName)}" title="View total uptime, utilized time, and PDR downtime"><svg class="clock" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg><span>Time</span></button>`;
     return `
       ${supervisorNotif}
       <div class="machine-card-face machine-card-face-normal">
@@ -19125,12 +21677,15 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
           <div class="machine-card-title">
             <h3>${esc(machineName)}</h3>
             ${s.is_test_machine ? `<span class="machine-test-only-pill">TEST ONLY</span>` : ""}
+            ${mixingJobCount > 1 ? `<span class="machine-mixing-jobs-pill">${esc(mixingJobCount)} MIXING JOBS</span>` : ""}
             ${supervisorRotationBadge}
             ${alertMeta.pills.map(alert => `<span class="machine-card-alert-pill ${esc(alert.kind)} ${esc(alert.prominence)}" title="${esc(alert.title)}">${esc(alert.label)}</span>`).join("")}
           </div>
           <div class="machine-card-status-stack">
             <span class="machine-status-badge ${esc(css)}">${esc(statusText)}</span>
             ${tonnage ? `<span class="machine-tonnage">${esc(tonnage)}</span>` : ""}
+            ${uptimeStarted ? `<span class="machine-uptime" data-uptime-started="${esc(uptimeStarted)}">Uptime ${esc(fmtStatusDuration(Math.max(0, Math.floor((Date.now() - Date.parse(uptimeStarted)) / 1000))))}</span>` : ""}
+            ${machineTimeButton}
           </div>
         </div>
         <div class="machine-compact-meta">
@@ -19147,7 +21702,10 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         <div class="machine-compact-bottom">
           ${manualStatus ? `
             <div class="machine-compact-duration">
-              <span class="clock">Γù╖</span>
+              <svg class="clock" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <circle cx="12" cy="12" r="9"></circle>
+                <path d="M12 7v5l3 2"></path>
+              </svg>
               <span class="machine-status-live-duration" data-status-started="${esc(statusStartedAt)}">${esc(statusDuration)}</span>
             </div>
           ` : css === "disconnected" ? `
@@ -19171,6 +21729,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
           <strong>${esc(machineName)}</strong>
           <div class="machine-hover-head-actions">
             <span>${esc(tonnage || statusText)}</span>
+            ${machineTimeButton}
           </div>
         </div>
         <div class="machine-hover-counters">
@@ -19203,11 +21762,18 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   }
 
   function updateMachineStatusDurations(){
+    document.querySelectorAll(".machine-uptime[data-uptime-started]").forEach(el => {
+      const startedMs = Date.parse(el.dataset.uptimeStarted || "");
+      if(!Number.isFinite(startedMs)) return;
+      const totalSeconds = Math.max(0, Math.floor((Date.now() - startedMs) / 1000));
+      el.textContent = `Uptime ${fmtStatusDuration(totalSeconds)}`;
+    });
     document.querySelectorAll(".machine-status-live-duration[data-status-started]").forEach(el => {
       const startedMs = Date.parse(String(el.dataset.statusStarted || ""));
       if(!Number.isFinite(startedMs)) return;
       el.textContent = fmtStatusDuration(Math.max(0, Math.floor((Date.now() - startedMs) / 1000)));
     });
+    if(machineTimeOverlay?.classList.contains("active")) renderMachineTimeModal();
   }
   window.setInterval(updateMachineStatusDurations, 1000);
 
@@ -19321,7 +21887,9 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       s.machine_name = s.machine_name || MACHINE_NAME_MAP[code] || code;
       const card = upsertMachineCard(s, code, css, statusLabel);
       card.hidden = Boolean(hideInactiveMachines && css === "inactive");
-      const targetGrid = isFactory4Machine(code, s) ? additionalMachineGrid : machineGrid;
+      const targetGrid = isMixingMachine(code)
+        ? mixingMachineGrid
+        : (isFactory4Machine(code, s) ? additionalMachineGrid : machineGrid);
       if(card.parentNode !== targetGrid){
         targetGrid?.appendChild(card);
       }
@@ -19343,7 +21911,10 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     renderDashboardSectionIfChanged("job-queue", state.job_queue || [], () => renderJobQueue(state.job_queue || []));
     renderDashboardSectionIfChanged("finished-jobs", state.finished_jobs || [], () => renderFinishedJobs(state.finished_jobs || []));
     renderDashboardSectionIfChanged("archived-jobs", state.archived_jobs || [], () => renderArchivedJobs(state.archived_jobs || []));
-    renderDashboardSectionIfChanged("machine-status-archive", machineStatusArchiveState, () => renderMachineStatusArchive(machineStatusArchiveState));
+    renderDashboardSectionIfChanged("machine-status-archive", machineStatusArchiveState, () => {
+      renderMachineStatusArchive(machineStatusArchiveState);
+      renderFinishedShiftPdr(pdrSummaryState);
+    });
     renderDashboardSectionIfChanged("downtime-archive", [state.finished_jobs || [], state.archived_jobs || []], () => renderDowntimeArchive(state.finished_jobs || [], state.archived_jobs || []));
     renderDashboardSectionIfChanged("maintenance", [state.sessions || [], state.daily_roles || [], state.maintenance_profiles || []], () => renderMaintenanceTab(state || {}));
     renderDashboardSectionIfChanged("planning-summary", [state.planning_board || {}, state.job_queue || []], () => renderPlanningOpsSummary(state || {}, state.job_queue || []));
@@ -19448,6 +22019,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         machineFilterBtn?.setAttribute("aria-expanded", "false");
       }
       if(target === "finishShiftTab") loadCompleteFinishedHistory();
+      if(target === "pdrTab") loadPdrMonth();
       if(target === "userKpiTab") loadUserKpis();
       if(target === "planningTab" && !lowStockItemsState.length) loadLowStockRecommendations(false);
       if(target !== "planningTab"){
@@ -19458,6 +22030,16 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       }
     });
   });
+  const requestedDashboardTab = String(location.hash || "").replace(/^#/, "");
+  if(requestedDashboardTab === "userKpiTab"){
+    // Production Cards can be expensive to build. Do not reopen it merely
+    // because an in-page link left its hash in the browser address bar.
+    history.replaceState(null, "", `${location.pathname}${location.search}`);
+  }else if(requestedDashboardTab){
+    const requestedTabButton = Array.from(document.querySelectorAll(".main-tab-button"))
+      .find(btn => btn.getAttribute("data-target") === requestedDashboardTab);
+    requestedTabButton?.click();
+  }
   document.addEventListener("pointerout", (ev) => {
     const partButton = ev.target && ev.target.closest ? ev.target.closest(".job-part-sku-button") : null;
     if(partButton && !partButton.contains(ev.relatedTarget)) partButton.classList.remove("tooltip-dismissed");
@@ -19601,6 +22183,20 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   if(userKpiRefreshBtn){
     userKpiRefreshBtn.addEventListener("click", () => loadUserKpis(userKpiRoleState));
   }
+  if(userKpiDateBtn){
+    userKpiDateBtn.textContent = new Date().toLocaleDateString("en-US", {
+      month: "long",
+      day: "numeric",
+      year: "numeric",
+    });
+  }
+  if(userKpiThemeBtn){
+    userKpiThemeBtn.addEventListener("click", async () => {
+      await loadServerSettingsUi(false);
+      showServerSettingsPage("theme");
+      serverSettingsOverlay?.classList.add("active");
+    });
+  }
   async function openMachineCard(code){
     const machineCode = String(code || "").trim();
     if(!machineCode) return;
@@ -19616,13 +22212,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     const timeoutId = window.setTimeout(() => controller?.abort(), 8000);
     try{
-      const response = await fetch(`/api/sessions/${encodeURIComponent(machineCode)}`, {
+      const response = await fetch(`/api/active-sessions/${encodeURIComponent(machineCode)}`, {
         cache:"no-store",
         signal:controller?.signal,
       });
       const body = await response.json();
-      if(response.ok && body?.ok && body.session){
-        fresh = {...fresh, ...body.session, summary_only: false};
+      if(response.ok && body?.ok && body.item){
+        fresh = {...fresh, ...body.item, summary_only: false};
         if(Array.isArray(latestState?.sessions)){
           latestState.sessions = latestState.sessions.map(row =>
             String(row?.machine_code || "").trim() === machineCode ? fresh : row
@@ -19654,6 +22250,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const code = String(card.getAttribute("data-machine-code") || "").trim();
     if(!code) return;
     ev.preventDefault();
+    const timeBtn = eventPath.find(node => node instanceof Element && node.matches?.(".machine-time-btn"))
+      || target?.closest(".machine-time-btn");
+    if(timeBtn){
+      ev.stopPropagation();
+      openMachineTime(code);
+      return;
+    }
     const switchBtn = eventPath.find(node => node instanceof Element && node.matches?.(".machine-linkage-switch"))
       || target?.closest(".machine-linkage-switch");
     if(switchBtn){
@@ -19669,12 +22272,18 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const card = ev.target?.closest?.("[data-machine-code]");
     if(!card) return;
     ev.preventDefault();
+    if(ev.target?.closest?.(".machine-time-btn")){
+      openMachineTime(card.getAttribute("data-machine-code"));
+      return;
+    }
     void openMachineCard(card.getAttribute("data-machine-code"));
   };
   machineGrid?.addEventListener("pointerdown", handleMachineGridPointerDown);
   additionalMachineGrid?.addEventListener("pointerdown", handleMachineGridPointerDown);
+  mixingMachineGrid?.addEventListener("pointerdown", handleMachineGridPointerDown);
   machineGrid?.addEventListener("keydown", handleMachineGridKeyDown);
   additionalMachineGrid?.addEventListener("keydown", handleMachineGridKeyDown);
+  mixingMachineGrid?.addEventListener("keydown", handleMachineGridKeyDown);
   if(userKpiTableWrap){
     userKpiTableWrap.addEventListener("click", (ev) => {
       const card = ev.target && ev.target.closest ? ev.target.closest("[data-user-kpi-index]") : null;
@@ -19697,6 +22306,19 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   if(userKpiDetailOverlay){
     userKpiDetailOverlay.addEventListener("click", (ev) => {
       if(ev.target === userKpiDetailOverlay) userKpiDetailOverlay.classList.remove("active");
+      const detailTab = ev.target && ev.target.closest ? ev.target.closest("[data-user-kpi-detail-tab]") : null;
+      if(detailTab){
+        const target = detailTab.getAttribute("data-user-kpi-detail-tab");
+        userKpiDetailOverlay.querySelectorAll("[data-user-kpi-detail-tab]").forEach(tab => {
+          const selected = tab === detailTab;
+          tab.classList.toggle("active", selected);
+          tab.setAttribute("aria-selected", selected ? "true" : "false");
+        });
+        userKpiDetailOverlay.querySelectorAll("[data-user-kpi-detail-panel]").forEach(panel => {
+          panel.hidden = panel.getAttribute("data-user-kpi-detail-panel") !== target;
+        });
+        return;
+      }
       const jobRow = ev.target && ev.target.closest ? ev.target.closest("[data-user-kpi-job-index]") : null;
       if(!jobRow) return;
       const jobIdx = Number(jobRow.getAttribute("data-user-kpi-job-index") || "-1");
@@ -19731,6 +22353,17 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       host.querySelector(`#${target}`)?.classList.add("active");
     });
   }
+  [pdrAmStartHour,pdrNightStartHour].forEach(input => input?.addEventListener("change", () => {
+    const am = Number(pdrAmStartHour?.value), night = Number(pdrNightStartHour?.value);
+    if(Number.isInteger(am) && Number.isInteger(night) && am >= 0 && am < night && night <= 23){
+      pdrAmBoundaryHour = am; pdrNightBoundaryHour = night; renderFinishedShiftPdr(pdrSummaryState);
+      hydrateSelectedPdrMonth();
+    }
+  }));
+  pdrMonthFilter?.addEventListener("change", () => {
+    loadPdrMonth(pdrMonthFilter.value);
+  });
+  pdrRefreshBtn?.addEventListener("click", () => loadPdrMonth(pdrMonthFilter?.value || pdrLoadedMonth));
 
   if(planningLookupBtn){
     planningLookupBtn.addEventListener("click", () => addPlanningJobFromInput());
@@ -19945,39 +22578,53 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
         // The selected view still works for this page session.
       }
       renderFinishedShiftQueue(finishedShiftState);
+      renderFinishedShiftQueue(
+        mixingFinishedShiftState,
+        mixingShiftQueueList,
+        "No mixing shifts are waiting for review."
+      );
     });
   });
   // The shift queue is rebuilt by live polling. Handle the initial pointer
   // press so replacement of the button cannot swallow the action.
-  finishedShiftQueueList?.addEventListener("pointerdown", async (ev) => {
-    if(ev.button !== undefined && ev.button !== 0) return;
-    const target = ev.target instanceof Element ? ev.target : null;
-    const btn = target?.closest(".shift-review-btn");
-    if(!btn) return;
-    ev.preventDefault();
-    const idx = Number(btn.getAttribute("data-row-index"));
-    if(Number.isNaN(idx) || idx < 0) return;
-    const sorted = [...(finishedShiftState || [])].reverse();
-    const row = sorted[idx];
-    if(!row) return;
-    let detailRow = row;
-    try {
-      btn.disabled = true;
-      btn.textContent = "Loading...";
-      const resp = await fetch(`/api/finished-jobs/detail?job_key=${encodeURIComponent(jobKeyOf(row))}`);
-      const out = await resp.json();
-      if(!resp.ok || !out.ok || !out.item) throw new Error(out.error || `HTTP ${resp.status}`);
-      detailRow = out.item;
-    } catch(err) {
-      alert(`Unable to load finished-shift details: ${err?.message || err}`);
-      renderFinishedShiftQueue(finishedShiftState);
-      return;
-    }
-    openApprovePrintOverlay(detailRow);
-    setOverlayStep("review");
-    if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = "none";
-    if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = isApprovedShiftRecord(detailRow) ? "Save Changes" : "Approve & Continue";
-  });
+  function bindFinishedShiftReviewList(listElement, stateRows, emptyText = "No finished shifts yet."){
+    listElement?.addEventListener("pointerdown", async (ev) => {
+      if(ev.button !== undefined && ev.button !== 0) return;
+      const target = ev.target instanceof Element ? ev.target : null;
+      const btn = target?.closest(".shift-review-btn");
+      if(!btn) return;
+      ev.preventDefault();
+      const idx = Number(btn.getAttribute("data-row-index"));
+      if(Number.isNaN(idx) || idx < 0) return;
+      const rows = stateRows();
+      const sorted = [...rows].reverse();
+      const row = sorted[idx];
+      if(!row) return;
+      let detailRow = row;
+      try {
+        btn.disabled = true;
+        btn.textContent = "Loading...";
+        const resp = await fetch(`/api/finished-jobs/detail?job_key=${encodeURIComponent(jobKeyOf(row))}`);
+        const out = await resp.json();
+        if(!resp.ok || !out.ok || !out.item) throw new Error(out.error || `HTTP ${resp.status}`);
+        detailRow = out.item;
+      } catch(err) {
+        alert(`Unable to load finished-shift details: ${err?.message || err}`);
+        renderFinishedShiftQueue(rows, listElement, emptyText);
+        return;
+      }
+      openApprovePrintOverlay(detailRow);
+      setOverlayStep("review");
+      if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = "none";
+      if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = isApprovedShiftRecord(detailRow) ? "Save Changes" : "Approve & Continue";
+    });
+  }
+  bindFinishedShiftReviewList(finishedShiftQueueList, () => finishedShiftState);
+  bindFinishedShiftReviewList(
+    mixingShiftQueueList,
+    () => mixingFinishedShiftState,
+    "No mixing shifts are waiting for review."
+  );
   function toggleLinkedJobComparison(ev, root){
     const target = ev.target instanceof Element ? ev.target : null;
     const btn = target?.closest(".toggle-linked-job-btn");
@@ -20068,13 +22715,40 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     syncReviewSubslides();
   });
   machineDetailCloseBtn.addEventListener("click", closeMachineDetail);
+  machineTimeCloseBtn?.addEventListener("click", closeMachineTime);
+  machineTimeOverlay?.addEventListener("click", ev => {
+    if(ev.target === machineTimeOverlay) closeMachineTime();
+  });
+  machineDetailMixingJobsBtn?.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    setMachineDetailSupervisorMenuOpen(false);
+    setMachineDetailFinishShiftsMenuOpen(false);
+    setMachineDetailMixingJobsMenuOpen(machineDetailMixingJobsMenu?.hidden !== false);
+  });
+  machineDetailMixingJobsMenu?.addEventListener("click", (ev) => {
+    const option = ev.target instanceof Element ? ev.target.closest("[data-mixing-job-key]") : null;
+    if(!option) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const jobKey = String(option.getAttribute("data-mixing-job-key") || "").trim().toUpperCase();
+    const machineCode = String(activeMachineDetailCode || "").trim();
+    const fresh = (Array.isArray(latestState?.sessions) ? latestState.sessions : []).find(row =>
+      String(row?.machine_code || "").trim() === machineCode
+    );
+    if(!jobKey || !fresh) return;
+    activeMachineDetailMixingJobKey = jobKey;
+    setMachineDetailMixingJobsMenuOpen(false);
+    openMachineDetail(fresh);
+  });
   machineDetailSupervisorBtn?.addEventListener("click", (ev) => {
     ev.stopPropagation();
+    setMachineDetailMixingJobsMenuOpen(false);
     setMachineDetailFinishShiftsMenuOpen(false);
     setMachineDetailSupervisorMenuOpen(machineDetailSupervisorMenu?.hidden !== false);
   });
   machineDetailFinishShiftsBtn?.addEventListener("click", (ev) => {
     ev.stopPropagation();
+    setMachineDetailMixingJobsMenuOpen(false);
     setMachineDetailSupervisorMenuOpen(false);
     setMachineDetailFinishShiftsMenuOpen(machineDetailFinishShiftsMenu?.hidden !== false);
   });
@@ -20089,6 +22763,11 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     await openMachineLatestPartialReview(code, option, jobKey);
   });
   document.addEventListener("pointerdown", ev => {
+    if(machineDetailMixingJobsMenu?.hidden === false
+      && !machineDetailMixingJobsBtn?.contains(ev.target)
+      && !machineDetailMixingJobsMenu?.contains(ev.target)){
+      setMachineDetailMixingJobsMenuOpen(false);
+    }
     if(machineDetailSupervisorMenu?.hidden === false
       && !machineDetailSupervisorBtn?.contains(ev.target)
       && !machineDetailSupervisorMenu?.contains(ev.target)){
@@ -20101,6 +22780,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     }
   });
   window.addEventListener("resize", () => {
+    if(machineDetailMixingJobsMenu?.hidden === false) positionMachineDetailMixingJobsMenu();
     if(machineDetailSupervisorMenu?.hidden === false) positionMachineDetailSupervisorMenu();
     if(machineDetailFinishShiftsMenu?.hidden === false) positionMachineDetailFinishShiftsMenu();
   });
@@ -20507,11 +23187,10 @@ Archive warning: ${e}`;
   // Apply saved dashboard theme/settings immediately on page load.
   loadServerSettingsUi(true).catch(() => {});
 
-  // Warm product cache on page load so overlay opens fast.
-  loadProducts(false).then(() => {
-    // Optional background refresh; does not block UI.
-    loadProducts(true).catch(() => {});
-  }).catch(() => {});
+  // Load the local product cache on page load so the overlay opens fast.
+  // A fresh catalog download remains available through Settings >
+  // Update Product Items; avoid repeating that expensive request per reload.
+  loadProducts(false).catch(() => {});
 </script>
 </body>
 </html>
@@ -20538,7 +23217,10 @@ DASHBOARD_PAGE_HTML, DASHBOARD_CSS, DASHBOARD_JAVASCRIPT, DASHBOARD_ASSET_VERSIO
 
 @APP.get("/", response_class=HTMLResponse)
 def dashboard():
-    return HTMLResponse(DASHBOARD_PAGE_HTML)
+    return HTMLResponse(
+        DASHBOARD_PAGE_HTML,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @APP.get("/assets/dashboard.css")
@@ -20567,84 +23249,299 @@ PROFILE_CREATOR_HTML = """
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Profile QR Creator</title>
   <style>
-    body { margin: 0; font-family: Poppins, Segoe UI, sans-serif; background: #eef2f7 url('/Images/bgbg.png') center / cover fixed no-repeat; color: #1f2937; }
-    .wrap { max-width: 980px; margin: 22px auto; padding: 0 14px; }
-    .card { background: rgba(255,255,255,.96); border: 1px solid #dbe4f0; border-radius: 16px; box-shadow: 0 20px 48px rgba(15,23,42,.18), 0 6px 16px rgba(15,23,42,.10); overflow: hidden; }
-    .head { padding: 16px 18px; border-bottom: 1px solid #e5e7eb; font-weight: 800; font-size: 1.05rem; }
-    .body { padding: 16px 18px; display: grid; grid-template-columns: 1fr 380px; gap: 16px; }
-    .form { display: grid; gap: 10px; }
-    .row { display: grid; gap: 6px; }
-    label { font-size: .86rem; font-weight: 700; color: #475569; }
-    input, select { border: 1px solid #cbd5e1; border-radius: 10px; padding: 10px 12px; font: inherit; background: rgba(255,255,255,.98); box-shadow: 0 10px 22px rgba(15,23,42,.18), 0 2px 6px rgba(15,23,42,.08), inset 0 1px 0 rgba(255,255,255,.75); }
-    input:focus, select:focus { outline: none; border-color: #60a5fa; box-shadow: 0 0 0 4px rgba(59,130,246,.22), 0 14px 28px rgba(15,23,42,.20); }
-    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
-    button { border: none; border-radius: 12px; padding: 10px 14px; cursor: pointer; font-weight: 600; transition: transform .12s ease, box-shadow .16s ease; }
-    button:hover { transform: translateY(-1px); box-shadow: 0 8px 18px rgba(15,23,42,.10); }
-    button:active { transform: translateY(0) scale(.985); }
-    .primary { background: #1d4ed8; color: #fff; }
-    .secondary { background: #fff; color: #1f2937; border: 1px solid #cbd5e1; }
-    .preview { border: 1px solid #dbe4f0; border-radius: 14px; background: rgba(248,250,252,.95); padding: 12px; box-shadow: 0 14px 30px rgba(15,23,42,.14), inset 0 1px 0 rgba(255,255,255,.7); }
-    .preview h4 { margin: 0 0 8px; }
-    .preview img { width: 100%; height: auto; border: 1px solid #dbe4f0; border-radius: 10px; background: #fff; }
-    .mono { font-family: Consolas, monospace; font-size: .75rem; white-space: pre-wrap; word-break: break-all; margin-top: 8px; background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:8px; }
-    .status { font-size: .85rem; color: #334155; min-height: 20px; }
-    .table { margin-top: 14px; border: 1px solid #dbe4f0; border-radius: 12px; overflow: auto; background: rgba(255,255,255,.96); box-shadow: 0 18px 38px rgba(15,23,42,.15), 0 4px 12px rgba(15,23,42,.08); }
-    table { width: 100%; border-collapse: collapse; min-width: 720px; }
-    th, td { border-bottom: 1px solid #edf2f7; padding: 8px 10px; text-align: left; font-size: .84rem; }
-    th { background: #f8fafc; }
-    .mini-btn { border: 1px solid #cbd5e1; background: #fff; color: #1f2937; border-radius: 10px; padding: 6px 9px; font-size: .78rem; font-weight: 600; cursor:pointer; }
-    .mini-btn.primary { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
-    .mini-btn.danger { background: #fff1f2; color: #be123c; border-color: #fecdd3; }
-    .mini-actions { display:flex; gap:6px; flex-wrap:wrap; }
-    .photo-row { display:grid; grid-template-columns:58px minmax(0,1fr); gap:10px; align-items:center; border:1px solid #dbe4f0; border-radius:12px; padding:10px; background:#f8fafc; }
-    .photo-preview { width:52px; height:52px; border-radius:50%; border:1px solid #cbd5e1; background:#e2e8f0; object-fit:cover; display:block; }
-    .photo-help { margin-top:4px; font-size:.74rem; color:#64748b; }
-    .profile-thumb { width:34px; height:34px; border-radius:50%; object-fit:cover; border:1px solid #cbd5e1; background:#e2e8f0; display:block; }
-    body[data-theme="Soft Gray"] { background: #eef1f4 url('/Images/bgbg.png') center / cover fixed no-repeat; color: #243041; }
-    body[data-theme="Soft Gray"] .card, body[data-theme="Soft Gray"] .table { background: rgba(248,250,252,.96); border-color: #dbe2eb; }
-    body[data-theme="Soft Gray"] .head { border-bottom-color: #dbe2eb; color: #334155; }
-    body[data-theme="Soft Gray"] label { color: #475569; }
-    body[data-theme="Soft Gray"] input, body[data-theme="Soft Gray"] select { border-color: #dbe2eb; color: #334155; }
-    body[data-theme="Soft Gray"] .preview { border-color: #dbe2eb; background: rgba(248,250,252,.95); }
-    body[data-theme="Soft Gray"] th { background: #f8fafc; color: #475569; }
-    body[data-theme="Dark"] { background: #0b1220 url('/Images/bgbg.png') center / cover fixed no-repeat; color: #e5e7eb; }
-    body[data-theme="Dark"] .card, body[data-theme="Dark"] .table { background: rgba(15,23,42,.96); border-color: #334155; box-shadow: 0 20px 48px rgba(0,0,0,.40), 0 6px 16px rgba(0,0,0,.25); }
-    body[data-theme="Dark"] .head { border-bottom-color: #334155; color: #e5e7eb; }
-    body[data-theme="Dark"] label { color: #cbd5e1; }
-    body[data-theme="Dark"] input, body[data-theme="Dark"] select { background: rgba(17,24,39,.96); border-color: #334155; color: #e5e7eb; box-shadow: 0 10px 22px rgba(0,0,0,.28), 0 2px 6px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.03); }
-    body[data-theme="Dark"] input:focus, body[data-theme="Dark"] select:focus { border-color: #60a5fa; box-shadow: 0 0 0 4px rgba(59,130,246,.22), 0 14px 28px rgba(0,0,0,.30); }
-    body[data-theme="Dark"] .secondary { background: #111827; color: #e5e7eb; border-color: #334155; }
-    body[data-theme="Dark"] .primary { background: #2563eb; }
-    body[data-theme="Dark"] .preview { border-color: #334155; background: rgba(17,24,39,.92); }
-    body[data-theme="Dark"] .preview h4, body[data-theme="Dark"] .status { color: #e5e7eb; }
-    body[data-theme="Dark"] .preview img, body[data-theme="Dark"] .mono { background: #0f172a; border-color: #334155; color: #cbd5e1; }
-    body[data-theme="Dark"] th { background: #1f2937; color: #cbd5e1; }
-    body[data-theme="Dark"] td { border-bottom-color: #253041; color: #e5e7eb; }
-    body[data-theme="Dark"] .mini-btn { background: #111827; color: #e5e7eb; border-color: #334155; }
-    body[data-theme="Dark"] .mini-btn.primary { background: #1d4ed8; border-color: #3b82f6; }
-    body[data-theme="Dark"] .mini-btn.danger { background: rgba(127,29,29,.22); color: #fecdd3; border-color: #7f1d1d; }
-    body[data-theme="Red"] { background: #fff4f4 url('/Images/bgbg.png') center / cover fixed no-repeat; color: #7f1d1d; }
-    body[data-theme="Red"] .card, body[data-theme="Red"] .table { background: rgba(255,255,255,.96); border-color: #fecaca; }
-    body[data-theme="Red"] .head { border-bottom-color: #fecaca; color: #7f1d1d; }
-    body[data-theme="Red"] label { color: #991b1b; }
-    body[data-theme="Red"] input, body[data-theme="Red"] select { border-color: #fecaca; color: #7f1d1d; }
-    body[data-theme="Red"] .preview { border-color: #fecaca; background: rgba(255,247,247,.95); }
-    body[data-theme="Red"] th { background: #fef2f2; color: #991b1b; }
-    body[data-theme="Red"] td { border-bottom-color: #fee2e2; color: #7f1d1d; }
-    body[data-theme="Red"] .secondary { border-color: #fecaca; color: #7f1d1d; }
-    body[data-theme="Red"] .primary { background: #dc2626; }
-    @media (max-width: 900px) { .body { grid-template-columns: 1fr; } }
+    * { box-sizing: border-box; }
+    html, body { width:100%; height:100%; min-height:100%; }
+    body { margin:0; overflow:hidden; font-size:clamp(16px, 1vw, 19px); font-family:Inter, Poppins, "Segoe UI", sans-serif; background:var(--ui-subtle); color:var(--ui-text); }
+    .wrap { width:100%; max-width:none; height:100dvh; margin:0; padding:clamp(14px,1.2vw,24px); overflow:hidden; }
+    .page-title { margin:0; font-size:clamp(1.55rem,1.7vw,2rem); line-height:1.15; font-weight:800; letter-spacing:-.025em; }
+    .page-subtitle { margin:7px 0 clamp(14px,1.2vw,22px); color:var(--ui-muted); font-size:.86rem; }
+    .creator-grid { display:grid; grid-template-columns:minmax(0,1.65fr) minmax(360px,1fr); gap:clamp(16px,1.2vw,24px); }
+    .card { min-width:0; background:var(--ui-surface); border:1px solid var(--ui-border); border-radius:clamp(14px,1vw,18px); box-shadow:0 1px 3px rgba(15,23,42,.04); overflow:hidden; }
+    .head { padding:clamp(18px,1.25vw,24px) clamp(20px,1.5vw,30px) 5px; border:0; font-size:.9rem; font-weight:800; }
+    .body { padding:clamp(12px,.9vw,18px) clamp(20px,1.5vw,30px) clamp(18px,1.3vw,25px); }
+    .form { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:clamp(12px,.9vw,17px) clamp(16px,1.25vw,25px); }
+    .row { min-width:0; display:grid; align-content:start; gap:6px; }
+    label { font-size:.78rem; line-height:1.15; font-weight:700; color:var(--ui-text); }
+    input, select { width:100%; height:clamp(40px,2.7vw,48px); border:1px solid var(--ui-border); border-radius:10px; padding:0 clamp(12px,.9vw,17px); font:inherit; font-size:.82rem; background:var(--ui-surface); color:var(--ui-text); box-shadow:0 1px 2px rgba(15,23,42,.02); }
+    input::placeholder { color:var(--ui-muted); }
+    input:focus, select:focus { outline:none; border-color:var(--ui-accent); box-shadow:0 0 0 3px rgba(37,99,235,.10); }
+    .actions { grid-column:1 / -1; display:flex; gap:clamp(10px,.8vw,15px); flex-wrap:wrap; margin-top:4px; padding-top:clamp(14px,1vw,19px); border-top:1px solid var(--ui-border); }
+    button { min-height:clamp(40px,2.7vw,48px); border:1px solid transparent; border-radius:10px; padding:0 clamp(15px,1vw,20px); cursor:pointer; font:inherit; font-size:.8rem; font-weight:750; transition:background .15s ease, border-color .15s ease, transform .12s ease; }
+    button:hover { transform:translateY(-1px); }
+    button:active { transform:translateY(0); }
+    .primary { background:var(--ui-accent); color:var(--ui-on-accent); }
+    .primary:hover { background:var(--ui-accent); }
+    .secondary { background:var(--ui-surface); color:var(--ui-text); border-color:var(--ui-border); }
+    .status { grid-column:1 / -1; min-height:17px; color:var(--ui-muted); font-size:.75rem; }
+    .photo-row { min-height:38px; display:flex; align-items:center; gap:8px; }
+    .photo-preview { width:40px; height:40px; flex:0 0 40px; border-radius:50%; border:1px solid var(--ui-border); background:var(--ui-subtle); object-fit:cover; display:block; }
+    .photo-input-wrap { min-width:0; flex:1; }
+    .photo-input-wrap input { height:clamp(40px,2.7vw,48px); padding:7px 10px; font-size:.75rem; }
+    .photo-help { margin-top:5px; color:var(--ui-muted); font-size:.7rem; line-height:1.25; }
+    .preview-card .body { height:calc(100% - 46px); padding-top:12px; }
+    .preview { position:relative; min-height:clamp(220px,24vh,300px); height:100%; display:flex; align-items:center; justify-content:center; overflow:hidden; border:1px dashed var(--ui-border); border-radius:13px; background:var(--ui-surface); padding:18px; }
+    .preview-empty { display:grid; justify-items:center; gap:10px; max-width:290px; color:var(--ui-muted); text-align:center; font-size:.72rem; line-height:1.45; }
+    .preview-empty svg { width:46px; height:46px; color:var(--ui-muted); }
+    .preview.has-image .preview-empty { display:none; }
+    .preview img { display:none; max-width:100%; max-height:180px; width:auto; height:auto; border:0; background:var(--ui-surface); object-fit:contain; }
+    .preview.has-image img { display:block; }
+    .mono { display:none; }
+    .profile-toolbar { display:flex; align-items:center; gap:clamp(10px,.9vw,16px); margin:clamp(14px,1.1vw,20px) 0 clamp(9px,.7vw,13px); }
+    .profile-search-wrap { position:relative; flex:1; min-width:180px; }
+    .profile-search-wrap svg { position:absolute; left:15px; top:50%; width:18px; height:18px; color:var(--ui-muted); transform:translateY(-50%); pointer-events:none; }
+    .profile-search-wrap input { height:clamp(42px,2.8vw,50px); padding-left:44px; }
+    .profile-filters { display:flex; gap:clamp(7px,.6vw,11px); }
+    .filter-btn { min-height:clamp(42px,2.8vw,50px); background:var(--ui-surface); border-color:var(--ui-border); color:var(--ui-text); white-space:nowrap; }
+    .filter-btn.active { background:#111827; border-color:var(--ui-border); color:var(--ui-on-accent); }
+    .table { width:100%; border:1px solid var(--ui-border); border-radius:13px; overflow:hidden; background:var(--ui-surface); box-shadow:0 1px 3px rgba(15,23,42,.04); }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; }
+    th, td { overflow:hidden; border-bottom:1px solid var(--ui-border); padding:clamp(11px,.8vw,15px) clamp(9px,.8vw,16px); text-align:left; text-overflow:ellipsis; white-space:nowrap; font-size:.78rem; vertical-align:middle; }
+    th:nth-child(1) { width:18%; }
+    th:nth-child(2) { width:10%; }
+    th:nth-child(3) { width:10%; }
+    th:nth-child(4) { width:8%; }
+    th:nth-child(5) { width:13%; }
+    th:nth-child(6) { width:14%; }
+    th:nth-child(7) { width:6%; }
+    th:nth-child(8) { width:21%; }
+    th { height:clamp(40px,2.8vw,48px); background:var(--ui-subtle); color:var(--ui-muted); font-size:.67rem; font-weight:800; letter-spacing:.055em; text-transform:uppercase; }
+    tbody tr:last-child td { border-bottom:0; }
+    tbody tr:hover { background:var(--ui-surface); }
+    .profile-person { display:flex; align-items:center; gap:12px; min-width:0; font-weight:750; color:var(--ui-text); }
+    .profile-person span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .profile-thumb { width:38px; height:38px; flex:0 0 38px; border-radius:50%; object-fit:cover; border:1px solid var(--ui-border); background:var(--ui-subtle); display:flex; align-items:center; justify-content:center; color:var(--ui-muted); font-size:.62rem; font-weight:700; }
+    .role-pill { display:inline-flex; align-items:center; border-radius:999px; padding:5px 11px; background:var(--ui-subtle); color:var(--ui-link); font-size:.69rem; font-weight:700; }
+    .date-main { color:var(--ui-text); white-space:nowrap; }
+    .date-time { margin-left:4px; color:var(--ui-muted); font-size:.68rem; white-space:nowrap; }
+    .print-count { display:inline-flex; min-width:29px; height:29px; align-items:center; justify-content:center; border-radius:8px; background:var(--ui-subtle); color:var(--ui-muted); font-weight:750; }
+    .mini-actions { display:flex; justify-content:flex-end; gap:7px; white-space:nowrap; }
+    .mini-btn { width:36px; min-width:36px; min-height:36px; height:36px; padding:0; display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--ui-border); background:var(--ui-surface); color:var(--ui-muted); border-radius:9px; font-size:.88rem; cursor:pointer; }
+    .mini-btn.primary { width:auto; min-width:62px; padding:0 14px; background:var(--ui-accent); color:var(--ui-on-accent); border-color:var(--ui-accent); font-size:.72rem; }
+    .mini-btn.danger { background:var(--ui-surface); color:#df5268; border-color:#f0d9df; }
+    .table-footer { width:100%; display:flex; align-items:center; justify-content:space-between; padding:clamp(10px,.8vw,15px) clamp(12px,.9vw,18px); border-top:1px solid var(--ui-border); color:var(--ui-muted); font-size:.74rem; }
+    .pagination { display:flex; align-items:center; gap:10px; }
+    .page-btn { width:36px; min-width:36px; min-height:36px; height:36px; padding:0; background:var(--ui-surface); color:var(--ui-muted); border-color:var(--ui-border); }
+    .page-btn:disabled { opacity:.4; cursor:not-allowed; transform:none; }
+    @media (max-width: 1200px) and (min-width: 821px) {
+      th:nth-child(4), td:nth-child(4), th:nth-child(5), td:nth-child(5) { display:none; }
+      th:nth-child(1) { width:21%; }
+      th:nth-child(2) { width:12%; }
+      th:nth-child(3) { width:12%; }
+      th:nth-child(6) { width:18%; }
+      th:nth-child(7) { width:7%; }
+      th:nth-child(8) { width:30%; }
+      .mini-actions { gap:5px; }
+      .mini-btn { width:34px; min-width:34px; }
+      .mini-btn.primary { min-width:58px; padding:0 11px; }
+    }
+    @media (max-width: 820px) {
+      body { overflow:auto; }
+      .wrap { height:auto; min-height:100dvh; overflow:visible; }
+      .creator-grid { grid-template-columns:1fr; }
+      .form { grid-template-columns:1fr 1fr; }
+      .profile-toolbar { align-items:stretch; flex-direction:column; }
+      .profile-filters { overflow:auto; }
+      th:nth-child(4), td:nth-child(4), th:nth-child(5), td:nth-child(5), th:nth-child(6), td:nth-child(6) { display:none; }
+      th:nth-child(1) { width:27%; }
+      th:nth-child(2) { width:17%; }
+      th:nth-child(3) { width:17%; }
+      th:nth-child(7) { width:9%; }
+      th:nth-child(8) { width:30%; }
+      .mini-actions { gap:4px; }
+      .mini-btn { width:32px; min-width:32px; min-height:32px; height:32px; }
+      .mini-btn.primary { min-width:52px; padding:0 9px; }
+    }
+    @media (max-width: 560px) {
+      .wrap { width:100%; padding:12px 10px; }
+      .form { grid-template-columns:1fr; }
+      .actions { flex-direction:column; }
+      .actions button { width:100%; }
+      .profile-filters { display:grid; grid-template-columns:repeat(3,1fr); }
+      .filter-btn { padding:0 8px; }
+    }
+
+    /* Profiles dashboard layout */
+    body { font-size:clamp(16px,1vw,20px); background:var(--ui-subtle); }
+    .wrap { width:100%; max-width:none; margin:0; padding:clamp(20px,1.6vw,32px); }
+    .dashboard-header { display:flex; align-items:flex-start; justify-content:space-between; gap:24px; margin-bottom:20px; }
+    .page-title { font-size:clamp(1.75rem,2.1vw,2.35rem); }
+    .page-subtitle { margin:8px 0 0; font-size:.9rem; }
+    .summary-strip { display:flex; gap:12px; }
+    .summary-card { width:128px; min-height:68px; display:grid; align-content:center; gap:4px; padding:12px 16px; border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); }
+    .summary-card strong { color:var(--ui-text); font-size:1.15rem; line-height:1; }
+    .summary-card span { color:var(--ui-muted); font-size:.72rem; }
+    .dashboard-grid { display:grid; grid-template-columns:minmax(0,1fr) clamp(420px,28vw,540px); align-items:stretch; gap:clamp(18px,1.4vw,28px); }
+    .profiles-panel { min-width:0; display:flex; flex-direction:column; }
+    .profile-toolbar { margin:0 0 10px; gap:10px; }
+    .profile-search-wrap input, .filter-btn { height:46px; min-height:46px; }
+    .profile-search-wrap input { font-size:.84rem; }
+    .profile-filters { gap:0; padding:3px; border-radius:9px; background:var(--ui-subtle); }
+    .filter-btn { padding:0 18px; border:0; border-radius:7px; background:transparent; font-size:.78rem; }
+    .filter-btn.active { background:#111827; box-shadow:0 1px 2px rgba(15,23,42,.12); }
+    .editor-card { height:100%; border-radius:14px; }
+    .editor-card .head { padding:22px 24px 10px; font-size:1rem; }
+    .editor-card .body { padding:10px 24px 24px; }
+    .editor-card .preview { width:100%; height:230px; min-height:230px; margin-bottom:18px; border-radius:11px; padding:16px; }
+    .editor-card .preview img { max-height:198px; }
+    .editor-card .preview-empty { font-size:.78rem; }
+    .editor-card .preview-empty svg { display:none; }
+    .editor-card .form { grid-template-columns:1fr 1fr; gap:14px 12px; }
+    .editor-card .row.full { grid-column:1 / -1; }
+    .editor-card label { font-size:.76rem; }
+    .editor-card input, .editor-card select { height:46px; padding:0 13px; border-radius:9px; font-size:.82rem; }
+    .editor-card .photo-row { min-height:46px; gap:0; }
+    .editor-card .photo-preview { width:40px; height:40px; flex-basis:40px; margin-right:7px; }
+    .editor-card .photo-input-wrap input { height:46px; padding:7px; font-size:.72rem; }
+    .editor-card .photo-help { grid-column:1 / -1; margin:0; font-size:.71rem; }
+    .editor-card .actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:2px 0 0; padding-top:13px; }
+    .editor-card .actions button { width:100%; height:46px; min-height:46px; padding:0 10px; font-size:.78rem; }
+    .editor-card .actions .primary { grid-column:1 / -1; }
+    .editor-card .status { min-height:16px; font-size:.73rem; }
+    .table { flex:1; display:flex; flex-direction:column; border-radius:12px; }
+    .table > table { flex:none; height:auto; }
+    .empty-row td { height:100%; padding:32px; text-align:center; vertical-align:middle; white-space:normal; }
+    .empty-state { min-height:180px; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:7px; color:var(--ui-muted); }
+    .empty-state strong { color:var(--ui-text); font-size:.95rem; }
+    .empty-state span { font-size:.75rem; }
+    .empty-reset { min-height:36px; margin-top:7px; padding:0 16px; border:1px solid var(--ui-border); border-radius:8px; background:var(--ui-surface); color:var(--ui-text); font-size:.72rem; }
+    th, td { display:table-cell; padding:13px 15px; font-size:.82rem; }
+    th { height:42px; font-size:.68rem; }
+    th:nth-child(1) { width:20%; }
+    th:nth-child(2) { width:11%; }
+    th:nth-child(3) { width:13%; }
+    th:nth-child(4) { width:13%; }
+    th:nth-child(5) { width:20%; }
+    th:nth-child(6) { width:23%; }
+    .profile-thumb { width:40px; height:40px; flex-basis:40px; font-size:.64rem; }
+    .profile-person { gap:12px; }
+    .person-copy, .cell-stack { min-width:0; display:grid; gap:2px; }
+    .person-copy strong { overflow:hidden; color:var(--ui-text); text-overflow:ellipsis; font-size:.82rem; }
+    .person-id, .cell-subtle { color:var(--ui-muted); font-size:.7rem; }
+    .dept-empty { color:var(--ui-muted); line-height:1.3; white-space:normal; }
+    .photo-pill { display:inline-flex; width:max-content; padding:5px 11px; border-radius:999px; background:var(--ui-subtle); color:#2f7d4a; font-size:.7rem; font-weight:700; }
+    .photo-pill.missing { background:#fff0cf; color:#9a6500; }
+    .role-pill { padding:5px 11px; font-size:.7rem; }
+    .mini-actions { gap:6px; }
+    .mini-btn { width:36px; min-width:36px; height:36px; min-height:36px; border-radius:8px; font-size:.84rem; }
+    .mini-btn.primary { min-width:64px; padding:0 13px; font-size:.74rem; }
+    .table-footer { min-height:50px; margin-top:auto; padding:10px 15px; font-size:.74rem; }
+    .page-btn { width:34px; min-width:34px; height:34px; min-height:34px; }
+    @media (max-width:1150px) {
+      .dashboard-grid { grid-template-columns:minmax(0,1fr) 360px; }
+      th:nth-child(3), td:nth-child(3) { display:none; }
+      th:nth-child(1) { width:22%; }
+      th:nth-child(2) { width:12%; }
+      th:nth-child(4) { width:15%; }
+      th:nth-child(5) { width:22%; }
+      th:nth-child(6) { width:29%; }
+    }
+    @media (max-width:850px) {
+      body { overflow:auto; }
+      .wrap { height:auto; min-height:100dvh; overflow:visible; }
+      .dashboard-header { align-items:stretch; flex-direction:column; }
+      .summary-strip { display:grid; grid-template-columns:repeat(3,1fr); }
+      .summary-card { width:auto; }
+      .dashboard-grid { grid-template-columns:1fr; align-items:start; }
+      .profiles-panel { display:block; }
+      .editor-card { grid-row:1; height:auto; }
+      .table { display:block; }
+      .table > table { height:auto; }
+      .profile-toolbar { align-items:stretch; flex-direction:column; }
+      th:nth-child(3), td:nth-child(3), th:nth-child(4), td:nth-child(4) { display:none; }
+      th:nth-child(1) { width:27%; }
+      th:nth-child(2) { width:16%; }
+      th:nth-child(5) { width:24%; }
+      th:nth-child(6) { width:33%; }
+    }
+    @media (max-width:560px) {
+      .wrap { padding:14px 10px; }
+      .summary-card { padding:9px; }
+      .editor-card .form { grid-template-columns:1fr; }
+      .editor-card .row.full, .editor-card .actions, .editor-card .photo-help { grid-column:1; }
+      .editor-card .actions { grid-template-columns:1fr; }
+      .editor-card .actions .primary { grid-column:1; }
+      th:nth-child(2), td:nth-child(2), th:nth-child(5), td:nth-child(5) { display:none; }
+      th:nth-child(1) { width:42%; }
+      th:nth-child(6) { width:58%; }
+      .mini-actions .mini-btn:nth-child(3) { display:none; }
+    }
+
+    /* Shared palette: layout and semantic status colors stay independent. */
+    body {
+      --ui-page:#edf2f7; --ui-surface:#ffffff; --ui-subtle:#f5f7fb;
+      --ui-border:#cbd5e1; --ui-text:#1e293b; --ui-muted:#526277;
+      --ui-accent:#1d4ed8; --ui-accent-soft:#e5edff;
+      --ui-link:var(--ui-accent); --ui-success:#166534;
+      --ui-on-accent:#ffffff; --ui-shadow:rgba(15,23,42,.16);
+      color-scheme:light; background-color:var(--ui-page); color:var(--ui-text);
+    }
+    body[data-theme="Soft Gray"] {
+      --ui-page:#e8ebef; --ui-surface:#f9fafb; --ui-subtle:#eef1f4;
+      --ui-border:#bac3cf; --ui-text:#253140; --ui-muted:#526171;
+      --ui-accent:#475569; --ui-accent-soft:#e1e7ef;
+    }
+    body[data-theme="Blue Accent"] {
+      --ui-page:#e8f0fc; --ui-surface:#ffffff; --ui-subtle:#eff5ff;
+      --ui-border:#b6cbe9; --ui-text:#172e50; --ui-muted:#456287;
+      --ui-accent:#174fc9; --ui-accent-soft:#dce9ff;
+    }
+    body[data-theme="Red"] {
+      --ui-page:#f6ecee; --ui-surface:#fffafa; --ui-subtle:#f8eff1;
+      --ui-border:#ddbec5; --ui-text:#3e252c; --ui-muted:#79545d;
+      --ui-accent:#a31d3b; --ui-accent-soft:#f8dfe5;
+    }
+    body[data-theme="Dark"] {
+      --ui-page:#0e1522; --ui-surface:#182334; --ui-subtle:#202e43;
+      --ui-border:#42536a; --ui-text:#edf3fc; --ui-muted:#b0bfd3;
+      --ui-accent:#2861c9; --ui-accent-soft:#243e63;
+      --ui-link:#8ab4ff; --ui-success:#86efac;
+      --ui-shadow:rgba(0,0,0,.38); color-scheme:dark;
+    }
+    body :is(input,select,textarea) {
+      background-color:var(--ui-surface); color:var(--ui-text);
+      border-color:var(--ui-border); accent-color:var(--ui-accent);
+    }
+    body :is(input,textarea)::placeholder { color:var(--ui-muted); opacity:1; }
+    body :is(button,input,select,textarea,a):focus-visible {
+      outline:3px solid var(--ui-accent); outline-offset:3px;
+    }
+    body ::selection { background:var(--ui-accent); color:var(--ui-on-accent); }
+    body { scrollbar-color:var(--ui-border) var(--ui-subtle); }
+    button { color:inherit; }
+    .person-menu-icon::before, .person-menu-icon::after { border-color:var(--ui-muted); }
+    body[data-theme="Dark"] .menu-ico-img { filter:brightness(0) invert(1); }
+    .main-tab-button.active { background:var(--ui-accent); color:var(--ui-on-accent); }
+    @media print {
+      body, body[data-theme] {
+        --ui-page:#fff; --ui-surface:#fff; --ui-subtle:#f5f7fb;
+        --ui-text:#1e293b; --ui-muted:#526277; --ui-border:#cbd5e1;
+        --ui-accent:#1d4ed8; --ui-accent-soft:#e5edff;
+        --ui-link:#1d4ed8; --ui-success:#166534; color-scheme:light;
+      }
+    }
+
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <div class="head">Profile Creation / QR Generator</div>
-      <div class="body">
-        <div>
+    <header class="dashboard-header">
+      <div>
+        <h1 class="page-title">Profiles &amp; QR</h1>
+        <p class="page-subtitle">Create profiles, add photos, and print ID cards.</p>
+      </div>
+      <div class="summary-strip" aria-label="Profile summary">
+        <div class="summary-card"><strong id="pfTotalCount">0</strong><span>Profiles</span></div>
+        <div class="summary-card"><strong id="pfMissingPhotoCount">—</strong><span>Missing photo</span></div>
+        <div class="summary-card"><strong id="pfNotPrintedCount">—</strong><span>Not printed</span></div>
+      </div>
+    </header>
+    <div class="creator-grid">
+      <section class="card">
+        <div class="head">New profile</div>
+        <div class="body">
           <div class="form">
-            <div class="row"><label>Name</label><input id="pfName" type="text" /></div>
-            <div class="row"><label>ID Number</label><input id="pfId" type="text" /></div>
+            <div class="row"><label for="pfName">Name</label><input id="pfName" type="text" placeholder="Full name" /></div>
+            <div class="row"><label for="pfId">ID number</label><input id="pfId" type="text" placeholder="e.g. 26-01252" /></div>
             <div class="row"><label>Company Role</label>
               <select id="pfRole">
                 <option>Supervisor</option>
@@ -20656,48 +23553,112 @@ PROFILE_CREATOR_HTML = """
                 <option>Production Manager</option>
               </select>
             </div>
+            <div class="row"><label for="pfDepartment">Department</label>
+              <select id="pfDepartment">
+                <option value="">Select department</option>
+                <option>Production</option>
+                <option>Quality</option>
+                <option>Maintenance</option>
+                <option>Material Handling</option>
+                <option>Planning</option>
+                <option>Management</option>
+                <option>Administration</option>
+              </select>
+            </div>
             <div class="row"><label>Profile Photo</label>
               <div class="photo-row">
                 <img id="pfPhotoPreview" class="photo-preview" alt="Profile photo preview" />
-                <div>
+                <div class="photo-input-wrap">
                   <input id="pfPhoto" type="file" accept="image/png,image/jpeg,image/webp" />
-                  <div class="photo-help">Used on User KPI cards. Photos are resized before saving.</div>
+                  <div class="photo-help">Shown on the printed card. Optional.</div>
                 </div>
               </div>
             </div>
-            <div class="row"><label>Print Size</label>
+            <div class="row"><label>Print size</label>
               <select id="pfSize">
-                <option value="barcode_4x1.25">Barcode Printer (4 x 1.25 split by 3)</option>
-                <option value="normal_2x2">Normal Printer (2 x 2)</option>
+                <option value="barcode_4x1.25">Barcode printer (4 × 1.25, split by 3)</option>
+                <option value="normal_2x2">Normal printer (2 × 2)</option>
               </select>
             </div>
             <div class="actions">
               <button id="pfPreviewBtn" class="secondary" type="button">Preview QR</button>
-              <button id="pfSaveBtn" class="primary" type="button">Save Profile</button>
-              <button id="pfSavePrintBtn" class="primary" type="button">Save Profile and Print QR</button>
+              <button id="pfSaveBtn" class="secondary" type="button">Save profile</button>
+              <button id="pfSavePrintBtn" class="primary" type="button">Save profile and print QR</button>
             </div>
             <div id="pfStatus" class="status"></div>
           </div>
         </div>
-        <div class="preview">
-          <h4>QR Preview</h4>
-          <img id="pfPreviewImg" alt="QR preview" />
-          <div id="pfPayloadPreview" class="mono"></div>
+      </section>
+      <section class="card preview-card">
+        <div class="head">QR preview</div>
+        <div class="body">
+          <div id="pfPreviewPanel" class="preview">
+            <div class="preview-empty">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><path d="M15 14h2v2h-2zM19 14h2M19 18h2v3h-3M14 19h2v2h-2"></path></svg>
+              <span>Fill in the form and choose Preview QR to see the code here.</span>
+            </div>
+            <img id="pfPreviewImg" alt="QR preview" />
+            <div id="pfPayloadPreview" class="mono"></div>
+          </div>
         </div>
+      </section>
+    </div>
+    <div class="profile-toolbar">
+      <div class="profile-search-wrap">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg>
+        <input id="pfSearch" type="search" placeholder="Search by name or ID number" aria-label="Search profiles" />
+      </div>
+      <div class="profile-filters" aria-label="Profile filters">
+        <button class="filter-btn active" type="button" data-profile-filter="all">All</button>
+        <button class="filter-btn" type="button" data-profile-filter="missing-photo">Missing photo</button>
+        <button class="filter-btn" type="button" data-profile-filter="not-printed">Not printed</button>
       </div>
     </div>
     <div class="table">
       <table>
-        <thead><tr><th>Photo</th><th>Name</th><th>ID Number</th><th>Role</th><th>Created</th><th>Printed</th><th>Print Count</th><th>Action</th></tr></thead>
+        <thead><tr><th>Name</th><th>ID number</th><th>Role</th><th>Dept.</th><th>Created</th><th>Last printed</th><th>Prints</th><th style="text-align:right">Actions</th></tr></thead>
         <tbody id="pfTableBody"></tbody>
       </table>
+      <div class="table-footer">
+        <span id="pfTableSummary">Showing 0 of 0 saved profiles</span>
+        <div class="pagination"><button id="pfPrevPage" class="page-btn" type="button" aria-label="Previous page">‹</button><span id="pfPageSummary">Page 1 of 1</span><button id="pfNextPage" class="page-btn" type="button" aria-label="Next page">›</button></div>
+      </div>
       <input id="pfExistingPhotoInput" type="file" accept="image/png,image/jpeg,image/webp" style="display:none;" />
     </div>
   </div>
 <script>
+  (() => {
+    const wrap = document.querySelector('.wrap');
+    const creatorGrid = document.querySelector('.creator-grid');
+    const editorCard = creatorGrid?.querySelector('.card:not(.preview-card)');
+    const previewCard = creatorGrid?.querySelector('.preview-card');
+    const previewPanel = previewCard?.querySelector('.preview');
+    const toolbar = document.querySelector('.profile-toolbar');
+    const table = document.querySelector('.table');
+    if(wrap && creatorGrid && editorCard && previewPanel && toolbar && table){
+      editorCard.classList.add('editor-card');
+      editorCard.querySelector('.body')?.prepend(previewPanel);
+      editorCard.querySelectorAll('.row').forEach(row => {
+        const label = row.querySelector('label')?.textContent?.trim();
+        if(label === 'Name' || label === 'Department') row.classList.add('full');
+      });
+      const dashboard = document.createElement('div');
+      dashboard.className = 'dashboard-grid';
+      const profilesPanel = document.createElement('main');
+      profilesPanel.className = 'profiles-panel';
+      dashboard.append(profilesPanel, editorCard);
+      profilesPanel.append(toolbar, table);
+      wrap.insertBefore(dashboard, creatorGrid);
+      creatorGrid.remove();
+      previewCard.remove();
+      const tableHead = table.querySelector('thead');
+      if(tableHead) tableHead.innerHTML = '<tr><th>Name</th><th>Role</th><th>Dept.</th><th>Photo</th><th>Last printed</th><th style="text-align:right">Actions</th></tr>';
+    }
+  })();
   const pfName = document.getElementById('pfName');
   const pfId = document.getElementById('pfId');
   const pfRole = document.getElementById('pfRole');
+  const pfDepartment = document.getElementById('pfDepartment');
   const pfSize = document.getElementById('pfSize');
   const pfPhoto = document.getElementById('pfPhoto');
   const pfPhotoPreview = document.getElementById('pfPhotoPreview');
@@ -20706,12 +23667,28 @@ PROFILE_CREATOR_HTML = """
   const pfSaveBtn = document.getElementById('pfSaveBtn');
   const pfSavePrintBtn = document.getElementById('pfSavePrintBtn');
   const pfStatus = document.getElementById('pfStatus');
+  const pfPreviewPanel = document.getElementById('pfPreviewPanel');
   const pfPreviewImg = document.getElementById('pfPreviewImg');
   const pfPayloadPreview = document.getElementById('pfPayloadPreview');
   const pfTableBody = document.getElementById('pfTableBody');
+  const pfSearch = document.getElementById('pfSearch');
+  const pfTableSummary = document.getElementById('pfTableSummary');
+  const pfPageSummary = document.getElementById('pfPageSummary');
+  const pfPrevPage = document.getElementById('pfPrevPage');
+  const pfNextPage = document.getElementById('pfNextPage');
+  const pfTotalCount = document.getElementById('pfTotalCount');
+  const pfMissingPhotoCount = document.getElementById('pfMissingPhotoCount');
+  const pfNotPrintedCount = document.getElementById('pfNotPrintedCount');
   let lastPreview = { payload: '', image: '' };
   let profilePhotoDataUrl = '';
   let pendingExistingPhotoId = '';
+  let savedProfilesState = [];
+  let profileFilter = 'all';
+  let profilePage = 1;
+  function responsiveProfilePageSize(){
+    return 10;
+  }
+  let profilePageSize = responsiveProfilePageSize();
   function esc(s){ return (s ?? '').toString().replaceAll('&','&amp;').replaceAll('<','&lt;'); }
   function escAttr(s){ return esc(s).replaceAll('\"','&quot;'); }
   function fmtDateLocal(value){
@@ -20728,10 +23705,24 @@ PROFILE_CREATOR_HTML = """
       hour12: false,
     });
   }
+  function fmtProfileDate(value){
+    if(!value) return {date:'—', time:''};
+    const parsed = new Date(value);
+    if(Number.isNaN(parsed.getTime())) return {date:String(value), time:''};
+    return {
+      date: parsed.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'}),
+      time: parsed.toLocaleTimeString('en-US', {hour:'numeric', minute:'2-digit'}),
+    };
+  }
+  function profileInitials(name, id){
+    const parts = String(name || id || '?').trim().split(/\s+/).filter(Boolean);
+    if(!parts.length) return '?';
+    return `${parts[0][0] || ''}${parts.length > 1 ? parts[parts.length - 1][0] || '' : parts[0][1] || ''}`.toUpperCase();
+  }
   function setStatus(t){ pfStatus.textContent = t || ''; }
   function applyProfileTheme(theme){
     const t = String(theme || 'Default').trim() || 'Default';
-    if(t === 'Default' || t === 'Blue Accent'){
+    if(t === 'Default'){
       delete document.body.dataset.theme;
     } else {
       document.body.dataset.theme = t;
@@ -20761,7 +23752,47 @@ PROFILE_CREATOR_HTML = """
     if(photo){
       return `<img class="profile-thumb" src="${escAttr(photo)}" alt="${escAttr(name || 'Profile photo')}" />`;
     }
-    return '<div class="profile-thumb" aria-hidden="true"></div>';
+    return `<div class="profile-thumb" aria-hidden="true">${esc(profileInitials(name, ''))}</div>`;
+  }
+
+  function renderProfilesTable(){
+    if(pfTotalCount) pfTotalCount.textContent = String(savedProfilesState.length);
+    if(pfMissingPhotoCount) pfMissingPhotoCount.textContent = String(savedProfilesState.filter(row => !String(row?.photo_data_url || '').trim()).length);
+    if(pfNotPrintedCount) pfNotPrintedCount.textContent = String(savedProfilesState.filter(row => Number(row?.print_count || 0) <= 0).length);
+    const query = String(pfSearch?.value || '').trim().toLowerCase();
+    const rows = savedProfilesState.slice().reverse().filter(row => {
+      if(query && ![row?.name, row?.id_number].some(value => String(value || '').toLowerCase().includes(query))) return false;
+      if(profileFilter === 'missing-photo' && String(row?.photo_data_url || '').trim()) return false;
+      if(profileFilter === 'not-printed' && Number(row?.print_count || 0) > 0) return false;
+      return true;
+    });
+    const totalPages = Math.max(1, Math.ceil(rows.length / profilePageSize));
+    profilePage = Math.max(1, Math.min(profilePage, totalPages));
+    const start = (profilePage - 1) * profilePageSize;
+    const visible = rows.slice(start, start + profilePageSize);
+    pfTableBody.innerHTML = visible.map(x => {
+      const printed = fmtProfileDate(x.last_printed_at_utc);
+      const hasPhoto = Boolean(String(x.photo_data_url || '').trim());
+      const printCount = Number(x.print_count || 0);
+      return `<tr>
+        <td><div class="profile-person">${profilePhotoThumb(x.photo_data_url, x.name)}<div class="person-copy"><strong>${esc(x.name)}</strong><span class="person-id">${esc(x.id_number)}</span></div></div></td>
+        <td><span class="role-pill">${esc(x.role)}</span></td>
+        <td>${x.department ? esc(x.department) : '<span class="dept-empty">No<br>department</span>'}</td>
+        <td><span class="photo-pill${hasPhoto ? '' : ' missing'}">${hasPhoto ? 'Photo added' : 'No photo'}</span></td>
+        <td><div class="cell-stack"><span class="date-main">${esc(printed.date)}${printed.time ? ` · ${esc(printed.time)}` : ''}</span><span class="cell-subtle">${printCount} print${printCount === 1 ? '' : 's'}</span></div></td>
+        <td><div class="mini-actions">
+          <button type="button" class="mini-btn" data-act="edit" data-id="${escAttr(x.id_number)}" title="Edit profile" aria-label="Edit profile">✎</button>
+          <button type="button" class="mini-btn" data-act="photo" data-id="${escAttr(x.id_number)}" title="Add or replace photo" aria-label="Add or replace photo">◎</button>
+          <button type="button" class="mini-btn" data-act="clear-photo" data-id="${escAttr(x.id_number)}" title="Clear photo" aria-label="Clear photo">×</button>
+          <button type="button" class="mini-btn danger" data-act="remove" data-id="${escAttr(x.id_number)}" title="Remove profile" aria-label="Remove profile">⌫</button>
+          <button type="button" class="mini-btn primary" data-act="print" data-id="${escAttr(x.id_number)}" data-name="${escAttr(x.name)}" data-role="${escAttr(x.role)}" data-print-count="${escAttr(x.print_count ?? 0)}">Print</button>
+        </div></td>
+      </tr>`;
+    }).join('') || `<tr class="empty-row"><td colspan="6"><div class="empty-state"><strong>${savedProfilesState.length ? 'No profiles match this view' : 'No profiles yet'}</strong><span>${savedProfilesState.length ? 'Clear the search or reset the filters to see your profiles.' : 'Create your first profile using the form.'}</span>${savedProfilesState.length ? '<button type="button" class="empty-reset" data-act="reset-view">Reset view</button>' : ''}</div></td></tr>`;
+    if(pfTableSummary) pfTableSummary.textContent = `Showing ${visible.length} of ${savedProfilesState.length} profiles`;
+    if(pfPageSummary) pfPageSummary.textContent = `Page ${profilePage} of ${totalPages}`;
+    if(pfPrevPage) pfPrevPage.disabled = profilePage <= 1;
+    if(pfNextPage) pfNextPage.disabled = profilePage >= totalPages;
   }
   async function fileToProfilePhotoDataUrl(file){
     if(!file) return '';
@@ -20799,6 +23830,7 @@ PROFILE_CREATOR_HTML = """
       name: (pfName.value || '').trim(),
       id_number: (pfId.value || '').trim(),
       role: (pfRole.value || '').trim(),
+      department: (pfDepartment.value || '').trim(),
       print_size: (pfSize.value || 'barcode_4x1.25').trim(),
       photo_data_url: profilePhotoDataUrl,
     };
@@ -20809,26 +23841,11 @@ PROFILE_CREATOR_HTML = """
       const out = await r.json();
       if(!r.ok || !out.ok) throw new Error(out.error || 'Profile request failed.');
       const rows = Array.isArray(out.items) ? out.items : [];
-      pfTableBody.innerHTML = rows.slice().reverse().map(x => `<tr>
-        <td>${profilePhotoThumb(x.photo_data_url, x.name)}</td>
-        <td>${esc(x.name)}</td>
-        <td>${esc(x.id_number)}</td>
-        <td>${esc(x.role)}</td>
-        <td>${esc(fmtDateLocal(x.created_at_utc))}</td>
-        <td>${esc(x.last_printed_at_utc ? fmtDateLocal(x.last_printed_at_utc) : "-")}</td>
-        <td>${esc(x.print_count ?? 0)}</td>
-        <td>
-          <div class="mini-actions">
-            <button type="button" class="mini-btn" data-act="photo" data-id="${escAttr(x.id_number)}">Photo</button>
-            <button type="button" class="mini-btn" data-act="clear-photo" data-id="${escAttr(x.id_number)}">Clear Photo</button>
-            <button type="button" class="mini-btn primary" data-act="print" data-id="${escAttr(x.id_number)}" data-name="${escAttr(x.name)}" data-role="${escAttr(x.role)}" data-print-count="${escAttr(x.print_count ?? 0)}">Print</button>
-            <button type="button" class="mini-btn danger" data-act="remove" data-id="${escAttr(x.id_number)}">Remove</button>
-          </div>
-        </td>
-      </tr>`).join('') || '<tr><td colspan="8">No profiles yet.</td></tr>';
+      savedProfilesState = rows;
+      renderProfilesTable();
       setStatus(`${rows.length} saved profile${rows.length === 1 ? '' : 's'} loaded.`);
     }catch(err){
-      pfTableBody.innerHTML = `<tr><td colspan="8">Failed to load profiles: ${esc(err?.message || err)}</td></tr>`;
+      pfTableBody.innerHTML = `<tr class="empty-row"><td colspan="6"><div class="empty-state"><strong>Profiles could not be loaded</strong><span>${esc(err?.message || err)}</span></div></td></tr>`;
       setStatus(`Failed to load profiles: ${err?.message || err}`);
     }
   }
@@ -20887,7 +23904,8 @@ PROFILE_CREATOR_HTML = """
       return null;
     }
     w.document.write(`<!doctype html><html><head><title>Print QR</title>
-      <style>html,body{margin:0;padding:16px;font-family:Arial,sans-serif;background:#fff;color:#111;}</style>
+      <style>html,body{margin:0;padding:16px;font-family:Arial,sans-serif;background:#fff;color:#1e293b;}
+  </style>
       </head><body>Preparing QR...</body></html>`);
     w.document.close();
     try { w.focus(); } catch(_e) {}
@@ -20898,10 +23916,11 @@ PROFILE_CREATOR_HTML = """
     try {
       w.document.write(`<!doctype html><html><head><title>Print QR</title>
         <style>
-          html,body{margin:0;padding:16px;font-family:Arial,sans-serif;background:#fff;color:#111;}
+          html,body{margin:0;padding:16px;font-family:Arial,sans-serif;background:#fff;color:#1e293b;}
           .msg{font-size:16px;line-height:1.4;}
-          button{margin-top:12px;padding:8px 14px;border:1px solid #aaa;border-radius:6px;background:#f8f8f8;cursor:pointer;}
-        </style>
+          button{margin-top:12px;padding:8px 14px;border:1px solid #cbd5e1;border-radius:6px;background:#f5f7fb;cursor:pointer;}
+
+  </style>
         </head><body><div class="msg">${esc(message)}</div><button onclick="window.close()">Close</button></body></html>`);
       w.document.close();
       w.focus();
@@ -20923,7 +23942,8 @@ PROFILE_CREATOR_HTML = """
         html,body { margin:0; padding:0; background:#fff; }
         body { display:flex; align-items:flex-start; justify-content:flex-start; }
         img { ${sizeCss} display:block; object-fit:contain; image-rendering:auto; }
-      </style></head><body><img id="qrPrintImage" src="${imageSrc}" />
+
+  </style></head><body><img id="qrPrintImage" src="${imageSrc}" />
       <script>
         const img = document.getElementById('qrPrintImage');
         function runPrint(){ setTimeout(() => { try { window.focus(); window.print(); } catch(_e) {} }, 120); }
@@ -20961,6 +23981,7 @@ PROFILE_CREATOR_HTML = """
     }
     pfPreviewImg.src = out.image_data_url || '';
     pfPayloadPreview.textContent = out.qr_payload || '';
+    pfPreviewPanel?.classList.toggle('has-image', Boolean(out.image_data_url));
     await openPrintWindow(out.image_data_url || '', out.print_size || printSize, printWindow);
     await loadProfiles();
     setStatus('Profile print opened.');
@@ -20974,12 +23995,19 @@ PROFILE_CREATOR_HTML = """
     lastPreview = { payload: out.qr_payload || '', image: out.image_data_url || '' };
     pfPreviewImg.src = out.image_data_url || '';
     pfPayloadPreview.textContent = out.qr_payload || '';
+    pfPreviewPanel?.classList.toggle('has-image', Boolean(out.image_data_url));
     setStatus('Preview generated.');
     return true;
   }
   async function saveProfile(andPrint=false, printWindow=null){
     const form = getForm();
     if(!form.name || !form.id_number || !form.role){ closePreparedPrintWindow(printWindow, 'Complete Name, ID Number, and Role first.'); setStatus('Complete Name, ID Number, and Role first.'); return; }
+    const exists = savedProfilesState.some(row => String(row?.id_number || '').trim() === form.id_number);
+    if(exists){
+      const password = window.prompt('Admin password required to update this existing profile:', '');
+      if(password === null){ closePreparedPrintWindow(printWindow, 'Profile update cancelled.'); setStatus('Profile update cancelled.'); return; }
+      form.admin_password = password;
+    }
     const r = await fetch('/api/profiles', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(form) });
     const out = await r.json();
     if(!out.ok){ closePreparedPrintWindow(printWindow, out.error || 'Save failed.'); setStatus(out.error || 'Save failed.'); return; }
@@ -20999,6 +24027,22 @@ PROFILE_CREATOR_HTML = """
   }
   pfPreviewBtn.addEventListener('click', previewQr);
   pfSaveBtn.addEventListener('click', () => saveProfile(false));
+  pfSearch?.addEventListener('input', () => { profilePage = 1; renderProfilesTable(); });
+  document.querySelectorAll('[data-profile-filter]').forEach(button => button.addEventListener('click', () => {
+    profileFilter = String(button.getAttribute('data-profile-filter') || 'all');
+    profilePage = 1;
+    document.querySelectorAll('[data-profile-filter]').forEach(item => item.classList.toggle('active', item === button));
+    renderProfilesTable();
+  }));
+  pfPrevPage?.addEventListener('click', () => { profilePage = Math.max(1, profilePage - 1); renderProfilesTable(); });
+  pfNextPage?.addEventListener('click', () => { profilePage += 1; renderProfilesTable(); });
+  window.addEventListener('resize', () => {
+    const nextPageSize = responsiveProfilePageSize();
+    if(nextPageSize === profilePageSize) return;
+    profilePageSize = nextPageSize;
+    profilePage = 1;
+    renderProfilesTable();
+  });
   pfPhoto.addEventListener('change', async () => {
     const file = pfPhoto.files && pfPhoto.files[0];
     if(!file){ setPhotoPreview(''); return; }
@@ -21035,9 +24079,33 @@ PROFILE_CREATOR_HTML = """
     if(!btn) return;
     const act = btn.getAttribute('data-act') || '';
     const id = btn.getAttribute('data-id') || '';
+    if(act === 'reset-view'){
+      if(pfSearch) pfSearch.value = '';
+      profileFilter = 'all';
+      profilePage = 1;
+      document.querySelectorAll('[data-profile-filter]').forEach(item => item.classList.toggle('active', item.getAttribute('data-profile-filter') === 'all'));
+      renderProfilesTable();
+      return;
+    }
     if(act === 'photo'){
       pendingExistingPhotoId = id;
       pfExistingPhotoInput.click();
+      return;
+    }
+    if(act === 'edit'){
+      const profile = savedProfilesState.find(row => String(row?.id_number || '').trim() === id);
+      if(!profile) return;
+      pfName.value = profile.name || '';
+      pfId.value = profile.id_number || '';
+      pfRole.value = profile.role || 'Operator';
+      const department = String(profile.department || '').trim();
+      if(department && !Array.from(pfDepartment.options).some(option => option.value === department)){
+        pfDepartment.add(new Option(department, department));
+      }
+      pfDepartment.value = department;
+      setPhotoPreview(profile.photo_data_url || '');
+      setStatus('Profile loaded. Update the fields, then click Save Profile.');
+      window.scrollTo({top:0, behavior:'smooth'});
       return;
     }
     if(act === 'clear-photo'){
@@ -21105,24 +24173,220 @@ def api_user_kpis(role: str = "all"):
     return {"ok": True, **build_user_kpis(role_filter=role)}
 
 
+@APP.get("/api/breaktime/users")
+def api_breaktime_users():
+    """Return only the four profile fields the Breaktime app is allowed to use."""
+    items = [_breaktime_public_profile(profile) for profile in PROFILES if isinstance(profile, dict)]
+    return {"ok": True, "items": items, "count": len(items)}
+
+
+@APP.post("/api/breaktime/users/sync")
+async def api_breaktime_users_sync(req: Request):
+    """Update role and department for existing IDs; never create a profile implicitly."""
+    data = await req.json()
+    incoming = data.get("items") if isinstance(data, dict) and isinstance(data.get("items"), list) else [data]
+    updated: List[Dict[str, str]] = []
+    unchanged: List[Dict[str, str]] = []
+    unregistered: List[Dict[str, str]] = []
+    errors: List[Dict[str, str]] = []
+    with PROFILE_SYNC_LOCK:
+        next_profiles = [dict(profile) if isinstance(profile, dict) else profile for profile in PROFILES]
+        for raw in incoming:
+            if not isinstance(raw, dict):
+                errors.append({"id_number": "", "error": "Each item must be an object"})
+                continue
+            name = str(raw.get("name") or "").strip()
+            id_number = str(raw.get("id_number") or "").strip()
+            role = _normalize_company_role(raw.get("role") or "")
+            department = str(raw.get("department") or "").strip()
+            if not id_number:
+                errors.append({"id_number": "", "error": "id_number is required"})
+                continue
+            if len(name) > 255 or len(role) > 100 or len(department) > 150:
+                errors.append({"id_number": id_number, "error": "name, role, or department is too long"})
+                continue
+            index = next(
+                (
+                    i for i, profile in enumerate(next_profiles)
+                    if isinstance(profile, dict) and str(profile.get("id_number") or "").strip() == id_number
+                ),
+                -1,
+            )
+            if index < 0:
+                _breaktime_record_unregistered(id_number, source="profile_sync", name=name)
+                unregistered.append({"id_number": id_number, "name": name})
+                continue
+            current = dict(next_profiles[index] or {})
+            changed = False
+            if role and str(current.get("role") or "").strip() != role:
+                current["role"] = role
+                current["company_role"] = role
+                changed = True
+            if "department" in raw and str(current.get("department") or "").strip() != department:
+                current["department"] = department
+                changed = True
+            if changed:
+                current["breaktime_profile_synced_at_utc"] = datetime.now(timezone.utc).isoformat()
+                next_profiles[index] = current
+                updated.append(_breaktime_public_profile(current))
+            else:
+                unchanged.append(_breaktime_public_profile(current))
+            _breaktime_resolve_notifications_for_id(id_number)
+        if updated:
+            try:
+                save_profiles([profile for profile in next_profiles if isinstance(profile, dict)])
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+            PROFILES[:] = [profile for profile in next_profiles if isinstance(profile, dict)]
+    return {
+        "ok": not errors,
+        "updated": updated,
+        "unchanged": unchanged,
+        "unregistered": unregistered,
+        "errors": errors,
+    }
+
+
+@APP.post("/api/breaktime/status")
+async def api_breaktime_status(req: Request):
+    """Accept break state only. AVAILABLE clears break and is resolved from local app activity."""
+    data = await req.json()
+    id_number = str((data or {}).get("id_number") or "").strip()
+    raw_status = str((data or {}).get("status") or "").strip().upper().replace(" ", "_").replace("-", "_")
+    if not id_number or not raw_status:
+        return JSONResponse({"ok": False, "error": "id_number and status are required"}, status_code=400)
+    profile = _find_profile_by_id_number(id_number)
+    if not isinstance(profile, dict):
+        notification = _breaktime_record_unregistered(id_number, source="status", name=str((data or {}).get("name") or ""))
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "User is not registered on the server",
+                "id_number": id_number,
+                "notification_created": True,
+                "notification": notification,
+            },
+            status_code=404,
+        )
+    aliases = {
+        "BREAK": "ON_BREAK",
+        "ONBREAK": "ON_BREAK",
+        "ON_BREAK": "ON_BREAK",
+        "OVER_BREAK": "OVERBREAK",
+        "OVERBREAK": "OVERBREAK",
+        "RETURN": "CLEAR",
+        "RETURNED": "CLEAR",
+        "END_BREAK": "CLEAR",
+        "BREAK_ENDED": "CLEAR",
+        "AVAILABLE": "CLEAR",
+        "CLEAR": "CLEAR",
+    }
+    status = aliases.get(raw_status)
+    if status is None:
+        return JSONResponse(
+            {"ok": False, "error": "status must be ON_BREAK, OVERBREAK, RETURNED, END_BREAK, AVAILABLE, or CLEAR"},
+            status_code=400,
+        )
+    now_text = datetime.now(timezone.utc).isoformat()
+    with BREAKTIME_STATE_LOCK:
+        statuses = BREAKTIME_STATE.setdefault("statuses", {})
+        if status == "CLEAR":
+            statuses.pop(id_number, None)
+        else:
+            existing = dict(statuses.get(id_number) or {})
+            previous_status = str(existing.get("status") or "").strip().upper()
+            status_since = str((data or {}).get("status_since_utc") or "").strip()
+            if not status_since or previous_status != status:
+                status_since = now_text
+            statuses[id_number] = {
+                "status": status,
+                "status_since_utc": status_since,
+                "updated_at_utc": now_text,
+                "source": "breaktime",
+            }
+        save_breaktime_state()
+    _breaktime_resolve_notifications_for_id(id_number)
+    resolved = _breaktime_profile_status(profile)
+    return {
+        "ok": True,
+        "id_number": id_number,
+        "received_status": raw_status,
+        **resolved,
+        "note": "Availability is resolved by server/client activity when the break state is cleared.",
+    }
+
+
+@APP.get("/api/breaktime/statuses")
+def api_breaktime_statuses():
+    return {"ok": True, **_breaktime_status_snapshot()}
+
+
+@APP.get("/api/breaktime/notifications")
+def api_breaktime_notifications():
+    items = _breaktime_open_notifications()
+    return {"ok": True, "items": items, "count": len(items)}
+
+
+@APP.post("/api/breaktime/notifications/acknowledge")
+async def api_breaktime_notifications_acknowledge(req: Request):
+    data = await req.json()
+    id_number = str((data or {}).get("id_number") or "").strip()
+    now_text = datetime.now(timezone.utc).isoformat()
+    acknowledged = 0
+    with BREAKTIME_STATE_LOCK:
+        for row in BREAKTIME_STATE.get("notifications", []):
+            if not isinstance(row, dict) or row.get("acknowledged_at_utc"):
+                continue
+            if id_number and str(row.get("id_number") or "").strip() != id_number:
+                continue
+            row["acknowledged_at_utc"] = now_text
+            row["acknowledged_reason"] = "dashboard_acknowledged"
+            acknowledged += 1
+        if acknowledged:
+            save_breaktime_state()
+    return {"ok": True, "acknowledged": acknowledged, "remaining": len(_breaktime_open_notifications())}
+
+
 @APP.post("/api/profiles")
 async def api_profiles_create(req: Request):
     data = await req.json()
     name = str(data.get("name", "")).strip()
     id_number = str(data.get("id_number", "")).strip()
-    role = str(data.get("role", "")).strip()
+    role = _normalize_company_role(data.get("role", ""))
+    department = str(data.get("department", "")).strip()
     if not name or not id_number or not role:
         return JSONResponse({"ok": False, "error": "name, id_number, and role are required"}, status_code=400)
+    if len(department) > 150:
+        return JSONResponse({"ok": False, "error": "department must be 150 characters or fewer"}, status_code=400)
     try:
         photo_data_url = _clean_profile_photo_data_url(data.get("photo_data_url"))
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-    if any(str(p.get("id_number", "")).strip() == id_number for p in PROFILES if isinstance(p, dict)):
-        return JSONResponse({"ok": False, "error": "Profile already exists for this ID number"}, status_code=409)
+    existing_index = next(
+        (i for i, p in enumerate(PROFILES) if isinstance(p, dict) and str(p.get("id_number", "")).strip() == id_number),
+        -1,
+    )
+    if existing_index >= 0:
+        if str(data.get("admin_password") or "") != PROFILE_REPRINT_ADMIN_PASSWORD:
+            return JSONResponse({"ok": False, "error": "Admin password is required to update an existing profile"}, status_code=403)
+        current = dict(PROFILES[existing_index] or {})
+        current.update({
+            "name": name,
+            "id_number": id_number,
+            "role": role,
+            "department": department,
+            "updated_at_utc": utc_now().isoformat(),
+        })
+        if photo_data_url:
+            current["photo_data_url"] = photo_data_url
+        PROFILES[existing_index] = current
+        save_profiles(PROFILES)
+        return {"ok": True, "item": current, "updated": True}
     row = {
         "name": name,
         "id_number": id_number,
         "role": role,
+        "department": department,
         "photo_data_url": photo_data_url,
         "created_at_utc": utc_now().isoformat(),
         "print_count": 0,
@@ -21520,6 +24784,11 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
         _fill_session_product_identity(sess)
     if isinstance(snap.get("linkage_jobs"), list):
         sess.linkage_jobs = [dict(row) for row in snap.get("linkage_jobs") or [] if isinstance(row, dict)]
+    if isinstance(snap.get("mixing_open_jobs"), list):
+        sess.mixing_open_jobs = [
+            dict(row) for row in snap.get("mixing_open_jobs") or []
+            if isinstance(row, dict)
+        ]
     sess.linkage_enabled = bool(snap.get("linkage_enabled", bool(sess.linkage_jobs)))
     sess.linkage_job_code = snap.get("linkage_job_code", sess.linkage_job_code)
     sess.linkage_job_name = snap.get("linkage_job_name", sess.linkage_job_name)
@@ -21625,6 +24894,13 @@ def _apply_supervisor_rotation_check(
     sess.last_supervisor_check_at_utc = checked_at
     sess.last_supervisor_check_name = row["supervisor_name"] or None
     sess.last_supervisor_check_code = row["supervisor_code"] or None
+    _record_supervisor_rotation_history({
+        **row,
+        "machine_code": str(sess.machine_code or "").strip(),
+        "machine_name": str(sess.machine_name or sess.machine_code or "").strip(),
+        "client_id": str(sess.client_id or "").strip(),
+        "source": "SUPERVISOR_ROTATION_CHECK",
+    })
     return row
 
 
@@ -21993,6 +25269,62 @@ def _session_sync_can_adopt_newer_segment(
     return False
 
 
+def _mixing_session_sync_can_switch_active_job(
+    sess: MachineSession,
+    snap: Dict[str, Any],
+    incoming_session_id: str,
+    client_id: str,
+    machine_code: str,
+) -> bool:
+    """Allow switching the displayed job inside one Mixing client registry.
+
+    A normal machine has one forward-only production-session fence. Mixing
+    Mode intentionally keeps several jobs open and moves ACTIVE between them,
+    so its session ID can move in either direction. Limit that exception to a
+    full snapshot from the same client/machine whose open-job registry contains
+    both the server's current session and the incoming ACTIVE session.
+    """
+    if not isinstance(snap, dict):
+        return False
+    if str(snap.get("client_mode") or "").strip().upper() != "MIXING":
+        return False
+    incoming_id = str(incoming_session_id or "").strip()
+    current_id = str(sess.production_session_id or "").strip()
+    if not incoming_id or not current_id or incoming_id == current_id:
+        return False
+    if str(snap.get("production_session_id") or "").strip() != incoming_id:
+        return False
+    snap_machine = str(snap.get("machine_code") or machine_code or "").strip()
+    if snap_machine != str(machine_code or "").strip():
+        return False
+    current_client = str(sess.client_id or "").strip()
+    if current_client and current_client != str(client_id or "").strip():
+        return False
+
+    rows = snap.get("mixing_open_jobs")
+    if not isinstance(rows, list):
+        return False
+    open_session_ids = {
+        str(row.get("production_session_id") or "").strip()
+        for row in rows
+        if isinstance(row, dict)
+        and bool(row.get("mixing_open", True))
+        and str(row.get("production_session_id") or "").strip()
+    }
+    incoming_is_active = any(
+        isinstance(row, dict)
+        and bool(row.get("mixing_open", True))
+        and bool(row.get("mixing_active"))
+        and str(row.get("production_session_id") or "").strip() == incoming_id
+        for row in rows
+    )
+    return bool(
+        incoming_is_active
+        and incoming_id in open_session_ids
+        and current_id in open_session_ids
+    )
+
+
 def _legacy_session_can_adopt_live_event(
     sess: MachineSession,
     incoming_session_id: str,
@@ -22132,7 +25464,7 @@ async def api_sync_batch(req: Request):
 
 
 @APP.get("/api/machines/{machine_code}/activity")
-async def api_machine_client_activity(machine_code: str, limit: int = 400):
+async def api_machine_client_activity(machine_code: str, limit: int = 400, current_shift: bool = False):
     code = str(machine_code or "").strip()
     sess = SESSIONS.get(code)
     if sess is None:
@@ -22140,8 +25472,9 @@ async def api_machine_client_activity(machine_code: str, limit: int = 400):
             (row for key, row in SESSIONS.items() if str(key).strip().casefold() == code.casefold()),
             None,
         )
-    safe_limit = max(1, min(1000, int(limit or 400)))
-    stored = _load_machine_activity_logs_sql(code, safe_limit)
+    safe_limit = max(1, min(10000, int(limit or 400)))
+    shift_started_at = str(sess.job_started_at or "").strip() if current_shift and sess is not None else ""
+    stored = _load_machine_activity_logs_sql(code, safe_limit, shift_started_at)
     if stored is not None:
         return {
             "ok": True,
@@ -22150,6 +25483,13 @@ async def api_machine_client_activity(machine_code: str, limit: int = 400):
             "total": stored["total"],
         }
     rows = [dict(row) for row in ((sess.client_app_logs if sess else None) or []) if isinstance(row, dict)]
+    if shift_started_at:
+        started = _parse_iso_utc(shift_started_at)
+        if started is not None:
+            rows = [
+                row for row in rows
+                if (_parse_iso_utc(row.get("timestamp_utc")) or datetime.min.replace(tzinfo=timezone.utc)) >= started
+            ]
     rows.sort(key=lambda row: str(row.get("timestamp_utc") or ""), reverse=True)
     return {
         "ok": True,
@@ -22211,6 +25551,13 @@ async def api_heartbeat(req: Request):
         # presence views aligned; the existing 3-second state tick broadcasts
         # this in-memory timestamp without adding a full broadcast per client.
         session.last_seen_utc = str(client_status.get("last_seen_utc") or utc_now().isoformat())
+        try:
+            reported_uptime = int(float(heartbeat_event.get("rpi_uptime_seconds")))
+        except (TypeError, ValueError):
+            reported_uptime = -1
+        if reported_uptime >= 0:
+            session.rpi_uptime_seconds = reported_uptime
+            session.rpi_uptime_reported_at_utc = session.last_seen_utc
         activity_rows = _normalize_client_activity_rows(heartbeat_event.get("client_activity_logs"))
         client_activity_ack_ids = [str(row.get("activity_id") or "") for row in activity_rows]
         activity_added = _merge_client_app_logs(session, activity_rows)
@@ -22548,8 +25895,13 @@ async def api_event(req: Request):
         and incoming_session_id
         and current_session_id != incoming_session_id
         and ev_type == "SESSION_SYNC"
-        and _session_sync_can_adopt_newer_segment(
-            sess, session_snapshot, incoming_session_id, client_id, machine_code
+        and (
+            _mixing_session_sync_can_switch_active_job(
+                sess, session_snapshot, incoming_session_id, client_id, machine_code
+            )
+            or _session_sync_can_adopt_newer_segment(
+                sess, session_snapshot, incoming_session_id, client_id, machine_code
+            )
         )
     ):
         previous_session_id = current_session_id
@@ -23215,6 +26567,11 @@ async def api_event(req: Request):
             sess.linkage_enabled = bool(snap.get("linkage_enabled", sess.linkage_enabled))
             if isinstance(snap.get("linkage_jobs"), list):
                 sess.linkage_jobs = list(snap.get("linkage_jobs") or [])
+            if isinstance(snap.get("mixing_open_jobs"), list):
+                sess.mixing_open_jobs = [
+                    dict(row) for row in snap.get("mixing_open_jobs") or []
+                    if isinstance(row, dict)
+                ]
             if isinstance(snap.get("operator_shift_logs"), list):
                 sess.operator_shift_logs = _clean_operator_shift_logs_for_session(
                     snap.get("operator_shift_logs") or [],
@@ -23307,6 +26664,16 @@ async def api_event(req: Request):
             rows = dict(sess.butal_by_job or {})
             rows[assigned_job_code] = int(rows.get(assigned_job_code, 0) or 0) + qty
             sess.butal_by_job = rows
+        # Compact production events must retain their history as well as the
+        # counter. Recovery/void screens cannot depend on a later full sync.
+        if qty > 0:
+            record = dict(ev.get("butal_record") or {}) if isinstance(ev.get("butal_record"), dict) else {}
+            record.update({"qty": qty, "voided": False, "event_id": event_id})
+            record.setdefault("scanned_at", data.get("event_created_at_utc") or utc_now().isoformat())
+            record.setdefault("assigned_job_code", assigned_job_code)
+            record.setdefault("assigned_job_name", ev.get("assigned_job_name") or sess.job_name)
+            record.setdefault("source", "BUTAL")
+            sess.butal_scan_logs = list(sess.butal_scan_logs or []) + [record]
     elif ev_type in {"REJECT", "STARTUP_REJECT"}:
         appended_rejects = _append_reject_event_records(
             sess,
@@ -23364,7 +26731,7 @@ async def api_event(req: Request):
     if ev_type not in ("HEARTBEAT", "FINISH_JOB"):
         state_persisted = await asyncio.to_thread(_persist_active_sessions_state, machine_code)
     durable_production_events = PACK_COUNTER_EVENT_TYPES | {
-        "REJECT", "STARTUP_REJECT", "PACK_VOID", "PRODUCT_PART_VOID", "BUTAL_VOID", "REJECT_VOID"
+        "REJECT", "STARTUP_REJECT", "PACK_VOID", "PRODUCT_PART_VOID", "BUTAL_VOID", "REJECT_VOID", "SESSION_SYNC"
     }
     if ev_type in durable_production_events and not state_persisted:
         # Do not acknowledge/remove a durable production event until both its
@@ -23394,10 +26761,167 @@ async def api_event(req: Request):
         "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION,
         "server_authoritative": True,
         "session_recovered": session_recovered,
+        "snapshot_applied": bool(ev_type == "SESSION_SYNC" and session_snapshot and not stale_snapshot_segment),
         "previous_production_session_id": previous_session_id or None,
         "session": _session_protocol_payload(resulting_session),
         "client_activity_ack_ids": client_activity_ack_ids,
     }
+
+
+def _part_inventory_items() -> List[Dict[str, Any]]:
+    """Flatten positive product-part balances from completed jobs for Settings."""
+    history_rows = [
+        row
+        for row in [*FINISHED_JOBS, *ARCHIVED_JOBS]
+        if isinstance(row, dict)
+        and str(row.get("record_type") or "FINAL_JOB").strip().upper() != "SHIFT_PARTIAL"
+    ]
+    hydrated = _load_history_details_batch_sql(history_rows)
+    items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for wrapper in hydrated:
+        row = wrapper.get("item") if isinstance(wrapper, dict) else None
+        if not isinstance(row, dict):
+            continue
+        source_job_key = str(wrapper.get("job_key") or _finished_job_key(row)).strip()
+        excess_rows = row.get("product_part_excess_logs")
+        if not isinstance(excess_rows, list):
+            continue
+        operator_id = str(row.get("operator_id") or "").strip()
+        operator_name = str(row.get("operator_name") or "").strip()
+        if not operator_name and operator_id:
+            person = _person_from_badge_any(operator_id)
+            if isinstance(person, dict):
+                operator_name = str(person.get("name") or "").strip()
+        for index, excess in enumerate(excess_rows):
+            if not isinstance(excess, dict):
+                continue
+            qty = max(
+                0.0,
+                _parse_number_like(
+                    excess.get(
+                        "excess_available_qty",
+                        excess.get(
+                            "carryover_available_qty",
+                            excess.get("available_qty", excess.get("qty", 0)),
+                        ),
+                    )
+                ),
+            )
+            if qty <= 0:
+                continue
+            product_id = str(
+                excess.get("material_product_id")
+                or excess.get("product_id")
+                or excess.get("part_product_id")
+                or ""
+            ).strip()
+            sku = str(
+                excess.get("material_sku")
+                or excess.get("job_part_sku")
+                or excess.get("part_sku")
+                or excess.get("sku")
+                or ""
+            ).strip()
+            part_name = str(
+                excess.get("material_name")
+                or excess.get("material")
+                or excess.get("job_part_name")
+                or excess.get("part_name")
+                or excess.get("product_name")
+                or excess.get("name")
+                or sku
+                or product_id
+                or "Product Part"
+            ).strip()
+            transferred_at = str(
+                excess.get("recorded_at_utc")
+                or excess.get("transferred_at_utc")
+                or row.get("approved_at_utc")
+                or row.get("finished_at_utc")
+                or ""
+            ).strip()
+            identity = json.dumps(
+                {
+                    "job_key": source_job_key,
+                    "index": index,
+                    "product_id": product_id,
+                    "sku": sku,
+                    "qty": qty,
+                    "transferred_at_utc": transferred_at,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            )
+            inventory_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+            if inventory_id in seen:
+                continue
+            seen.add(inventory_id)
+            items.append(
+                {
+                    "inventory_id": inventory_id,
+                    "transferred_at_utc": transferred_at,
+                    "part_name": part_name,
+                    "sku": sku,
+                    "product_id": product_id,
+                    "qty": qty,
+                    "unit": str(excess.get("unit") or "kg").strip() or "kg",
+                    "job_code": str(row.get("job_code") or "").strip(),
+                    "job_name": str(row.get("job_name") or "").strip(),
+                    "machine_code": str(row.get("machine_code") or "").strip(),
+                    "machine_name": str(row.get("machine_name") or "").strip(),
+                    "operator_id": operator_id,
+                    "operator_name": operator_name,
+                    "source_job_key": source_job_key,
+                }
+            )
+    items.sort(
+        key=lambda item: str(item.get("transferred_at_utc") or ""),
+        reverse=True,
+    )
+    return items
+
+
+@APP.get("/api/part-inventory")
+def api_part_inventory():
+    items = _part_inventory_items()
+    return {
+        "ok": True,
+        "items": items,
+        "total": len(items),
+        "generated_at_utc": utc_now().isoformat(),
+    }
+
+
+@APP.get("/api/mixing/material-history")
+def api_mixing_material_history(machine_code: str = "", job_code: str = ""):
+    """Return original, de-duplicated part scans from prior mixing shifts."""
+    machine = str(machine_code or "").strip().upper()
+    job = str(job_code or "").strip()
+    if not machine or not job:
+        return JSONResponse(
+            {"ok": False, "error": "machine_code and job_code are required"},
+            status_code=400,
+        )
+    totals = _same_job_partial_raw_material_totals(
+        {"machine_code": machine, "job_code": job}
+    )
+    return {
+        "ok": True,
+        "machine_code": machine,
+        "job_code": job,
+        **totals,
+    }
+
+
+def _finished_detail_with_prior_partials(row: Dict[str, Any]) -> Dict[str, Any]:
+    detail = _load_history_detail_sql(row)
+    if str(detail.get("record_type") or "").strip().upper() == "SHIFT_PARTIAL":
+        detail["prior_partial_raw_material_totals"] = (
+            _same_job_partial_raw_material_totals(detail)
+        )
+    return detail
 
 
 @APP.get("/api/finished-jobs")
@@ -23418,6 +26942,14 @@ def api_finished_jobs(page: int = 1, page_size: int = 50):
     }
 
 
+@APP.get("/api/pdr/month")
+def api_pdr_month(month: str = ""):
+    requested_month = str(month or "").strip()
+    if requested_month and not re.fullmatch(r"\d{4}-\d{2}", requested_month):
+        return JSONResponse({"ok": False, "error": "month must use YYYY-MM"}, status_code=400)
+    return {"ok": True, **_pdr_month_summaries(requested_month)}
+
+
 @APP.get("/api/finished-jobs/detail")
 def api_finished_job_detail(job_key: str = ""):
     key = str(job_key or "").strip()
@@ -23425,8 +26957,37 @@ def api_finished_job_detail(job_key: str = ""):
         return JSONResponse({"ok": False, "error": "job_key is required"}, status_code=400)
     for row in reversed(FINISHED_JOBS):
         if isinstance(row, dict) and _finished_job_key(row) == key:
-            return {"ok": True, "item": _load_history_detail_sql(row)}
+            return {"ok": True, "item": _finished_detail_with_prior_partials(row)}
     return JSONResponse({"ok": False, "error": "finished shift was not found"}, status_code=404)
+
+
+@APP.post("/api/finished-jobs/details")
+async def api_finished_job_details(req: Request):
+    data = await req.json()
+    keys = data.get("job_keys") if isinstance(data, dict) else []
+    if not isinstance(keys, list):
+        return JSONResponse({"ok": False, "error": "job_keys must be a list"}, status_code=400)
+    requested = {str(key).strip() for key in keys if str(key).strip()}
+    if not requested:
+        return {"ok": True, "items": []}
+    if len(requested) > 24:
+        return JSONResponse({"ok": False, "error": "at most 24 job_keys are allowed"}, status_code=400)
+    rows = [
+        row for row in FINISHED_JOBS
+        if isinstance(row, dict) and _finished_job_key(row) in requested
+    ]
+    hydrated = _load_history_details_batch_sql(rows)
+    for wrapper in hydrated:
+        detail = wrapper.get("item") if isinstance(wrapper, dict) else None
+        if (
+            isinstance(detail, dict)
+            and str(detail.get("record_type") or "").strip().upper()
+            == "SHIFT_PARTIAL"
+        ):
+            detail["prior_partial_raw_material_totals"] = (
+                _same_job_partial_raw_material_totals(detail)
+            )
+    return {"ok": True, "items": hydrated}
 
 
 @APP.get("/api/archived-jobs/detail")
@@ -23806,6 +27367,177 @@ async def api_active_session_reset_fresh(req: Request):
     return {"ok": True, "item": sess.to_dict()}
 
 
+@APP.post("/api/active-sessions/correct-operator")
+async def api_active_session_correct_operator(req: Request):
+    """Correct a restored session whose original operator was mistaken for a reliever."""
+    data = await req.json()
+    machine_code = str(data.get("machine_code") or "").strip()
+    client_id = str(data.get("client_id") or "").strip()
+    operator_id = str(data.get("operator_id") or "").strip()
+    operator_name = str(data.get("operator_name") or "").strip()
+    if not machine_code or not operator_id:
+        return JSONResponse({"ok": False, "error": "machine_code and operator_id are required"}, status_code=400)
+    sess = SESSIONS.get(machine_code)
+    if sess is None:
+        return JSONResponse({"ok": False, "error": "active session not found"}, status_code=404)
+    if client_id and str(sess.client_id or "").strip() != client_id:
+        return JSONResponse({"ok": False, "error": "session belongs to another client"}, status_code=403)
+
+    full_identity = f"{operator_id} - {operator_name}" if operator_name else operator_id
+    full_keys = {
+        "operator_id", "active_scan_operator_id", "active_operator",
+        "original_operator", "operator", "machine_operator",
+    }
+    name_keys = {"operator_name", "active_operator_name", "original_operator_name"}
+
+    def correct_rows(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in list(value.items()):
+                if key in full_keys:
+                    value[key] = full_identity
+                elif key in name_keys:
+                    value[key] = operator_name or full_identity
+                elif key == "scan_owner_type":
+                    value[key] = "ORIGINAL"
+                elif key == "break_session_id":
+                    value[key] = ""
+                elif key in {"reliever_id", "reliever_operator", "reliever_operator_name"}:
+                    value[key] = None
+                elif key == "reliever_qr_payload":
+                    value[key] = ""
+                else:
+                    correct_rows(child)
+        elif isinstance(value, list):
+            for child in value:
+                correct_rows(child)
+
+    for rows in (
+        sess.product_pack_history_logs, sess.raw_material_logs, sess.reject_review_logs,
+        sess.butal_scan_logs, sess.supervisor_review_logs,
+    ):
+        correct_rows(rows)
+    sess.operator_id = full_identity
+    sess.operator_qr_payload = operator_id
+    sess.active_scan_operator_id = full_identity
+    sess.active_scan_owner_type = "ORIGINAL"
+    sess.reliever_id = None
+    sess.reliever_qr_payload = ""
+    sess.break_active = False
+    sess.current_break_session_id = ""
+    sess.break_out_time = None
+    sess.break_sessions = []
+    sess.operator_shift_logs = []
+    sess.last_seen_utc = utc_now().isoformat()
+    if not await asyncio.to_thread(_persist_active_sessions_state, machine_code):
+        return JSONResponse({"ok": False, "error": "corrected session could not be persisted"}, status_code=503)
+    await broadcast_state()
+    return {"ok": True, "item": _session_protocol_payload(sess)}
+
+
+@APP.post("/api/active-sessions/split-at-shift")
+async def api_active_session_split_at_shift(req: Request):
+    """Keep only production activity after a completed-shift boundary."""
+    data = await req.json()
+    machine_code = str(data.get("machine_code") or "").strip()
+    client_id = str(data.get("client_id") or "").strip()
+    cutoff_text = str(data.get("cutoff_utc") or data.get("cutoff") or "").strip()
+    cutoff = _parse_iso_utc(cutoff_text)
+    if not machine_code or cutoff is None:
+        return JSONResponse({"ok": False, "error": "machine_code and a valid cutoff are required"}, status_code=400)
+    sess = SESSIONS.get(machine_code)
+    if sess is None:
+        return JSONResponse({"ok": False, "error": "active session not found"}, status_code=404)
+    if client_id and str(sess.client_id or "").strip() != client_id:
+        return JSONResponse({"ok": False, "error": "session belongs to another client"}, status_code=403)
+
+    local_tz = timezone(timedelta(hours=8))
+
+    def row_timestamp(row: Dict[str, Any]) -> Optional[datetime]:
+        for key in (
+            "timestamp_utc", "scanned_at_utc", "scanned_at", "created_at_utc",
+            "changed_at_utc", "approved_at_utc", "started_at_utc", "start_time",
+            "finished_at_utc", "ended_at_utc", "end_time", "closed_at_utc",
+            "opened_at_utc", "last_updated_at_utc", "set_at_utc", "timestamp",
+        ):
+            raw = str(row.get(key) or "").strip()
+            if not raw:
+                continue
+            parsed = _parse_iso_utc(raw)
+            if parsed is not None and ("/" not in raw or "T" in raw):
+                return parsed
+            try:
+                return datetime.strptime(raw, "%m/%d/%Y %H:%M:%S").replace(tzinfo=local_tz).astimezone(timezone.utc)
+            except ValueError:
+                continue
+        return None
+
+    def after_cutoff(rows: Any) -> List[Dict[str, Any]]:
+        kept: List[Dict[str, Any]] = []
+        for source in rows or []:
+            if not isinstance(source, dict):
+                continue
+            stamped = row_timestamp(source)
+            if stamped is not None and stamped > cutoff:
+                kept.append(dict(source))
+        return kept
+
+    sess.product_pack_history_logs = after_cutoff(sess.product_pack_history_logs)
+    sess.raw_material_logs = after_cutoff(sess.raw_material_logs)
+    sess.butal_scan_logs = after_cutoff(sess.butal_scan_logs)
+    sess.reject_review_logs = after_cutoff(sess.reject_review_logs)
+    sess.pdr_downtime_logs = after_cutoff(sess.pdr_downtime_logs)
+    sess.cycle_time_change_logs = after_cutoff(sess.cycle_time_change_logs)
+    sess.machine_counter_overwrite_logs = after_cutoff(sess.machine_counter_overwrite_logs)
+    sess.supervisor_review_logs = after_cutoff(sess.supervisor_review_logs)
+    sess.supervisor_rotation_logs = after_cutoff(sess.supervisor_rotation_logs)
+    sess.operator_shift_logs = after_cutoff(sess.operator_shift_logs)
+    sess.break_sessions = after_cutoff(sess.break_sessions)
+
+    valid_packs = [row for row in sess.product_pack_history_logs if not bool(row.get("voided"))]
+    sess.pack_total = len(valid_packs)
+    sess.good_total = sum(
+        max(0, int(float(row.get("scanned_pack_qty") or row.get("qty_q") or row.get("qty") or 0)))
+        for row in valid_packs
+    )
+    reject_scans = [
+        row for row in sess.reject_review_logs
+        if str(row.get("entry_type") or "").strip().upper() == "REJECT_SCAN" and not bool(row.get("voided"))
+    ]
+    reject_breakdown: Dict[str, int] = {}
+    for row in reject_scans:
+        code = _canonical_reject_code(row.get("reason_code") or row.get("reason_text"))
+        if code:
+            reject_breakdown[code] = reject_breakdown.get(code, 0) + 1
+    sess.reject_total = len(reject_scans)
+    sess.reject_breakdown = reject_breakdown
+    sess.no_shot_total = int(reject_breakdown.get("NO", 0))
+    sess.startup_reject_total = 0
+    sess.butal_total = sum(max(0, int(float(row.get("qty") or row.get("quantity") or 0))) for row in sess.butal_scan_logs if not bool(row.get("voided")))
+    sess.raw_sacks_count = sum(
+        1 for row in sess.raw_material_logs
+        if not bool(row.get("voided")) and str(row.get("material_type") or "").strip().upper() == "RAW_MATERIAL"
+    )
+    sess.raw_material_scans = [
+        str(row.get("material_name") or row.get("material") or row.get("material_sku") or "").strip()
+        for row in sess.raw_material_logs
+        if str(row.get("material_name") or row.get("material") or row.get("material_sku") or "").strip()
+    ]
+    sess.job_started_at = cutoff.isoformat()
+    sess.production_session_id = str(data.get("production_session_id") or f"PS-{uuid.uuid4().hex.upper()}").strip()
+    sess.machine_counter_shift_start = max(
+        0,
+        int(sess.machine_counter_current or 0) - sess.good_total - sess.reject_total - sess.no_shot_total,
+    )
+    sess.machine_counter_shift_end = None
+    sess.downtime_last_seconds = sum(max(0, int(row.get("duration_seconds") or 0)) for row in sess.pdr_downtime_logs)
+    sess.supervisor_rotation_count = len(sess.supervisor_rotation_logs)
+    sess.last_seen_utc = utc_now().isoformat()
+    if not await asyncio.to_thread(_persist_active_sessions_state, machine_code):
+        return JSONResponse({"ok": False, "error": "split session could not be persisted"}, status_code=503)
+    await broadcast_state()
+    return {"ok": True, "item": _session_protocol_payload(sess)}
+
+
 @APP.post("/api/average-weight")
 @APP.post("/average-weight")
 async def api_average_weight(req: Request):
@@ -24041,6 +27773,147 @@ async def api_jobs_lookup(req: Request):
         )
     except Exception as e:
         return JSONResponse({"ok": False, "found": False, "error": str(e)}, status_code=502)
+
+
+@APP.post("/api/mixing/jobs/{job_id}/partials")
+async def api_mixing_create_job_partial(job_id: int, req: Request):
+    """Idempotently proxy one Mixing shift partial to BMS."""
+    try:
+        data = await req.json()
+    except Exception:
+        return JSONResponse(
+            {"ok": False, "error": "request body must be valid JSON"},
+            status_code=400,
+        )
+    if not isinstance(data, dict):
+        return JSONResponse(
+            {"ok": False, "error": "request body must be a JSON object"},
+            status_code=400,
+        )
+    request_id = str(req.headers.get("X-Idempotency-Key") or "").strip()
+    if not request_id:
+        request_id = "mixing-legacy-" + hashlib.sha256(
+            json.dumps(
+                {"job_id": job_id, "body": data},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{16,160}", request_id):
+        return JSONResponse(
+            {"ok": False, "error": "invalid X-Idempotency-Key"},
+            status_code=400,
+        )
+    body_sha256 = hashlib.sha256(
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    request_lock = MIXING_PARTIAL_REQUEST_LOCKS.setdefault(
+        request_id, asyncio.Lock()
+    )
+    async with request_lock:
+        with MIXING_PARTIAL_ACK_LOCK:
+            acknowledgements = _load_mixing_partial_acknowledgements()
+            previous = acknowledgements.get(request_id)
+            if (
+                isinstance(previous, dict)
+                and previous.get("body_sha256")
+                and previous.get("body_sha256") != body_sha256
+            ):
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": "idempotency key was already used for a different partial",
+                    },
+                    status_code=409,
+                )
+            if isinstance(previous, dict) and previous.get("status") == "acknowledged":
+                return {
+                    "ok": True,
+                    "job_id": job_id,
+                    "request_id": request_id,
+                    "duplicate_suppressed": True,
+                    "payload": previous.get("payload") or {},
+                }
+            if isinstance(previous, dict) and previous.get("status") == "sending":
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "pending": True,
+                        "request_id": request_id,
+                        "error": "this partial is already awaiting acknowledgement",
+                    },
+                    status_code=202,
+                )
+            acknowledgements[request_id] = {
+                "status": "sending",
+                "job_id": job_id,
+                "body_sha256": body_sha256,
+                "started_at_utc": utc_now().isoformat(),
+            }
+            _save_mixing_partial_acknowledgements(acknowledgements)
+
+        try:
+            payload = await asyncio.to_thread(
+                create_job_partial_in_bms, job_id, data, request_id
+            )
+        except ValueError as error:
+            with MIXING_PARTIAL_ACK_LOCK:
+                acknowledgements = _load_mixing_partial_acknowledgements()
+                acknowledgements.pop(request_id, None)
+                _save_mixing_partial_acknowledgements(acknowledgements)
+            return JSONResponse(
+                {"ok": False, "error": str(error)}, status_code=400
+            )
+        except urllib_error.HTTPError as error:
+            body = error.read().decode("utf-8", errors="ignore")
+            with MIXING_PARTIAL_ACK_LOCK:
+                acknowledgements = _load_mixing_partial_acknowledgements()
+                acknowledgements.pop(request_id, None)
+                _save_mixing_partial_acknowledgements(acknowledgements)
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": f"BMS HTTP {error.code}",
+                    "body": body[:500],
+                },
+                status_code=502,
+            )
+        except Exception as error:
+            # The stable idempotency key is forwarded to BMS. Clearing a
+            # confirmed failure lets the single client worker try the same
+            # request later without creating a new logical submission.
+            with MIXING_PARTIAL_ACK_LOCK:
+                acknowledgements = _load_mixing_partial_acknowledgements()
+                acknowledgements.pop(request_id, None)
+                _save_mixing_partial_acknowledgements(acknowledgements)
+            return JSONResponse(
+                {"ok": False, "error": str(error)}, status_code=502
+            )
+
+        with MIXING_PARTIAL_ACK_LOCK:
+            acknowledgements = _load_mixing_partial_acknowledgements()
+            acknowledgements[request_id] = {
+                "status": "acknowledged",
+                "job_id": job_id,
+                "body_sha256": body_sha256,
+                "acknowledged_at_utc": utc_now().isoformat(),
+                "payload": payload,
+            }
+            _save_mixing_partial_acknowledgements(acknowledgements)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "request_id": request_id,
+            "duplicate_suppressed": False,
+            "payload": payload,
+        }
 
 
 @APP.get("/api/planning/low-stock")
