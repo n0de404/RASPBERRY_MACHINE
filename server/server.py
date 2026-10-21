@@ -8682,7 +8682,10 @@ def _dashboard_product_part_shortages(row: Dict[str, Any], *, include_prior_part
                 scanned += max(0.0, _parse_number_like(raw.get("qty") or raw.get("quantity")))
                 used += max(0.0, _parse_number_like(raw.get("used_qty")))
         for raw in scans:
-            if "CARRYOVER" in str(raw.get("source") or "").upper():
+            # A carried balance is real stock available to the current shift.
+            # When prior partial rows are hydrated, those original scans are
+            # already included and the carryover mirror must not be added twice.
+            if include_prior_partials and "CARRYOVER" in str(raw.get("source") or "").upper():
                 continue
             if part_keys.intersection(_dashboard_material_identity_keys(raw)):
                 scanned += max(0.0, _parse_number_like(raw.get("qty") or raw.get("quantity")))
@@ -13762,6 +13765,24 @@ DASHBOARD_HTML = r"""
     return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
   }
 
+  function dashboardPartIsRunningProductOrMold(part, item){
+    const row = (item && typeof item === "object") ? item : {};
+    const payload = (row.job_payload && typeof row.job_payload === "object") ? row.job_payload : {};
+    const data = (payload.data && typeof payload.data === "object") ? payload.data : payload;
+    const job = (data.job && typeof data.job === "object") ? data.job : {};
+    const details = (data.job_details && typeof data.job_details === "object") ? data.job_details : {};
+    const runningKeys = [
+      row.product_sku, job.sku, job.product_sku,
+      row.mold, row.mold_no, details.mold, details.mold_no, job.custom_05,
+    ].map(materialKeyText).filter(Boolean);
+    const source = (part && typeof part === "object") ? part : {};
+    const partKeys = [
+      source.sku, source.part_sku, source.product_code,
+      source.name, source.part_name,
+    ].map(materialKeyText).filter(Boolean);
+    return partKeys.some(key => runningKeys.includes(key));
+  }
+
   function consumedUnitCount(item){
     const row = (item && typeof item === "object") ? item : {};
     const totalGood = Number(row.total_good ?? row.partial_qty ?? ((Number(row.good_total || 0) + Number(row.butal_total || 0))));
@@ -13895,13 +13916,15 @@ DASHBOARD_HTML = r"""
       ? [...priorMaterialRows, ...currentScannedRows]
       : currentMaterialRows;
     const partMap = new Map();
-    allJobPartRows(item).forEach(part => {
+    allJobPartRows(item)
+      .filter(part => !dashboardPartIsRunningProductOrMold(part, item))
+      .forEach(part => {
       if(!part || typeof part !== "object") return;
       const sku = firstValue(part.sku, part.part_sku, part.product_sku, part.part_code, part.product_code, part.code, "-");
       const productId = firstValue(part.part_product_id, part.product_id, part.id, "-");
       const key = `${materialKeyText(productId)}|${materialKeyText(sku)}`;
       if(!partMap.has(key)) partMap.set(key, part);
-    });
+      });
     const parts = [...partMap.values()];
     const consumedUnits = consumedUnitCount(item);
     const appPartQtyKg = Math.max(0, Number(item.external_average_weight_grams || 0) / 1000);
