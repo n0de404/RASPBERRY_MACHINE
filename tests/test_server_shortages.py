@@ -95,6 +95,32 @@ class DashboardPartShortageTests(unittest.TestCase):
             "Z-RM-PP-R-MF30SCN-TITAN-SM598",
         )
 
+    def test_standard_weight_excludes_piece_counted_stickers_and_products(self):
+        row = self._machine_308_row()
+        parts = row["job_payload"]["data"]["job_details"]["parts"]
+        for sku in ("Z-FS-STK-CHRISTMAS", "W-823-BODY", "MOLD-12"):
+            parts.append({"sku": sku, "approve_part_qty": "3000"})
+        result = dashboard_server._dashboard_standard_product_weight(row)
+        self.assertAlmostEqual(result["weight_kg"], 0.193)
+        self.assertEqual(len(result["components"]), 1)
+
+    def test_standard_weight_sums_resin_and_additives_with_sku_aliases(self):
+        row = self._machine_308_row()
+        row["job_payload"]["data"]["job_details"]["parts"].append(
+            {"part_sku": " z-rm-add-test ", "approve_part_qty": "30"}
+        )
+        self.assertAlmostEqual(
+            dashboard_server._dashboard_standard_product_weight(row)["weight_kg"], 0.203
+        )
+
+    def test_standard_weight_without_raw_materials_is_unavailable(self):
+        row = self._machine_308_row()
+        row["job_payload"]["data"]["job_details"]["parts"] = [
+            {"sku": "Z-FS-STK-TEST", "approve_part_qty": "3000"}
+        ]
+        result = dashboard_server._dashboard_standard_product_weight(row)
+        self.assertEqual(result, {"weight_kg": 0.0, "source": "", "components": []})
+
     def test_assigned_part_without_consumption_is_not_short(self) -> None:
         row = self._machine_308_row()
         row["production_session_id"] = "TEST-M308-NO-DEMAND"
@@ -103,6 +129,21 @@ class DashboardPartShortageTests(unittest.TestCase):
 
         self.assertEqual(result["count"], 0)
         self.assertEqual(result["names"], [])
+
+    def test_shortage_clears_when_covered_and_returns_if_delivery_voided(self):
+        row = self._machine_308_row()
+        part = row['job_payload']['data']['job_details']['parts'][1]
+        row['job_payload']['data']['job_details']['parts'].append(dict(part))
+        row['product_pack_history_logs'] = [{
+            'raw_part_consumption': [{'product_id': 5516, 'used_qty': 25}]
+        }]
+        result = dashboard_server._dashboard_product_part_shortages(row)
+        self.assertEqual(result['count'], 1)
+        self.assertEqual(result['details'][0]['shortage_qty'], 25)
+        row['raw_material_logs'] = [{'product_id': 5516, 'qty': 25, 'unit': 'kg'}]
+        self.assertEqual(dashboard_server._dashboard_product_part_shortages(row)['count'], 0)
+        row['raw_material_logs'][0]['voided'] = True
+        self.assertEqual(dashboard_server._dashboard_product_part_shortages(row)['count'], 1)
 
     def test_same_job_partials_are_included_without_double_counting_carryover(self) -> None:
         row = self._machine_308_row()
@@ -153,6 +194,79 @@ class DashboardPartShortageTests(unittest.TestCase):
         self.assertEqual(result["names"], [replacement])
         self.assertAlmostEqual(result["details"][0]["scanned_qty"], 225.0)
         self.assertAlmostEqual(result["details"][0]["used_qty"], 255.818627)
+
+    def test_current_shift_can_be_covered_while_job_history_is_short(self) -> None:
+        row = self._machine_308_row()
+        row["production_session_id"] = "TEST-M314-CURRENT-COVERED"
+        row["prior_partial_raw_material_totals"] = {
+            "rows": [{"material_product_id": 5516, "qty": 600, "used_qty": 706.1443944}]
+        }
+        row["raw_material_logs"] = [{"product_id": 5516, "qty": 175}]
+        row["product_pack_history_logs"] = [{
+            "raw_part_consumption": [{"product_id": 5516, "used_qty": 156.72}]
+        }]
+
+        current = dashboard_server._dashboard_product_part_shortages(row, include_prior_partials=False)
+        whole_job = dashboard_server._dashboard_product_part_shortages(row)
+
+        self.assertEqual(current["count"], 0)
+        self.assertEqual(whole_job["count"], 1)
+        self.assertAlmostEqual(whole_job["details"][0]["shortage_qty"], 87.8643944, places=5)
+
+    def test_running_product_and_mold_are_not_reported_as_missing_parts(self) -> None:
+        row = self._machine_308_row()
+        row["production_session_id"] = "TEST-SELF-PARTS"
+        row["product_sku"] = "W-823-BODY"
+        row["job_payload"]["data"]["job_details"]["mold"] = "MOLD-12"
+        row["job_payload"]["data"]["job_details"]["parts"].extend([
+            {"part_product_id": 7001, "sku": "W-823-BODY", "approve_part_qty": 1},
+            {"part_product_id": 7002, "sku": "MOLD-12", "approve_part_qty": 1},
+        ])
+        row["product_pack_history_logs"] = [{"raw_part_consumption": [
+            {"product_id": 7001, "used_qty": 10},
+            {"product_id": 7002, "used_qty": 10},
+            {"product_id": 5516, "used_qty": 10},
+        ]}]
+
+        result = dashboard_server._dashboard_product_part_shortages(row, include_prior_partials=False)
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["names"], ["Z-RM-PP-R-MF30SCN-TITAN-SM598"])
+
+    def test_distinct_material_still_reports_partial_shortage(self) -> None:
+        row = self._machine_308_row()
+        row["production_session_id"] = "TEST-DISTINCT-SHORT"
+        row["raw_material_logs"] = [{"product_id": 5516, "qty": 4}]
+        row["product_pack_history_logs"] = [{
+            "raw_part_consumption": [{"product_id": 5516, "used_qty": 10}]
+        }]
+
+        result = dashboard_server._dashboard_product_part_shortages(row, include_prior_partials=False)
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["details"][0]["shortage_qty"], 6)
+
+    def test_carryover_does_not_hide_current_shift_short_or_missing(self) -> None:
+        row = self._machine_308_row()
+        row["production_session_id"] = "TEST-M309-CARRYOVER"
+        row["raw_material_logs"] = [
+            {"product_id": 5516, "qty": 29.539, "source": "FINISH_SHIFT_PART_CARRYOVER"},
+            {"product_id": 5516, "qty": 175, "source": "PACK_QR_JOB_PART"},
+            {"product_id": 9001, "qty": 9215.241, "source": "FINISH_SHIFT_PART_CARRYOVER"},
+        ]
+        row["job_payload"]["data"]["job_details"]["parts"].append({
+            "part_product_id": 9001, "sku": "Z-FS-STK-TEST", "approve_part_qty": 100,
+        })
+        row["product_pack_history_logs"] = [{"raw_part_consumption": [
+            {"product_id": 5516, "used_qty": 184.365},
+            {"product_id": 9001, "used_qty": 184.552},
+        ]}]
+
+        result = dashboard_server._dashboard_product_part_shortages(row, include_prior_partials=False)
+
+        self.assertEqual(result["count"], 2)
+        self.assertAlmostEqual(result["details"][0]["shortage_qty"], 9.365)
+        self.assertAlmostEqual(result["details"][1]["shortage_qty"], 184.552)
 
     def test_replacement_with_enough_scanned_weight_is_not_short(self) -> None:
         row = self._machine_308_row()

@@ -27,8 +27,11 @@ class DashboardPerformanceSafetyTests(unittest.TestCase):
 
         summary = session.to_dashboard_dict()
 
-        for field in dashboard_server.DASHBOARD_HEAVY_SESSION_FIELDS:
+        # Mixing jobs retain only a compact per-job summary for the live cards;
+        # every full audit ledger must stay out of the dashboard payload.
+        for field in dashboard_server.DASHBOARD_HEAVY_SESSION_FIELDS - {"mixing_open_jobs"}:
             self.assertNotIn(field, summary)
+        self.assertEqual(summary["mixing_open_jobs"], [])
         self.assertEqual(len(session.product_pack_history_logs), 1)
         self.assertEqual(len(session.client_app_logs), 1)
         self.assertTrue(summary["summary_only"])
@@ -66,6 +69,72 @@ class DashboardPerformanceSafetyTests(unittest.TestCase):
         script = dashboard_server.DASHBOARD_JAVASCRIPT
         self.assertIn('STATE_PATCH', script)
         self.assertIn('renderDashboardSectionIfChanged', script)
+
+    def test_dashboard_defers_hidden_heavy_panels_until_after_machine_cards(self):
+        script = dashboard_server.DASHBOARD_JAVASCRIPT
+        self.assertIn('scheduleDeferredDashboardSections(state);', script)
+        self.assertIn('window.requestIdleCallback(run, {timeout:250});', script)
+        render_start = script.index('function render(state)')
+        render_end = script.index('function setPlanningQueueOpen', render_start)
+        render_source = script[render_start:render_end]
+        self.assertLess(
+            render_source.index('renderMachineTodo(state || {});'),
+            render_source.index('scheduleDeferredDashboardSections(state);'),
+        )
+
+    def test_dashboard_reload_uses_product_cache_without_forced_refresh(self):
+        script = dashboard_server.DASHBOARD_JAVASCRIPT
+        self.assertIn('loadProducts(false).catch(() => {});', script)
+        self.assertNotIn('loadProducts(true).catch(() => {});', script)
+
+    def test_shift_history_always_includes_durable_scan_ledgers(self):
+        script = dashboard_server.DASHBOARD_JAVASCRIPT
+        self.assertNotIn('if(!clientRows.length){', script)
+        self.assertIn('(item.product_pack_history_logs || [])', script)
+
+    def test_single_shift_detail_hydrates_its_activity_time_window(self):
+        detail = {
+            "record_type": "SHIFT_PARTIAL",
+            "machine_code": "M00005",
+            "started_at_utc": "2026-11-03T10:44:45+00:00",
+            "ended_at_utc": "2026-11-03T22:39:54+00:00",
+            "client_app_logs": [
+                {"timestamp_utc": "2026-11-03T10:45:00+00:00", "message": "embedded"}
+            ],
+        }
+        stored = {
+            "items": [
+                {"timestamp_utc": "2026-11-03T12:00:00+00:00", "message": "stored"}
+            ],
+            "total": 1,
+        }
+        with patch.object(dashboard_server, "_load_history_detail_sql", return_value=detail):
+            with patch.object(
+                dashboard_server,
+                "_same_job_partial_raw_material_totals",
+                return_value={"rows": []},
+            ):
+                with patch.object(
+                    dashboard_server,
+                    "_load_machine_activity_logs_sql",
+                    return_value=stored,
+                ) as load_activity:
+                    result = dashboard_server._finished_detail_with_prior_partials(
+                        {}, include_activity=True
+                    )
+        self.assertEqual([row["message"] for row in result["client_app_logs"]], ["embedded", "stored"])
+        self.assertEqual(result["client_app_logs_total"], 1)
+        args = load_activity.call_args.args
+        self.assertEqual(args[0], "M00005")
+        self.assertEqual(args[2], "2026-11-03T10:44:45+00:00")
+        self.assertEqual(args[3], "2026-11-03T22:40:54+00:00")
+
+    def test_active_session_recovery_snapshot_uses_compact_lossless_json(self):
+        source = (SERVER_DIR / "server.py").read_text(encoding="utf-8-sig")
+        self.assertIn(
+            'json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))',
+            source,
+        )
 
     def test_sql_history_does_not_load_large_json_fallback(self):
         compact = {

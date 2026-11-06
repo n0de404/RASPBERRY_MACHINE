@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import copy
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import sys
@@ -108,6 +109,7 @@ ACTIVE_MACHINE_SESSIONS_FILE = CLIENT_ACTIVE_MACHINE_SESSIONS_FILE
 SERVER_EVENT_QUEUE_FILE = os.path.join(DATABASE_DIR, "server_event_queue.json")
 SERVER_CONFIRMED_SESSIONS_FILE = os.path.join(DATABASE_DIR, "server_confirmed_sessions.json")
 SERVER_SYNC_PROTOCOL_VERSION = 2
+CLIENT_DISPLAY_VERSION = "v1.02.01"
 SCANNED_PACK_QR_KEYS_FILE = os.path.join(DATABASE_DIR, "scanned_pack_qr_keys.json")
 INVALID_SCAN_GIF = os.environ.get(
     "MACHINE_INVALID_SCAN_GIF",
@@ -1680,6 +1682,9 @@ class ClientState:
     pdr_downtime_logs: List[Dict[str, Any]] = None
     pdr_current_segment_start_seconds: Optional[int] = None
     pdr_followup_reasons_remaining: int = 0
+    # True while a PDR was opened with only the machine selected.  Its timer
+    # and audit rows are transferred to the first job scanned afterward.
+    pdr_started_before_job: bool = False
     downtime_started_at: Optional[float] = None
     downtime_last_seconds: Optional[int] = None
     downtime_active: bool = False
@@ -1922,8 +1927,8 @@ class CounterCard(QWidget):
 
     flash = pyqtProperty(float, fget=getFlash, fset=setFlash)
 
-    def add_points(self, val: int):
-        delta = int(val or 0)
+    def add_points(self, val: Any):
+        delta = float(val or 0)
         if delta == 0:
             return
         old_value = self._value
@@ -1953,7 +1958,11 @@ class CounterCard(QWidget):
 
         self._floating.append(
             FloatingText(
-                text=f"{delta:+d}",
+                text=(
+                    f"{int(delta):+d}"
+                    if float(delta).is_integer()
+                    else f"{delta:+.4f}".rstrip("0").rstrip(".")
+                ),
                 x=self.width() * 0.72,
                 y=self.height() * 0.42,
                 start_y=self.height() * 0.42,
@@ -1961,8 +1970,8 @@ class CounterCard(QWidget):
         )
         self._sync_tick_timer()
 
-    def set_value(self, value: int):
-        next_value = max(0, int(value))
+    def set_value(self, value: Any):
+        next_value = max(0.0, float(value or 0))
         if self._value == next_value and self._display_value == float(next_value):
             return
         self._value = next_value
@@ -2106,7 +2115,11 @@ class CounterCard(QWidget):
         painter.drawText(title_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, self.title)
 
     def _draw_value(self, painter: QPainter, rect: QRectF, c: dict):
-        text = str(int(round(self._display_value)))
+        text = (
+            str(int(round(self._display_value)))
+            if abs(self._display_value - round(self._display_value)) <= 1e-9
+            else f"{self._display_value:.4f}".rstrip("0").rstrip(".")
+        )
         value_rect = QRectF(rect.left(), rect.top() + max(18, int(rect.height() * 0.24)), rect.width(), rect.height() - max(20, int(rect.height() * 0.22)))
         is_green_theme = str(self._float_theme_override or self.theme or "green").lower() != "red"
         glow_alpha = int((110 if is_green_theme else 170) + 65 * self._glow)
@@ -3482,6 +3495,7 @@ class ClientUI(QWidget):
     server_session_received = pyqtSignal(dict)
     server_closed_session_received = pyqtSignal(str, str)
     virtual_pack_reservation_received = pyqtSignal(dict)
+    job_configurations_received = pyqtSignal(dict)
 
     @staticmethod
     def _load_digital_font_family() -> str:
@@ -3500,12 +3514,16 @@ class ClientUI(QWidget):
         self.state = ClientState()
         self._crew_action_mode = ""
         self._reliever_action_mode = False
+        self._change_operator_phase = ""
+        self._change_operator_target: Optional[Dict[str, Any]] = None
         self.client_config = _load_client_config()
         self.job_api_config = _load_job_api_config()
         # The server remains authoritative. Successful lookups populate a
         # bounded local cache used only when that server lookup is unavailable.
         self._job_details_cache: List[Dict[str, Any]] = _load_job_details_cache_json()
         self._last_job_payload_source = ""
+        self._job_configuration_versions: Dict[str, str] = {}
+        self._job_configuration_refresh_inflight = False
         self._pending_job_api_retry: Optional[Dict[str, Any]] = None
         self._pending_no_zrm_job_confirmation: Optional[Dict[str, Any]] = None
         self._pending_job_api_retry_timer = QTimer(self)
@@ -3701,6 +3719,13 @@ QWidget#ClientUIRoot {{
         self.headerDateTime.setObjectName("HeaderMetaValue")
         self.headerDateTime.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.headerServerConnection = ServerConnectionIndicator()
+        self.headerVersion = QLabel(CLIENT_DISPLAY_VERSION)
+        self.headerVersion.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.headerVersion.setStyleSheet(
+            "color: #b8bec9; background: rgba(31, 41, 55, 0.72);"
+            "border: 1px solid rgba(184, 190, 201, 0.38); border-radius: 8px;"
+            "padding: 2px 7px; font-size: 10px; font-weight: 700; letter-spacing: 0.4px;"
+        )
         self.btnSettings = QPushButton("\u2699")
         self.btnSettings.setObjectName("HeaderSettingsButton")
         self.btnSettings.setFixedSize(40, 40)
@@ -3723,6 +3748,7 @@ QWidget#ClientUIRoot {{
         headerRow.addWidget(self.headerJobDuration, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.headerDateTime, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         headerRow.addWidget(self.headerServerConnection, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        headerRow.addWidget(self.headerVersion, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.headerCard = QFrame()
         self.headerCard.setObjectName("HeaderCard")
@@ -6017,6 +6043,8 @@ QWidget#ClientUIRoot {{
         self._pending_final_review_payload: Optional[Dict[str, Any]] = None
         self._pending_final_review_linked_payloads: List[Dict[str, Any]] = []
         self._finish_shift_cancel_snapshot: Optional[Dict[str, Any]] = None
+        self._pending_finish_shift_clear_choice = False
+        self._pending_finish_shift_turnover_snapshot: Optional[Dict[str, Any]] = None
         self._finish_job_cancel_snapshot: Optional[Dict[str, Any]] = None
         self._app_log_ready = False
         self._app_log_filter = AppInteractionLogFilter(self)
@@ -6461,7 +6489,9 @@ QWidget#ClientUIRoot {{
         self.graphicsModeToggle.modeChanged.connect(self._apply_graphics_settings)
         self.displayApplyBtn.clicked.connect(self._apply_display_settings)
         self.apiJobApiTestBtn.clicked.connect(self._test_job_api_settings)
-        self.apiRefreshRunningJobsBtn.clicked.connect(self._refresh_all_running_job_details)
+        self.apiRefreshRunningJobsBtn.clicked.connect(
+            lambda _checked=False: self._refresh_all_running_job_details(manual=True)
+        )
         self.apiApplyBtn.clicked.connect(self._apply_api_settings)
         self.settingsContent.layout().addLayout(self.settingsContentTop)
         self.settingsContent.layout().addWidget(self.settingsContentDivider)
@@ -6663,6 +6693,7 @@ QWidget#ClientUIRoot {{
         self.server_session_received.connect(self._apply_acknowledged_server_session)
         self.server_closed_session_received.connect(self._apply_server_closed_session)
         self.virtual_pack_reservation_received.connect(self._apply_virtual_pack_reservation)
+        self.job_configurations_received.connect(self._apply_server_job_configurations)
         self._ui_refresh_timer = QTimer(self)
         self._ui_refresh_timer.setSingleShot(True)
         self._ui_refresh_timer.timeout.connect(self._refresh_ui_now)
@@ -8913,6 +8944,8 @@ QWidget#ClientUIRoot {{
             caps.add("supervisor")
         if "maintenance" in s:
             caps.add("maintenance")
+        if "line technician" in s:
+            caps.add("pdr_maintenance")
         if "operator" in s:
             caps.add("operator")
         if "qa/qc" in s or "qaqc" in s or ("qa" in s and "qc" in s) or s in ("qc", "qa"):
@@ -9128,6 +9161,8 @@ QWidget#ClientUIRoot {{
             role_text = "QC"
         elif "maintenance" in caps:
             role_text = "MAINTENANCE"
+        elif "pdr_maintenance" in caps:
+            role_text = "LINE TECHNICIAN"
         else:
             role_text = "AUTHORIZED"
         return {
@@ -9137,8 +9172,17 @@ QWidget#ClientUIRoot {{
             "can_supervisor": "1" if "supervisor" in caps else "0",
             "can_qc": "1" if "qc" in caps else "0",
             "can_maintenance": "1" if "maintenance" in caps else "0",
+            "can_pdr_maintenance": "1" if {"maintenance", "pdr_maintenance"}.intersection(caps) else "0",
             "can_operator": "1" if "operator" in caps else "0",
         }
+
+    def _can_handle_pdr_maintenance(self, person: Optional[Dict[str, str]]) -> bool:
+        if not isinstance(person, dict):
+            return False
+        return bool(
+            str(person.get("can_pdr_maintenance", "0")) == "1"
+            or str(person.get("can_maintenance", "0")) == "1"
+        )
 
     def _reviewer_from_scan(self, raw: str) -> Optional[Dict[str, str]]:
         person = self._authorized_person_from_scan(raw)
@@ -9600,13 +9644,26 @@ QWidget#ClientUIRoot {{
         # Queue completion immediately even while offline. The SQLite outbox is
         # the durable handoff, so the operator can begin the next job without
         # waiting for the server to become reachable.
+        # Keep a small copy of the completed job setup until the operator picks
+        # the next action. A fast server acknowledgement may clear the old
+        # production session before num_1 is scanned.
+        self._pending_finish_shift_turnover_snapshot = self._state_to_active_snapshot()
+        self._pending_finish_shift_clear_choice = True
         self._last_finish_shift_sync_signature = ""
         self.sync_local_finish_shifts_to_server(force=True)
         self._finish_shift_cancel_snapshot = None
         self._hide_operator_shift_overlay()
-        self._clear_shift_session_keep_machine()
+        self._show_info_overlay(
+            "SHIFT COMPLETE - CHOOSE NEXT ACTION",
+            "num_1  SHIFT TURNOVER\n"
+            "Keep the same job, product-part setup, and operator; clear shift totals and continue setup.\n\n"
+            "num_2  CHANGE MOLD / CHANGE COLOR\n"
+            "Clear all shift data, JOB, and OPERATOR, then scan the next JOB.",
+            hide_ms=0,
+        )
         self.status.setText(
-            f"Shift approved by {self._safe_text(reviewer.get('name'))}. Scan JOB QR for the next operator."
+            f"Shift approved by {self._safe_text(reviewer.get('name'))}. "
+            "Scan num_1 for shift turnover or num_2 for change mold/color."
         )
 
     def _set_reject_review_blur(self, enabled: bool):
@@ -10171,19 +10228,15 @@ QWidget#ClientUIRoot {{
     def _refresh_ui_now(self):
         self._ui_refresh_pending = False
         s = self.state
+        self._sanitize_transient_command_modes()
         self._restore_job_payload_from_active_snapshot()
         self.lblMachine.setText(f"Machine: {_machine_display_name(s.machine_code, s.machine_name)}")
         self.lblJob.setText(f"Job: {s.job_name or '-'}")
-        manpower_count = self._crew_count()
-        if manpower_count >= 2:
-            self.lblOperator.setText(f"MANPOWER: {manpower_count}")
-            self.lblOperator.setStyleSheet("")
-        elif s.break_active and s.reliever_id:
-            self.lblOperator.setText(f"RELIEVER: {self._operator_display_name(s.reliever_id)}")
-            self.lblOperator.setStyleSheet("color: #f59e0b; font-weight: 900;")
-        else:
-            self.lblOperator.setText(f"OPERATOR: {self._operator_display_name(s.operator_id)}")
-            self.lblOperator.setStyleSheet("")
+        operator_header_text, reliever_active = self._operator_header_display()
+        self.lblOperator.setText(operator_header_text)
+        self.lblOperator.setStyleSheet(
+            "color: #f59e0b; font-weight: 900;" if reliever_active else ""
+        )
         payload = s.job_payload or {}
         data_obj = payload.get("data") if isinstance(payload, dict) else {}
         job = data_obj.get("job") if isinstance(data_obj, dict) else {}
@@ -10277,13 +10330,32 @@ QWidget#ClientUIRoot {{
             f"Start Up Reject: {int(s.startup_reject_total or 0)}    No Shot: {int(s.no_shot_total or 0)}"
         )
 
-        # banner message depending on workflow
-        if not s.machine_code:
+        # Every active command reports its next expected scan in the permanent
+        # blue banner, so an interrupted operator can resume without guessing.
+        command_banner = self._active_command_banner_text()
+        if bool(getattr(self, "_pending_finish_shift_clear_choice", False)):
+            self._set_banner_text("SHIFT COMPLETE: num_1 turnover / num_2 change mold or color")
+        elif not s.machine_code:
             self._set_banner_text("Scan MACHINE QR to start")
+        elif s.pdr_started_before_job and self._pdr_workflow_active():
+            if s.waiting_downtime_start_maintenance:
+                self._set_banner_text("Machine-only PDR: scan Maintenance/Line Technician QR or scan JOB")
+            elif s.waiting_pdr_maintenance_reason:
+                self._set_banner_text("Machine-only PDR: scan reason QR (01-15) or scan JOB")
+            elif s.waiting_downtime_end_maintenance or s.downtime_active:
+                self._set_banner_text("Machine-only PDR active: scan Maintenance/Line Technician QR or scan JOB")
+            elif s.waiting_cycle_time_input:
+                self._set_banner_text("Machine-only PDR: scan JOB to attach downtime")
+            elif s.waiting_supervisor_qr:
+                self._set_banner_text("Machine-only PDR: scan non-Operator badge or scan JOB")
+            else:
+                self._set_banner_text("Machine-only PDR active: scan JOB to attach downtime")
         elif not s.job_code:
             self._set_banner_text("Scan JOB QR")
         elif not s.operator_id:
             self._set_banner_text("Scan OPERATOR badge")
+        elif command_banner:
+            self._set_banner_text(command_banner)
         elif str(getattr(self, "_change_work_order_phase", "") or "").upper() == "SELECT":
             self._set_banner_text("CHANGE WORK ORDER: scan the running JOB to replace")
         elif str(getattr(self, "_change_work_order_phase", "") or "").upper() == "REPLACE":
@@ -10329,23 +10401,23 @@ QWidget#ClientUIRoot {{
             self._set_banner_text(f"Butal +{int(s.pending_butal_qty or 0)} pending: scan MAIN or LINKED JOB QR")
         elif s.waiting_cycle_time_input:
             if str(s.cycle_time_new_input or "").strip():
-                self._set_banner_text("Downtime resolve: Scan QC, Maintenance, or Supervisor badge")
+                self._set_banner_text("Downtime resolve: Scan QC, Maintenance, Line Technician, or Supervisor badge")
             else:
                 self._set_banner_text("Downtime resolve: Scan numkeys to input new cycle time")
         elif s.waiting_downtime_start_maintenance:
-            self._set_banner_text("PDR waiting: scan Maintenance QR to start downtime")
+            self._set_banner_text("PDR waiting: scan Maintenance or Line Technician QR")
         elif s.waiting_pdr_maintenance_reason:
             self._set_banner_text("Downtime stopped: scan reason QR (01-15)")
         elif s.waiting_downtime_end_maintenance:
-            self._set_banner_text("Downtime active: scan Maintenance QR when repair is done")
+            self._set_banner_text("Downtime active: scan Maintenance or Line Technician QR when done")
         elif s.waiting_maintenance_qr:
-            self._set_banner_text("Downtime resolve: Scan Maintenance QR to stop downtime")
+            self._set_banner_text("Downtime resolve: Scan Maintenance or Line Technician QR")
         elif s.waiting_supervisor_qr:
             self._set_banner_text("Downtime resolve: scan any registered non-Operator badge")
         elif s.waiting_operator_downtime_confirm:
             self._set_banner_text("Downtime resolve: Scan Operator QR to proceed")
         elif s.downtime_active:
-            self._set_banner_text("Downtime active: scan Maintenance QR when repair is done")
+            self._set_banner_text("Downtime active: scan Maintenance or Line Technician QR when done")
         else:
             self._set_banner_text("Ready: Scan PACK / BUTAL / Reject~1")
         multiplier_hint = self._reject_multiplier_indicator_text()
@@ -11639,6 +11711,7 @@ QWidget#ClientUIRoot {{
             "downtime_total_seconds": self._pdr_total_downtime_seconds(include_active=True),
             "pdr_current_segment_start_seconds": s.pdr_current_segment_start_seconds,
             "pdr_followup_reasons_remaining": int(s.pdr_followup_reasons_remaining or 0),
+            "pdr_started_before_job": bool(s.pdr_started_before_job),
             "downtime_wait_started_at": s.downtime_wait_started_at,
             "downtime_wait_last_seconds": s.downtime_wait_last_seconds,
             "waiting_downtime_start_maintenance": bool(s.waiting_downtime_start_maintenance),
@@ -12762,6 +12835,8 @@ QWidget#ClientUIRoot {{
         ]
         self._crew_action_mode = ""
         self._reliever_action_mode = False
+        self._change_operator_phase = ""
+        self._change_operator_target = None
         s.active_scan_operator_id = snap.get("active_scan_operator_id") or s.operator_id
         s.active_scan_owner_type = str(snap.get("active_scan_owner_type") or ("RELIEVER" if snap.get("break_active") else "ORIGINAL")).strip().upper() or "ORIGINAL"
         s.reliever_id = snap.get("reliever_id")
@@ -12817,6 +12892,21 @@ QWidget#ClientUIRoot {{
         s.pdr_downtime_logs = list(snap.get("pdr_downtime_logs") or [])
         s.pdr_current_segment_start_seconds = snap.get("pdr_current_segment_start_seconds")
         s.pdr_followup_reasons_remaining = int(snap.get("pdr_followup_reasons_remaining") or 0)
+        s.pdr_started_before_job = bool(
+            snap.get("pdr_started_before_job")
+            or (
+                not s.job_code
+                and (
+                    s.waiting_production_report_reason
+                    or s.waiting_downtime_start_maintenance
+                    or s.waiting_pdr_maintenance_reason
+                    or s.waiting_downtime_end_maintenance
+                    or s.downtime_active
+                    or s.pdr_reason_segments
+                    or s.pdr_downtime_logs
+                )
+            )
+        )
         s.downtime_wait_started_at = snap.get("downtime_wait_started_at")
         s.downtime_wait_last_seconds = snap.get("downtime_wait_last_seconds")
         s.waiting_downtime_start_maintenance = bool(snap.get("waiting_downtime_start_maintenance"))
@@ -13334,6 +13424,8 @@ QWidget#ClientUIRoot {{
         s.crew_members = []
         self._crew_action_mode = ""
         self._reliever_action_mode = False
+        self._change_operator_phase = ""
+        self._change_operator_target = None
         s.active_scan_operator_id = None
         s.active_scan_owner_type = "ORIGINAL"
         s.reliever_id = None
@@ -13381,6 +13473,7 @@ QWidget#ClientUIRoot {{
         s.pdr_downtime_logs = []
         s.pdr_current_segment_start_seconds = None
         s.pdr_followup_reasons_remaining = 0
+        s.pdr_started_before_job = False
         s.downtime_started_at = None
         s.downtime_last_seconds = None
         s.downtime_active = False
@@ -13527,6 +13620,116 @@ QWidget#ClientUIRoot {{
         self._broadcast_machine_no_job_running()
         self.status.setText("Finish shift saved. Scan JOB QR.")
 
+    def _clear_shift_for_turnover_keep_job(self, snap: Optional[Dict[str, Any]] = None) -> bool:
+        """Start a clean shift while retaining the same job and permanent crew."""
+        source = dict(snap or {})
+        if not str(source.get("job_code") or "").strip():
+            source = self._state_to_active_snapshot()
+        machine_code = str(source.get("machine_code") or "").strip()
+        job_code = str(source.get("job_code") or "").strip()
+        if not machine_code or not job_code:
+            return False
+
+        machine_name = source.get("machine_name")
+        job_name = source.get("job_name") or job_code
+        job_payload = dict(source.get("job_payload") or {})
+        operator_id = str(source.get("operator_id") or "").strip() or None
+        operator_qr_payload = str(source.get("operator_qr_payload") or "")
+        operator_pending_server_validation = bool(source.get("operator_pending_server_validation"))
+        crew_members = [dict(row) for row in (source.get("crew_members") or []) if isinstance(row, dict)]
+        linkage_enabled = bool(source.get("linkage_enabled"))
+        linkage_job_code = source.get("linkage_job_code")
+        linkage_job_name = source.get("linkage_job_name")
+        linkage_job_payload = dict(source.get("linkage_job_payload") or {})
+        linkage_jobs = [dict(row) for row in (source.get("linkage_jobs") or []) if isinstance(row, dict)]
+        for row in linkage_jobs:
+            for counter_key in (
+                "linkage_pack_count",
+                "linkage_good_total",
+                "prepack_units",
+                "prepack_good_total",
+            ):
+                if counter_key in row:
+                    row[counter_key] = 0
+            if "linkage_output_allocation" in row:
+                row["linkage_output_allocation"] = {}
+        prepack_mode_enabled = bool(source.get("prepack_mode_enabled"))
+        prepack_active_job_code = source.get("prepack_active_job_code")
+        prepack_pack_qty = int(source.get("prepack_pack_qty") or 0)
+
+        self._clear_full_session()
+        s = self.state
+        s.machine_code = machine_code
+        s.machine_name = machine_name
+        s.job_code = job_code
+        s.job_name = job_name
+        s.job_payload = job_payload
+        s.job_started_at = datetime.now(timezone.utc).isoformat()
+        s.production_session_id = self._new_production_session_id()
+        s.operator_id = operator_id
+        s.operator_qr_payload = operator_qr_payload
+        s.operator_pending_server_validation = operator_pending_server_validation
+        s.crew_members = crew_members
+        s.active_scan_operator_id = operator_id
+        s.active_scan_owner_type = "ORIGINAL"
+        s.linkage_enabled = linkage_enabled
+        s.linkage_job_code = linkage_job_code
+        s.linkage_job_name = linkage_job_name
+        s.linkage_job_payload = linkage_job_payload
+        s.linkage_jobs = linkage_jobs
+        s.prepack_mode_enabled = prepack_mode_enabled
+        s.prepack_active_job_code = prepack_active_job_code
+        s.prepack_pack_qty = prepack_pack_qty
+
+        # Reapply only the unused same-job product-part balance saved by the
+        # finished shift. All production counters and scan history stay clean.
+        self._restore_same_job_part_carryover()
+        if operator_id:
+            self._start_operator_shift_tracking()
+            self._begin_initial_cycle_time_setup()
+        self._refresh_ui()
+        self._save_active_session_snapshot(force=True)
+        self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (SHIFT TURNOVER)")
+        if operator_id:
+            self.status.setText(
+                f"Shift turnover ready for {s.job_name or s.job_code} / "
+                f"{self._operator_display_name(operator_id)}. Enter the new shift cycle time."
+            )
+        else:
+            self.status.setText(
+                f"Shift turnover ready for {s.job_name or s.job_code}. Scan the OPERATOR QR."
+            )
+        return True
+
+    def _handle_finish_shift_clear_choice(self, raw_text: str) -> bool:
+        if not bool(getattr(self, "_pending_finish_shift_clear_choice", False)):
+            return False
+        raw_l = str(raw_text or "").strip().lower()
+        if raw_l not in ("num_1", "1", "num_2", "2"):
+            self.status.setText("Shift is complete. Scan num_1 for turnover or num_2 for change mold/color.")
+            self._show_info_overlay(
+                "SHIFT COMPLETE - CHOOSE NEXT ACTION",
+                "num_1  SHIFT TURNOVER - keep JOB, product parts, and OPERATOR.\n\n"
+                "num_2  CHANGE MOLD / CHANGE COLOR - clear JOB and OPERATOR; scan next JOB.",
+                hide_ms=0,
+            )
+            return True
+
+        turnover_snap = self._pending_finish_shift_turnover_snapshot
+        self._pending_finish_shift_clear_choice = False
+        self._pending_finish_shift_turnover_snapshot = None
+        self._hide_invalid_overlay()
+        if raw_l in ("num_1", "1"):
+            if self._clear_shift_for_turnover_keep_job(turnover_snap):
+                return True
+            self._clear_shift_session_keep_machine()
+            self.status.setText("Turnover job could not be retained. Scan JOB QR, then OPERATOR QR.")
+            return True
+
+        self._clear_shift_session_keep_machine()
+        self.status.setText("Change mold/color selected. Scan the next JOB QR, then OPERATOR QR.")
+        return True
+
     def _broadcast_machine_no_job_running(self):
         s = self.state
         if not s.machine_code:
@@ -13572,12 +13775,97 @@ QWidget#ClientUIRoot {{
         reason_map = {k: v for k, v in PRODUCTION_DAILY_REPORT_ITEMS}
         return reason_map.get(str(code or "").strip().zfill(2))
 
+    def _pdr_workflow_active(self) -> bool:
+        s = self.state
+        return bool(
+            s.waiting_production_report_reason
+            or s.waiting_downtime_start_maintenance
+            or s.waiting_pdr_maintenance_reason
+            or s.waiting_downtime_end_maintenance
+            or s.waiting_cycle_time_input
+            or s.waiting_maintenance_qr
+            or s.waiting_supervisor_qr
+            or s.waiting_operator_downtime_confirm
+            or s.downtime_active
+        )
+
+    def _capture_prejob_pdr_state(self) -> Dict[str, Any]:
+        """Keep machine-only PDR data while the first job is initialized."""
+        s = self.state
+        if s.job_code or not bool(s.pdr_started_before_job):
+            return {}
+        fields = (
+            "waiting_production_report_reason",
+            "downtime_reason_code",
+            "downtime_reason_text",
+            "pdr_operator_reason_code",
+            "pdr_operator_reason_text",
+            "waiting_pdr_maintenance_reason",
+            "pdr_reason_segments",
+            "pdr_downtime_logs",
+            "pdr_current_segment_start_seconds",
+            "pdr_followup_reasons_remaining",
+            "downtime_started_at",
+            "downtime_last_seconds",
+            "downtime_active",
+            "downtime_wait_started_at",
+            "downtime_wait_last_seconds",
+            "waiting_downtime_start_maintenance",
+            "waiting_downtime_end_maintenance",
+            "downtime_resolution_started_at",
+            "maintenance_downtime_seconds",
+            "supervisor_downtime_confirmation_started_at",
+            "supervisor_downtime_confirmation_seconds",
+            "operator_downtime_confirmation_started_at",
+            "operator_downtime_confirmation_seconds",
+            "waiting_cycle_time_input",
+            "waiting_maintenance_qr",
+            "waiting_supervisor_qr",
+            "waiting_operator_downtime_confirm",
+            "cycle_time_current",
+            "cycle_time_temporary",
+            "cycle_time_supervisor_confirmed",
+            "cycle_time_pending_supervisor",
+            "cycle_time_change_logs",
+            "cycle_time_new_input",
+            "cycle_time_confirmed_by",
+            "cycle_time_confirm_actor_code",
+            "cycle_time_confirm_actor_name",
+            "cycle_time_confirm_actor_role",
+            "maintenance_name",
+            "supervisor_name",
+        )
+        return {name: copy.deepcopy(getattr(s, name)) for name in fields}
+
+    def _restore_prejob_pdr_state(self, saved: Dict[str, Any]) -> bool:
+        if not saved:
+            return False
+        for name, value in saved.items():
+            setattr(self.state, name, copy.deepcopy(value))
+        # It now belongs to the production session created for the scanned job.
+        self.state.pdr_started_before_job = False
+        return True
+
     def _pdr_elapsed_seconds(self) -> int:
         s = self.state
         base_seconds = int(s.downtime_last_seconds or s.maintenance_downtime_seconds or 0)
         if s.downtime_started_at:
             return base_seconds + max(0, int(time.time() - s.downtime_started_at))
         return base_seconds
+
+    def _stopped_pdr_repair_duration(self) -> Optional[int]:
+        """Return a completed repair duration, including server-restored PDRs."""
+        s = self.state
+        if s.downtime_active or s.downtime_started_at:
+            return None
+        raw_duration = (
+            s.maintenance_downtime_seconds
+            if s.maintenance_downtime_seconds is not None
+            else s.downtime_last_seconds
+        )
+        if raw_duration is None:
+            return None
+        return max(0, int(raw_duration or 0))
 
     def _close_pdr_reason_segment(self, ended_by: str) -> Optional[Dict[str, Any]]:
         s = self.state
@@ -13660,6 +13948,31 @@ QWidget#ClientUIRoot {{
         s.pdr_downtime_logs = rows
         return row
 
+    def _complete_prejob_pdr_without_cycle_time(self) -> Optional[Dict[str, Any]]:
+        """Close a machine-only PDR and leave it ready for the next job.
+
+        A cycle time belongs to a production job. When downtime starts before
+        any job is scanned, keep the completed downtime locally so the next
+        job can receive it through ``_restore_prejob_pdr_state``.
+        """
+        s = self.state
+        if s.job_code or not bool(s.pdr_started_before_job):
+            return None
+        if s.maintenance_downtime_seconds is not None:
+            s.downtime_last_seconds = int(s.maintenance_downtime_seconds or 0)
+        s.downtime_started_at = None
+        s.downtime_active = False
+        s.waiting_downtime_end_maintenance = False
+        s.waiting_pdr_maintenance_reason = False
+        downtime_record = self._record_completed_pdr_downtime(
+            confirmed_by=str(s.maintenance_name or "Maintenance"),
+            confirmed_by_role="Maintenance",
+        )
+        self._reset_downtime_resolution_state()
+        # Keep this marker until JOB_SET captures and transfers the record.
+        s.pdr_started_before_job = True
+        return downtime_record
+
     def _operator_code_only(self, operator_text: Optional[str]) -> str:
         if not operator_text:
             return ""
@@ -13703,6 +14016,7 @@ QWidget#ClientUIRoot {{
         s.pdr_reason_segments = []
         s.pdr_current_segment_start_seconds = None
         s.pdr_followup_reasons_remaining = 0
+        s.pdr_started_before_job = False
         self._hide_production_overlay()
         self.status.setText("PDR start cancelled. Continue current job.")
         self._refresh_ui()
@@ -14430,47 +14744,132 @@ QWidget#ClientUIRoot {{
             self._append_job_api_log(f"TEST ERROR: {e}")
             print(f"[JobAPI] TEST ERROR: {e}")
 
-    def _refresh_all_running_job_details(self):
-        """Refresh API payloads without resetting the active production session."""
-        s = self.state
-        if not s.job_code:
-            self.status.setText("No running jobs to refresh.")
-            return
-        refreshed = 0
-        failed: List[str] = []
-        self._show_bms_loading("Refreshing all running jobs from BMS...")
-        try:
-            main_payload = self._fetch_job_payload_from_api(str(s.job_code or ""))
-            if isinstance(main_payload, dict):
-                main_job = self._extract_job_record_from_payload(main_payload)
-                s.job_payload = main_payload
-                s.job_name = (
-                    self._safe_text(main_job.get("ref_no"), "")
-                    or s.job_name
-                    or s.job_code
-                )
-                refreshed += 1
-            else:
-                failed.append(str(s.job_name or s.job_code))
+    def _running_job_configuration_identifiers(self) -> List[str]:
+        identifiers: List[str] = []
+        for value in [self.state.job_code] + [
+            row.get("job_code")
+            for row in (self.state.linkage_jobs or [])
+            if isinstance(row, dict)
+        ]:
+            identifier = str(value or "").strip()
+            if identifier and identifier not in identifiers:
+                identifiers.append(identifier)
+        return identifiers
 
-            for row in (s.linkage_jobs or []):
-                if not isinstance(row, dict):
-                    continue
-                code = str(row.get("job_code") or "").strip()
-                payload = self._fetch_job_payload_from_api(code) if code else None
-                if not isinstance(payload, dict):
-                    failed.append(str(row.get("job_name") or code or "linked job"))
-                    continue
-                job = self._extract_job_record_from_payload(payload)
-                row["job_payload"] = payload
-                row["job_name"] = (
-                    self._safe_text(job.get("ref_no"), "")
-                    or row.get("job_name")
-                    or code
+    def _refresh_all_running_job_details(self, manual: bool = True):
+        """Ask the server for complete versioned configs; never process BMS locally."""
+        identifiers = self._running_job_configuration_identifiers()
+        if not identifiers:
+            if manual:
+                self.status.setText("No running jobs to refresh.")
+            return
+        if self._job_configuration_refresh_inflight:
+            if manual:
+                self.status.setText("Job configuration refresh is already running.")
+            return
+        server_url = str(
+            (self.client_config or {}).get("server_url", SERVER_URL) or SERVER_URL
+        ).strip().rstrip("/")
+        if not server_url:
+            if manual:
+                self.status.setText("Job refresh unavailable: server URL is empty.")
+            return
+        self._job_configuration_refresh_inflight = True
+        if manual:
+            self._show_bms_loading("Server is refreshing all running job details...")
+
+        def worker() -> None:
+            result: Dict[str, Any] = {"manual": bool(manual)}
+            try:
+                response = requests.post(
+                    f"{server_url}/api/jobs/configurations",
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                    json={
+                        "job_identifiers": identifiers,
+                        "known_versions": dict(self._job_configuration_versions),
+                        "force": bool(manual),
+                    },
+                    timeout=(1.5, 25.0),
                 )
-                refreshed += 1
-        finally:
+                response.raise_for_status()
+                body = response.json()
+                if not isinstance(body, dict):
+                    raise RuntimeError("server returned an invalid job configuration response")
+                result["response"] = body
+            except Exception as exc:
+                result["error"] = str(exc)
+            self.job_configurations_received.emit(result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_server_job_configurations(self, result: Dict[str, Any]) -> None:
+        """Apply only server-owned configuration fields to the live session."""
+        self._job_configuration_refresh_inflight = False
+        manual = bool((result or {}).get("manual"))
+        if manual:
             self._hide_bms_loading()
+        error = str((result or {}).get("error") or "").strip()
+        body = (result or {}).get("response")
+        if error or not isinstance(body, dict):
+            if manual:
+                self.status.setText(f"Job refresh failed: {error or 'invalid server response'}")
+            return
+
+        items = [row for row in (body.get("items") or []) if isinstance(row, dict)]
+        lookup: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            for value in (
+                item.get("job_identifier"), item.get("job_id"), item.get("job_name")
+            ):
+                key = self._normalize_job_code(value)
+                if key:
+                    lookup[key] = item
+
+        changed = 0
+        s = self.state
+
+        def apply_to_job(code: Any, current_name: Any, setter) -> bool:
+            key = self._normalize_job_code(code) or self._normalize_job_code(current_name)
+            item = lookup.get(key)
+            payload = item.get("payload") if isinstance(item, dict) else None
+            version = str((item or {}).get("version") or "").strip()
+            if not isinstance(payload, dict) or not version:
+                return False
+            version_key = self._normalize_job_code(item.get("job_id") or code) or key
+            if not manual and self._job_configuration_versions.get(version_key) == version:
+                return False
+            job = self._extract_job_record_from_payload(payload)
+            name = (
+                self._safe_text(item.get("job_name"), "")
+                or self._safe_text(job.get("ref_no"), "")
+                or str(current_name or code or "")
+            )
+            setter(dict(payload), name)
+            self._job_configuration_versions[version_key] = version
+            self._cache_job_payload(payload, code, name, item.get("job_id"))
+            return True
+
+        if apply_to_job(
+            s.job_code,
+            s.job_name,
+            lambda payload, name: (
+                setattr(s, "job_payload", payload),
+                setattr(s, "job_name", name),
+            ),
+        ):
+            changed += 1
+
+        for row in (s.linkage_jobs or []):
+            if not isinstance(row, dict):
+                continue
+            if apply_to_job(
+                row.get("job_code"),
+                row.get("job_name"),
+                lambda payload, name, target=row: target.update(
+                    {"job_payload": payload, "job_name": name}
+                ),
+            ):
+                changed += 1
 
         primary_code = self._normalize_job_code(s.linkage_job_code)
         primary = next(
@@ -14484,16 +14883,28 @@ QWidget#ClientUIRoot {{
         if isinstance(primary, dict):
             s.linkage_job_name = primary.get("job_name")
             s.linkage_job_payload = primary.get("job_payload") or {}
-        self._job_parts_table_refresh_key = ""
-        self._refresh_ui(force=True)
-        self._save_active_session_snapshot()
-        self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (REFRESH ALL JOB DETAILS)")
-        if failed:
-            self.status.setText(
-                f"Refreshed {refreshed} running job(s). Failed: {', '.join(failed[:3])}."
+
+        if changed:
+            self._job_parts_table_refresh_key = ""
+            self._refresh_ui(force=True)
+            self._save_active_session_snapshot()
+            self.sync_session_snapshot_to_server(
+                "SESSION SNAPSHOT SYNC (SERVER JOB CONFIGURATION UPDATE)"
             )
-        else:
-            self.status.setText(f"Refreshed all {refreshed} running job(s) from BMS.")
+        if manual:
+            errors = [
+                str(row.get("job_identifier") or "job")
+                for row in (body.get("errors") or [])
+                if isinstance(row, dict)
+            ]
+            if errors:
+                self.status.setText(
+                    f"Server refreshed {changed} job(s). Failed: {', '.join(errors[:3])}."
+                )
+            else:
+                self.status.setText(
+                    f"Server refresh complete: {changed} job configuration(s) applied."
+                )
 
     def _running_work_order_rows(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
@@ -18065,6 +18476,7 @@ QWidget#ClientUIRoot {{
         s.pdr_downtime_logs = []
         s.pdr_current_segment_start_seconds = None
         s.pdr_followup_reasons_remaining = 0
+        s.pdr_started_before_job = False
         s.downtime_started_at = None
         s.downtime_last_seconds = None
         s.downtime_active = False
@@ -18166,7 +18578,10 @@ QWidget#ClientUIRoot {{
             self._show_invalid_overlay("No active operator data to save.")
             return False
         self._close_open_relief_for_operator_handoff()
-        self._reset_production_for_operator_handoff()
+        # This is a permanent personnel replacement inside the same running
+        # job. Preserve production totals, material/pack history, cycle time,
+        # and machine counter; the finalized segment keeps the old operator's
+        # contribution, and the new baseline starts from the current totals.
         s.operator_id = operator_value
         new_primary_code = self._operator_code_only(operator_value)
         s.crew_members = [
@@ -18187,7 +18602,7 @@ QWidget#ClientUIRoot {{
         new_name = self._operator_display_name(operator_value)
         message = (
             f"Operator has been changed: {old_name} -> {new_name}. "
-            "You may now proceed again. Previous operator scans were saved in the shift logs."
+            "Production continues with the current job and totals. Previous operator data is saved in shift logs."
         )
         self._hide_invalid_overlay()
         self._refresh_ui(force=True)
@@ -19247,6 +19662,16 @@ QWidget#ClientUIRoot {{
             return parts[1] or "-"
         return str(text)
 
+    def _operator_header_display(self) -> tuple[str, bool]:
+        """Return header text and whether temporary-reliever styling is active."""
+        s = self.state
+        if s.break_active and s.reliever_id:
+            return f"RELIEVER: {self._operator_display_name(s.reliever_id)}", True
+        manpower_count = self._crew_count()
+        if manpower_count >= 2:
+            return f"MANPOWER: {manpower_count}", False
+        return f"OPERATOR: {self._operator_display_name(s.operator_id)}", False
+
     def _crew_member_code(self, row: Any) -> str:
         if not isinstance(row, dict):
             return ""
@@ -19283,6 +19708,225 @@ QWidget#ClientUIRoot {{
         self.status.setText(f"Machine crew displayed. Manpower: {self._crew_count()}.")
         self._show_info_overlay("MACHINE CREW", "\n".join(lines), hide_ms=8000)
 
+    def _change_operator_candidates(self) -> List[Dict[str, Any]]:
+        s = self.state
+        rows: List[Dict[str, Any]] = []
+        if s.operator_id:
+            rows.append({
+                "role": "MAIN",
+                "operator_id": str(s.operator_id),
+                "operator_code": self._operator_code_only(s.operator_id),
+            })
+        for helper in (s.crew_members or []):
+            if not isinstance(helper, dict):
+                continue
+            code = self._crew_member_code(helper)
+            if not code:
+                continue
+            rows.append({
+                "role": "HELPER",
+                "operator_id": str(helper.get("operator_id") or helper.get("name") or code),
+                "operator_code": code,
+            })
+        return rows
+
+    def _show_change_operator_target_prompt(self) -> None:
+        candidates = self._change_operator_candidates()
+        lines = ["Choose the permanent crew member to replace:", ""]
+        for index, row in enumerate(candidates, start=1):
+            role = "MAIN OPERATOR" if row.get("role") == "MAIN" else f"HELPER {index - 1}"
+            lines.append(
+                f"num_{index}  {role}: {self._operator_display_name(row.get('operator_id'))}"
+            )
+        lines.extend(["", "After choosing, scan the NEW Operator QR.", "Scan CHANGE OPERATOR again to cancel."])
+        self.status.setText(f"Change operator: choose num_1 to num_{len(candidates)}.")
+        self._show_info_overlay("CHANGE OPERATOR", "\n".join(lines), hide_ms=0)
+
+    def _cancel_change_operator_mode(self, message: str = "Change operator cancelled.") -> None:
+        self._change_operator_phase = ""
+        self._change_operator_target = None
+        self._hide_invalid_overlay()
+        self.status.setText(message)
+        self._refresh_ui()
+
+    def _begin_change_operator_mode(self) -> None:
+        s = self.state
+        if not (s.machine_code and s.job_code and s.operator_id):
+            self._cancel_change_operator_mode("Complete MACHINE, JOB, and primary OPERATOR first.")
+            self._show_invalid_overlay("Set the primary operator before using Change Operator.")
+            return
+        self._crew_action_mode = ""
+        self._reliever_action_mode = False
+        candidates = self._change_operator_candidates()
+        if len(candidates) <= 1:
+            self._change_operator_phase = "SCAN"
+            self._change_operator_target = candidates[0] if candidates else None
+            self.status.setText("Change main operator: scan the NEW Operator QR.")
+            self._show_info_overlay(
+                "CHANGE MAIN OPERATOR",
+                f"Current main: {self._operator_display_name(s.operator_id)}\n\n"
+                "No helpers are assigned, so the main operator was selected automatically.\n"
+                "Scan the NEW Operator QR now.\n\n"
+                "Scan CHANGE OPERATOR again to cancel.",
+                hide_ms=0,
+            )
+            return
+        self._change_operator_phase = "SELECT"
+        self._change_operator_target = None
+        self._show_change_operator_target_prompt()
+
+    def _replace_helper_operator(
+        self,
+        target: Dict[str, Any],
+        operator_value: str,
+        raw_payload: str,
+        pending_validation: bool,
+    ) -> bool:
+        old_code = str(target.get("operator_code") or "").strip()
+        new_code = self._operator_code_only(operator_value)
+        if not old_code or not new_code:
+            return False
+        primary_code = self._operator_code_only(self.state.operator_id)
+        helpers = [dict(row) for row in (self.state.crew_members or []) if isinstance(row, dict)]
+        target_index = next(
+            (index for index, row in enumerate(helpers) if self._crew_member_code(row) == old_code),
+            -1,
+        )
+        if target_index < 0:
+            return False
+        occupied_codes = {
+            self._crew_member_code(row)
+            for index, row in enumerate(helpers)
+            if index != target_index and self._crew_member_code(row)
+        }
+        if new_code == primary_code or new_code in occupied_codes:
+            self.status.setText("That operator is already assigned to this machine crew.")
+            self._show_invalid_overlay("Scan a different Operator QR for this helper position.")
+            return False
+        old_value = str(helpers[target_index].get("operator_id") or old_code)
+        helpers[target_index] = {
+            **helpers[target_index],
+            "operator_id": operator_value,
+            "operator_code": new_code,
+            "operator_name": self._operator_display_name(operator_value),
+            "operator_qr_payload": str(raw_payload or "").strip(),
+            "pending_server_validation": bool(pending_validation),
+            "replaced_operator_id": old_value,
+            "replaced_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        self.state.crew_members = helpers
+        self._hide_invalid_overlay()
+        self._refresh_ui(force=True)
+        self._save_active_session_snapshot()
+        self.push_event(
+            {
+                "type": "CREW_UPDATE",
+                "action": "REPLACE",
+                "previous_operator": old_value,
+                "operator_id": operator_value,
+                "crew_members": list(helpers),
+                "manpower_count": self._crew_count(),
+            },
+            f"HELPER CHANGE {self._operator_display_name(old_value)} -> {self._operator_display_name(operator_value)}",
+        )
+        self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (HELPER CHANGE)")
+        self.status.setText(
+            f"Helper changed: {self._operator_display_name(old_value)} -> "
+            f"{self._operator_display_name(operator_value)}. Production continues."
+        )
+        return True
+
+    def _handle_change_operator_scan(self, raw_scan: str) -> bool:
+        raw_text = str(raw_scan or "").strip()
+        command = raw_text.lower()
+        commands = {
+            "changeoperator~1",
+            "change_operator~1",
+            "operatorchange~1",
+            "operator_change~1",
+        }
+        phase = str(self.__dict__.get("_change_operator_phase", "") or "").upper()
+        if command in commands:
+            if phase:
+                self._cancel_change_operator_mode()
+            else:
+                self._begin_change_operator_mode()
+            return True
+        if not phase:
+            return False
+
+        if phase == "SELECT":
+            digit = self._numpad_digit_from_scan(command)
+            candidates = self._change_operator_candidates()
+            if digit is None or int(digit) < 1 or int(digit) > len(candidates):
+                self._show_change_operator_target_prompt()
+                return True
+            self._change_operator_target = dict(candidates[int(digit) - 1])
+            self._change_operator_phase = "SCAN"
+            target = self._change_operator_target
+            role = "MAIN OPERATOR" if target.get("role") == "MAIN" else "HELPER"
+            self.status.setText(f"{role} selected. Scan the NEW Operator QR.")
+            self._show_info_overlay(
+                f"CHANGE {role}",
+                f"Replacing: {self._operator_display_name(target.get('operator_id'))}\n\n"
+                "Scan the NEW Operator QR now.\n\n"
+                "Scan CHANGE OPERATOR again to cancel.",
+                hide_ms=0,
+            )
+            return True
+
+        target = self._change_operator_target if isinstance(self._change_operator_target, dict) else None
+        if target is None:
+            self._cancel_change_operator_mode("Change operator target was lost. Scan CHANGE OPERATOR again.")
+            return True
+        operator = self._operator_from_scan(raw_text)
+        pending_validation = False
+        if operator is None:
+            operator = self._offline_operator_from_scan(raw_text)
+            pending_validation = operator is not None
+        if operator is None:
+            self.status.setText("Change operator: scan a valid Operator QR.")
+            self._show_invalid_overlay("Only an Operator QR can replace the selected crew member.")
+            return True
+        operator_value = self._operator_display_value(
+            str(operator.get("code") or raw_text),
+            str(operator.get("name") or ""),
+        )
+        if self._operator_code_only(operator_value) == str(target.get("operator_code") or ""):
+            self.status.setText("The scanned operator is already assigned to that position.")
+            self._show_invalid_overlay("Scan a different Operator QR, or scan CHANGE OPERATOR to cancel.")
+            return True
+
+        changed = False
+        if target.get("role") == "MAIN":
+            helper_codes = {
+                self._crew_member_code(row)
+                for row in (self.state.crew_members or [])
+                if isinstance(row, dict) and self._crew_member_code(row)
+            }
+            if self._operator_code_only(operator_value) in helper_codes:
+                self.status.setText("That operator is already assigned as a helper.")
+                self._show_invalid_overlay("Scan an Operator QR not already assigned to this crew.")
+                return True
+            changed = self._change_operator_for_active_job(
+                operator_value,
+                raw_payload=raw_text,
+                pending_server_validation=pending_validation,
+            )
+        else:
+            changed = self._replace_helper_operator(
+                target,
+                operator_value,
+                raw_text,
+                pending_validation,
+            )
+        if changed:
+            self._change_operator_phase = ""
+            self._change_operator_target = None
+            self._hide_invalid_overlay()
+            self._refresh_ui(force=True)
+        return True
+
     def _set_crew_action_mode(self, mode: str) -> None:
         requested = str(mode or "").strip().upper()
         if requested not in ("ADD", "REMOVE"):
@@ -19318,6 +19962,8 @@ QWidget#ClientUIRoot {{
     def _handle_crew_control_scan(self, raw_scan: str) -> bool:
         raw_text = str(raw_scan or "").strip()
         command = raw_text.lower()
+        if self._handle_change_operator_scan(raw_text):
+            return True
         if command in ("reliever~1", "relief~1", "relieveradd~1"):
             if not (self.state.machine_code and self.state.job_code and self.state.operator_id):
                 self._reliever_action_mode = False
@@ -19652,6 +20298,17 @@ QWidget#ClientUIRoot {{
             f"BREAK IN {self._operator_display_name(s.operator_id)}",
         )
         return True
+
+    def _operator_scan_ends_relief(self, operator_code: Any) -> bool:
+        """Allow either the returning main or active reliever to close relief."""
+        s = self.state
+        code = self._operator_code_only(operator_code)
+        if not s.break_active or not code:
+            return False
+        return code in {
+            self._operator_code_only(s.operator_id),
+            self._operator_code_only(s.reliever_id),
+        }
 
     def _update_current_operator_logs(self, old_code: str, new_operator: str, new_name: str, raw_payload: str = "") -> None:
         old_code = self._operator_code_only(old_code)
@@ -20633,6 +21290,8 @@ QWidget#ClientUIRoot {{
             or s.waiting_cycle_time_input
             or s.waiting_cycle_time_confirm_popup
             or s.waiting_butal_completion_carry_input
+            or bool(getattr(self, "_pending_finish_shift_clear_choice", False))
+            or bool(str(self.__dict__.get("_change_operator_phase", "") or "").strip())
         )
         # Repeated digits are intentional input (11, 1001, etc.). Transport
         # deduplication is appropriate for production labels, not numpad keys.
@@ -22163,6 +22822,8 @@ QWidget#ClientUIRoot {{
             return "Reject summary requested"
         if res.kind == "OPERATOR_SHIFT_TRIGGER":
             return "Operator shift handoff requested"
+        if res.kind == "CHANGE_OPERATOR_TRIGGER":
+            return "Permanent operator/helper change requested"
         if res.kind == "COLOR_CHANGE_TRIGGER":
             return str(res.value or "Change job segment")
         if res.kind == "VIRTUAL_PACK_QR_TRIGGER":
@@ -22325,6 +22986,11 @@ QWidget#ClientUIRoot {{
         crew_mode = str(getattr(self, "_crew_action_mode", "") or "").strip().upper()
         if crew_mode in ("ADD", "REMOVE"):
             return f"Scan an Operator QR to {crew_mode.lower()} manpower."
+        change_operator_phase = str(self.__dict__.get("_change_operator_phase", "") or "").upper()
+        if change_operator_phase == "SELECT":
+            return "Scan a num key to choose Main Operator or Helper."
+        if change_operator_phase == "SCAN":
+            return "Scan the new permanent Operator QR."
         if bool(getattr(self, "_reliever_action_mode", False)):
             return "Scan the reliever Operator QR."
         prereq = self._missing_session_prereq_message()
@@ -22359,7 +23025,7 @@ QWidget#ClientUIRoot {{
         if s.waiting_production_report_reason or s.waiting_pdr_maintenance_reason:
             return "Scan a valid downtime reason QR."
         if s.waiting_downtime_start_maintenance or s.waiting_downtime_end_maintenance or s.waiting_maintenance_qr:
-            return "Scan a Maintenance badge."
+            return "Scan a Maintenance or Line Technician badge."
         if s.waiting_operator_downtime_confirm:
             return "Scan the active Operator badge."
         if s.waiting_supervisor_qr:
@@ -22373,6 +23039,111 @@ QWidget#ClientUIRoot {{
         if s.waiting_butal_completion_carry_input:
             return 'Scan num_0 to num_9 for the carry quantity, then scan "confirm".'
         return "Scan a valid QR command for the current screen."
+
+    def _sanitize_transient_command_modes(self) -> bool:
+        """Drop orphaned command modes after reconnect/session replacement."""
+        s = self.state
+        session_ready = bool(s.machine_code and s.job_code and s.operator_id)
+        changed = False
+        if not session_ready:
+            for name, empty in (
+                ("_change_work_order_phase", ""),
+                ("_remove_job_linkage_mode", False),
+                ("_crew_action_mode", ""),
+                ("_reliever_action_mode", False),
+                ("_change_operator_phase", ""),
+            ):
+                if self.__dict__.get(name, empty) != empty:
+                    self.__dict__[name] = empty
+                    changed = True
+            self._change_work_order_target = None
+            self._change_operator_target = None
+
+        phase = str(getattr(self, "_change_work_order_phase", "") or "").upper()
+        running_rows = self._running_work_order_rows() if session_ready else []
+        if phase and not running_rows:
+            self._change_work_order_phase = ""
+            self._change_work_order_target = None
+            changed = True
+        elif phase == "REPLACE":
+            target = getattr(self, "_change_work_order_target", None)
+            target_code = self._normalize_job_code(
+                target.get("job_code") if isinstance(target, dict) else ""
+            )
+            if not target_code or not any(
+                self._normalize_job_code(row.get("job_code")) == target_code
+                for row in running_rows
+            ):
+                self._change_work_order_phase = ""
+                self._change_work_order_target = None
+                changed = True
+        if bool(getattr(self, "_remove_job_linkage_mode", False)) and not any(
+            isinstance(row, dict) for row in (s.linkage_jobs or [])
+        ):
+            self._remove_job_linkage_mode = False
+            changed = True
+        return changed
+
+    def _active_command_banner_text(self) -> str:
+        """Return the active command state for the permanent blue banner."""
+        s = self.state
+        if isinstance(getattr(self, "_pending_final_review_payload", None), dict):
+            return "FINISH JOB REVIEW: scan NEXT, PREV, or CONFIRM"
+        if bool(getattr(self, "_operator_shift_flash_active", False)):
+            return "SHIFT REVIEW: scan Supervisor badge to confirm"
+        if s.supervisor_review_open:
+            return "SUPERVISOR REVIEW: review rejects/cycle time and scan required confirmation"
+        phase = str(getattr(self, "_change_work_order_phase", "") or "").upper()
+        if phase == "SELECT":
+            return "CHANGE WORK ORDER: scan running JOB to replace (scan command again to cancel)"
+        if phase == "REPLACE":
+            return "CHANGE WORK ORDER: scan NEW replacement JOB (scan command again to cancel)"
+        if bool(getattr(self, "_remove_job_linkage_mode", False)):
+            return "REMOVE JOB LINKAGE: scan LINKED JOB (scan command again to cancel)"
+        crew_mode = str(getattr(self, "_crew_action_mode", "") or "").upper()
+        if crew_mode:
+            return f"{crew_mode} MANPOWER: scan Operator QR"
+        change_operator_phase = str(self.__dict__.get("_change_operator_phase", "") or "").upper()
+        if change_operator_phase == "SELECT":
+            return "CHANGE OPERATOR: choose MAIN or HELPER with num key"
+        if change_operator_phase == "SCAN":
+            return "CHANGE OPERATOR: scan new permanent Operator QR"
+        if bool(getattr(self, "_reliever_action_mode", False)):
+            return "RELIEVER MODE: scan reliever Operator QR"
+        if str(getattr(self, "_mixing_pending_job_raw", "") or "").strip():
+            return "MIXING JOB ASSIGNMENT: scan MACHINE QR"
+        if s.prepack_mode_enabled:
+            return "MULTI-COLOR PREPACK: scan component JOB or generic PACK QR"
+        if s.pending_offline_qr_raw:
+            if str(s.pending_offline_qr_phase or "").upper() == "ASK_MAIN_QTY":
+                return "OFFLINE QR: scan quantity digits, then CONFIRM"
+            return "OFFLINE QR: num_1 PRODUCT PART / num_0 reject"
+        if s.waiting_machine_counter_overwrite_input:
+            return "COUNTER OVERWRITE: scan digits, then Supervisor badge"
+        if s.waiting_machine_counter_overwrite_supervisor:
+            return "COUNTER OVERWRITE: scan Supervisor badge"
+        if s.waiting_cycle_time_confirm_popup:
+            return "CYCLE TIME: scan Supervisor badge" if int(s.cycle_time_confirm_phase or 0) == 2 else "CYCLE TIME: scan digits, then CONFIRM"
+        checks = (
+            (s.waiting_initial_cycle_time_input, "INITIAL SETUP: scan cycle-time digits, then CONFIRM"),
+            (s.waiting_initial_machine_counter_input, "INITIAL SETUP: scan machine-counter digits, then CONFIRM"),
+            (s.waiting_shift_end_machine_counter_input, "SHIFT END: scan ending-counter digits, then CONFIRM"),
+            (s.waiting_initial_cycle_qc_confirm, "INITIAL SETUP: scan QC badge"),
+            (s.waiting_linkage_job_scan, "JOB LINKAGE: scan JOB QR to link"),
+            (s.waiting_color_change_job_scan, "COLOR/MOLD CHANGE: scan NEW JOB QR"),
+            (s.waiting_butal_job_assignment, "BUTAL ASSIGNMENT: scan MAIN or LINKED JOB QR"),
+            (s.waiting_reject_reason, "REJECT MODE: scan reject-detail QR or SUR"),
+            (s.waiting_production_report_reason or s.waiting_pdr_maintenance_reason, "PDR MODE: scan downtime reason QR"),
+            (s.waiting_downtime_start_maintenance, "PDR MODE: scan Maintenance/Line Technician badge"),
+            (s.waiting_downtime_end_maintenance or s.waiting_maintenance_qr, "DOWNTIME: scan Maintenance/Line Technician badge"),
+            (s.waiting_supervisor_qr, "AUTHORIZATION: scan required authorized badge"),
+            (s.waiting_operator_downtime_confirm, "DOWNTIME: scan active Operator badge"),
+            (s.waiting_void_scan, "VOID MODE: scan item QR to void"),
+            (s.waiting_butal_completion_carry_input, "BUTAL COMPLETION: scan carry digits, then CONFIRM"),
+            (s.waiting_butal_completion_butal_scan, "BUTAL COMPLETION: scan BUTAL QR"),
+            (s.waiting_butal_completion_pack_scan, "BUTAL COMPLETION: scan PACK QR"),
+        )
+        return next((text for active, text in checks if active), "")
 
     def _is_logs_section_active(self) -> bool:
         try:
@@ -22622,7 +23393,7 @@ QWidget#ClientUIRoot {{
         self.status.setText("Reject Details guide opened. Press Email again to close.")
 
     def _refresh_running_jobs_shortcut(self):
-        self.status.setText("Calculator shortcut: refreshing all running jobs from BMS...")
+        self.status.setText("Calculator shortcut: asking server for all running job changes...")
         QTimer.singleShot(0, self._refresh_all_running_job_details)
 
     def _minimize_to_desktop(self):
@@ -22708,6 +23479,8 @@ QWidget#ClientUIRoot {{
         self._scan_feedback_context_active = True
         QTimer.singleShot(50, lambda: setattr(self, "_scan_feedback_context_active", False))
         self._mark_animation_burst()
+        if self._handle_finish_shift_clear_choice(raw_s):
+            return
         if self._pending_final_review_payload:
             raw_l = raw_s.lower()
             if raw_l in ("finishjob", "finishjob~1", "jobfinish"):
@@ -23149,6 +23922,23 @@ QWidget#ClientUIRoot {{
             return
 
         res_pre = parse_scan(raw_s)
+        if res_pre is not None and res_pre.kind == "JOB_API_REFRESH_TRIGGER":
+            if not s.job_code:
+                self.status.setText("No running job to refresh.")
+                self._show_invalid_overlay("Scan MACHINE and JOB before refreshing job details.")
+                return
+            self.status.setText("Refresh QR accepted. Asking server for all running job changes...")
+            self._refresh_all_running_job_details(manual=True)
+            return
+        # A job scanned during a machine-only PDR must reach the normal JOB
+        # router.  The PDR handlers otherwise consume every scan while waiting
+        # for Maintenance/reason/cycle confirmation.
+        prejob_pdr_job_scan = bool(
+            not s.job_code
+            and s.pdr_started_before_job
+            and res_pre is not None
+            and res_pre.kind in ("JOB", "JOB_STUB")
+        )
         if res_pre is not None and res_pre.kind == "SUPERVISOR_REVIEW_TRIGGER":
             in_downtime_flow = (
                 s.waiting_production_report_reason
@@ -23677,16 +24467,16 @@ QWidget#ClientUIRoot {{
 
         if res_pre and res_pre.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
             self.status.setText(
-                "PDR completion requires the Maintenance badge. Scan Maintenance when the repair is done."
+                "PDR completion requires a Maintenance or Line Technician badge. Scan it when the repair is done."
             )
             return
 
         # PDR waiting step: the first Maintenance scan ends response waiting
         # and starts repair downtime immediately. The reason is intentionally
         # collected only after Maintenance scans again to finish the repair.
-        if s.waiting_downtime_start_maintenance:
+        if s.waiting_downtime_start_maintenance and not prejob_pdr_job_scan:
             auth = self._authorized_person_from_scan(raw_s)
-            if auth and str(auth.get("can_maintenance", "0")) == "1":
+            if self._can_handle_pdr_maintenance(auth):
                 s.maintenance_name = str(auth.get("name") or raw_s)
                 if s.downtime_wait_started_at:
                     s.downtime_wait_last_seconds = max(
@@ -23706,7 +24496,7 @@ QWidget#ClientUIRoot {{
                 s.downtime_active = True
                 s.waiting_downtime_end_maintenance = True
                 self.status.setText(
-                    "Maintenance acknowledged. Downtime started; scan the Maintenance QR again when repair is done."
+                    "Maintenance/Line Technician acknowledged. Downtime started; scan the badge again when repair is done."
                 )
                 self._set_production_overlay_mode("active")
                 self._show_production_overlay()
@@ -23717,25 +24507,23 @@ QWidget#ClientUIRoot {{
                 )
                 return
             if auth:
-                self.status.setText(f"Waiting mode: scanned badge is {auth.get('role') or 'not Maintenance'}. Scan Maintenance QR.")
+                self.status.setText(f"Waiting mode: scanned badge is {auth.get('role') or 'not authorized'}. Scan Maintenance or Line Technician QR.")
             else:
-                self.status.setText("Waiting mode: Maintenance QR not found in profiles/cache. Check server/SQL profile role.")
+                self.status.setText("Waiting mode: Maintenance/Line Technician QR not found in profiles/cache. Check server/SQL profile role.")
             return
 
         # After the second Maintenance scan stops downtime, record one reason
         # for the completed repair interval and continue directly to cycle time.
-        if s.waiting_pdr_maintenance_reason:
+        if s.waiting_pdr_maintenance_reason and not prejob_pdr_job_scan:
             code = self._extract_production_reason_code(raw_s)
             reason = self._production_reason_text(code) if code else None
             if not code or not reason:
                 self.status.setText("PDR validation: scan valid reason QR (01-15).")
                 return
-            if (
-                not s.downtime_active
-                and not s.downtime_started_at
-                and s.maintenance_downtime_seconds is not None
-            ):
-                duration = max(0, int(s.maintenance_downtime_seconds or 0))
+            stopped_repair_duration = self._stopped_pdr_repair_duration()
+            if stopped_repair_duration is not None:
+                duration = stopped_repair_duration
+                s.maintenance_downtime_seconds = duration
                 s.waiting_pdr_maintenance_reason = False
                 s.downtime_reason_code = code
                 s.downtime_reason_text = reason
@@ -23752,6 +24540,35 @@ QWidget#ClientUIRoot {{
                 }]
                 s.pdr_current_segment_start_seconds = duration
                 s.pdr_followup_reasons_remaining = 0
+                if s.pdr_started_before_job and not s.job_code:
+                    downtime_record = self._complete_prejob_pdr_without_cycle_time()
+                    self._hide_resolve_overlay()
+                    self._hide_production_overlay()
+                    self.status.setText(
+                        f"PDR reason recorded: {code} - {reason}. "
+                        "Scan JOB QR; this downtime will be logged to that job."
+                    )
+                    self._refresh_ui()
+                    self._save_active_session_snapshot()
+                    self.push_event(
+                        {
+                            "type": "PRODUCTION_DAILY_REPORT_RESOLVED",
+                            "reason_code": code,
+                            "reason": reason,
+                            "reason_segments": list(s.pdr_reason_segments or []),
+                            "downtime_record": downtime_record,
+                            "downtime_total_seconds": self._pdr_total_downtime_seconds(),
+                            "cycle_time": None,
+                            "awaiting_job": True,
+                            "waiting_seconds": int(s.downtime_wait_last_seconds or 0),
+                            "downtime_seconds": duration,
+                            "maintenance_downtime_seconds": duration,
+                            "maintenance": s.maintenance_name,
+                        },
+                        "MACHINE-ONLY PDR SAVED - WAITING FOR JOB",
+                        defer_snapshot=True,
+                    )
+                    return
                 self._begin_downtime_resolution()
                 self.status.setText(
                     f"PDR reason recorded: {code} - {reason}. Input the updated cycle time."
@@ -23789,16 +24606,16 @@ QWidget#ClientUIRoot {{
             s.pdr_followup_reasons_remaining = 2 if str(code or "").strip().zfill(2) == "07" else 0
             s.downtime_active = True
             s.waiting_downtime_end_maintenance = True
-            self.status.setText(f"PDR reason validated: {code} - {reason}. Scan Maintenance QR when repair is done.")
+            self.status.setText(f"PDR reason validated: {code} - {reason}. Scan Maintenance or Line Technician QR when done.")
             self._refresh_ui()
             self._save_active_session_snapshot()
             return
 
         # Downtime running step: the second Maintenance scan stops the repair
         # timer, then reason 01-15 is requested before cycle-time input.
-        if s.waiting_downtime_end_maintenance and s.downtime_active and raw_l not in ("productiondailyreport~2", "pdr_done", "pdrdone"):
+        if s.waiting_downtime_end_maintenance and s.downtime_active and not prejob_pdr_job_scan and raw_l not in ("productiondailyreport~2", "pdr_done", "pdrdone"):
             auth = self._authorized_person_from_scan(raw_s)
-            if auth and str(auth.get("can_maintenance", "0")) == "1":
+            if self._can_handle_pdr_maintenance(auth):
                 s.maintenance_name = str(auth.get("name") or raw_s)
                 s.downtime_last_seconds = self._pdr_elapsed_seconds()
                 s.maintenance_downtime_seconds = int(s.downtime_last_seconds or 0)
@@ -23814,7 +24631,7 @@ QWidget#ClientUIRoot {{
                     and float(s.external_average_weight_grams or 0) > 0
                 )
                 self.status.setText(
-                    "Maintenance completed the repair and downtime stopped. "
+                    "Maintenance/Line Technician completed the repair and downtime stopped. "
                     "Scan the applicable PDR reason QR (01-15)."
                 )
                 self._set_production_overlay_mode("select")
@@ -23825,11 +24642,11 @@ QWidget#ClientUIRoot {{
                     "SESSION SNAPSHOT SYNC (PDR DOWNTIME STOPPED)"
                 )
                 return
-            self.status.setText("Downtime active: scan the Maintenance QR when repair is completed.")
+            self.status.setText("Downtime active: scan the Maintenance or Line Technician QR when repair is completed.")
             return
 
         # Resolution step 1: Cycle time input via num_0..num_9, backspace, confirm
-        if s.waiting_cycle_time_input:
+        if s.waiting_cycle_time_input and not prejob_pdr_job_scan:
             if raw_l.startswith("num_") and raw_l[-1:].isdigit():
                 s.cycle_time_new_input += raw_l[-1]
                 self._update_cycle_input_display()
@@ -23862,7 +24679,7 @@ QWidget#ClientUIRoot {{
                 auth
                 and (
                     str(auth.get("can_qc", "0")) == "1"
-                    or str(auth.get("can_maintenance", "0")) == "1"
+                    or self._can_handle_pdr_maintenance(auth)
                     or str(auth.get("can_supervisor", "0")) == "1"
                 )
             )
@@ -23875,19 +24692,19 @@ QWidget#ClientUIRoot {{
                 s.waiting_supervisor_qr = True
             else:
                 self.status.setText(
-                    "Cycle Time input mode: scan digits, then scan QC, Maintenance, or Supervisor badge."
+                    "Cycle Time input mode: scan digits, then scan QC, Maintenance, Line Technician, or Supervisor badge."
                 )
                 return
 
         # Resolution step 2: any registered non-Operator role logs the update.
-        if s.waiting_supervisor_qr:
+        if s.waiting_supervisor_qr and not prejob_pdr_job_scan:
             auth = self._authorized_person_from_scan(raw_s)
             auth_role = str((auth or {}).get("role") or "").strip()
             can_confirm_pdr = bool(
                 auth
                 and (
                     str(auth.get("can_qc", "0")) == "1"
-                    or str(auth.get("can_maintenance", "0")) == "1"
+                    or self._can_handle_pdr_maintenance(auth)
                     or str(auth.get("can_supervisor", "0")) == "1"
                 )
             )
@@ -23963,13 +24780,13 @@ QWidget#ClientUIRoot {{
             self._supervisor_validation_failed_value = ""
             self._supervisor_validation_pending = False
             self.status.setText("PDR confirmation rejected: scan a registered non-Operator badge.")
-            self._show_invalid_overlay("Operator role cannot confirm this PDR step. Scan Maintenance, Supervisor, QC, or another non-Operator role.")
+            self._show_invalid_overlay("Operator role cannot confirm this PDR step. Scan Maintenance, Line Technician, Supervisor, or QC.")
             return
 
         # Resolution step 3: Maintenance stops downtime, then cycle time can be confirmed.
-        if s.waiting_maintenance_qr:
+        if s.waiting_maintenance_qr and not prejob_pdr_job_scan:
             auth = self._authorized_person_from_scan(raw_s)
-            if auth and str(auth.get("can_maintenance", "0")) == "1":
+            if self._can_handle_pdr_maintenance(auth):
                 s.maintenance_name = str(auth.get("name") or raw_s)
                 if s.downtime_started_at:
                     s.maintenance_downtime_seconds = max(0, int(time.time() - s.downtime_started_at))
@@ -23980,16 +24797,16 @@ QWidget#ClientUIRoot {{
                 s.waiting_maintenance_qr = False
                 self._begin_downtime_resolution()
                 self.status.setText(
-                    "Maintenance QR logged. Input cycle time, then scan QC, Maintenance, or Supervisor badge."
+                    "Maintenance/Line Technician QR logged. Input cycle time, then scan QC, Maintenance, Line Technician, or Supervisor badge."
                 )
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 return
-            self.status.setText("Scan valid Maintenance QR.")
+            self.status.setText("Scan a valid Maintenance or Line Technician QR.")
             return
 
         # Legacy resolution step 4: Operator confirmation
-        if s.waiting_operator_downtime_confirm:
+        if s.waiting_operator_downtime_confirm and not prejob_pdr_job_scan:
             op_auth = self._operator_from_scan(raw_s)
             if op_auth:
                 op_value = f"{op_auth.get('code', raw_s)} - {op_auth.get('name', raw_s)}"
@@ -24045,7 +24862,7 @@ QWidget#ClientUIRoot {{
             return
 
         # Downtime lock: keep scans constrained while downtime flow is active.
-        if s.downtime_active and raw_l not in ("productiondailyreport~2", "pdr_done", "pdrdone", "sur"):
+        if s.downtime_active and not prejob_pdr_job_scan and raw_l not in ("productiondailyreport~2", "pdr_done", "pdrdone", "sur"):
             self.status.setText("Downtime flow active: complete maintenance/cycle/supervisor/operator steps.")
             return
 
@@ -24183,7 +25000,7 @@ QWidget#ClientUIRoot {{
             self._show_invalid_overlay(f"Scan {choice_hint}a JOB QR / job order to continue.")
             return
 
-        if s.waiting_production_report_reason:
+        if s.waiting_production_report_reason and not prejob_pdr_job_scan:
             code = self._extract_production_reason_code(raw_s)
             if not code:
                 self.status.setText("Production Daily Report: scan valid reason QR (01-15).")
@@ -24470,6 +25287,8 @@ QWidget#ClientUIRoot {{
                 pack_hist["good_qty"] = 0
                 pack_hist["qty_q"] = 0
                 pack_key = self._pack_history_key(pack_hist)
+                if pack_key:
+                    pack_hist["pack_key"] = pack_key
                 if pack_key and pack_key in (s.product_pack_history_keys or set()):
                     self.status.setText("Invalid PACK QR: duplicate product, job, and index.")
                     self._show_invalid_overlay("PACK QR index already scanned for this product and job.")
@@ -24802,7 +25621,7 @@ QWidget#ClientUIRoot {{
                 return
             s.waiting_downtime_end_maintenance = False
             s.waiting_maintenance_qr = True
-            self.status.setText("Downtime done. Scan Maintenance QR to stop downtime timer.")
+            self.status.setText("Downtime done. Scan Maintenance or Line Technician QR to stop the timer.")
             self._refresh_ui()
             self._save_active_session_snapshot()
             return
@@ -24989,6 +25808,7 @@ QWidget#ClientUIRoot {{
             s.pdr_downtime_logs = []
             s.pdr_current_segment_start_seconds = None
             s.pdr_followup_reasons_remaining = 0
+            s.pdr_started_before_job = False
             s.downtime_started_at = None
             s.downtime_last_seconds = None
             s.downtime_active = False
@@ -25092,6 +25912,7 @@ QWidget#ClientUIRoot {{
 
         if res.kind in ("JOB", "JOB_STUB"):
             print(f"[SCAN] Job-like scan detected kind={res.kind} raw={raw_s!r} value={res.value!r}")
+            prejob_pdr_state = self._capture_prejob_pdr_state()
             if self._handle_remove_job_linkage_scan(res, raw_s):
                 return
             if self._handle_change_work_order_job_scan(res, raw_s):
@@ -25458,6 +26279,7 @@ QWidget#ClientUIRoot {{
             s.pdr_downtime_logs = []
             s.pdr_current_segment_start_seconds = None
             s.pdr_followup_reasons_remaining = 0
+            s.pdr_started_before_job = False
             s.downtime_started_at = None
             s.downtime_last_seconds = None
             s.downtime_active = False
@@ -25555,8 +26377,22 @@ QWidget#ClientUIRoot {{
             self._hide_reject_summary_overlay()
             self._hide_product_history_overlay()
             self._hide_reject_review_overlay()
+            prejob_pdr_attached = self._restore_prejob_pdr_state(prejob_pdr_state)
+            if prejob_pdr_attached:
+                if s.waiting_cycle_time_input or s.waiting_supervisor_qr or s.waiting_maintenance_qr:
+                    self._show_resolve_overlay()
+                elif self._pdr_workflow_active():
+                    self._set_production_overlay_mode(
+                        "select" if s.waiting_pdr_maintenance_reason else "active"
+                    )
+                    self._show_production_overlay()
             restored_part_count = self._restore_same_job_part_carryover()
-            if restored_part_count > 0:
+            if prejob_pdr_attached:
+                self.status.setText(
+                    f"Job set: {s.job_name}. Machine-only PDR downtime attached to this job; "
+                    "continue the active PDR step."
+                )
+            elif restored_part_count > 0:
                 self.status.setText(
                     f"Job continued: restored {restored_part_count} remaining product part(s) "
                     "from the previous shift. Scan linkage jobs again for this shift if needed."
@@ -25624,7 +26460,7 @@ QWidget#ClientUIRoot {{
             raw_operator_payload = str(
                 (res.meta or {}).get("operator_qr_payload") if isinstance(res.meta, dict) else raw_s
             ).strip() or raw_s
-            if current_operator_code and new_operator_code == current_operator_code and bool(s.break_active):
+            if self._operator_scan_ends_relief(new_operator_code):
                 self._end_operator_relief(raw_operator_payload)
                 return
             if current_operator_code and new_operator_code != current_operator_code:
@@ -25718,7 +26554,13 @@ QWidget#ClientUIRoot {{
             return
 
         if res.kind in ("PACK", "BUTAL", "REJECT_TRIGGER", "PRODUCTION_DAILY_REPORT_TRIGGER"):
-            if not self.can_accept_production_scans():
+            machine_only_pdr_start = bool(
+                res.kind == "PRODUCTION_DAILY_REPORT_TRIGGER"
+                and s.machine_code
+                and not s.job_code
+                and not self._pdr_workflow_active()
+            )
+            if not machine_only_pdr_start and not self.can_accept_production_scans():
                 msg = self._missing_session_prereq_message() or "Complete session first: MACHINE -> JOB -> OPERATOR."
                 self.status.setText(msg[:1].upper() + msg[1:])
                 self._show_invalid_overlay(msg)
@@ -25756,6 +26598,7 @@ QWidget#ClientUIRoot {{
                 s.pdr_reason_segments = []
                 s.pdr_current_segment_start_seconds = None
                 s.pdr_followup_reasons_remaining = 0
+                s.pdr_started_before_job = bool(not s.job_code)
                 s.supervisor_downtime_confirmation_started_at = None
                 s.supervisor_downtime_confirmation_seconds = None
                 s.operator_downtime_confirmation_started_at = None
@@ -25764,7 +26607,11 @@ QWidget#ClientUIRoot {{
                 s.supervisor_name = None
                 self._set_production_overlay_mode("active")
                 self._show_production_overlay()
-                self.status.setText("PDR waiting time started. Scan Maintenance QR to start downtime.")
+                self.status.setText(
+                    "Machine-only PDR started. Scan Maintenance/Line Technician QR; the next JOB receives this downtime."
+                    if s.pdr_started_before_job
+                    else "PDR waiting time started. Scan Maintenance or Line Technician QR to start downtime."
+                )
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (PDR WAITING FOR MAINTENANCE)")
@@ -26016,6 +26863,8 @@ QWidget#ClientUIRoot {{
                     scan_idx = str(pack_hist.get("index") or "").strip()
                     scan_lot = str(pack_hist.get("lot_number") or "").strip()
                     pack_key = self._pack_history_key(pack_hist)
+                    if pack_key:
+                        pack_hist["pack_key"] = pack_key
                     if pack_key and pack_key in (s.product_pack_history_keys or set()):
                         self.status.setText(
                             f"Invalid PACK QR: duplicate index {scan_idx} for this product and job."

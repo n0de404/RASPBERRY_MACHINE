@@ -63,6 +63,10 @@ async def _app_lifespan(app: FastAPI):
             except Exception:
                 pass
             STATE_TICK_TASK = None
+        try:
+            await asyncio.to_thread(_flush_client_status_registry_if_due, True)
+        except Exception:
+            pass
 
 
 APP = FastAPI(title="Machine Dashboard Server", lifespan=_app_lifespan)
@@ -74,7 +78,7 @@ BATCH_BROADCAST_DEFERRED: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "batch_broadcast_deferred", default=False
 )
 SLOW_API_LOG_LAST_AT: Dict[str, float] = {}
-SLOW_HEARTBEAT_LOG_INTERVAL_SECONDS = 10.0
+SLOW_API_LOG_INTERVAL_SECONDS = 10.0
 
 
 @APP.middleware("http")
@@ -104,11 +108,10 @@ async def _request_timing_middleware(request: Request, call_next):
     is_heartbeat = path == "/api/heartbeat"
     slow_threshold_ms = 1000.0 if is_heartbeat else 100.0
     now = time.monotonic()
-    heartbeat_log_due = (
-        not is_heartbeat
-        or now - SLOW_API_LOG_LAST_AT.get(path, 0.0) >= SLOW_HEARTBEAT_LOG_INTERVAL_SECONDS
+    slow_log_due = (
+        now - SLOW_API_LOG_LAST_AT.get(path, 0.0) >= SLOW_API_LOG_INTERVAL_SECONDS
     )
-    if path.startswith("/api/") and elapsed_ms >= slow_threshold_ms and heartbeat_log_due:
+    if path.startswith("/api/") and elapsed_ms >= slow_threshold_ms and slow_log_due:
         SLOW_API_LOG_LAST_AT[path] = now
         _append_server_app_log(
             "slow_api_request",
@@ -128,6 +131,7 @@ ACTIVE_TTL_SECONDS = max(
 )  # allow short local queue/network pauses without status flicker
 JOB_QUEUE_STALE_SECONDS = 24 * 60 * 60  # hide abandoned active-session snapshots after one day
 STATE_TICK_SECONDS = 3.0
+STATE_BROADCAST_MIN_INTERVAL_SECONDS = 2.0
 OPERATOR_BREAK_WINDOW_SECONDS = float(os.environ.get("MACHINE_OPERATOR_BREAK_WINDOW_SECONDS", "1800"))
 PRODUCT_SOURCE_FILE = Path(__file__).resolve().parent / "Product_ID.json"  # legacy fallback
 PRODUCT_API_CONFIG_FILE = Path(__file__).resolve().parent / "Database" / "product_api_config.json"
@@ -139,6 +143,12 @@ SERVING_RATE_API_URL = os.environ.get(
     "http://192.168.11.173:8765/api/serving-rate",
 ).strip()
 ACTIVE_MACHINE_SESSIONS_FILE = Path(__file__).resolve().parent / "Database" / "active_machine_sessions.json"
+CLIENT_STATUS_FILE = Path(__file__).resolve().parent / "Database" / "client_statuses.json"
+CLIENT_STATUS_SAVE_INTERVAL_SECONDS = 30.0
+CLIENT_STATUS_LOCK = threading.RLock()
+JOB_CONFIGURATION_CACHE_TTL_SECONDS = 20.0
+JOB_CONFIGURATION_CACHE_LOCK = threading.RLock()
+JOB_CONFIGURATION_CACHE: Dict[str, Dict[str, Any]] = {}
 SERVER_APP_LOG_FILE = Path(__file__).resolve().parent / "Database" / "server_app_logs.jsonl"
 MIXING_PARTIAL_ACK_FILE = Path(__file__).resolve().parent / "Database" / "mixing_partial_acknowledgements.json"
 MIXING_PARTIAL_ACK_LOCK = threading.RLock()
@@ -2643,6 +2653,88 @@ def _legacy_production_session_id(
     return f"LEGACY-{uuid.uuid5(uuid.NAMESPACE_URL, seed).hex.upper()}"
 
 
+def _canonical_pack_counter_key(value: Any) -> str:
+    key = str(value or "").strip()
+    if not key:
+        return ""
+    if key.upper().startswith("VIRTUAL|"):
+        return key.upper()
+    parts = key.split("|")
+    if len(parts) == 3:
+        normalized = []
+        for part in parts:
+            text = str(part or "").strip()
+            normalized.append((text.lstrip("0") or "0") if text.isdigit() else text.upper())
+        return "|".join(normalized)
+    return key
+
+
+def _pack_history_record_key(row: Any, production_session_id: Any = "") -> str:
+    if not isinstance(row, dict):
+        return ""
+    explicit = _canonical_pack_counter_key(row.get("pack_key"))
+    if explicit:
+        return explicit
+    virtual_scan_id = str(row.get("virtual_scan_id") or "").strip().upper()
+    if virtual_scan_id:
+        session_id = str(row.get("production_session_id") or production_session_id or "LEGACY").strip()
+        return f"VIRTUAL|{session_id}|{virtual_scan_id}".upper()
+    product = str(row.get("product_p") or row.get("product_id") or "").strip()
+    index = str(row.get("index") or row.get("series_index") or "").strip()
+    job = str(row.get("po_number") or "").strip()
+    raw_scan = str(row.get("raw_scan") or "").strip()
+    if raw_scan and not (product and index and job):
+        match = re.search(r"P(\d{11}).*?I(\d{11}).*?L\d{14}-(\d+)", raw_scan, flags=re.IGNORECASE)
+        if match:
+            product = product or match.group(1)
+            index = index or match.group(2)
+            job = job or match.group(3)
+    if index and (product or job):
+        return _canonical_pack_counter_key(f"{product}|{index}|{job}")
+    return raw_scan
+
+
+def _dedupe_pack_history_rows(
+    rows: Any,
+    production_session_id: Any = "",
+) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
+    clean: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    duplicate_good = 0
+    duplicate_active = 0
+    active_good_before = 0
+    active_good_after = 0
+    for raw_row in rows if isinstance(rows, list) else []:
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        active = not bool(row.get("voided"))
+        try:
+            good_qty = max(0, int(float(row.get("good_qty", row.get("completed_pack_qty", 0)) or 0)))
+        except (TypeError, ValueError):
+            good_qty = 0
+        if active:
+            active_good_before += good_qty
+        key = _pack_history_record_key(row, production_session_id)
+        if key and key in seen:
+            if active:
+                duplicate_good += good_qty
+                duplicate_active += 1
+            continue
+        if key:
+            seen.add(key)
+            row["pack_key"] = key
+        if active:
+            active_good_after += good_qty
+        clean.append(row)
+    return clean, {
+        "duplicate_good": duplicate_good,
+        "duplicate_active": duplicate_active,
+        "active_good_before": active_good_before,
+        "active_good_after": active_good_after,
+    }
+
+
 def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSession]:
     if not isinstance(raw, dict):
         return None
@@ -2664,6 +2756,20 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         production_session_id = _legacy_production_session_id(
             machine_code, raw_job_code, raw_job_started_at, client_id
         )
+    raw_pack_logs = [
+        dict(row)
+        for row in (raw.get("product_pack_history_logs") or [])
+        if isinstance(row, dict)
+        and str(row.get("source") or "").strip().upper() != "PACK_EVENT_FALLBACK"
+    ]
+    clean_pack_logs, pack_dedupe = _dedupe_pack_history_rows(raw_pack_logs, production_session_id)
+    pack_total = int(raw.get("pack_total", raw.get("pack_count", 0)) or 0)
+    good_total = int(raw.get("good_total", 0) or 0)
+    raw_active_pack_count = sum(1 for row in raw_pack_logs if not bool(row.get("voided")))
+    if pack_dedupe["duplicate_active"] and pack_total == raw_active_pack_count:
+        pack_total = max(0, pack_total - pack_dedupe["duplicate_active"])
+    if pack_dedupe["duplicate_good"] and good_total == pack_dedupe["active_good_before"]:
+        good_total = pack_dedupe["active_good_after"]
     return MachineSession(
         client_id=client_id,
         machine_code=machine_code,
@@ -2695,8 +2801,8 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         external_average_weight_sent_at=str(raw.get("external_average_weight_sent_at") or "").strip() or None,
         external_average_weight_source=str(raw.get("external_average_weight_source") or "").strip() or None,
         external_average_weight_sender=str(raw.get("external_average_weight_sender") or "").strip() or None,
-        pack_total=int(raw.get("pack_total", raw.get("pack_count", 0)) or 0),
-        good_total=int(raw.get("good_total", 0) or 0),
+        pack_total=pack_total,
+        good_total=good_total,
         butal_total=int(raw.get("butal_total", 0) or 0),
         reject_total=int(raw.get("reject_total", 0) or 0),
         reject_breakdown=_canonical_reject_breakdown(raw.get("reject_breakdown")),
@@ -2704,12 +2810,7 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         raw_sacks_count=int(raw.get("raw_sacks_count", 0) or 0),
         raw_material_scans=list(raw.get("raw_material_scans") or []),
         raw_material_logs=list(raw.get("raw_material_logs") or []),
-        product_pack_history_logs=[
-            row
-            for row in (raw.get("product_pack_history_logs") or [])
-            if isinstance(row, dict)
-            and str(row.get("source") or "").strip().upper() != "PACK_EVENT_FALLBACK"
-        ],
+        product_pack_history_logs=clean_pack_logs,
         butal_scan_logs=[dict(row) for row in (raw.get("butal_scan_logs") or []) if isinstance(row, dict)],
         reject_review_logs=[dict(row) for row in (raw.get("reject_review_logs") or []) if isinstance(row, dict)],
         client_app_logs=[
@@ -2944,6 +3045,7 @@ def _load_machine_activity_logs_sql(
     machine_code: str,
     limit: int = 400,
     since_utc: Optional[str] = None,
+    until_utc: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     code = str(machine_code or "").strip()
     if not code:
@@ -2953,6 +3055,7 @@ def _load_machine_activity_logs_sql(
         return None
     safe_limit = max(1, min(10000, int(limit or 400)))
     since = str(since_utc or "").strip()
+    until = str(until_utc or "").strip()
     try:
         with conn.cursor() as cur:
             where_sql = "`machine_code`=%s"
@@ -2960,6 +3063,9 @@ def _load_machine_activity_logs_sql(
             if since:
                 where_sql += " AND `timestamp_utc` >= %s"
                 params.append(since)
+            if until:
+                where_sql += " AND `timestamp_utc` <= %s"
+                params.append(until)
             cur.execute(f"SELECT COUNT(*) AS total FROM `machine_activity_logs` WHERE {where_sql}", tuple(params))
             count_row = cur.fetchone() or {}
             cur.execute(
@@ -3058,7 +3164,27 @@ WS_CLIENTS: List[WebSocket] = []
 STATE_TICK_TASK: Optional[asyncio.Task] = None
 MACHINE_STATUS_OVERRIDES: Dict[str, Dict[str, Any]] = {}
 MACHINE_STATUS_ARCHIVE: List[Dict[str, Any]] = []
-CLIENT_STATUSES: Dict[str, Dict[str, Any]] = {}
+def _load_client_status_registry() -> Dict[str, Dict[str, Any]]:
+    payload = _load_json_object(CLIENT_STATUS_FILE)
+    stored = payload.get("items") if isinstance(payload.get("items"), dict) else payload
+    rows: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(stored, dict):
+        return rows
+    for stored_key, item in stored.items():
+        if not isinstance(item, dict):
+            continue
+        client_id = str(item.get("client_id") or "").strip()
+        remote_host = str(item.get("remote_host") or "").strip()
+        key = str(stored_key or "").strip() or client_id or remote_host
+        if not key:
+            continue
+        rows[key] = dict(item)
+    return rows
+
+
+CLIENT_STATUSES: Dict[str, Dict[str, Any]] = _load_client_status_registry()
+CLIENT_STATUSES_DIRTY = False
+CLIENT_STATUSES_LAST_FLUSH = time.monotonic()
 try:
     ACTIVE_SESSIONS_FILE_MTIME: Optional[float] = float(ACTIVE_MACHINE_SESSIONS_FILE.stat().st_mtime or 0)
 except Exception:
@@ -3121,16 +3247,23 @@ def _update_client_status(
     last_event: str = "",
     machine_scanned: bool = False,
 ) -> Dict[str, Any]:
+    global CLIENT_STATUSES_DIRTY
     now = utc_now().isoformat()
     key = _client_status_key(client_id, remote_host)
-    row = dict(CLIENT_STATUSES.get(key) or {})
+    with CLIENT_STATUS_LOCK:
+        row = dict(CLIENT_STATUSES.get(key) or {})
     row.pop("identity_conflict", None)
     row.pop("conflict_remote_host", None)
     row.pop("conflict_last_seen_utc", None)
     code = str(machine_code or "").strip()
+    incoming_host = str(remote_host or "").strip()
+    # Client-specific active-session polls are valid presence signals but do
+    # not carry the request IP into this helper. Never let those empty poll
+    # updates erase the last real address recorded by a heartbeat/event.
+    effective_host = incoming_host or str(row.get("remote_host") or "").strip()
     row.update({
         "client_id": str(client_id or "").strip() or row.get("client_id") or "UNKNOWN",
-        "remote_host": str(remote_host or "").strip(),
+        "remote_host": effective_host,
         "machine_code": code,
         "machine_name": _machine_display_name(code, machine_name) if code else str(machine_name or "").strip(),
         "machine_scanned": bool(machine_scanned and code),
@@ -3138,8 +3271,36 @@ def _update_client_status(
         "last_event": str(last_event or "").strip(),
         "last_seen_utc": now,
     })
-    CLIENT_STATUSES[key] = row
+    with CLIENT_STATUS_LOCK:
+        CLIENT_STATUSES[key] = row
+        CLIENT_STATUSES_DIRTY = True
     return row
+
+
+def _flush_client_status_registry_if_due(force: bool = False) -> bool:
+    global CLIENT_STATUSES_DIRTY, CLIENT_STATUSES_LAST_FLUSH
+    with CLIENT_STATUS_LOCK:
+        if not CLIENT_STATUSES_DIRTY:
+            return False
+        now = time.monotonic()
+        if (
+            not force
+            and now - CLIENT_STATUSES_LAST_FLUSH < CLIENT_STATUS_SAVE_INTERVAL_SECONDS
+        ):
+            return False
+        payload = {
+            "saved_at_utc": utc_now().isoformat(),
+            "items": {
+                str(key): dict(row)
+                for key, row in CLIENT_STATUSES.items()
+                if isinstance(row, dict)
+            },
+        }
+        if not _save_json_object(CLIENT_STATUS_FILE, payload):
+            return False
+        CLIENT_STATUSES_DIRTY = False
+        CLIENT_STATUSES_LAST_FLUSH = now
+        return True
 
 
 def _active_client_identity_conflict(client_id: str, remote_host: str) -> Optional[Dict[str, Any]]:
@@ -3650,6 +3811,8 @@ def _normalize_company_role(value: Any) -> str:
         return "Operator"
     if low == "maintenance":
         return "Maintenance"
+    if low in {"line technician", "line_technician"}:
+        return "Line Technician"
     if low in {"material loader", "material_loader", "loader"}:
         return "Material Loader"
     if low == "planner":
@@ -6760,7 +6923,7 @@ def append_planning_activity_log(entries: List[Dict[str, Any]], source_ip: str =
     global PLANNING_ACTIVITY_LOG
     if not isinstance(entries, list) or not entries:
         return []
-    allowed_actions = {"QUEUED", "ASSIGNED", "MOVED", "REORDERED", "REMOVED", "LINKED", "STARTED"}
+    allowed_actions = {"QUEUED", "ASSIGNED", "MOVED", "REORDERED", "REMOVED", "LINKED", "STARTED", "MANPOWER", "SCHEDULED"}
     now_text = utc_now().isoformat()
     clean_entries: List[Dict[str, Any]] = []
     def safe_position(value: Any) -> int:
@@ -6951,6 +7114,8 @@ def _planning_job_card_from_payload(identifier: str, payload: Dict[str, Any]) ->
         "qty_per_shift": str(details.get("qty_per_shift") or "").strip(),
         "request_qty": str(job.get("request_qty") or job.get("qty") or "").strip(),
         "parts_count": len(parts),
+        "schedule_date": "",
+        "manpower_count": 0,
         "source": "BMS",
         "raw_payload": payload,
         "created_at_utc": utc_now().isoformat(),
@@ -6993,6 +7158,51 @@ def fetch_job_payload_from_bms(identifier: str) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise RuntimeError("BMS job response is invalid")
     return parsed
+
+
+def _job_configuration_version(payload: Dict[str, Any]) -> str:
+    """Return a stable version for every server-owned field in a job payload."""
+    encoded = json.dumps(
+        payload if isinstance(payload, dict) else {},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _server_job_configuration(identifier: str, force: bool = False) -> Dict[str, Any]:
+    """Fetch/cache the complete BMS job payload and its content version."""
+    job_identifier = str(identifier or "").strip()
+    if not job_identifier:
+        raise ValueError("job identifier is required")
+    now = time.monotonic()
+    with JOB_CONFIGURATION_CACHE_LOCK:
+        cached = JOB_CONFIGURATION_CACHE.get(job_identifier)
+        if (
+            not force
+            and isinstance(cached, dict)
+            and now - float(cached.get("cached_at_monotonic") or 0.0)
+            < JOB_CONFIGURATION_CACHE_TTL_SECONDS
+        ):
+            return dict(cached)
+    payload = fetch_job_payload_from_bms(job_identifier)
+    job = _planning_extract_job_record(payload)
+    item = {
+        "job_identifier": job_identifier,
+        "job_id": str(job.get("id") or job.get("job_id") or job_identifier).strip(),
+        "job_name": str(
+            job.get("ref_no") or job.get("reference_no") or job_identifier
+        ).strip(),
+        "version": _job_configuration_version(payload),
+        "payload": payload,
+        "cached_at_utc": utc_now().isoformat(),
+        "cached_at_monotonic": now,
+    }
+    with JOB_CONFIGURATION_CACHE_LOCK:
+        JOB_CONFIGURATION_CACHE[job_identifier] = dict(item)
+    return item
 
 
 def create_job_partial_in_bms(
@@ -8071,6 +8281,22 @@ def _planning_card_sku(card: Dict[str, Any]) -> str:
     return ""
 
 
+def _planning_card_schedule_date(card: Dict[str, Any]) -> str:
+    if not isinstance(card, dict):
+        return ""
+    return str(card.get("schedule_date") or card.get("planning_date") or "").strip()[:10]
+
+
+def _planning_cards_for_today(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return today's queue while treating legacy undated cards as today's plan."""
+    today = datetime.now().astimezone().date().isoformat()
+    return [
+        card for card in (cards or [])
+        if isinstance(card, dict)
+        and (_planning_card_schedule_date(card) in ("", today))
+    ]
+
+
 def _clear_planning_queue_alert(machine_code: Any) -> None:
     lane = _planning_lane_machine_code(machine_code)
     PLANNING_QUEUE_ALERTS.pop(lane, None)
@@ -8088,7 +8314,8 @@ def _reconcile_planning_queue_for_session(sess: Optional[MachineSession]) -> str
     if not lane or not running_key:
         return ""
     lanes = PLANNING_BOARD.get("lanes") if isinstance(PLANNING_BOARD.get("lanes"), dict) else {}
-    cards = lanes.get(lane) if isinstance(lanes.get(lane), list) else []
+    all_cards = lanes.get(lane) if isinstance(lanes.get(lane), list) else []
+    cards = _planning_cards_for_today(all_cards)
     if not cards:
         PLANNING_QUEUE_ALERTS.pop(lane, None)
         return "EMPTY"
@@ -8100,7 +8327,15 @@ def _reconcile_planning_queue_for_session(sess: Optional[MachineSession]) -> str
         return "UNKNOWN"
     if queued_key == running_key:
         promoted = dict(queued)
-        lanes[lane] = cards[1:]
+        promoted_id = str(promoted.get("id") or "")
+        removed = False
+        remaining_cards = []
+        for card in all_cards:
+            if not removed and isinstance(card, dict) and str(card.get("id") or "") == promoted_id:
+                removed = True
+                continue
+            remaining_cards.append(card)
+        lanes[lane] = remaining_cards
         PLANNING_BOARD = save_planning_board({"lanes": lanes})
         PLANNING_QUEUE_ALERTS.pop(lane, None)
         append_planning_activity_log([{
@@ -8147,7 +8382,27 @@ def _refresh_active_planning_queue_alerts() -> None:
     }
     for lane in list(PLANNING_QUEUE_ALERTS):
         session = sessions_by_lane.get(lane)
-        if session is None:
+        alert = PLANNING_QUEUE_ALERTS.get(lane) or {}
+        if session is None or not str(session.job_code or "").strip():
+            PLANNING_QUEUE_ALERTS.pop(lane, None)
+            continue
+        alert_session_id = str(alert.get("production_session_id") or "").strip()
+        current_session_id = str(session.production_session_id or "").strip()
+        if alert_session_id and current_session_id and alert_session_id != current_session_id:
+            PLANNING_QUEUE_ALERTS.pop(lane, None)
+            _reconcile_planning_queue_for_session(session)
+            continue
+        lanes = PLANNING_BOARD.get("lanes") if isinstance(PLANNING_BOARD.get("lanes"), dict) else {}
+        all_cards = lanes.get(lane) if isinstance(lanes.get(lane), list) else []
+        cards = _planning_cards_for_today(all_cards)
+        queue_head = cards[0] if cards and isinstance(cards[0], dict) else {}
+        alerted_card_id = str(alert.get("queued_card_id") or "").strip()
+        queue_head_id = str(queue_head.get("id") or "").strip()
+        # A mismatch belongs to the exact Plan A card that was at the front
+        # when this production session started. If a planner removes or moves
+        # that card, resolve only that alert. Do not transfer the mismatch to
+        # the next future job or consume any of the remaining queue.
+        if not alerted_card_id or alerted_card_id != queue_head_id:
             PLANNING_QUEUE_ALERTS.pop(lane, None)
             continue
         _reconcile_planning_queue_for_session(session)
@@ -8405,6 +8660,9 @@ def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, 
             "partial_count": 0,
             "scan_count": 0,
             "consumed_units": 0,
+            "output_sacks": 0,
+            "output_good_kg": 0.0,
+            "output_total_kg": 0.0,
             "rows": [],
             "scans": [],
         }
@@ -8465,7 +8723,34 @@ def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, 
     seen_scans: set = set()
     scan_rows: List[Dict[str, Any]] = []
     scan_count = 0
+    output_sacks = 0
+    output_good_kg = 0.0
+    output_total_kg = 0.0
     for partial in unique_partials:
+        output_sacks += max(
+            0,
+            int(
+                _parse_number_like(
+                    partial.get("mixing_sack_count")
+                    or partial.get("pack_count")
+                    or partial.get("pack_total")
+                    or 0
+                )
+            ),
+        )
+        partial_good_kg = max(
+            0.0,
+            _parse_number_like(
+                partial.get("mixing_total_kg")
+                or partial.get("good_total")
+                or 0
+            ),
+        )
+        partial_total_kg = partial_good_kg + max(
+            0.0, _parse_number_like(partial.get("butal_total"))
+        )
+        output_good_kg += partial_good_kg
+        output_total_kg += partial_total_kg
         output_total = sum(
             max(0.0, _parse_number_like(partial.get(field)))
             for field in ("good_total", "butal_total", "reject_total", "startup_reject_total", "no_shot_total")
@@ -8543,6 +8828,9 @@ def _same_job_partial_raw_material_totals(session: Dict[str, Any]) -> Dict[str, 
         "partial_count": len(unique_partials),
         "scan_count": scan_count,
         "consumed_units": consumed_units,
+        "output_sacks": output_sacks,
+        "output_good_kg": round(output_good_kg, 6),
+        "output_total_kg": round(output_total_kg, 6),
         "rows": list(material_groups.values()),
         "scans": scan_rows,
     }
@@ -8682,10 +8970,12 @@ def _dashboard_product_part_shortages(row: Dict[str, Any], *, include_prior_part
                 scanned += max(0.0, _parse_number_like(raw.get("qty") or raw.get("quantity")))
                 used += max(0.0, _parse_number_like(raw.get("used_qty")))
         for raw in scans:
-            # A carried balance is real stock available to the current shift.
-            # When prior partial rows are hydrated, those original scans are
-            # already included and the carryover mirror must not be added twice.
-            if include_prior_partials and "CARRYOVER" in str(raw.get("source") or "").upper():
+            source_is_carryover = "CARRYOVER" in str(raw.get("source") or "").upper()
+            # Carryover is a mirror of material scanned in an earlier shift,
+            # not a new delivery for the current shift. Whole-job totals use
+            # the hydrated prior rows when available; older snapshots without
+            # that history may use the carryover mirror as a fallback.
+            if source_is_carryover and (not include_prior_partials or prior_rows):
                 continue
             if part_keys.intersection(_dashboard_material_identity_keys(raw)):
                 scanned += max(0.0, _parse_number_like(raw.get("qty") or raw.get("quantity")))
@@ -8826,6 +9116,9 @@ def _state_payload(
 
 
 _LAST_BROADCAST_PAYLOAD: Optional[Dict[str, Any]] = None
+_STATE_BROADCAST_LOCK = asyncio.Lock()
+_STATE_BROADCAST_DIRTY = True
+_STATE_BROADCAST_LAST_AT = 0.0
 
 
 def _payload_signature(value: Any) -> str:
@@ -8836,54 +9129,77 @@ def _payload_signature(value: Any) -> str:
 
 async def broadcast_state(only_if_dirty: bool = False):
     global _LAST_BROADCAST_PAYLOAD
-    current = await asyncio.to_thread(_state_payload, include_history=False)
-    previous = _LAST_BROADCAST_PAYLOAD
-    payload: Dict[str, Any] = current
-    changed = True
-    if previous is not None:
-        previous_sessions = {
-            str(row.get("machine_code") or "").strip(): row
-            for row in (previous.get("sessions") or []) if isinstance(row, dict)
-        }
-        current_session_codes = {
-            str(row.get("machine_code") or "").strip()
-            for row in (current.get("sessions") or []) if isinstance(row, dict)
-        }
-        changed_sessions = []
-        for row in current.get("sessions") or []:
-            if not isinstance(row, dict):
-                continue
-            code = str(row.get("machine_code") or "").strip()
-            if _payload_signature(row) != _payload_signature(previous_sessions.get(code)):
-                changed_sessions.append(row)
-        patch: Dict[str, Any] = {
-            "type": "STATE_PATCH",
-            "sessions": changed_sessions,
-            "server_time_utc": current.get("server_time_utc"),
-        }
-        for key, value in current.items():
-            if key in {"type", "sessions", "server_time_utc"}:
-                continue
-            if _payload_signature(value) != _payload_signature(previous.get(key)):
-                patch[key] = value
-        changed = bool(changed_sessions or len(patch) > 3 or current_session_codes != set(previous_sessions))
-        payload = current if current_session_codes != set(previous_sessions) else patch
-    _LAST_BROADCAST_PAYLOAD = current
-    if only_if_dirty and not changed:
-        return
-    if not WS_CLIENTS:
-        return
-    message = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    global _STATE_BROADCAST_DIRTY, _STATE_BROADCAST_LAST_AT
 
-    async def send_one(ws: WebSocket) -> Optional[WebSocket]:
-        try:
-            await asyncio.wait_for(ws.send_text(message), timeout=3.0)
-            return ws
-        except Exception:
-            return None
+    # Event bursts only mark the dashboard dirty. One caller performs the
+    # rebuild while concurrent callers return immediately; the periodic state
+    # tick delivers anything deferred by the short rate limit.
+    if not only_if_dirty:
+        _STATE_BROADCAST_DIRTY = True
+    if _STATE_BROADCAST_LOCK.locked():
+        return
+    if only_if_dirty and not _STATE_BROADCAST_DIRTY:
+        return
+    if (
+        not only_if_dirty
+        and time.monotonic() - _STATE_BROADCAST_LAST_AT
+        < STATE_BROADCAST_MIN_INTERVAL_SECONDS
+    ):
+        return
 
-    results = await asyncio.gather(*(send_one(ws) for ws in list(WS_CLIENTS)))
-    WS_CLIENTS[:] = [ws for ws in results if ws is not None]
+    async with _STATE_BROADCAST_LOCK:
+        if only_if_dirty and not _STATE_BROADCAST_DIRTY:
+            return
+        _STATE_BROADCAST_DIRTY = False
+        current = await asyncio.to_thread(_state_payload, include_history=False)
+        previous = _LAST_BROADCAST_PAYLOAD
+        payload: Dict[str, Any] = current
+        changed = True
+        if previous is not None:
+            previous_sessions = {
+                str(row.get("machine_code") or "").strip(): row
+                for row in (previous.get("sessions") or []) if isinstance(row, dict)
+            }
+            current_session_codes = {
+                str(row.get("machine_code") or "").strip()
+                for row in (current.get("sessions") or []) if isinstance(row, dict)
+            }
+            changed_sessions = []
+            for row in current.get("sessions") or []:
+                if not isinstance(row, dict):
+                    continue
+                code = str(row.get("machine_code") or "").strip()
+                if _payload_signature(row) != _payload_signature(previous_sessions.get(code)):
+                    changed_sessions.append(row)
+            patch: Dict[str, Any] = {
+                "type": "STATE_PATCH",
+                "sessions": changed_sessions,
+                "server_time_utc": current.get("server_time_utc"),
+            }
+            for key, value in current.items():
+                if key in {"type", "sessions", "server_time_utc"}:
+                    continue
+                if _payload_signature(value) != _payload_signature(previous.get(key)):
+                    patch[key] = value
+            changed = bool(changed_sessions or len(patch) > 3 or current_session_codes != set(previous_sessions))
+            payload = current if current_session_codes != set(previous_sessions) else patch
+        _LAST_BROADCAST_PAYLOAD = current
+        _STATE_BROADCAST_LAST_AT = time.monotonic()
+        if only_if_dirty and not changed:
+            return
+        if not WS_CLIENTS:
+            return
+        message = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
+        async def send_one(ws: WebSocket) -> Optional[WebSocket]:
+            try:
+                await asyncio.wait_for(ws.send_text(message), timeout=3.0)
+                return ws
+            except Exception:
+                return None
+
+        results = await asyncio.gather(*(send_one(ws) for ws in list(WS_CLIENTS)))
+        WS_CLIENTS[:] = [ws for ws in results if ws is not None]
 
 
 async def _state_tick_loop():
@@ -8894,6 +9210,10 @@ async def _state_tick_loop():
             pass
         try:
             await asyncio.to_thread(_flush_active_sessions_json_if_due)
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(_flush_client_status_registry_if_due)
         except Exception:
             pass
         await asyncio.sleep(STATE_TICK_SECONDS)
@@ -9695,6 +10015,38 @@ DASHBOARD_HTML = r"""
     #maintenanceTab .maintenance-performance-wrap { border:1px solid var(--ui-border); border-radius:14px; background:color-mix(in srgb, var(--ui-surface) 92%, transparent); box-shadow:0 12px 26px rgba(15,23,42,.07); }
     #maintenanceTab .maintenance-performance-wrap .data-table th { background:var(--ui-surface); color:var(--ui-muted); }
     .planning-shell { background:linear-gradient(180deg, var(--ui-surface), var(--ui-subtle)); border:1px solid var(--ui-border); border-radius:18px; padding:16px; box-shadow:0 18px 44px rgba(15,23,42,.10); }
+    .planning-view-toolbar { display:inline-flex; align-items:center; gap:7px; margin:0; }
+    .planning-view-toolbar[hidden] { display:none; }
+    .planning-view-tabs { display:inline-flex; gap:4px; padding:4px; border:1px solid var(--ui-border); border-radius:11px; background:var(--ui-subtle); }
+    .planning-view-tab { border:0; border-radius:8px; padding:8px 14px; background:transparent; color:var(--ui-muted); font:inherit; font-size:.78rem; font-weight:900; cursor:pointer; }
+    .planning-view-tab.active { background:var(--ui-accent); color:var(--ui-on-accent); box-shadow:0 5px 12px rgba(37,99,235,.2); }
+    .planning-date-controls { display:flex; align-items:center; gap:7px; }
+    .planning-date-controls label { color:var(--ui-muted); font-size:.72rem; font-weight:850; }
+    .planning-date-controls input, .planning-date-controls button { min-height:34px; box-sizing:border-box; border:1px solid var(--ui-border); border-radius:8px; padding:6px 9px; background:var(--ui-surface); color:var(--ui-text); font:inherit; font-size:.75rem; font-weight:800; }
+    .planning-date-controls input { width:132px; }
+    .planning-date-controls button { cursor:pointer; }
+    .planning-weekly-view { display:none; min-height:610px; }
+    .planning-shell.calendar-mode .planning-workspace { display:none; }
+    .planning-shell.calendar-mode .planning-weekly-view { display:block; }
+    .planning-week-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; }
+    .planning-week-title { color:var(--ui-text); font-size:1rem; font-weight:950; }
+    .planning-week-nav { display:flex; gap:6px; }
+    .planning-week-nav button { border:1px solid var(--ui-border); border-radius:8px; padding:7px 10px; background:var(--ui-surface); color:var(--ui-text); font:inherit; font-size:.72rem; font-weight:850; cursor:pointer; }
+    .planning-week-grid { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:7px; }
+    .planning-calendar-weekday { padding:3px 8px; color:var(--ui-muted); font-size:.62rem; font-weight:950; letter-spacing:.055em; text-align:center; text-transform:uppercase; }
+    .planning-week-day { min-height:105px; display:flex; flex-direction:column; align-items:stretch; text-align:left; border:1px solid var(--ui-border); border-radius:11px; padding:9px; background:var(--ui-surface); color:var(--ui-text); cursor:pointer; box-shadow:0 5px 13px rgba(15,23,42,.05); }
+    .planning-week-day.outside { cursor:default; border-style:dashed; background:color-mix(in srgb,var(--ui-subtle) 65%,transparent); box-shadow:none; opacity:.45; }
+    .planning-week-day:hover { border-color:var(--ui-accent); transform:translateY(-1px); }
+    .planning-week-day.today { border-color:var(--ui-accent); background:var(--ui-accent-soft); }
+    .planning-week-day.selected { outline:3px solid color-mix(in srgb,var(--ui-accent) 30%,transparent); }
+    .planning-week-day-name { color:var(--ui-muted); font-size:.58rem; font-weight:950; letter-spacing:.05em; text-transform:uppercase; }
+    .planning-week-day-date { font-size:.88rem; font-weight:950; }
+    .planning-week-stats { margin-top:auto; display:grid; gap:4px; }
+    .planning-week-stat { display:flex; align-items:center; justify-content:space-between; gap:5px; border-top:1px solid var(--ui-border); padding-top:4px; color:var(--ui-muted); font-size:.59rem; font-weight:800; }
+    .planning-week-stat strong { color:var(--ui-text); font-size:.92rem; line-height:1; }
+    .planning-manpower { border:1px solid #a7f3d0; border-radius:999px; padding:3px 7px; background:#dcfce7; color:#047857; font:inherit; font-size:.58rem; line-height:1; font-weight:900; white-space:nowrap; cursor:pointer; }
+    .planning-manpower.unassigned { border-color:#fde68a; background:#fef3c7; color:#92400e; }
+    @media (max-width: 760px) { .planning-week-grid { gap:3px; } .planning-week-day { min-height:86px; padding:5px; } .planning-week-stat span { display:none; } .planning-view-toolbar { align-items:stretch; } .planning-date-controls { width:100%; } }
     .planning-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
     .planning-title h3 { margin:0; color:var(--ui-text); font-size:1.22rem; }
     .planning-controls { display:grid; grid-template-columns:minmax(0, 280px) auto auto; gap:7px; align-items:center; }
@@ -9732,8 +10084,8 @@ DASHBOARD_HTML = r"""
     .planning-machine-grid .planning-dropzone > * { width:270px; min-width:270px; box-sizing:border-box; }
     .planning-machine-grid .planning-empty { border:0; background:transparent; padding:2px 0; }
     .planning-machine-grid .planning-card { position:relative; padding:7px 8px; box-shadow:none; min-height:104px; max-height:none; overflow:visible; }
-    .planning-machine-grid .planning-card-top { gap:4px; }
-    .planning-machine-grid .planning-card-top-actions { max-width:none; margin-right:22px; justify-content:flex-end; flex-wrap:nowrap; gap:3px; }
+    .planning-machine-grid .planning-card-top { display:grid; grid-template-columns:minmax(0,1fr); gap:5px; }
+    .planning-machine-grid .planning-card-top-actions { min-width:0; max-width:none; margin-right:22px; justify-content:flex-start; flex-wrap:wrap; gap:3px; }
     .planning-machine-grid .planning-job { font-size:.82rem; line-height:1.15; }
     .planning-machine-grid .planning-meta { max-width:100%; margin-top:3px; font-size:.66rem; line-height:1.2; white-space:normal; overflow-wrap:break-word; word-break:normal; }
     .planning-product-line { display:block; min-width:0; white-space:normal; }
@@ -10778,7 +11130,7 @@ DASHBOARD_HTML = r"""
     .machine-detail-body { padding:16px; overflow-y:auto; overflow-x:hidden; display:grid; grid-template-columns:minmax(0,1fr); grid-auto-rows:max-content; align-content:start; gap:12px; min-width:0; background:linear-gradient(145deg,var(--ui-surface),var(--ui-surface)); }
     .machine-detail-body > * { width: 100%; max-width: 100%; min-width: 0; }
     .machine-detail-layout { min-width:0; display:grid; grid-template-columns:270px minmax(0,1fr); gap:18px; align-items:start; }
-    .machine-detail-sidebar { min-width:0; position:sticky; top:0; display:grid; gap:13px; padding:16px; border:1px solid var(--ui-border); border-radius:16px; background:color-mix(in srgb, var(--ui-surface) 98%, transparent); box-shadow:0 10px 28px rgba(30,64,175,.07); }
+    .machine-detail-sidebar { min-width:0; position:sticky; top:0; display:grid; gap:13px; padding:16px; border:0; border-radius:16px; background:color-mix(in srgb, var(--ui-surface) 98%, transparent); box-shadow:0 10px 28px rgba(30,64,175,.08); }
     .machine-detail-side-top { display:flex; align-items:center; justify-content:space-between; gap:8px; }
     .machine-detail-eyebrow { color:var(--ui-link); font-size:.62rem; line-height:1; font-weight:950; letter-spacing:.06em; text-transform:uppercase; }
     .machine-detail-status-chip { display:inline-flex; align-items:center; gap:5px; padding:6px 9px; border:1px solid var(--ui-border); border-radius:999px; background:var(--ui-surface); color:var(--ui-muted); font-size:.58rem; font-weight:950; text-transform:uppercase; box-shadow:0 5px 14px rgba(15,23,42,.06); }
@@ -10793,7 +11145,7 @@ DASHBOARD_HTML = r"""
     .machine-detail-machine-name { min-width:0; color:#0f2a68; font-size:1.25rem; line-height:1.1; font-weight:950; overflow-wrap:anywhere; }
     .machine-detail-machine-code { margin-top:6px; color:var(--ui-muted); font-size:.72rem; font-weight:800; overflow-wrap:anywhere; }
     .machine-detail-side-metrics { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; }
-    .machine-detail-side-metric { min-width:0; min-height:66px; display:grid; align-content:space-between; gap:6px; padding:11px; border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); box-shadow:0 7px 18px rgba(30,64,175,.06); }
+    .machine-detail-side-metric { min-width:0; min-height:66px; display:grid; align-content:space-between; gap:6px; padding:11px; border:0; border-radius:12px; background:var(--ui-subtle); box-shadow:none; }
     .machine-detail-side-metric .k { color:var(--ui-muted); font-size:.59rem; font-weight:950; letter-spacing:.04em; text-transform:uppercase; }
     .machine-detail-side-metric .v { color:#172554; font-size:1.14rem; line-height:1; font-weight:950; }
     .machine-detail-side-metric.good .k,.machine-detail-side-metric.good .v { color:#10b981; }
@@ -10817,8 +11169,9 @@ DASHBOARD_HTML = r"""
     .machine-detail-reject-bubble-row { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding-top:6px; border-top:1px solid #fee2e2; font-size:.64rem; line-height:1.25; font-weight:850; }
     .machine-detail-reject-bubble-row span:first-child { min-width:0; overflow-wrap:anywhere; }
     .machine-detail-reject-bubble-row strong { flex:0 0 auto; color:#b91c1c; }
-    .machine-detail-side-list { display:grid; }
-    .machine-detail-side-row { min-width:0; display:grid; grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr); gap:8px; padding:9px 0; border-top:1px solid var(--ui-border); }
+    .machine-detail-side-list { display:grid; gap:2px; }
+    .machine-detail-side-row { min-width:0; display:grid; grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr); gap:8px; padding:8px 10px; border:0; border-radius:8px; }
+    .machine-detail-side-row:nth-child(odd) { background:color-mix(in srgb, var(--ui-subtle) 62%, transparent); }
     .machine-detail-side-row .k { color:var(--ui-muted); font-size:.59rem; font-weight:900; text-transform:uppercase; }
     .machine-detail-side-row .v { color:var(--ui-link); font-size:.66rem; font-weight:900; text-align:right; overflow-wrap:anywhere; }
     .machine-detail-side-callout { display:grid; gap:4px; padding:11px 12px; border-radius:11px; background:linear-gradient(135deg,var(--ui-surface),var(--ui-surface)); box-shadow:0 6px 16px rgba(30,64,175,.05); }
@@ -10834,18 +11187,18 @@ DASHBOARD_HTML = r"""
     .machine-detail-chip.inactive { border-color:var(--ui-border); background:var(--ui-subtle); color:var(--ui-muted); }
     .machine-detail-chip.manual { border-color:#fed7aa; background:var(--ui-subtle); color:#f97316; }
     .machine-detail-chip.purple { border-color:#ede9fe; background:var(--ui-subtle); color:#7c3aed; }
-    .machine-detail-info-panel { min-width:0; overflow:hidden; border:1px solid var(--ui-border); border-radius:16px; background:color-mix(in srgb, var(--ui-surface) 98%, transparent); box-shadow:0 9px 24px rgba(30,64,175,.06); }
-    .machine-detail-info-title { padding:15px 18px 12px; color:var(--ui-link); font-size:.68rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; border-bottom:1px solid var(--ui-border); }
+    .machine-detail-info-panel { min-width:0; overflow:hidden; border:0; border-radius:16px; background:color-mix(in srgb, var(--ui-surface) 98%, transparent); box-shadow:0 7px 22px rgba(30,64,175,.075); }
+    .machine-detail-info-title { padding:14px 18px 11px; color:var(--ui-link); font-size:.68rem; font-weight:950; letter-spacing:.035em; text-transform:uppercase; border:0; background:color-mix(in srgb, var(--ui-subtle) 60%, transparent); }
     .machine-detail-info-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); }
     .product-weight-info-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
     .downtime-summary-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
     .product-weight-info-grid .machine-detail-info-item:nth-child(3n) { border-right:0; }
-    .downtime-summary-grid .machine-detail-info-item:nth-child(3n) { border-right:1px solid var(--ui-border); }
+    .downtime-summary-grid .machine-detail-info-item:nth-child(3n) { border-right:0; }
     .downtime-summary-grid .machine-detail-info-item:nth-child(4n) { border-right:0; }
-    .product-weight-info-grid .machine-detail-info-item { border-bottom:1px solid var(--ui-border); }
+    .product-weight-info-grid .machine-detail-info-item { border-bottom:0; }
     .product-weight-info-grid .machine-detail-info-item:nth-last-child(-n+3) { border-bottom:0; }
     .downtime-summary-grid .machine-detail-info-item { border-bottom:0; }
-    .machine-detail-info-item { min-width:0; min-height:70px; padding:13px 18px; border-right:1px solid var(--ui-border); border-bottom:1px solid var(--ui-border); }
+    .machine-detail-info-item { min-width:0; min-height:70px; padding:13px 18px; border-right:0; border-bottom:0; }
     .machine-detail-info-item:nth-child(3n) { border-right:0; }
     .machine-detail-info-item:nth-last-child(-n+3) { border-bottom:0; }
     .machine-detail-info-item .k { color:var(--ui-muted); font-size:.58rem; font-weight:900; letter-spacing:.035em; text-transform:uppercase; }
@@ -10867,7 +11220,7 @@ DASHBOARD_HTML = r"""
     #machineDetailOverlay .review-kv-table th,
     #machineDetailOverlay .review-kv-table td { min-width: 0; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
     .job-parts-panel { overflow:visible; }
-    .job-parts-panel .machine-detail-info-title { border-radius:16px 16px 0 0; background:color-mix(in srgb, var(--ui-surface) 98%, transparent); }
+    .job-parts-panel .machine-detail-info-title { border-radius:16px 16px 0 0; }
     .job-parts-panel-body { min-width:0; padding:10px 12px 12px; border-radius:0 0 16px 16px; background:color-mix(in srgb, var(--ui-surface) 98%, transparent); }
     .job-parts-table { min-width:0; overflow:visible; }
     .job-parts-table > .review-data-table { width:100%; table-layout:fixed; }
@@ -10915,7 +11268,7 @@ DASHBOARD_HTML = r"""
     .machine-detail-record-panel-body .review-data-table th:first-child,
     .machine-detail-record-panel-body .review-data-table td:first-child { width:34px; padding-left:3px; padding-right:3px; text-align:center; }
     .machine-detail-record-panel-body .machine-detail-empty { padding:3px 0; color:var(--ui-muted); font-size:.72rem; line-height:1.35; font-weight:800; }
-    .machine-detail-downtime-history { border-top:1px solid var(--ui-border); }
+    .machine-detail-downtime-history { border-top:0; }
     .product-pack-table { min-width:0; overflow:hidden; }
     .product-pack-table > .review-data-table { width:100%; table-layout:fixed; }
     .product-pack-table > .review-data-table > thead > tr > th { color:var(--ui-muted); font-size:.58rem; line-height:1.3; font-weight:900; letter-spacing:.035em; font-family:inherit; }
@@ -11031,7 +11384,7 @@ DASHBOARD_HTML = r"""
     .raw-material-stat-panel-body { min-width:0; padding:12px; }
     .raw-stat-note { margin:0 0 10px; color:var(--ui-muted); font-size:.68rem; font-weight:750; line-height:1.4; }
     .raw-stat-carryover { display:block; margin-top:3px; color:var(--ui-muted); font-size:.61rem; font-weight:750; white-space:nowrap; }
-    .raw-stat-table { min-width:0; overflow:hidden; border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); }
+    .raw-stat-table { min-width:0; overflow:hidden; border:0; border-radius:12px; background:var(--ui-surface); }
     .raw-stat-table .review-data-table { width:100%; table-layout:fixed; }
     .raw-stat-table .review-data-table th { color:var(--ui-muted); font-size:.56rem; line-height:1.25; font-weight:900; }
     .raw-stat-table .review-data-table td { color:#172554; font-size:.68rem; line-height:1.35; font-weight:850; vertical-align:middle; }
@@ -11039,6 +11392,12 @@ DASHBOARD_HTML = r"""
     .raw-stat-table .review-data-table td:first-child { width:32px; text-align:center; }
     .raw-stat-table .review-data-table th:nth-child(2),
     .raw-stat-table .review-data-table td:nth-child(2) { width:25%; }
+    #machineDetailOverlay .review-data-table th,
+    #machineDetailOverlay .review-kv-table td { border-bottom:0; }
+    #machineDetailOverlay .review-data-table thead tr { background:color-mix(in srgb, var(--ui-subtle) 72%, transparent); }
+    #machineDetailOverlay .review-data-table tbody tr:nth-child(even) { background:color-mix(in srgb, var(--ui-subtle) 48%, transparent); }
+    #machineDetailOverlay .review-data-table tbody tr { transition:background-color .15s ease; }
+    #machineDetailOverlay .review-data-table tbody tr:hover { background:color-mix(in srgb, var(--ui-accent-soft) 24%, var(--ui-surface)); }
     .raw-stat-material { color:#172554; font-weight:900; overflow-wrap:anywhere; }
     .raw-stat-sku { margin-top:3px; color:var(--ui-link); font-size:.62rem; font-weight:900; overflow-wrap:anywhere; }
     .raw-insight-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; margin-bottom:12px; }
@@ -11370,6 +11729,16 @@ DASHBOARD_HTML = r"""
       <button class="machine-filter-btn planning-activity-btn" id="planningActivityBtn" type="button" aria-label="Toggle Planning Activity Log" aria-pressed="false" title="Planning Activity Log" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 8h8M8 12h5M8 16h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="17" cy="16" r="3.5" fill="#eef3f8" stroke="currentColor" stroke-width="1.8"/><path d="M17 14.3v1.9l1.3.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
       </button>
+      <div id="planningScheduleToolbar" class="planning-view-toolbar" hidden>
+        <div class="planning-view-tabs" role="tablist" aria-label="Planning schedule view">
+          <button id="planningDailyTab" class="planning-view-tab active" type="button" role="tab" aria-selected="true">Daily</button>
+          <button id="planningCalendarTab" class="planning-view-tab" type="button" role="tab" aria-selected="false">Calendar</button>
+        </div>
+        <div class="planning-date-controls">
+          <input id="planningDateInput" type="date" title="Planning date" aria-label="Planning date" />
+          <button id="planningTodayBtn" type="button">Today</button>
+        </div>
+      </div>
       <button id="planningQueueToggle" class="machine-filter-btn planning-queue-toggle" type="button" aria-label="Open Production Progress and ETA" aria-expanded="false" aria-controls="planningQueuePanel" title="Production Progress &amp; ETA" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/><path d="M5 4l-2 2M19 4l2 2"/></svg>
         <span id="planningQueueToggleCount" class="planning-queue-toggle-count">0</span>
@@ -11396,7 +11765,18 @@ DASHBOARD_HTML = r"""
   </div>
 
   <div id="planningTab" class="main-tab-content">
-    <div class="planning-shell">
+    <div id="planningShell" class="planning-shell">
+      <section id="planningCalendarView" class="planning-weekly-view" aria-label="Monthly production schedule">
+        <div class="planning-week-head">
+          <div id="planningMonthTitle" class="planning-week-title">Monthly Schedule</div>
+          <div class="planning-week-nav">
+            <button id="planningPrevMonthBtn" type="button">Previous month</button>
+            <button id="planningThisMonthBtn" type="button">This month</button>
+            <button id="planningNextMonthBtn" type="button">Next month</button>
+          </div>
+        </div>
+        <div id="planningMonthGrid" class="planning-week-grid"></div>
+      </section>
       <div class="planning-workspace">
         <div class="planning-left-grid">
           <div class="planning-lane backlog">
@@ -11463,7 +11843,7 @@ DASHBOARD_HTML = r"""
               <div class="planning-activity-filters">
                 <input id="planningActivitySearch" type="search" placeholder="Search mold, SKU, job, machine, or note..." />
                 <select id="planningActivityActionFilter" aria-label="Filter planning action">
-                  <option value="">All actions</option><option value="QUEUED">Queued</option><option value="ASSIGNED">Assigned</option><option value="STARTED">Started</option><option value="MOVED">Moved</option><option value="REORDERED">Reordered</option><option value="LINKED">Linked parent</option><option value="REMOVED">Removed</option>
+                  <option value="">All actions</option><option value="QUEUED">Queued</option><option value="ASSIGNED">Assigned</option><option value="STARTED">Started</option><option value="MOVED">Moved</option><option value="REORDERED">Reordered</option><option value="LINKED">Linked parent</option><option value="MANPOWER">Manpower</option><option value="SCHEDULED">Scheduled</option><option value="REMOVED">Removed</option>
                 </select>
                 <select id="planningActivityMachineFilter" aria-label="Filter planning machine"><option value="">All machines</option></select>
                 <input id="planningActivityDateFilter" type="date" aria-label="Filter planning date" />
@@ -12365,6 +12745,18 @@ DASHBOARD_HTML = r"""
   const planningActivityMachineFilter = document.getElementById("planningActivityMachineFilter");
   const planningActivityDateFilter = document.getElementById("planningActivityDateFilter");
   const planningActivityTableWrap = document.getElementById("planningActivityTableWrap");
+  const planningScheduleToolbar = document.getElementById("planningScheduleToolbar");
+  const planningShell = document.getElementById("planningShell");
+  const planningDailyTab = document.getElementById("planningDailyTab");
+  const planningCalendarTab = document.getElementById("planningCalendarTab");
+  const planningDateInput = document.getElementById("planningDateInput");
+  const planningTodayBtn = document.getElementById("planningTodayBtn");
+  const planningCalendarView = document.getElementById("planningCalendarView");
+  const planningMonthTitle = document.getElementById("planningMonthTitle");
+  const planningMonthGrid = document.getElementById("planningMonthGrid");
+  const planningPrevMonthBtn = document.getElementById("planningPrevMonthBtn");
+  const planningThisMonthBtn = document.getElementById("planningThisMonthBtn");
+  const planningNextMonthBtn = document.getElementById("planningNextMonthBtn");
   const jobQueueSummary = document.getElementById("jobQueueSummary");
   const jobQueueTableWrap = document.getElementById("jobQueueTableWrap");
   const planningQueueToggle = document.getElementById("planningQueueToggle");
@@ -12587,6 +12979,33 @@ DASHBOARD_HTML = r"""
   let latestState = { sessions: [], active_ttl_seconds: 30 };
   let activePlanOverviewFactory = "F03";
   let planningBoard = { lanes: { BACKLOG: [] }, updated_at_utc: "" };
+  function planningDateKey(value=new Date()){
+    const date = value instanceof Date ? new Date(value) : new Date(`${value}T12:00:00`);
+    if(Number.isNaN(date.getTime())) return "";
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  }
+  function planningDateFromKey(value){
+    const parts = String(value || "").split("-").map(Number);
+    if(parts.length !== 3 || parts.some(part => !Number.isFinite(part))) return new Date();
+    return new Date(parts[0], parts[1] - 1, parts[2], 12, 0, 0, 0);
+  }
+  function planningAddDays(value, amount){
+    const date = new Date(value);
+    date.setDate(date.getDate() + Number(amount || 0));
+    return date;
+  }
+  function planningMonthStart(value){
+    const date = value instanceof Date ? new Date(value) : planningDateFromKey(value);
+    return new Date(date.getFullYear(), date.getMonth(), 1, 12, 0, 0, 0);
+  }
+  function planningAddMonths(value, amount){
+    const date = planningMonthStart(value);
+    date.setMonth(date.getMonth() + Number(amount || 0));
+    return date;
+  }
+  let activePlanningDate = planningDateKey();
+  let planningCalendarMonth = planningMonthStart(new Date());
+  let planningViewMode = "daily";
   let planningSaveTimer = null;
   let planningLocalDirty = false;
   let planningPendingActivities = [];
@@ -12710,6 +13129,8 @@ DASHBOARD_HTML = r"""
   let userKpiLoading = false;
   let userKpiItemsState = [];
   const dashboardSectionSignatures = new Map();
+  let deferredDashboardRenderPending = false;
+  let deferredDashboardRenderState = null;
 
   function renderDashboardSectionIfChanged(key, value, renderFn){
     let signature = "";
@@ -12718,6 +13139,41 @@ DASHBOARD_HTML = r"""
     if(dashboardSectionSignatures.get(key) === signature) return;
     dashboardSectionSignatures.set(key, signature);
     renderFn();
+  }
+
+  function scheduleDeferredDashboardSections(state){
+    // Machine cards are the first thing operators need after a reload. Keep
+    // the large, normally hidden history/planning panels out of that first
+    // browser paint and coalesce any newer full state that arrives meanwhile.
+    deferredDashboardRenderState = state;
+    if(deferredDashboardRenderPending) return;
+    deferredDashboardRenderPending = true;
+    const run = () => {
+      deferredDashboardRenderPending = false;
+      const snapshot = deferredDashboardRenderState || latestState || {};
+      deferredDashboardRenderState = null;
+      renderDashboardSectionIfChanged("job-queue", snapshot.job_queue || [], () => renderJobQueue(snapshot.job_queue || []));
+      renderDashboardSectionIfChanged("finished-jobs", snapshot.finished_jobs || [], () => renderFinishedJobs(snapshot.finished_jobs || []));
+      renderDashboardSectionIfChanged("archived-jobs", snapshot.archived_jobs || [], () => renderArchivedJobs(snapshot.archived_jobs || []));
+      renderDashboardSectionIfChanged("machine-status-archive", machineStatusArchiveState, () => {
+        renderMachineStatusArchive(machineStatusArchiveState);
+        renderFinishedShiftPdr(pdrSummaryState);
+      });
+      renderDashboardSectionIfChanged("downtime-archive", [snapshot.finished_jobs || [], snapshot.archived_jobs || []], () => renderDowntimeArchive(snapshot.finished_jobs || [], snapshot.archived_jobs || []));
+      renderDashboardSectionIfChanged("maintenance", [snapshot.sessions || [], snapshot.daily_roles || [], snapshot.maintenance_profiles || []], () => renderMaintenanceTab(snapshot));
+      renderDashboardSectionIfChanged("planning-summary", [snapshot.planning_board || {}, snapshot.job_queue || []], () => renderPlanningOpsSummary(snapshot, snapshot.job_queue || []));
+      renderDashboardSectionIfChanged("planning-queue", snapshot.job_queue || [], () => renderPlanningQueue(snapshot.job_queue || []));
+      renderDashboardSectionIfChanged("planning-board", snapshot.planning_board || {}, () => renderPlanningBoard(snapshot));
+      renderDashboardSectionIfChanged("planning-alerts", snapshot.planning_queue_alerts || [], () => renderPlanningQueueMismatchAlerts(snapshot.planning_queue_alerts || []));
+      if(!trialBoardDirty) trialBoardState = normalizeTrialBoard(snapshot.trial_board || trialBoardState);
+      if(planningBoardView?.classList.contains("trial-active")) renderTrialBoard(trialBoardState);
+      if(deferredDashboardRenderState) scheduleDeferredDashboardSections(deferredDashboardRenderState);
+    };
+    if(typeof window.requestIdleCallback === "function"){
+      window.requestIdleCallback(run, {timeout:250});
+    }else{
+      window.setTimeout(run, 0);
+    }
   }
 
   function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;"); }
@@ -14328,39 +14784,38 @@ DASHBOARD_HTML = r"""
     const clientRows = (Array.isArray(item.client_app_logs) ? item.client_app_logs : []).filter(withinShift);
     clientRows.forEach(row => push(row, row?.source, row?.message, row?.actor));
 
-    // Older shift records may predate the client action log. Rebuild a useful
-    // history from their saved scan/audit records only when that log is absent.
-    if(!clientRows.length){
-      (item.product_pack_history_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+    // Scan/audit ledgers are durable production records and must remain
+    // visible even when a shift contains only one or a few client action rows.
+    // push() removes exact duplicates when both sources contain the same row.
+    (item.product_pack_history_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
         row, "SCAN",
         `PACK scanned${row.series != null ? ` | Series ${row.series}` : ""}${row.sku || row.product_sku ? ` | SKU ${row.sku || row.product_sku}` : ""} | Qty ${row.qty ?? row.good_qty ?? row.pack_qty ?? 0}`,
         item.operator_name || displayNameForId(item.operator_id || "-")
-      ));
-      (item.raw_material_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+    ));
+    (item.raw_material_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
         row, "SCAN",
         `RAW MATERIAL scanned | ${row.material_sku || row.sku || row.material_name || row.material || "-"} | Qty ${row.qty ?? row.quantity ?? 0}`,
         item.operator_name || displayNameForId(item.operator_id || "-")
-      ));
-      (item.butal_scan_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+    ));
+    (item.butal_scan_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
         row, "SCAN", `BUTAL scanned | Qty ${row.qty ?? row.quantity ?? 0}`,
         item.operator_name || displayNameForId(item.operator_id || "-")
-      ));
-      (item.reject_review_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+    ));
+    (item.reject_review_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
         row, "REJECT", `${row.entry_type || row.action || "REJECT"} | ${row.reason_text || row.reason_code || "-"} | Qty ${row.qty ?? row.quantity ?? 0}`
-      ));
-      (item.cycle_time_change_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+    ));
+    (item.cycle_time_change_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
         row, "STATUS", `Cycle time changed | ${row.old_value ?? "-"} to ${row.new_value ?? row.current ?? "-"}`
-      ));
-      (item.machine_counter_overwrite_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+    ));
+    (item.machine_counter_overwrite_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
         row, "STATUS", `Machine counter changed | ${row.old_value ?? "-"} to ${row.new_value ?? "-"}`
-      ));
-      (item.pdr_downtime_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+    ));
+    (item.pdr_downtime_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
         row, "DOWNTIME", `${row.reason_text || row.reason || row.reason_code || "Downtime"}${row.duration_seconds != null ? ` | ${fmtDowntimeSeconds(row.duration_seconds)}` : ""}`
-      ));
-      (item.supervisor_review_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
+    ));
+    (item.supervisor_review_logs || []).filter(row => row && typeof row === "object").forEach(row => push(
         row, "SUPERVISOR", row.message || row.action || "Supervisor check"
-      ));
-    }
+    ));
     (item.review_history || []).filter(row => row && typeof row === "object").forEach(row => push(
       row, "REVIEW", `${row.action || row.review_status || "Shift review"}${row.remarks ? ` | ${row.remarks}` : ""}`
     ));
@@ -18670,7 +19125,18 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
 
   function planningLaneCards(lane){
     planningBoard = normalizePlanningBoard(planningBoard);
-    return planningBoard.lanes[lane] || [];
+    const cards = planningBoard.lanes[lane] || [];
+    if(lane === "BACKLOG") return cards;
+    return cards.filter(card => planningCardScheduleDate(card) === activePlanningDate);
+  }
+
+  function planningCardScheduleDate(card){
+    return String(card?.schedule_date || card?.planning_date || "").trim() || planningDateKey();
+  }
+
+  function planningCardManpower(card){
+    const value = Math.floor(Number(card?.manpower_count || 0));
+    return Number.isFinite(value) ? Math.max(0, value) : 0;
   }
 
   function planningSetStatus(text, isError=false){
@@ -18737,7 +19203,11 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       job.request_qty ? `Qty: ${job.request_qty}` : "",
     ]).filter(Boolean).join("<br>");
     const tonnageTitle = job.tonnage_source ? `Required machine tonnage | ${job.tonnage_source}` : "Required machine tonnage";
-    return `<div class="planning-card${cardClass}" draggable="true" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><div class="planning-card-top-actions">${relationBadge}${abcBadge}${itemTonnage ? `<span class="planning-item-tonnage" title="${esc(tonnageTitle)}">${esc(itemTonnage)} T</span>` : ""}<span class="planning-chip ${esc(roleClass)}">${esc(roleLabel)}</span><button class="planning-remove" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}" title="Remove ${esc(title)}" aria-label="Remove ${esc(title)}">&times;</button></div></div><div class="planning-meta">${details || "No BMS details available."}</div></div>`;
+    const manpower = planningCardManpower(job);
+    const manpowerButton = Number.isInteger(queueIndex)
+      ? `<button class="planning-manpower${manpower ? "" : " unassigned"}" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}" title="Set assigned manpower">People: ${manpower || "Set"}</button>`
+      : "";
+    return `<div class="planning-card${cardClass}" draggable="true" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}"><div class="planning-card-top"><div class="planning-job">${esc(title)}</div><div class="planning-card-top-actions">${relationBadge}${abcBadge}${itemTonnage ? `<span class="planning-item-tonnage" title="${esc(tonnageTitle)}">${esc(itemTonnage)} T</span>` : ""}<span class="planning-chip ${esc(roleClass)}">${esc(roleLabel)}</span>${manpowerButton}<button class="planning-remove" type="button" data-card-id="${esc(job.id || "")}" data-lane="${esc(lane)}" title="Remove ${esc(title)}" aria-label="Remove ${esc(title)}">&times;</button></div></div><div class="planning-meta">${details || "No BMS details available."}</div></div>`;
   }
 
   function livePlanningCardHtml(session){
@@ -19566,6 +20036,9 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
 
   function focusPlanningQueueMismatch(cardId, lane){
     planningMismatchFocus = { cardId:String(cardId || ""), lane:String(lane || ""), until:Date.now() + 6500, scrollPending:true };
+    activePlanningDate = planningDateKey();
+    planningCalendarMonth = planningMonthStart(new Date());
+    setPlanningView("daily", { render:false });
     const planningTabButton = document.querySelector('.main-tab-button[data-target="planningTab"]');
     if(!document.getElementById("planningTab")?.classList.contains("active")) planningTabButton?.click();
     setPlanningQueueOpen(false);
@@ -19594,6 +20067,72 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     });
   }
 
+  function planningScheduledCardsForDate(dateKey){
+    planningBoard = normalizePlanningBoard(planningBoard);
+    const cards = [];
+    Object.entries(planningBoard.lanes).forEach(([lane, laneCards]) => {
+      if(lane === "BACKLOG") return;
+      (laneCards || []).forEach(card => {
+        if(planningCardScheduleDate(card) === dateKey) cards.push(card);
+      });
+    });
+    return cards;
+  }
+
+  function renderPlanningCalendar(){
+    if(!planningMonthGrid) return;
+    const monthStart = planningMonthStart(planningCalendarMonth);
+    const gridStart = planningAddDays(monthStart, -monthStart.getDay());
+    const nextMonth = planningAddMonths(monthStart, 1);
+    const lastDay = planningAddDays(nextMonth, -1);
+    const cellCount = Math.ceil((monthStart.getDay() + lastDay.getDate()) / 7) * 7;
+    if(planningMonthTitle){
+      planningMonthTitle.textContent = monthStart.toLocaleDateString(undefined, { month:"long", year:"numeric" });
+    }
+    const todayKey = planningDateKey();
+    const weekdayHeaders = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+      .map(day => `<div class="planning-calendar-weekday">${day.slice(0, 3)}</div>`).join("");
+    const dayCells = Array.from({ length:cellCount }, (_, index) => {
+      const date = planningAddDays(gridStart, index);
+      const dateKey = planningDateKey(date);
+      if(date.getMonth() !== monthStart.getMonth()){
+        return `<div class="planning-week-day outside" aria-hidden="true"><span class="planning-week-day-date">${esc(date.getDate())}</span></div>`;
+      }
+      const cards = planningScheduledCardsForDate(dateKey);
+      const manpower = cards.reduce((total, card) => total + planningCardManpower(card), 0);
+      const classes = ["planning-week-day"];
+      if(dateKey === todayKey) classes.push("today");
+      if(dateKey === activePlanningDate) classes.push("selected");
+      return `<button class="${classes.join(" ")}" type="button" data-planning-day="${esc(dateKey)}" aria-label="Open schedule for ${esc(date.toLocaleDateString())}"><span class="planning-week-day-date">${esc(date.getDate())}</span><span class="planning-week-stats"><span class="planning-week-stat"><span>Jobs queued</span><strong>${esc(cards.length)}</strong></span><span class="planning-week-stat"><span>Manpower</span><strong>${esc(manpower)}</strong></span></span></button>`;
+    }).join("");
+    planningMonthGrid.innerHTML = weekdayHeaders + dayCells;
+    planningMonthGrid.querySelectorAll("[data-planning-day]").forEach(button => {
+      button.addEventListener("click", () => {
+        activePlanningDate = button.getAttribute("data-planning-day") || planningDateKey();
+        planningCalendarMonth = planningMonthStart(activePlanningDate);
+        setPlanningView("daily");
+      });
+    });
+  }
+
+  function setPlanningView(mode, options={}){
+    planningViewMode = mode === "calendar" ? "calendar" : "daily";
+    const calendar = planningViewMode === "calendar";
+    if(calendar){
+      setPlanOverviewOpen(false);
+      setTrialBoardOpen(false);
+      setPlanningActivityOpen(false);
+    }
+    planningShell?.classList.toggle("calendar-mode", calendar);
+    planningDailyTab?.classList.toggle("active", !calendar);
+    planningCalendarTab?.classList.toggle("active", calendar);
+    planningDailyTab?.setAttribute("aria-selected", calendar ? "false" : "true");
+    planningCalendarTab?.setAttribute("aria-selected", calendar ? "true" : "false");
+    if(planningDateInput) planningDateInput.value = activePlanningDate;
+    if(calendar) renderPlanningCalendar();
+    else if(options.render !== false) renderPlanningBoard({ ...latestState, planning_board:planningBoard });
+  }
+
   function renderPlanningBoard(state){
     if(planningDragActive || Date.now() < planningMachineScrollActiveUntil) return;
     document.querySelectorAll(".planning-machine-grid .planning-dropzone").forEach(zone => {
@@ -19601,14 +20140,16 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       if(lane) planningMachineDropScrollLeft[lane] = zone.scrollLeft || 0;
     });
     planningBoard = normalizePlanningBoard((planningLocalDirty ? planningBoard : state?.planning_board) || planningBoard);
+    if(planningDateInput && planningDateInput.value !== activePlanningDate) planningDateInput.value = activePlanningDate;
     renderLowStockRecommendations(lowStockItemsState);
     if(planningMachineGrid){
       const sessionsByMachine = new Map((state?.sessions || []).map(s => [planningLaneMachineCode(s?.machine_code), s]));
       const queueByMachine = new Map(((state?.job_queue || [])).map(row => [planningLaneMachineCode(row?.machine_code), row]));
+      const showLiveProduction = activePlanningDate === planningDateKey();
       planningMachineGrid.innerHTML = DEFAULT_MACHINE_CODES.map(code => {
         const cards = planningLaneCards(code);
-        const live = sessionsByMachine.get(code);
-        const queueRow = queueByMachine.get(code);
+        const live = showLiveProduction ? sessionsByMachine.get(code) : null;
+        const queueRow = showLiveProduction ? queueByMachine.get(code) : null;
         const machineTonnage = String((state?.machine_tonnage && state.machine_tonnage[code]) || "").trim();
         return `<div class="planning-lane"><div class="planning-lane-head"><div><div class="planning-lane-title-row"><div class="planning-lane-title">${esc(MACHINE_NAME_MAP[code] || code)}</div>${machineTonnage ? `<span class="planning-machine-tonnage">${esc(machineTonnage)}</span>` : ""}</div>${planningMachineTimingHtml(code, queueRow, cards)}</div><div class="planning-lane-count">${esc(cards.length)} planned</div></div><div class="planning-dropzone" data-lane="${esc(code)}">${live && live.job_code ? livePlanningCardHtml(live) : ""}${cards.map((c, idx) => planningCardHtml(c, code, idx)).join("") || (!live || !live.job_code ? '<div class="planning-empty">Drop jobs here.</div>' : "")}</div></div>`;
       }).join("");
@@ -19620,6 +20161,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       const lane = zone.getAttribute("data-lane") || "";
       if(lane && planningMachineDropScrollLeft[lane] != null) zone.scrollLeft = planningMachineDropScrollLeft[lane];
     });
+    if(planningViewMode === "calendar") renderPlanningCalendar();
   }
 
   function findAndMovePlanningCard(cardId, targetLane, targetIndex=null){
@@ -19633,9 +20175,26 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       }
     }
     if(!found) return false;
+    if(targetLane !== "BACKLOG"){
+      found.schedule_date = activePlanningDate;
+      found.manpower_count = planningCardManpower(found);
+    }
     if(!Array.isArray(planningBoard.lanes[targetLane])) planningBoard.lanes[targetLane] = [];
     if(Number.isInteger(targetIndex)){
-      const insertAt = Math.max(0, Math.min(targetIndex, planningBoard.lanes[targetLane].length));
+      const targetCards = planningBoard.lanes[targetLane];
+      let insertAt = Math.max(0, Math.min(targetIndex, targetCards.length));
+      if(targetLane !== "BACKLOG"){
+        const sameDateIndexes = targetCards
+          .map((card, index) => planningCardScheduleDate(card) === activePlanningDate ? index : -1)
+          .filter(index => index >= 0);
+        if(sameDateIndexes.length){
+          insertAt = targetIndex < sameDateIndexes.length
+            ? sameDateIndexes[Math.max(0, targetIndex)]
+            : sameDateIndexes[sameDateIndexes.length - 1] + 1;
+        }else{
+          insertAt = targetCards.length;
+        }
+      }
       planningBoard.lanes[targetLane].splice(insertAt, 0, found);
     }else{
       planningBoard.lanes[targetLane].push(found);
@@ -19823,6 +20382,40 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
           schedulePlanningSave(savedActivities);
         }
         clearPlanningDragState();
+      });
+    });
+    scope.querySelectorAll(".planning-manpower").forEach(btn => {
+      if(btn.dataset.planningManpowerBound === "1") return;
+      btn.dataset.planningManpowerBound = "1";
+      btn.addEventListener("pointerdown", ev => ev.stopPropagation());
+      btn.addEventListener("click", ev => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const cardId = btn.getAttribute("data-card-id") || "";
+        const location = findPlanningCardLocation(cardId);
+        if(!location?.card){
+          planningSetStatus("That queued job could not be found. Refresh Planning and try again.", true);
+          return;
+        }
+        const current = planningCardManpower(location.card);
+        const response = window.prompt("How many people are assigned to this queued job? Enter 0 to clear it.", String(current));
+        if(response === null) return;
+        const manpower = Number(response);
+        if(!Number.isInteger(manpower) || manpower < 0 || manpower > 999){
+          planningSetStatus("Manpower must be a whole number from 0 to 999.", true);
+          return;
+        }
+        location.card.manpower_count = manpower;
+        if(location.lane !== "BACKLOG" && !String(location.card.schedule_date || "").trim()){
+          location.card.schedule_date = activePlanningDate;
+        }
+        const label = String(location.card.job_ref || location.card.job_name || location.card.product_sku || "Queued job").trim();
+        renderPlanningBoard({ ...latestState, planning_board:planningBoard });
+        schedulePlanningSave(planningActivityEntry(
+          location.card, "MANPOWER", location.lane, location.lane, location.index, location.index,
+          manpower ? `Assigned manpower: ${manpower}` : "Cleared assigned manpower"
+        ));
+        planningSetStatus(manpower ? `Assigned ${manpower} people to ${label}.` : `Cleared manpower for ${label}.`);
       });
     });
     scope.querySelectorAll(".planning-remove").forEach(btn => {
@@ -21931,22 +22524,8 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       renderMachineTodo(state || {});
       return;
     }
-    renderDashboardSectionIfChanged("job-queue", state.job_queue || [], () => renderJobQueue(state.job_queue || []));
-    renderDashboardSectionIfChanged("finished-jobs", state.finished_jobs || [], () => renderFinishedJobs(state.finished_jobs || []));
-    renderDashboardSectionIfChanged("archived-jobs", state.archived_jobs || [], () => renderArchivedJobs(state.archived_jobs || []));
-    renderDashboardSectionIfChanged("machine-status-archive", machineStatusArchiveState, () => {
-      renderMachineStatusArchive(machineStatusArchiveState);
-      renderFinishedShiftPdr(pdrSummaryState);
-    });
-    renderDashboardSectionIfChanged("downtime-archive", [state.finished_jobs || [], state.archived_jobs || []], () => renderDowntimeArchive(state.finished_jobs || [], state.archived_jobs || []));
-    renderDashboardSectionIfChanged("maintenance", [state.sessions || [], state.daily_roles || [], state.maintenance_profiles || []], () => renderMaintenanceTab(state || {}));
-    renderDashboardSectionIfChanged("planning-summary", [state.planning_board || {}, state.job_queue || []], () => renderPlanningOpsSummary(state || {}, state.job_queue || []));
-    renderDashboardSectionIfChanged("planning-queue", state.job_queue || [], () => renderPlanningQueue(state.job_queue || []));
-    renderDashboardSectionIfChanged("planning-board", state.planning_board || {}, () => renderPlanningBoard(state || {}));
-    renderDashboardSectionIfChanged("planning-alerts", state.planning_queue_alerts || [], () => renderPlanningQueueMismatchAlerts(state.planning_queue_alerts || []));
     renderMachineTodo(state || {});
-    if(!trialBoardDirty) trialBoardState = normalizeTrialBoard(state.trial_board || trialBoardState);
-    if(planningBoardView?.classList.contains("trial-active")) renderTrialBoard(trialBoardState);
+    scheduleDeferredDashboardSections(state);
   }
 
   function setPlanningQueueOpen(open){
@@ -21974,6 +22553,36 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   });
   planningActivityBtn?.addEventListener("click", () => {
     setPlanningActivityOpen(!planningBoardView?.classList.contains("activity-active"));
+  });
+  planningDailyTab?.addEventListener("click", () => setPlanningView("daily"));
+  planningCalendarTab?.addEventListener("click", () => {
+    planningCalendarMonth = planningMonthStart(activePlanningDate);
+    setPlanningView("calendar");
+  });
+  planningDateInput?.addEventListener("change", () => {
+    const selected = planningDateKey(planningDateInput.value);
+    if(!selected) return;
+    activePlanningDate = selected;
+    planningCalendarMonth = planningMonthStart(selected);
+    if(planningViewMode === "calendar") renderPlanningCalendar();
+    else renderPlanningBoard({ ...latestState, planning_board:planningBoard });
+  });
+  planningTodayBtn?.addEventListener("click", () => {
+    activePlanningDate = planningDateKey();
+    planningCalendarMonth = planningMonthStart(new Date());
+    setPlanningView("daily");
+  });
+  planningPrevMonthBtn?.addEventListener("click", () => {
+    planningCalendarMonth = planningAddMonths(planningCalendarMonth, -1);
+    renderPlanningCalendar();
+  });
+  planningThisMonthBtn?.addEventListener("click", () => {
+    planningCalendarMonth = planningMonthStart(new Date());
+    renderPlanningCalendar();
+  });
+  planningNextMonthBtn?.addEventListener("click", () => {
+    planningCalendarMonth = planningAddMonths(planningCalendarMonth, 1);
+    renderPlanningCalendar();
   });
   planningActivityRefreshBtn?.addEventListener("click", loadPlanningActivity);
   [planningActivitySearch, planningActivityActionFilter, planningActivityMachineFilter, planningActivityDateFilter].forEach(control => {
@@ -22036,6 +22645,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       if(planningOverviewBtn) planningOverviewBtn.hidden = !planningActive;
       if(trialBoardBtn) trialBoardBtn.hidden = !planningActive;
       if(planningActivityBtn) planningActivityBtn.hidden = !planningActive;
+      if(planningScheduleToolbar) planningScheduleToolbar.hidden = !planningActive;
       if(planningQueueToggle) planningQueueToggle.hidden = !planningActive;
       if(planningActive && machineFilterMenu){
         machineFilterMenu.hidden = true;
@@ -23571,6 +24181,7 @@ PROFILE_CREATOR_HTML = """
                 <option>QA/QC</option>
                 <option>Operator</option>
                 <option>Maintenance</option>
+                <option>Line Technician</option>
                 <option>Material Loader</option>
                 <option>Planner</option>
                 <option>Production Manager</option>
@@ -24120,7 +24731,16 @@ PROFILE_CREATOR_HTML = """
       if(!profile) return;
       pfName.value = profile.name || '';
       pfId.value = profile.id_number || '';
-      pfRole.value = profile.role || 'Operator';
+      const role = String(profile.role || 'Operator').trim() || 'Operator';
+      const roleOption = Array.from(pfRole.options).find(option =>
+        String(option.value || '').trim().toLowerCase() === role.toLowerCase()
+      );
+      if(roleOption){
+        pfRole.value = roleOption.value;
+      } else {
+        pfRole.add(new Option(role, role));
+        pfRole.value = role;
+      }
       const department = String(profile.department || '').trim();
       if(department && !Array.from(pfDepartment.options).some(option => option.value === department)){
         pfDepartment.add(new Option(department, department));
@@ -24787,10 +25407,34 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
     if isinstance(snap.get("raw_material_logs"), list):
         sess.raw_material_logs = list(snap.get("raw_material_logs") or [])
     if isinstance(snap.get("product_pack_history_logs"), list):
-        incoming_pack_logs = list(snap.get("product_pack_history_logs") or [])
+        incoming_pack_logs = [
+            dict(row) for row in (snap.get("product_pack_history_logs") or [])
+            if isinstance(row, dict)
+        ]
+        clean_pack_logs, pack_dedupe = _dedupe_pack_history_rows(
+            incoming_pack_logs,
+            incoming_session_id or sess.production_session_id,
+        )
+        raw_active_pack_count = sum(1 for row in incoming_pack_logs if not bool(row.get("voided")))
+        if pack_dedupe["duplicate_active"] and int(sess.pack_total or 0) == raw_active_pack_count:
+            sess.pack_total = max(0, int(sess.pack_total or 0) - pack_dedupe["duplicate_active"])
+        if pack_dedupe["duplicate_good"] and int(sess.good_total or 0) == pack_dedupe["active_good_before"]:
+            sess.good_total = pack_dedupe["active_good_after"]
         # An acknowledged PACK void may legitimately remove the final row.
         # Session-ID fencing already protects this assignment from other runs.
-        sess.product_pack_history_logs = incoming_pack_logs
+        sess.product_pack_history_logs = clean_pack_logs
+        if pack_dedupe["duplicate_active"]:
+            _append_server_app_log(
+                "duplicate_pack_history_repaired",
+                {
+                    "machine_code": machine_code,
+                    "production_session_id": incoming_session_id or sess.production_session_id,
+                    "duplicates_removed": pack_dedupe["duplicate_active"],
+                    "duplicate_good_removed": pack_dedupe["duplicate_good"],
+                    "pack_total": sess.pack_total,
+                    "good_total": sess.good_total,
+                },
+            )
     if isinstance(snap.get("butal_scan_logs"), list):
         sess.butal_scan_logs = list(snap.get("butal_scan_logs") or [])
     if isinstance(snap.get("client_app_logs"), list):
@@ -25232,15 +25876,17 @@ def _pack_counter_event_key(event: Any) -> str:
     ev = event if isinstance(event, dict) else {}
     pack_record = ev.get("pack_record") if isinstance(ev.get("pack_record"), dict) else {}
     pack_scan = ev.get("pack_scan") if isinstance(ev.get("pack_scan"), dict) else {}
-    return str(ev.get("pack_key") or pack_record.get("pack_key") or pack_scan.get("pack_key") or "").strip()
+    explicit = ev.get("pack_key") or pack_record.get("pack_key") or pack_scan.get("pack_key")
+    return _canonical_pack_counter_key(explicit) or _pack_history_record_key(pack_record or pack_scan)
 
 
 def _session_has_pack_counter_event(sess: MachineSession, pack_key: str) -> bool:
-    key = str(pack_key or "").strip()
+    key = _canonical_pack_counter_key(pack_key)
     if not key:
         return False
     return any(
-        isinstance(row, dict) and str(row.get("pack_key") or "").strip() == key
+        isinstance(row, dict)
+        and _pack_history_record_key(row, sess.production_session_id) == key
         for row in (sess.product_pack_history_logs or [])
     )
 
@@ -25481,7 +26127,7 @@ async def api_sync_batch(req: Request):
                     })
     finally:
         BATCH_BROADCAST_DEFERRED.reset(token)
-    if any(row.get("status") in {"applied", "duplicate", "audit_only"} for row in results):
+    if any(row.get("status") in {"applied", "audit_only"} for row in results):
         await broadcast_state()
     return {"ok": True, "sync_protocol": SERVER_SYNC_PROTOCOL_VERSION, "results": results}
 
@@ -25715,14 +26361,9 @@ async def api_event(req: Request):
         return JSONResponse({"ok": False, "error": "JSON body must be an object"}, status_code=400)
 
     event_id = str(data.get("event_id") or "").strip()
-    preliminary_event = data.get("event") if isinstance(data.get("event"), dict) else {}
-    preliminary_event_type = str(preliminary_event.get("type") or "").strip().upper()
     if event_id and event_id in PROCESSED_EVENT_ID_SET:
-        if preliminary_event_type not in {"HEARTBEAT", "PING", "CLIENT_STATUS"}:
-            _append_server_app_log(
-                "api_event_duplicate_ignored",
-                {"remote_host": remote_host, "event_id": event_id},
-            )
+        # The original is already durable. Acknowledge immediately so the
+        # client removes its retry without another disk log or state rebuild.
         duplicate_machine = str(data.get("machine_code") or "").strip()
         if duplicate_machine == TEST_MACHINE_CODE:
             return {
@@ -26490,9 +27131,39 @@ async def api_event(req: Request):
                 if isinstance(snap.get("raw_material_logs"), list):
                     sess.raw_material_logs = list(snap.get("raw_material_logs") or [])
                 if isinstance(snap.get("product_pack_history_logs"), list):
-                    incoming_pack_logs = list(snap.get("product_pack_history_logs") or [])
+                    incoming_pack_logs = [
+                        dict(row) for row in (snap.get("product_pack_history_logs") or [])
+                        if isinstance(row, dict)
+                    ]
+                    clean_pack_logs, pack_dedupe = _dedupe_pack_history_rows(
+                        incoming_pack_logs,
+                        snapshot_session_id or sess.production_session_id,
+                    )
                     if incoming_pack_logs or not (sess.product_pack_history_logs or []):
-                        sess.product_pack_history_logs = incoming_pack_logs
+                        raw_active_pack_count = sum(
+                            1 for row in incoming_pack_logs if not bool(row.get("voided"))
+                        )
+                        if pack_dedupe["duplicate_active"] and int(sess.pack_total or 0) == raw_active_pack_count:
+                            sess.pack_total = max(
+                                0,
+                                int(sess.pack_total or 0) - pack_dedupe["duplicate_active"],
+                            )
+                        if pack_dedupe["duplicate_good"] and int(sess.good_total or 0) == pack_dedupe["active_good_before"]:
+                            sess.good_total = pack_dedupe["active_good_after"]
+                        sess.product_pack_history_logs = clean_pack_logs
+                        if pack_dedupe["duplicate_active"]:
+                            _append_server_app_log(
+                                "duplicate_pack_history_repaired",
+                                {
+                                    "machine_code": machine_code,
+                                    "production_session_id": snapshot_session_id or sess.production_session_id,
+                                    "duplicates_removed": pack_dedupe["duplicate_active"],
+                                    "duplicate_good_removed": pack_dedupe["duplicate_good"],
+                                    "pack_total": sess.pack_total,
+                                    "good_total": sess.good_total,
+                                    "source": ev_type,
+                                },
+                            )
                 if isinstance(snap.get("butal_scan_logs"), list):
                     sess.butal_scan_logs = [
                         dict(row) for row in snap.get("butal_scan_logs") or []
@@ -26938,12 +27609,46 @@ def api_mixing_material_history(machine_code: str = "", job_code: str = ""):
     }
 
 
-def _finished_detail_with_prior_partials(row: Dict[str, Any]) -> Dict[str, Any]:
+def _finished_detail_with_prior_partials(
+    row: Dict[str, Any],
+    *,
+    include_activity: bool = False,
+) -> Dict[str, Any]:
     detail = _load_history_detail_sql(row)
     if str(detail.get("record_type") or "").strip().upper() == "SHIFT_PARTIAL":
         detail["prior_partial_raw_material_totals"] = (
             _same_job_partial_raw_material_totals(detail)
         )
+        if include_activity:
+            machine_code = str(detail.get("machine_code") or "").strip()
+            started_at = _parse_iso_utc(detail.get("started_at_utc"))
+            ended_at = _parse_iso_utc(
+                detail.get("ended_at_utc") or detail.get("finished_at_utc")
+            )
+            stored = _load_machine_activity_logs_sql(
+                machine_code,
+                10000,
+                started_at.isoformat() if started_at is not None else None,
+                (ended_at + timedelta(seconds=60)).isoformat()
+                if ended_at is not None
+                else None,
+            )
+            if stored is not None:
+                merged: Dict[str, Dict[str, Any]] = {}
+                for activity in [
+                    *(detail.get("client_app_logs") or []),
+                    *(stored.get("items") or []),
+                ]:
+                    if not isinstance(activity, dict):
+                        continue
+                    normalized = dict(activity)
+                    normalized["activity_id"] = _machine_activity_id(normalized)
+                    merged[normalized["activity_id"]] = normalized
+                detail["client_app_logs"] = sorted(
+                    merged.values(),
+                    key=lambda item: str(item.get("timestamp_utc") or ""),
+                )
+                detail["client_app_logs_total"] = int(stored.get("total") or 0)
     return detail
 
 
@@ -26980,7 +27685,13 @@ def api_finished_job_detail(job_key: str = ""):
         return JSONResponse({"ok": False, "error": "job_key is required"}, status_code=400)
     for row in reversed(FINISHED_JOBS):
         if isinstance(row, dict) and _finished_job_key(row) == key:
-            return {"ok": True, "item": _finished_detail_with_prior_partials(row)}
+            return {
+                "ok": True,
+                "item": _finished_detail_with_prior_partials(
+                    row,
+                    include_activity=True,
+                ),
+            }
     return JSONResponse({"ok": False, "error": "finished shift was not found"}, status_code=404)
 
 
@@ -27057,6 +27768,34 @@ def api_active_sessions(client_id: str = "", machine_code: str = ""):
                 last_event=str(polled_session.last_event or "CLIENT ONLINE"),
                 machine_scanned=True,
             )
+        # This client_id + machine_code request is the five-second live
+        # connection/average-weight poll. Return only the fields that poll
+        # consumes instead of serializing the full recovery snapshot. Startup
+        # recovery uses client_id alone and an explicit machine scan uses
+        # machine_code alone, so those full-detail paths remain unchanged.
+        if (
+            polled_session is not None
+            and str(polled_session.client_id or "").strip() == cid
+        ):
+            return {
+                "ok": True,
+                "items": [{
+                    "client_id": str(polled_session.client_id or ""),
+                    "machine_code": str(polled_session.machine_code or ""),
+                    "machine_name": str(polled_session.machine_name or ""),
+                    "job_code": polled_session.job_code,
+                    "job_name": polled_session.job_name,
+                    "production_session_id": polled_session.production_session_id,
+                    "external_average_weight_grams": polled_session.external_average_weight_grams,
+                    "external_average_weight_unit": polled_session.external_average_weight_unit,
+                    "external_average_weight_received_at": polled_session.external_average_weight_received_at,
+                    "external_average_weight_sent_at": polled_session.external_average_weight_sent_at,
+                    "external_average_weight_source": polled_session.external_average_weight_source,
+                    "external_average_weight_sender": polled_session.external_average_weight_sender,
+                    "last_seen_utc": polled_session.last_seen_utc,
+                }],
+            }
+        return {"ok": True, "items": []}
     rows = []
     if code_filter == TEST_MACHINE_CODE:
         test_session = _test_machine_session_payload()
@@ -27796,6 +28535,59 @@ async def api_jobs_lookup(req: Request):
         )
     except Exception as e:
         return JSONResponse({"ok": False, "found": False, "error": str(e)}, status_code=502)
+
+
+@APP.post("/api/jobs/configurations")
+async def api_jobs_configurations(req: Request):
+    """Return complete, versioned job configurations for a running client."""
+    try:
+        data = await req.json()
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"invalid JSON: {exc}"}, status_code=400)
+    raw_identifiers = data.get("job_identifiers") if isinstance(data, dict) else None
+    if not isinstance(raw_identifiers, list):
+        return JSONResponse(
+            {"ok": False, "error": "job_identifiers must be a list"},
+            status_code=400,
+        )
+    identifiers: List[str] = []
+    for value in raw_identifiers[:20]:
+        identifier = str(value or "").strip()
+        if identifier and identifier not in identifiers:
+            identifiers.append(identifier)
+    if not identifiers:
+        return {"ok": True, "items": [], "errors": []}
+    force = bool(data.get("force"))
+    known_versions = data.get("known_versions") if isinstance(data.get("known_versions"), dict) else {}
+
+    async def load_one(identifier: str) -> tuple[str, Any]:
+        try:
+            item = await asyncio.to_thread(
+                _server_job_configuration, identifier, force
+            )
+            clean = {
+                key: value for key, value in item.items()
+                if key != "cached_at_monotonic"
+            }
+            known_version = str(
+                known_versions.get(str(clean.get("job_id") or "").strip())
+                or known_versions.get(identifier)
+                or ""
+            ).strip()
+            if not force and known_version and known_version == str(clean.get("version") or ""):
+                clean.pop("payload", None)
+                clean["unchanged"] = True
+            return "item", clean
+        except Exception as exc:
+            return "error", {
+                "job_identifier": identifier,
+                "error": str(exc),
+            }
+
+    results = await asyncio.gather(*(load_one(identifier) for identifier in identifiers))
+    items = [value for kind, value in results if kind == "item"]
+    errors = [value for kind, value in results if kind == "error"]
+    return {"ok": not errors, "items": items, "errors": errors}
 
 
 @APP.post("/api/mixing/jobs/{job_id}/partials")

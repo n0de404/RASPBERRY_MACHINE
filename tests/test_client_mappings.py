@@ -34,5 +34,19 @@ class TestMachineMappingTests(unittest.TestCase):
         self.assertEqual(result.meta.get("machine_code"), "TEST-MACHINE")
         self.assertTrue(result.meta.get("test_machine"))
 
+
+class ChangeOperatorMappingTests(unittest.TestCase):
+    def test_change_operator_qr_is_recognized(self):
+        result = parse_scan("changeoperator~1")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "CHANGE_OPERATOR_TRIGGER")
+
+    def test_change_operator_alias_is_case_insensitive(self):
+        result = parse_scan("OPERATOR_CHANGE~1")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "CHANGE_OPERATOR_TRIGGER")
+
 if __name__ == "__main__":
     unittest.main()

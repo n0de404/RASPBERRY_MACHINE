@@ -215,6 +215,24 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
     # Operator handoff trigger
     if s_l in ("operatorshift~1", "operator_shift~1", "shiftchange~1"):
         return ScanResult(kind="OPERATOR_SHIFT_TRIGGER", raw=raw, value="Finish shift")
+    if s_l in (
+        "changeoperator~1",
+        "change_operator~1",
+        "operatorchange~1",
+        "operator_change~1",
+    ):
+        return ScanResult(kind="CHANGE_OPERATOR_TRIGGER", raw=raw, value="Change operator or helper")
+    if s_l in (
+        "refreshjobapi~1",
+        "refresh_job_api~1",
+        "refreshjobs~1",
+        "jobrefresh~1",
+    ):
+        return ScanResult(
+            kind="JOB_API_REFRESH_TRIGGER",
+            raw=raw,
+            value="Refresh all running job details",
+        )
     if s_l in ("void", "void~1", "voidscan~1", "voidqr~1", "voidpack~1", "void_pack~1", "packvoid~1", "voidbutal~1", "void_butal~1", "butalvoid~1", "voidreject~1", "void_reject~1", "rejectvoid~1"):
         return ScanResult(kind="VOID_TRIGGER", raw=raw, value="Void mode")
     if s_l in ("butalpack~1", "butalcomplete~1", "butalcompletion~1"):

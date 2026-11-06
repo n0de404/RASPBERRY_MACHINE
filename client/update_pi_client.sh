@@ -207,9 +207,11 @@ mkdir -p "$HOME/.local/state/raspberry-machine-client" "$RUNTIME_DATA_DIR"
 export DISPLAY="${DISPLAY:-:0}"
 export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-if [[ -S "$XDG_RUNTIME_DIR/wayland-0" ]]; then
-  export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
-fi
+# The packaged Raspberry Pi executable includes Qt's XCB platform plugin.
+# Newer desktops advertise Wayland even when XWayland is available, causing
+# the one-file build to request an unbundled Wayland plugin and exit.
+export QT_QPA_PLATFORM="${MACHINE_QT_QPA_PLATFORM:-xcb}"
+unset WAYLAND_DISPLAY
 if [[ -S "$XDG_RUNTIME_DIR/bus" ]]; then
   export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 fi

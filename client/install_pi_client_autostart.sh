@@ -149,6 +149,11 @@ export MACHINE_SCANNER_COM_PORT="$SCANNER_PORT"
 export MACHINE_SCANNER_MODE="$SCANNER_MODE"
 export MACHINE_DEFAULT_GRAPHICS_MODE="$GRAPHICS_MODE"
 export MACHINE_PACK_SCAN_INTERVAL_SECONDS="$PACK_SCAN_INTERVAL"
+# PyInstaller's Raspberry Pi bundle includes Qt's XCB platform plugin. Newer
+# Raspberry Pi OS desktops advertise Wayland first even when XWayland is
+# available, which makes Qt request an unbundled Wayland plugin and abort.
+export QT_QPA_PLATFORM="${MACHINE_QT_QPA_PLATFORM:-xcb}"
+unset WAYLAND_DISPLAY
 
 mkdir -p "\$HOME/.local/state/raspberry-machine-client" "$RUNTIME_DATA_DIR"
 LOG_FILE="\$HOME/.local/state/raspberry-machine-client/client.log"

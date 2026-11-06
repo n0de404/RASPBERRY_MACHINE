@@ -183,7 +183,15 @@ class MixingClientUI(production_client.ClientUI):
         self._mixing_full_ui_restored = False
         self._mixing_sessions: Dict[str, Dict[str, Any]] = {}
         self._mixing_active_job_key = ""
+        self._mixing_active_jobs_by_machine: Dict[str, str] = {}
         self._mixing_history_synced_keys = set()
+        self._mixing_pending_job_raw = ""
+        self._mixing_pending_job_source_machine = ""
+        # Mixing production is optimistic and one-way: scans update the local
+        # state once, then the durable outbox sends those deltas to the server.
+        # A server reply must never replay its session snapshot into the live
+        # Mixing UI or make a just-scanned quantity appear a second time.
+        self._mixing_server_pull_blocked_until = 0.0
         self._load_mixing_sessions()
         super().__init__()
         self._mixing_mode_ready = True
@@ -469,14 +477,16 @@ class MixingClientUI(production_client.ClientUI):
     def _apply_server_average_weight(self, *args, **kwargs) -> None:
         return
 
-    def _ensure_mixing_kg_counter(self) -> int:
+    def _ensure_mixing_kg_counter(self) -> float:
         """Keep a cumulative job KG counter independent from shift output."""
-        current_value = self._parse_int_value(self.state.machine_counter_current)
-        current_kg = (
-            max(0, int(current_value))
-            if current_value is not None
-            else max(0, int(self.state.good_total or 0))
+        current_value = self._parse_number(self.state.machine_counter_current)
+        current_kg = max(
+            0.0,
+            current_value
+            if current_value > 0
+            else self._parse_number(self.state.good_total),
         )
+        current_kg = round(current_kg, 6)
         self.state.machine_counter_current = current_kg
         if self.state.machine_counter_shift_start is None:
             self.state.machine_counter_shift_start = current_kg
@@ -488,6 +498,112 @@ class MixingClientUI(production_client.ClientUI):
         self.state.waiting_machine_counter_overwrite_supervisor = False
         self.state.machine_counter_input = ""
         return current_kg
+
+    def _restore_state_from_snapshot(self, snap: Dict[str, Any]):
+        """Restore Mixing KG values without the production client's int coercion."""
+        recovered = self._repair_mixing_output_totals(snap)
+        super()._restore_state_from_snapshot(recovered)
+        self.state.good_total = round(
+            max(
+                0.0,
+                self._parse_number(
+                    recovered.get(
+                        "mixing_total_kg", recovered.get("good_total", 0)
+                    )
+                ),
+            ),
+            6,
+        )
+        for field in (
+            "machine_counter_current",
+            "machine_counter_shift_start",
+            "machine_counter_shift_end",
+            "operator_shift_baseline_machine_counter_start",
+        ):
+            raw_value = recovered.get(field)
+            if raw_value not in (None, ""):
+                setattr(
+                    self.state,
+                    field,
+                    round(max(0.0, self._parse_number(raw_value)), 6),
+                )
+
+    def _repair_mixing_output_totals(
+        self, snapshot: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Recover legacy unfinished-job totals from accepted sack history."""
+        recovered = dict(snapshot or {})
+        saved_sacks = max(
+            0,
+            int(
+                recovered.get("mixing_sack_count")
+                or recovered.get("pack_count")
+                or recovered.get("pack_total")
+                or 0
+            ),
+        )
+        saved_kg = max(
+            0.0,
+            self._parse_number(
+                recovered.get("mixing_total_kg")
+                or recovered.get("good_total")
+                or 0
+            ),
+        )
+
+        history_sacks = 0
+        history_kg = 0.0
+        seen = set()
+        for index, row in enumerate(recovered.get("product_pack_history_logs") or []):
+            if not isinstance(row, dict):
+                continue
+            marker = str(row.get("pack_key") or "").strip()
+            if not marker:
+                try:
+                    marker = self._pack_history_key(row)
+                except Exception:
+                    marker = ""
+            if not marker:
+                marker = f"ROW:{index}:{json.dumps(row, sort_keys=True, default=str)}"
+            if marker in seen:
+                continue
+            seen.add(marker)
+            history_sacks += max(1, int(row.get("mixing_sack_count") or 1))
+            for field in (
+                "mixing_good_kg",
+                "main_job_output_qty",
+                "good_qty",
+                "qty_q",
+                "scanned_pack_qty",
+            ):
+                value = self._parse_number(row.get(field))
+                if value > 0:
+                    history_kg += value
+                    break
+
+        if saved_sacks <= 0 and history_sacks > 0:
+            saved_sacks = history_sacks
+            recovered["pack_count"] = saved_sacks
+            recovered["pack_total"] = saved_sacks
+            recovered["mixing_sack_count"] = saved_sacks
+        if saved_kg <= 0 and history_kg > 0:
+            saved_kg = round(history_kg, 6)
+            recovered["good_total"] = saved_kg
+            recovered["total_good"] = saved_kg
+            recovered["partial_qty"] = saved_kg
+            recovered["mixing_total_kg"] = saved_kg
+        return recovered
+
+    def _apply_acknowledged_server_session(self, server_snap: Dict[str, Any]) -> None:
+        """Treat server session responses as ACKs, never as Mixing input.
+
+        Mixing scans are already applied locally before they enter the durable
+        outbox. Re-applying the returned server snapshot can resurrect older
+        quantities or duplicate state after an offline retry. The dispatcher
+        still validates the exact event ACK and removes the outbox row; only
+        the reverse state hydration is disabled here.
+        """
+        return
 
     def _repair_initial_setup_state(self) -> None:
         """Mixing starts immediately; sack scans supply the live cycle time."""
@@ -531,6 +647,12 @@ class MixingClientUI(production_client.ClientUI):
     def _start_operator_shift_tracking(self):
         self._ensure_mixing_kg_counter()
         super()._start_operator_shift_tracking()
+        self.state.operator_shift_baseline_machine_counter_start = (
+            self._ensure_mixing_kg_counter()
+        )
+        self.state.operator_shift_baseline_good_total = round(
+            self._parse_number(self.state.good_total), 6
+        )
         # The first accepted sack establishes the timestamp. The second and
         # later sacks produce real sack-to-sack cycle intervals.
         self._reset_live_cycle_tracking(start_now=False)
@@ -551,7 +673,7 @@ class MixingClientUI(production_client.ClientUI):
             self.state.cycle_time_current = cycle_text
             self.state.cycle_time_temporary = cycle_text
 
-    def _current_machine_counter_app_total(self) -> Optional[int]:
+    def _current_machine_counter_app_total(self) -> Optional[float]:
         if not (self.state.job_code or self.state.job_name):
             return None
         return self._ensure_mixing_kg_counter()
@@ -562,12 +684,12 @@ class MixingClientUI(production_client.ClientUI):
         self._refresh_machine_counter_header_labels()
 
     def _next_machine_counter_preview(
-        self, current_counter: Optional[int] = None
-    ) -> Optional[int]:
+        self, current_counter: Optional[float] = None
+    ) -> Optional[float]:
         if not (self.state.job_code or self.state.job_name):
             return None
         current_kg = (
-            max(0, int(current_counter))
+            max(0.0, float(current_counter))
             if current_counter is not None
             else self._ensure_mixing_kg_counter()
         )
@@ -581,11 +703,15 @@ class MixingClientUI(production_client.ClientUI):
             return
         has_job = bool(self.state.job_code or self.state.job_name)
         current_kg = self._ensure_mixing_kg_counter()
-        current_label.setText(f"Current KG Counter: {current_kg}" if has_job else "")
+        current_label.setText(
+            f"Current KG Counter: {self._mixing_qty_text(current_kg)}"
+            if has_job else ""
+        )
         current_label.setVisible(has_job)
         next_kg = self._next_machine_counter_preview(current_kg) if has_job else None
         next_label.setText(
-            f"Next Sack KG Counter: {next_kg}" if next_kg is not None else ""
+            f"Next Sack KG Counter: {self._mixing_qty_text(next_kg)}"
+            if next_kg is not None else ""
         )
         next_label.setVisible(next_kg is not None)
 
@@ -1196,10 +1322,12 @@ class MixingClientUI(production_client.ClientUI):
                 response_body = response.json()
             except Exception:
                 response_body = {}
-            acknowledged = response.status_code == 200 and bool(
-                response_body.get("ok")
-                if isinstance(response_body, dict)
-                else False
+            acknowledged = (
+                response.status_code == 200
+                and isinstance(response_body, dict)
+                and bool(response_body.get("ok"))
+                and str(response_body.get("request_id") or "").strip()
+                == request_id
             )
             if not acknowledged:
                 error_text = (
@@ -1366,6 +1494,56 @@ class MixingClientUI(production_client.ClientUI):
         return self._normalize_job_code(value)
 
     @staticmethod
+    def _mixing_machine_key(value: Any) -> str:
+        return str(value or "").strip().upper()
+
+    def _mixing_session_key(self, machine_code: Any, job_value: Any) -> str:
+        machine_key = self._mixing_machine_key(machine_code)
+        job_key = self._mixing_job_key(job_value)
+        return f"{machine_key}|{job_key}" if machine_key and job_key else ""
+
+    def _snapshot_mixing_session_key(
+        self, snapshot: Dict[str, Any], fallback_job: Any = ""
+    ) -> str:
+        if not isinstance(snapshot, dict):
+            return ""
+        return self._mixing_session_key(
+            snapshot.get("machine_code"),
+            snapshot.get("job_code") or snapshot.get("job_name") or fallback_job,
+        )
+
+    def _current_mixing_session_key(self) -> str:
+        return self._mixing_session_key(
+            getattr(self.state, "machine_code", None),
+            getattr(self.state, "job_code", None)
+            or getattr(self.state, "job_name", None),
+        )
+
+    def _active_mixing_key_for_machine(self, machine_code: Any) -> str:
+        machine_key = self._mixing_machine_key(machine_code)
+        preferred = str(self._mixing_active_jobs_by_machine.get(machine_key) or "").strip()
+        preferred_row = self._mixing_sessions.get(preferred)
+        if (
+            preferred
+            and isinstance(preferred_row, dict)
+            and bool(preferred_row.get("mixing_open", True))
+        ):
+            return preferred
+        candidates = [
+            (key, snapshot)
+            for key, snapshot in self._mixing_sessions.items()
+            if isinstance(snapshot, dict)
+            and self._mixing_machine_key(snapshot.get("machine_code")) == machine_key
+            and bool(snapshot.get("mixing_open", True))
+        ]
+        if not candidates:
+            return ""
+        return max(
+            candidates,
+            key=lambda item: float(item[1].get("mixing_last_active_at") or 0.0),
+        )[0]
+
+    @staticmethod
     def _is_mixing_identity_row(part: Dict[str, Any]) -> bool:
         """Treat the BMS Col row as the mix identity, not a consumed part."""
         sku = str(
@@ -1431,27 +1609,51 @@ class MixingClientUI(production_client.ClientUI):
         rows = payload.get("sessions") if isinstance(payload, dict) else None
         if not isinstance(rows, dict):
             return
-        self._mixing_sessions = {
-            str(key): {
+        migrated: Dict[str, Dict[str, Any]] = {}
+        legacy_key_map: Dict[str, str] = {}
+        for stored_key, snapshot in rows.items():
+            if not str(stored_key).strip() or not isinstance(snapshot, dict):
+                continue
+            clean = {
                 field: value
                 for field, value in dict(snapshot).items()
                 if field != "mixing_open_jobs"
             }
-            for key, snapshot in rows.items()
-            if str(key).strip() and isinstance(snapshot, dict)
-        }
+            session_key = self._snapshot_mixing_session_key(clean, stored_key)
+            if not session_key:
+                continue
+            legacy_key_map[str(stored_key).strip()] = session_key
+            previous = migrated.get(session_key)
+            if not isinstance(previous, dict) or float(
+                clean.get("mixing_last_active_at") or 0.0
+            ) >= float(previous.get("mixing_last_active_at") or 0.0):
+                migrated[session_key] = clean
+        self._mixing_sessions = migrated
         for snapshot in self._mixing_sessions.values():
             snapshot.setdefault("mixing_open", True)
-        self._mixing_active_job_key = str(
-            payload.get("active_job_key") or ""
-        ).strip()
+        stored_active = str(payload.get("active_job_key") or "").strip()
+        self._mixing_active_job_key = legacy_key_map.get(stored_active, stored_active)
+        stored_by_machine = payload.get("active_jobs_by_machine")
+        if isinstance(stored_by_machine, dict):
+            self._mixing_active_jobs_by_machine = {
+                self._mixing_machine_key(machine): legacy_key_map.get(
+                    str(key or "").strip(), str(key or "").strip()
+                )
+                for machine, key in stored_by_machine.items()
+                if self._mixing_machine_key(machine) and str(key or "").strip()
+            }
+        for key, snapshot in self._mixing_sessions.items():
+            machine_key = self._mixing_machine_key(snapshot.get("machine_code"))
+            if machine_key and key == self._mixing_active_job_key:
+                self._mixing_active_jobs_by_machine[machine_key] = key
 
     def _persist_mixing_sessions(self) -> None:
         try:
             MIXING_MULTI_JOB_PATH.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                "version": 1,
+                "version": 2,
                 "active_job_key": self._mixing_active_job_key,
+                "active_jobs_by_machine": self._mixing_active_jobs_by_machine,
                 "sessions": self._mixing_sessions,
             }
             temporary_path = MIXING_MULTI_JOB_PATH.with_suffix(".tmp")
@@ -1472,14 +1674,14 @@ class MixingClientUI(production_client.ClientUI):
     ) -> str:
         if not getattr(self, "_mixing_mode_ready", False):
             return ""
-        job_key = self._mixing_job_key(self.state.job_code or self.state.job_name)
-        if not job_key:
+        session_key = self._current_mixing_session_key()
+        if not session_key:
             return ""
-        existing = self._mixing_sessions.get(job_key)
+        existing = self._mixing_sessions.get(session_key)
         if (
             isinstance(existing, dict)
             and not bool(existing.get("mixing_open", True))
-            and str(self._mixing_active_job_key or "").strip() != job_key
+            and str(self._mixing_active_job_key or "").strip() != session_key
             and not allow_reopen_closed
         ):
             # Do not let a stale server/local startup snapshot resurrect a
@@ -1489,12 +1691,15 @@ class MixingClientUI(production_client.ClientUI):
         snapshot.pop("mixing_open_jobs", None)
         snapshot["mixing_open"] = True
         snapshot["mixing_last_active_at"] = time.time()
-        self._mixing_sessions[job_key] = snapshot
-        self._mixing_active_job_key = job_key
+        self._mixing_sessions[session_key] = snapshot
+        self._mixing_active_job_key = session_key
+        self._mixing_active_jobs_by_machine[
+            self._mixing_machine_key(self.state.machine_code)
+        ] = session_key
         if persist:
             self._persist_mixing_sessions()
         self._refresh_mixing_jobs_panel()
-        return job_key
+        return session_key
 
     def _build_mixing_jobs_panel(self) -> None:
         if hasattr(self, "mixingJobsPanel") or not hasattr(self, "rightPanel"):
@@ -1538,9 +1743,7 @@ class MixingClientUI(production_client.ClientUI):
     def _refresh_mixing_jobs_panel(self) -> None:
         if not hasattr(self, "mixingJobsList"):
             return
-        current_key = self._mixing_job_key(
-            getattr(self.state, "job_code", None) or getattr(self.state, "job_name", None)
-        )
+        current_key = self._current_mixing_session_key()
         rows = sorted(
             (
                 item
@@ -1561,8 +1764,22 @@ class MixingClientUI(production_client.ClientUI):
             job_name = str(
                 snapshot.get("job_name") or snapshot.get("job_code") or key
             ).strip()
-            sack_count = int(snapshot.get("mixing_sack_count", snapshot.get("pack_count", 0)) or 0)
-            good_kg = int(snapshot.get("mixing_total_kg", snapshot.get("good_total", 0)) or 0)
+            prior = self._mixing_prior_output_totals(
+                snapshot.get("machine_code"),
+                snapshot.get("job_code") or snapshot.get("job_name"),
+            )
+            sack_count = int(prior["sacks"]) + int(
+                snapshot.get("mixing_sack_count", snapshot.get("pack_count", 0))
+                or 0
+            )
+            good_kg = self._mixing_qty_text(
+                float(prior["total_kg"])
+                + self._parse_number(
+                    snapshot.get(
+                        "mixing_total_kg", snapshot.get("good_total", 0)
+                    )
+                )
+            )
             part_scans = len(snapshot.get("raw_material_logs") or [])
             display_rows.append(
                 f"{marker} {job_name}  |  Parts {part_scans}  |  Sacks {sack_count}  |  {good_kg} kg"
@@ -1577,12 +1794,12 @@ class MixingClientUI(production_client.ClientUI):
             self._refresh_linkage_panel()
 
     def _find_open_mixing_job(self, candidates: List[Any]) -> str:
-        wanted = {
+        wanted_jobs = {
             self._mixing_job_key(value)
             for value in candidates
             if self._mixing_job_key(value)
         }
-        if not wanted:
+        if not wanted_jobs:
             return ""
         for key, snapshot in self._mixing_sessions.items():
             if not self._mixing_session_is_for_current_machine(snapshot):
@@ -1590,11 +1807,10 @@ class MixingClientUI(production_client.ClientUI):
             if not bool(snapshot.get("mixing_open", True)):
                 continue
             identities = {
-                self._mixing_job_key(key),
                 self._mixing_job_key(snapshot.get("job_code")),
                 self._mixing_job_key(snapshot.get("job_name")),
             }
-            if wanted.intersection(identities):
+            if wanted_jobs.intersection(identities):
                 return key
         return ""
 
@@ -1603,7 +1819,7 @@ class MixingClientUI(production_client.ClientUI):
         snapshot = self._mixing_sessions.get(target_key)
         if not isinstance(snapshot, dict):
             return False
-        current_key = self._mixing_job_key(self.state.job_code or self.state.job_name)
+        current_key = self._current_mixing_session_key()
         if current_key and current_key != target_key:
             current_saved = self._mixing_sessions.get(current_key)
             # A shift that was already closed must not become OPEN again merely
@@ -1622,6 +1838,11 @@ class MixingClientUI(production_client.ClientUI):
         self._mixing_active_job_key = target_key
         self._mixing_sessions[target_key]["mixing_open"] = True
         self._mixing_sessions[target_key]["mixing_last_active_at"] = time.time()
+        target_machine = self._mixing_machine_key(
+            self._mixing_sessions[target_key].get("machine_code")
+        )
+        if target_machine:
+            self._mixing_active_jobs_by_machine[target_machine] = target_key
         self._persist_mixing_sessions()
         super()._save_active_session_snapshot(force=True)
         self.sync_session_snapshot_to_server(
@@ -1633,7 +1854,7 @@ class MixingClientUI(production_client.ClientUI):
             "MIXING JOB SELECTED",
             f"Active job: {job_label}\n"
             "Open mixing sessions: "
-            f"{sum(1 for row in self._mixing_sessions.values() if bool(row.get('mixing_open', True)))}",
+            f"{sum(1 for row in self._mixing_sessions.values() if self._mixing_session_is_for_current_machine(row) and bool(row.get('mixing_open', True)))}",
             hide_ms=2600,
         )
         self._refresh_ui(force=True)
@@ -1643,7 +1864,7 @@ class MixingClientUI(production_client.ClientUI):
     def _restore_owned_session_on_startup(self) -> None:
         """Recover state, then display the registry's next OPEN mixing job."""
         super()._restore_owned_session_on_startup()
-        target_key = str(self._mixing_active_job_key or "").strip()
+        target_key = self._active_mixing_key_for_machine(self.state.machine_code)
         target = self._mixing_sessions.get(target_key)
         if not isinstance(target, dict) or not bool(target.get("mixing_open", True)):
             candidates = sorted(
@@ -1657,16 +1878,80 @@ class MixingClientUI(production_client.ClientUI):
                 reverse=True,
             )
             target_key = candidates[0][0] if candidates else ""
-        current_key = self._mixing_job_key(self.state.job_code or self.state.job_name)
+        current_key = self._current_mixing_session_key()
         if target_key and target_key != current_key:
             self._switch_mixing_session(
                 target_key,
                 reason="next running job restored",
             )
 
+    def _fetch_active_session_snapshot_from_server(
+        self, machine_code: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Import every open Mixing job carried by the server snapshot."""
+        snapshot = super()._fetch_active_session_snapshot_from_server(machine_code)
+        if not isinstance(snapshot, dict):
+            return snapshot
+        return self._ingest_server_mixing_open_jobs(snapshot)
+
+    def _ingest_server_mixing_open_jobs(
+        self, server_snapshot: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Hydrate the local multi-job registry without losing nested totals."""
+        top = dict(server_snapshot or {})
+        machine_code = self._mixing_machine_key(top.get("machine_code"))
+        rows = top.get("mixing_open_jobs")
+        rows = rows if isinstance(rows, list) else []
+        changed = False
+        matching_top = None
+        top_job = self._mixing_job_key(top.get("job_code") or top.get("job_name"))
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            imported = dict(row)
+            imported["machine_code"] = (
+                self._mixing_machine_key(imported.get("machine_code"))
+                or machine_code
+            )
+            imported.setdefault("machine_name", top.get("machine_name"))
+            imported.setdefault("client_id", top.get("client_id"))
+            imported["mixing_open"] = bool(imported.get("mixing_open", True))
+            imported.setdefault("mixing_last_active_at", time.time())
+            key = self._snapshot_mixing_session_key(imported)
+            if not key:
+                continue
+            existing = self._mixing_sessions.get(key)
+            if not isinstance(existing, dict) or self._snapshot_richness_score(
+                imported
+            ) >= self._snapshot_richness_score(existing):
+                self._mixing_sessions[key] = imported
+                changed = True
+            if self._mixing_job_key(
+                imported.get("job_code") or imported.get("job_name")
+            ) == top_job:
+                matching_top = imported
+
+        if isinstance(matching_top, dict):
+            # The embedded row is the authoritative per-job snapshot. The
+            # top-level machine row can be only a zero-valued status shell.
+            enriched = dict(top)
+            enriched.update(matching_top)
+            enriched["machine_code"] = machine_code
+            enriched["mixing_open_jobs"] = rows
+            top = enriched
+
+        active_key = self._snapshot_mixing_session_key(top)
+        if active_key:
+            self._mixing_active_job_key = active_key
+            if machine_code:
+                self._mixing_active_jobs_by_machine[machine_code] = active_key
+        if changed:
+            self._persist_mixing_sessions()
+        return top
+
     def _activate_registry_open_job(self) -> None:
         """Reconcile delayed server recovery with the Mixing open-job registry."""
-        target_key = str(self._mixing_active_job_key or "").strip()
+        target_key = self._active_mixing_key_for_machine(self.state.machine_code)
         target = self._mixing_sessions.get(target_key)
         if not isinstance(target, dict) or not bool(target.get("mixing_open", True)):
             candidates = sorted(
@@ -1680,13 +1965,13 @@ class MixingClientUI(production_client.ClientUI):
                 reverse=True,
             )
             target_key = candidates[0][0] if candidates else ""
-        current_key = self._mixing_job_key(self.state.job_code or self.state.job_name)
+        current_key = self._current_mixing_session_key()
         if target_key and target_key != current_key:
             self._switch_mixing_session(target_key, reason="next running job")
 
-    def _prepare_empty_mixing_session(self) -> None:
-        machine_code = self.state.machine_code
-        machine_name = self.state.machine_name
+    def _prepare_empty_mixing_session(self, *, preserve_machine: bool = True) -> None:
+        machine_code = self.state.machine_code if preserve_machine else None
+        machine_name = self.state.machine_name if preserve_machine else None
         self.state = production_client.ClientState()
         self.state.machine_code = machine_code
         self.state.machine_name = machine_name
@@ -1698,6 +1983,126 @@ class MixingClientUI(production_client.ClientUI):
         self._hide_reject_summary_overlay()
         self._hide_product_history_overlay()
         self._hide_reject_review_overlay()
+
+    def _select_mixing_machine(self, raw_machine_scan: str, result: Any) -> bool:
+        """Switch to a machine group and restore its most recent open job."""
+        self._capture_current_mixing_session()
+        target_machine = str(
+            (result.meta or {}).get("machine_code")
+            if isinstance(getattr(result, "meta", None), dict)
+            else raw_machine_scan
+        ).strip().upper()
+        if not target_machine:
+            return False
+        target_key = self._active_mixing_key_for_machine(target_machine)
+        if target_key:
+            switched = self._switch_mixing_session(
+                target_key, reason="machine group selected"
+            )
+            if switched:
+                count = sum(
+                    1
+                    for row in self._mixing_sessions.values()
+                    if self._mixing_machine_key(row.get("machine_code")) == target_machine
+                    and bool(row.get("mixing_open", True))
+                )
+                self.status.setText(
+                    f"{self.state.machine_name or self.state.machine_code}: "
+                    f"showing {count} open mixing job(s). Scan a JOB QR to switch."
+                )
+            return switched
+
+        self._prepare_empty_mixing_session(preserve_machine=False)
+        super().on_scanned(raw_machine_scan)
+        self._mixing_active_job_key = ""
+        self._refresh_ui(force=True)
+        self._refresh_mixing_jobs_panel()
+        self.status.setText(
+            f"{self.state.machine_name or self.state.machine_code}: no open mixing jobs. "
+            "Scan a JOB QR to start one."
+        )
+        return True
+
+    def _queue_mixing_job_for_machine(self, raw_job_scan: str) -> None:
+        """Save the active job and require a machine scan for the next job."""
+        self._capture_current_mixing_session()
+        self._mixing_pending_job_raw = str(raw_job_scan or "").strip()
+        self._mixing_pending_job_source_machine = str(
+            self.state.machine_code or ""
+        ).strip().upper()
+        self.status.setText(
+            "Next mixing job scanned. Scan the MACHINE QR where this job will run."
+        )
+        self._show_info_overlay(
+            "SELECT MACHINE",
+            "Current job remains running on its machine.\n"
+            "Now scan the MACHINE QR for the new job.",
+            hide_ms=0,
+        )
+
+    def _assign_pending_mixing_job_to_machine(
+        self, raw_machine_scan: str, machine_result: Any
+    ) -> bool:
+        """Assign the queued job to a different scanned mixing machine."""
+        pending_raw = str(self._mixing_pending_job_raw or "").strip()
+        if not pending_raw:
+            return False
+        target_machine = str(
+            machine_result.meta.get("machine_code")
+            if isinstance(machine_result.meta, dict)
+            else raw_machine_scan
+        ).strip().upper()
+        # One machine may own several concurrently open Mixing jobs. Scanning
+        # the same machine is therefore a valid assignment, not an error.
+        self._prepare_empty_mixing_session(preserve_machine=False)
+        super().on_scanned(raw_machine_scan)
+
+        pending_result = production_client.parse_scan(pending_raw)
+        candidates: List[Any] = [pending_raw]
+        if pending_result is not None:
+            candidates.append(pending_result.value)
+            if isinstance(pending_result.meta, dict):
+                candidates.extend(
+                    pending_result.meta.get(key)
+                    for key in ("po_number", "job_code", "job_name")
+                )
+        existing_key = self._find_open_mixing_job(candidates)
+        if existing_key:
+            self._switch_mixing_session(
+                existing_key,
+                reason="machine selected for queued job",
+            )
+        elif self.state.job_code:
+            busy_job = str(self.state.job_name or self.state.job_code)
+            self.status.setText(
+                f"{self.state.machine_name or self.state.machine_code} is already running "
+                f"{busy_job}. Scan another MACHINE QR for the queued job."
+            )
+            self._show_invalid_overlay(
+                "Selected machine already has a different running job."
+            )
+            return True
+        else:
+            super().on_scanned(pending_raw)
+
+        if self.state.job_code:
+            self._mixing_pending_job_raw = ""
+            self._mixing_pending_job_source_machine = ""
+            self._capture_current_mixing_session(allow_reopen_closed=True)
+            self.sync_session_snapshot_to_server(
+                "SESSION SNAPSHOT SYNC (MIXING JOB MACHINE ASSIGNED)"
+            )
+            self.status.setText(
+                f"Mixing job {self.state.job_name or self.state.job_code} assigned to "
+                f"{self.state.machine_name or self.state.machine_code}. Scan the operator badge."
+            )
+            self._show_info_overlay(
+                "JOB MACHINE ASSIGNED",
+                f"Job: {self.state.job_name or self.state.job_code}\n"
+                f"Machine: {self.state.machine_name or self.state.machine_code}",
+                hide_ms=3000,
+            )
+        return True
 
     def _part_scan_identity(self, raw: str, result: Any) -> Dict[str, Any]:
         if result is None:
@@ -1825,9 +2230,7 @@ class MixingClientUI(production_client.ClientUI):
                 )
             ]
             if output_matches:
-                current_key = self._mixing_job_key(
-                    self.state.job_code or self.state.job_name
-                )
+                current_key = self._current_mixing_session_key()
                 target_key = current_key if current_key in output_matches else max(
                     output_matches,
                     key=lambda key: float(
@@ -1844,9 +2247,7 @@ class MixingClientUI(production_client.ClientUI):
         # can be required by multiple open jobs, so automatically choosing one
         # would place stock in the wrong session. Only the displayed job may
         # accept the part; the operator must scan its JOB QR before the part.
-        current_key = self._mixing_job_key(
-            self.state.job_code or self.state.job_name
-        )
+        current_key = self._current_mixing_session_key()
         matches = [
             key
             for key, snapshot in self._mixing_sessions.items()
@@ -2147,13 +2548,19 @@ class MixingClientUI(production_client.ClientUI):
             return
 
         if hasattr(self, "lblPack"):
-            self.lblPack.title = "SACK"
+            self.lblPack.title = "SACKS SCANNED"
+            self.lblPack.setMinimumWidth(0)
+            self.lblPack.show()
             self.lblPack.update()
         if hasattr(self, "lblGood"):
             self.lblGood.title = "GOOD KG"
+            self.lblGood.setMinimumWidth(0)
+            self.lblGood.show()
             self.lblGood.update()
         if hasattr(self, "lblTotalGood"):
             self.lblTotalGood.title = "TOTAL KG"
+            self.lblTotalGood.setMinimumWidth(0)
+            self.lblTotalGood.show()
             self.lblTotalGood.update()
         if hasattr(self, "jobPartsTable") and self.jobPartsTable is not None:
             header = self.jobPartsTable.horizontalHeaderItem(3)
@@ -2192,9 +2599,59 @@ class MixingClientUI(production_client.ClientUI):
         if hasattr(self, "state"):
             self._ensure_mixing_kg_counter()
         super()._refresh_ui_now()
+        self._refresh_mixing_output_cards()
         self._apply_mixing_panel_visibility()
         self._apply_mixing_labels()
         self._apply_mixing_cumulative_part_totals()
+
+    def _refresh_mixing_output_cards(self) -> None:
+        """Render cumulative job output without changing live-shift accounting."""
+        if not hasattr(self, "state"):
+            return
+        prior = self._mixing_prior_output_totals(
+            self.state.machine_code, self.state.job_code or self.state.job_name
+        )
+        sack_count = int(prior["sacks"]) + max(0, int(self.state.pack_count or 0))
+        good_kg = float(prior["good_kg"]) + max(
+            0.0, self._parse_number(self.state.good_total)
+        )
+        partial_kg = max(0.0, self._parse_number(self.state.butal_total))
+        total_kg = float(prior["total_kg"]) + max(
+            0.0,
+            self._parse_number(self.state.good_total) + partial_kg,
+        )
+        if hasattr(self, "lblPack"):
+            self.lblPack.set_value(sack_count)
+        if hasattr(self, "lblGood"):
+            self.lblGood.set_value(good_kg)
+        if hasattr(self, "lblTotalGood"):
+            self.lblTotalGood.set_value(round(total_kg, 6))
+
+    def _mixing_prior_output_totals(
+        self, machine_code: Any, job_code: Any
+    ) -> Dict[str, float]:
+        key = self._shift_carryover_key(machine_code, job_code)
+        if not key:
+            return {"sacks": 0, "good_kg": 0.0, "total_kg": 0.0}
+        matches = [
+            row
+            for row in production_client._load_shift_carryover_json()
+            if isinstance(row, dict)
+            and self._shift_carryover_key(
+                row.get("machine_code"), row.get("job_code")
+            )
+            == key
+        ]
+        row = matches[-1] if matches else {}
+        return {
+            "sacks": max(0, int(row.get("mixing_prior_output_sacks") or 0)),
+            "good_kg": max(
+                0.0, self._parse_number(row.get("mixing_prior_output_good_kg"))
+            ),
+            "total_kg": max(
+                0.0, self._parse_number(row.get("mixing_prior_output_total_kg"))
+            ),
+        }
 
     @staticmethod
     def _mixing_qty_text(value: Any) -> str:
@@ -2266,6 +2723,20 @@ class MixingClientUI(production_client.ClientUI):
 
     def _sync_mixing_material_history_from_server(self, *, force: bool = False) -> bool:
         """Hydrate legacy cumulative scans from completed server shifts."""
+        # Never pull server history into the client while locally scanned
+        # mutations are queued, nor immediately after a scan. This keeps the
+        # offline outbox one-way: local -> queue -> server ACK -> delete.
+        if time.time() < float(
+            getattr(self, "_mixing_server_pull_blocked_until", 0.0) or 0.0
+        ):
+            return False
+        try:
+            if self._has_pending_server_mutations():
+                return False
+        except Exception:
+            # If queue state cannot be read, preserving local state is safer
+            # than importing a possibly stale server history.
+            return False
         machine_code = str(self.state.machine_code or "").strip().upper()
         job_code = self._normalize_job_code(self.state.job_code)
         sync_key = f"{machine_code}|{job_code}" if machine_code and job_code else ""
@@ -2395,6 +2866,15 @@ class MixingClientUI(production_client.ClientUI):
             item["source"] = "MIXING_SERVER_SHIFT_HISTORY"
             unique_rows.append(item)
         target["mixing_cumulative_part_scans"] = unique_rows
+        target["mixing_prior_output_sacks"] = max(
+            0, int(body.get("output_sacks") or 0)
+        )
+        target["mixing_prior_output_good_kg"] = max(
+            0.0, self._parse_number(body.get("output_good_kg"))
+        )
+        target["mixing_prior_output_total_kg"] = max(
+            0.0, self._parse_number(body.get("output_total_kg"))
+        )
         target["mixing_history_synced_at"] = production_client.datetime.now(
             production_client.timezone.utc
         ).isoformat()
@@ -2605,11 +3085,11 @@ class MixingClientUI(production_client.ClientUI):
             }
             rows.append(target)
         target["mixing_cumulative_part_scans"] = cumulative_scans
-        target["mixing_kg_counter"] = int(
+        target["mixing_kg_counter"] = round(self._parse_number(
             shift_payload.get("mixing_kg_counter_end")
             or self._ensure_mixing_kg_counter()
             or 0
-        )
+        ), 6)
         target["mixing_last_sack_cycle_time_seconds"] = (
             shift_payload.get("mixing_sack_cycle_time_seconds")
         )
@@ -2638,11 +3118,11 @@ class MixingClientUI(production_client.ClientUI):
         ]
         if matches:
             latest = matches[-1]
-            counter = self._parse_int_value(latest.get("mixing_kg_counter"))
-            if counter is not None:
-                self.state.machine_counter_current = max(0, counter)
-                self.state.machine_counter_shift_start = max(0, counter)
-                self.state.operator_shift_baseline_machine_counter_start = max(0, counter)
+            counter = self._parse_number(latest.get("mixing_kg_counter"))
+            if counter >= 0:
+                self.state.machine_counter_current = max(0.0, counter)
+                self.state.machine_counter_shift_start = max(0.0, counter)
+                self.state.operator_shift_baseline_machine_counter_start = max(0.0, counter)
             cycle = self._parse_number(
                 latest.get("mixing_last_sack_cycle_time_seconds")
             )
@@ -2717,10 +3197,7 @@ class MixingClientUI(production_client.ClientUI):
 
         self._configure_mixing_jobs_grid()
 
-        current_key = self._mixing_job_key(
-            getattr(self.state, "job_code", None)
-            or getattr(self.state, "job_name", None)
-        )
+        current_key = self._current_mixing_session_key()
         rows = sorted(
             (
                 item
@@ -2766,12 +3243,61 @@ class MixingClientUI(production_client.ClientUI):
         self._refresh_history_panel()
         self._apply_mixing_panel_visibility()
 
-    def _mixing_kg_per_sack(self) -> int:
-        """Resolve the finished-product weight represented by one sack."""
-        generated_qty = super()._generated_pack_qty_from_job_payload()
-        if generated_qty is not None and int(generated_qty or 0) > 0:
-            return int(generated_qty)
+    def _allow_fractional_pack_output(self) -> bool:
+        """Mixing sack QRs may encode partial (Butal) weight in kilograms."""
+        return True
 
+    def _pack_history_key(self, row: Dict[str, Any]) -> str:
+        """Scope Mixing PACK series numbers by lot as well as product/job.
+
+        Mixing Butal labels can legitimately restart at series 1 for a new
+        lot.  The production client intentionally keeps its original identity
+        rules; only Mixing Mode adds the lot so the same series remains
+        blocked inside one lot but is accepted for a different lot.
+        """
+        base_key = super()._pack_history_key(row)
+        if not base_key or base_key.startswith("VIRTUAL|"):
+            return base_key
+
+        fields = row if isinstance(row, dict) else {}
+        raw_scan = str(fields.get("raw_scan") or "").strip()
+        if raw_scan:
+            parsed = self._extract_pack_history_fields(raw_scan)
+            if isinstance(parsed, dict):
+                fields = parsed
+        lot = str(fields.get("lot_number") or "").strip()
+        return f"{base_key}|LOT:{lot}" if lot else base_key
+
+    def _pack_qr_was_used_permanently(self, pack_key: str) -> bool:
+        """Read both lot-aware Mixing keys and legacy pre-change keys."""
+        key = str(pack_key or "").strip()
+        if not key:
+            return False
+        if super()._pack_qr_was_used_permanently(key):
+            return True
+        if "|LOT:" not in key:
+            return False
+
+        legacy_key, requested_lot = key.rsplit("|LOT:", 1)
+        rows = production_client._load_scanned_pack_qr_keys_json()
+        legacy_row = rows.get(legacy_key) if isinstance(rows, dict) else None
+        if not isinstance(legacy_row, dict):
+            return False
+
+        legacy_fields = legacy_row
+        raw_scan = str(legacy_row.get("raw_scan") or "").strip()
+        if raw_scan:
+            parsed = self._extract_pack_history_fields(raw_scan)
+            if isinstance(parsed, dict):
+                legacy_fields = parsed
+        legacy_lot = str(legacy_fields.get("lot_number") or "").strip()
+        if legacy_lot and legacy_lot == requested_lot:
+            self._used_pack_qr_keys.add(key)
+            return True
+        return False
+
+    def _mixing_kg_per_sack(self) -> float:
+        """Resolve the finished-product weight represented by one sack."""
         payload = self.state.job_payload if isinstance(self.state.job_payload, dict) else {}
         context = self._extract_job_payload_context(payload)
         job = context.get("job") if isinstance(context.get("job"), dict) else {}
@@ -2784,6 +3310,7 @@ class MixingClientUI(production_client.ClientUI):
             for key in (
                 "kg_per_sack",
                 "weight_per_sack",
+                "custom_03",
                 "default_qty",
                 "default_quantity",
                 "pack_qty",
@@ -2793,13 +3320,17 @@ class MixingClientUI(production_client.ClientUI):
             ):
                 value = self._parse_number(row.get(key))
                 if value > 0:
-                    return max(1, int(round(value)))
+                    return round(value, 6)
+
+        generated_qty = super()._generated_pack_qty_from_job_payload()
+        if generated_qty is not None and self._parse_number(generated_qty) > 0:
+            return round(self._parse_number(generated_qty), 6)
 
         identity = self._job_product_identity_from_payload(payload)
         product_id = str(identity.get("product_id") or "").strip()
         catalog_qty = self._lookup_product_default_qty(product_id) if product_id else 0
         if catalog_qty > 0:
-            return max(1, int(round(catalog_qty)))
+            return round(float(catalog_qty), 6)
 
         product_name = str(identity.get("product_name") or "")
         match = re.search(
@@ -2808,8 +3339,8 @@ class MixingClientUI(production_client.ClientUI):
             flags=re.IGNORECASE,
         )
         if match:
-            return max(1, int(round(float(match.group(1)))))
-        return 0
+            return round(float(match.group(1)), 6)
+        return 0.0
 
     def _apply_mixing_finished_sack_quantity(self, event: Dict[str, Any]) -> None:
         """Convert one accepted finished sack into its configured kg value."""
@@ -2826,14 +3357,24 @@ class MixingClientUI(production_client.ClientUI):
         counter_before = self._ensure_mixing_kg_counter()
         kg_per_sack = self._mixing_kg_per_sack()
         sack_count = max(1, int(event.get("pack_qty") or 1))
-        desired_kg = sack_count * kg_per_sack
-        recorded_kg = max(0, int(event.get("qty") or 0))
+        scanned_kg = self._parse_number(
+            event.get("scanned_pack_qty")
+            or (event.get("pack_record") or {}).get("scanned_pack_qty")
+        )
+        desired_kg = round(
+            scanned_kg if scanned_kg > 0 else sack_count * kg_per_sack,
+            6,
+        )
+        recorded_kg = max(0.0, self._parse_number(event.get("qty")))
         if desired_kg <= 0:
             return
 
         difference = desired_kg - recorded_kg
         if difference:
-            self.state.good_total = max(0, int(self.state.good_total or 0) + difference)
+            self.state.good_total = round(
+                max(0.0, self._parse_number(self.state.good_total) + difference),
+                6,
+            )
 
         event["qty"] = desired_kg
         event["mixing_sack_count"] = sack_count
@@ -2879,8 +3420,8 @@ class MixingClientUI(production_client.ClientUI):
         self.state.machine_counter_current = counter_before + desired_kg
         self._sync_machine_counter_current()
         self.status.setText(
-            f"Sack +{sack_count} | Good KG +{desired_kg} "
-            f"({kg_per_sack} kg per sack)"
+            f"Sack +{sack_count} | Good KG +{self._mixing_qty_text(desired_kg)} "
+            f"({self._mixing_qty_text(kg_per_sack)} kg full sack)"
         )
         self._refresh_ui(force=True)
 
@@ -2895,12 +3436,20 @@ class MixingClientUI(production_client.ClientUI):
         if str(event_payload.get("type") or "").strip().upper() == "PACK":
             self._apply_mixing_finished_sack_quantity(event_payload)
             last_event = replace_pack_terms(last_event)
-        return super().push_event(
+        queued = super().push_event(
             event_payload,
             last_event,
             silent=silent,
             defer_snapshot=defer_snapshot,
         )
+        if queued and str(event_payload.get("type") or "").strip().upper() != "HEARTBEAT":
+            # Cover the small race where a fast LAN acknowledgement removes
+            # the row before on_scanned reaches its history-refresh call.
+            self._mixing_server_pull_blocked_until = max(
+                float(getattr(self, "_mixing_server_pull_blocked_until", 0.0) or 0.0),
+                time.time() + 60.0,
+            )
+        return queued
 
     def on_scanned(self, raw: str):
         raw_s = self._normalize_mixing_machine_scan(raw)
@@ -2910,7 +3459,48 @@ class MixingClientUI(production_client.ClientUI):
         handled_by_multi_job = False
         opened_new_job = False
 
-        if result is not None and result.kind in ("JOB", "JOB_STUB"):
+        awaiting_initial_operator = bool(
+            self.state.machine_code
+            and self.state.job_code
+            and not self.state.operator_id
+        )
+        if self._mixing_pending_job_raw and awaiting_initial_operator:
+            # Older Mixing Mode builds could mistake an Operator badge for a
+            # structured JOB QR and arm the multi-job machine picker.  That
+            # pending state is invalid while the current job still needs its
+            # first operator, so recover automatically and let the production
+            # operator/profile resolver inspect this scan.
+            self._mixing_pending_job_raw = ""
+            self._mixing_pending_job_source_machine = ""
+
+        if self._mixing_pending_job_raw:
+            if result is not None and result.kind in ("JOB", "JOB_STUB"):
+                self._mixing_pending_job_raw = raw_s
+                self.status.setText(
+                    "Queued mixing job updated. Scan the MACHINE QR where it will run."
+                )
+                return
+            if result is None or result.kind != "MACHINE":
+                self.status.setText(
+                    "Machine selection required. Scan a MACHINE QR for the queued mixing job."
+                )
+                self._show_invalid_overlay("Scan MACHINE QR next.")
+                return
+            if self._assign_pending_mixing_job_to_machine(raw_s, result):
+                self._sync_mixing_material_history_from_server()
+                self._refresh_ui(force=True)
+                self._refresh_mixing_jobs_panel()
+                return
+
+        if result is not None and result.kind == "MACHINE":
+            self._select_mixing_machine(raw_s, result)
+            return
+
+        if (
+            result is not None
+            and result.kind in ("JOB", "JOB_STUB")
+            and not awaiting_initial_operator
+        ):
             candidates: List[Any] = [raw_s, result.value]
             if isinstance(result.meta, dict):
                 candidates.extend(
@@ -2927,11 +3517,11 @@ class MixingClientUI(production_client.ClientUI):
                     reason="job QR selected",
                 )
             elif self.state.machine_code and self.state.job_code:
-                self._capture_current_mixing_session()
-                self._prepare_empty_mixing_session()
-                opened_new_job = True
+                self._queue_mixing_job_for_machine(raw_s)
+                return
 
         block_part_scan = False
+        prior_session_key = self._current_mixing_session_key()
         if not handled_by_multi_job:
             if result is not None and result.kind in ("PACK", "RAW_MATERIAL"):
                 block_part_scan = (
@@ -2940,6 +3530,13 @@ class MixingClientUI(production_client.ClientUI):
                 )
             if not block_part_scan:
                 super().on_scanned(raw_s)
+                if (
+                    result is not None
+                    and result.kind in ("JOB", "JOB_STUB")
+                    and self._current_mixing_session_key()
+                    and self._current_mixing_session_key() != prior_session_key
+                ):
+                    opened_new_job = True
 
         self._sync_mixing_material_history_from_server()
         # A JOB QR that is not already open starts a fresh running session.
@@ -2962,7 +3559,7 @@ class MixingClientUI(production_client.ClientUI):
                 f"Started: {job_label}\n"
                 "The previous mixing job remains open.\n"
                 "Open mixing sessions: "
-                f"{sum(1 for row in self._mixing_sessions.values() if bool(row.get('mixing_open', True)))}",
+                f"{sum(1 for row in self._mixing_sessions.values() if self._mixing_session_is_for_current_machine(row) and bool(row.get('mixing_open', True)))}",
                 hide_ms=3000,
             )
         # The production dashboard batches normal UI refreshes.  In Mixing Mode
@@ -3182,7 +3779,11 @@ class MixingClientUI(production_client.ClientUI):
         payload["external_average_weight_source"] = None
         payload["external_average_weight_sender"] = None
         payload["external_average_weight_needs_refresh"] = False
-        payload["mixing_total_kg"] = int(self.state.good_total or 0)
+        mixing_total = round(self._parse_number(self.state.good_total), 6)
+        payload["mixing_total_kg"] = mixing_total
+        payload["good_total"] = mixing_total
+        payload["total_good"] = mixing_total
+        payload["partial_qty"] = mixing_total
         payload["mixing_sack_count"] = int(self.state.pack_count or 0)
         payload["mixing_kg_per_sack"] = self._mixing_kg_per_sack()
         payload["mixing_kg_counter_end"] = self._ensure_mixing_kg_counter()
@@ -3206,13 +3807,13 @@ class MixingClientUI(production_client.ClientUI):
         if isinstance(payload, dict):
             self._add_mixing_cumulative_payload(payload)
             kg_end = self._ensure_mixing_kg_counter()
-            baseline_counter = self._parse_int_value(
+            baseline_counter = self._parse_number(
                 self.state.operator_shift_baseline_machine_counter_start
             )
             kg_start = (
-                max(0, int(baseline_counter))
-                if baseline_counter is not None
-                else max(0, kg_end - int(self.state.good_total or 0))
+                max(0.0, baseline_counter)
+                if baseline_counter > 0
+                else max(0.0, kg_end - self._parse_number(self.state.good_total))
             )
             kg_produced = max(0, kg_end - kg_start)
             payload.update(
@@ -3234,18 +3835,18 @@ class MixingClientUI(production_client.ClientUI):
     def _populate_finish_shift_summary(self, shift_payload: Dict[str, Any]):
         """Show a compact Mixing-only output and material-usage review."""
         super()._populate_finish_shift_summary(shift_payload)
-        kg_start = max(0, int(shift_payload.get("mixing_kg_counter_start") or 0))
+        kg_start = max(0.0, self._parse_number(shift_payload.get("mixing_kg_counter_start")))
         kg_end = max(
             kg_start,
-            int(
+            self._parse_number(
                 shift_payload.get("mixing_kg_counter_end")
                 or shift_payload.get("mixing_total_kg")
                 or 0
             ),
         )
         kg_produced = max(
-            0,
-            int(
+            0.0,
+            self._parse_number(
                 shift_payload.get("mixing_kg_produced_shift")
                 if shift_payload.get("mixing_kg_produced_shift") is not None
                 else kg_end - kg_start
@@ -3424,9 +4025,12 @@ class MixingClientUI(production_client.ClientUI):
 
     def _state_to_active_snapshot(self) -> Dict[str, Any]:
         snapshot = super()._state_to_active_snapshot()
+        snapshot["good_total"] = round(self._parse_number(self.state.good_total), 6)
+        snapshot["machine_counter_current"] = self._ensure_mixing_kg_counter()
         snapshot = self._add_mixing_cumulative_payload(snapshot)
-        current_key = self._mixing_job_key(
-            snapshot.get("job_code") or snapshot.get("job_name")
+        current_key = self._mixing_session_key(
+            snapshot.get("machine_code"),
+            snapshot.get("job_code") or snapshot.get("job_name"),
         )
         open_jobs: List[Dict[str, Any]] = []
         source_rows = dict(self._mixing_sessions)
@@ -3459,7 +4063,7 @@ class MixingClientUI(production_client.ClientUI):
 
     def _clear_shift_session_keep_machine(self, *, preserve_carryover: bool = True):
         """Remove the closed shift from OPEN jobs and activate the next job."""
-        closing_key = self._mixing_job_key(self.state.job_code or self.state.job_name)
+        closing_key = self._current_mixing_session_key()
         finished_kg_counter = self._ensure_mixing_kg_counter()
         finished_sack_cycle = self._parse_number(self.state.live_cycle_avg_seconds)
         remaining_part_logs = self._build_part_availability_carryover_logs()
@@ -3546,6 +4150,12 @@ class MixingClientUI(production_client.ClientUI):
                 self._mixing_sessions.pop(closing_key, None)
             if self._mixing_active_job_key == closing_key:
                 self._mixing_active_job_key = ""
+            machine_key = self._mixing_machine_key(self.state.machine_code)
+            if self._mixing_active_jobs_by_machine.get(machine_key) == closing_key:
+                if next_key:
+                    self._mixing_active_jobs_by_machine[machine_key] = next_key
+                else:
+                    self._mixing_active_jobs_by_machine.pop(machine_key, None)
             self._persist_mixing_sessions()
 
         super()._clear_shift_session_keep_machine(preserve_carryover=preserve_carryover)
