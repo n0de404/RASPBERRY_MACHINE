@@ -1,12 +1,14 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 CLIENT_DIR = Path(__file__).resolve().parents[1] / "client"
 sys.path.insert(0, str(CLIENT_DIR))
 
-from client import _completion_pack_projection
+import client as client_module
+from client import ClientUI, _completion_pack_projection
 
 
 class CompletionPackProjectionTests(unittest.TestCase):
@@ -33,6 +35,30 @@ class CompletionPackProjectionTests(unittest.TestCase):
         self.assertEqual(result["remaining_qty"], 0)
         self.assertEqual(result["packs_remaining"], 0)
         self.assertEqual(result["projected_overrun"], 20)
+
+
+class StartupCompletionFenceTests(unittest.TestCase):
+    def test_approved_partial_shift_does_not_close_production_session(self):
+        partial = {
+            "record_type": "SHIFT_PARTIAL",
+            "review_status": "APPROVED",
+            "production_session_id": "PS-ACTIVE",
+        }
+        with patch.object(client_module, "_load_finish_shift_json", return_value=[partial]), patch.object(
+            client_module, "_load_finished_jobs_json", return_value=[]
+        ):
+            self.assertEqual(ClientUI._locally_completed_session_ids(object()), set())
+
+    def test_approved_finished_job_closes_production_session(self):
+        finished = {
+            "record_type": "FINISHED_JOB",
+            "review_status": "APPROVED",
+            "production_session_id": "PS-CLOSED",
+        }
+        with patch.object(client_module, "_load_finish_shift_json", return_value=[]), patch.object(
+            client_module, "_load_finished_jobs_json", return_value=[finished]
+        ):
+            self.assertEqual(ClientUI._locally_completed_session_ids(object()), {"PS-CLOSED"})
 
     def test_missing_pack_quantity_cannot_make_projection(self):
         result = _completion_pack_projection(4000, 3900, 0)

@@ -12078,8 +12078,14 @@ QWidget#ClientUIRoot {{
         merely because the server has not received that finish event yet.
         """
         closed: Set[str] = set()
-        for row in list(_load_finish_shift_json()) + list(_load_finished_jobs_json()):
+        # A FINISH_SHIFT row closes only one operator shift; the production
+        # session remains active for the next shift.  Treating an approved
+        # SHIFT_PARTIAL as a completed session makes startup delete the active
+        # snapshot and prevents heartbeats until the machine is scanned again.
+        for row in _load_finished_jobs_json():
             if not isinstance(row, dict):
+                continue
+            if str(row.get("record_type") or "").strip().upper() == RECORD_TYPE_SHIFT_PARTIAL:
                 continue
             status = str(row.get("review_status") or "").strip().upper()
             if status not in {REVIEW_STATUS_APPROVED, REVIEW_STATUS_CLOSED}:
