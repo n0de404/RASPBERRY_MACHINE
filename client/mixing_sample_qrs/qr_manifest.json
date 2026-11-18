@@ -1,0 +1,74 @@
+[
+  {
+    "title": "1. MACHINE — MT-301",
+    "subtitle": "Select the mixing machine",
+    "payload": "MT301",
+    "file": "01_machine_mt301.png"
+  },
+  {
+    "title": "2. JOB — MIX-TEST-BLACK-001",
+    "subtitle": "Black / Z-COL-FIC-BLACK-114H",
+    "payload": "O000000000240000099000100000000000",
+    "file": "02_job_black_mix.png"
+  },
+  {
+    "title": "3. OPERATOR",
+    "subtitle": "Scan your own authorized Operator badge",
+    "payload": "",
+    "file": ""
+  },
+  {
+    "title": "SETUP CONTROL — NUM 6",
+    "subtitle": "For a sample cycle time of 60: scan NUM 6, then NUM 0",
+    "payload": "num_6",
+    "file": "03a_setup_num_6.png"
+  },
+  {
+    "title": "SETUP CONTROL — NUM 0",
+    "subtitle": "Reusable digit QR",
+    "payload": "num_0",
+    "file": "03b_setup_num_0.png"
+  },
+  {
+    "title": "SETUP CONTROL — NUM 1",
+    "subtitle": "For a sample machine counter of 1000: scan once, then NUM 0 three times",
+    "payload": "num_1",
+    "file": "03c_setup_num_1.png"
+  },
+  {
+    "title": "SETUP CONTROL — CONFIRM",
+    "subtitle": "Reusable confirmation QR",
+    "payload": "confirm",
+    "file": "03d_setup_confirm.png"
+  },
+  {
+    "title": "4. PRODUCT PART — Pelletized Allan Yao",
+    "subtitle": "30 kg / Z-RM-PP-BLK-PLTZ-ALNY",
+    "payload": "O00000000000V2P00000011599Q00000000030I00000000001T00000000001L20261016120000-00000990001",
+    "file": "04_part_pelletized_30kg.png"
+  },
+  {
+    "title": "5. PRODUCT PART — Black Grind In House",
+    "subtitle": "25 kg / Z-RM-PP-BLK-GRND-IH",
+    "payload": "O00000000000V2P00000008659Q00000000025I00000000002T00000000001L20261016120000-00000990001",
+    "file": "05_part_grind_25kg.png"
+  },
+  {
+    "title": "6. FINISHED MIX — Black",
+    "subtitle": "One sack = 50 GOOD KG / Z-COL-FIC-BLACK-114H",
+    "payload": "O00000000000V2P00000013345Q00000000050I00000000003T00000000001L20261016120000-00000990001",
+    "file": "06_finished_black_50kg.png"
+  },
+  {
+    "title": "EXTRA PART — Pelletized partial sack",
+    "subtitle": "19.452 kg / use in a separate run",
+    "payload": "O00000000000V2P00000011599Q0000019.452I00000000004T00000000001L20261016120000-00000990001",
+    "file": "07_part_pelletized_partial_19_452kg.png"
+  },
+  {
+    "title": "EXTRA PART — Grind partial sack",
+    "subtitle": "16.144 kg / use in a separate run",
+    "payload": "O00000000000V2P00000008659Q0000016.144I00000000005T00000000001L20261016120000-00000990001",
+    "file": "08_part_grind_partial_16_144kg.png"
+  }
+]

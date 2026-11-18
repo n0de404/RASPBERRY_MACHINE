@@ -1,0 +1,956 @@
+[
+  {
+    "name": "ROLAND RECLA",
+    "role": "Operator",
+    "id_number": "25-00446",
+    "print_count": 8,
+    "created_at_utc": "2026-03-28T07:01:16.343573+00:00",
+    "last_printed_at_utc": "2026-03-30T11:19:44.783768+00:00"
+  },
+  {
+    "name": "RONNEL GALANG",
+    "role": "Supervisor",
+    "id_number": "80033",
+    "print_count": 17,
+    "created_at_utc": "2026-03-28T07:02:10.726511+00:00",
+    "last_printed_at_utc": "2026-10-09T09:05:29.801266+00:00"
+  },
+  {
+    "name": "MAINTENANCE",
+    "role": "Maintenance",
+    "id_number": "200001",
+    "print_count": 2,
+    "created_at_utc": "2026-03-28T07:03:00.779184+00:00",
+    "last_printed_at_utc": "2026-03-30T05:33:58.137915+00:00"
+  },
+  {
+    "name": "CHARMAINE LOPEZ",
+    "role": "Supervisor",
+    "id_number": "80055",
+    "print_count": 24,
+    "created_at_utc": "2026-03-30T05:30:37.963363+00:00",
+    "last_printed_at_utc": "2026-09-30T10:34:13.920633+00:00"
+  },
+  {
+    "name": "JOEL AYAWAN",
+    "role": "Operator",
+    "id_number": "25-00953",
+    "print_count": 4,
+    "created_at_utc": "2026-03-30T05:33:42.403596+00:00",
+    "last_printed_at_utc": "2026-05-26T23:06:00.014572+00:00"
+  },
+  {
+    "name": "Maintenance",
+    "role": "Maintenance",
+    "id_number": "80035",
+    "print_count": 7,
+    "created_at_utc": "2026-04-06T09:19:56.810030+00:00",
+    "last_printed_at_utc": "2026-04-07T08:47:41.308431+00:00"
+  },
+  {
+    "name": "Femelyn Valmas",
+    "role": "Operator",
+    "id_number": "26-00123",
+    "department": "Production",
+    "print_count": 3,
+    "created_at_utc": "2026-04-06T23:14:30.910639+00:00",
+    "last_printed_at_utc": "2026-04-24T06:58:19.756694+00:00",
+    "breaktime_profile_synced_at_utc": "2026-10-12T06:36:47.173100+00:00"
+  },
+  {
+    "name": "Maricris Gorres",
+    "role": "Operator",
+    "id_number": "26-00124",
+    "print_count": 2,
+    "created_at_utc": "2026-05-25T23:15:29.849101+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-06-22T05:18:08.746932+00:00",
+    "photo_updated_at_utc": ""
+  },
+  {
+    "name": "Jeffry Pejo",
+    "role": "Operator",
+    "id_number": "26-00020",
+    "print_count": 3,
+    "created_at_utc": "2026-05-25T23:16:28.681065+00:00",
+    "last_printed_at_utc": "2026-08-07T09:19:48.039655+00:00"
+  },
+  {
+    "name": "Mhel Leonard Madeja",
+    "role": "Operator",
+    "id_number": "2400106",
+    "print_count": 1,
+    "created_at_utc": "2026-05-26T09:58:42.047547+00:00",
+    "last_printed_at_utc": "2026-05-26T09:58:42.131635+00:00"
+  },
+  {
+    "name": "Aileen Carias",
+    "role": "Operator",
+    "id_number": "2600229",
+    "print_count": 4,
+    "created_at_utc": "2026-05-26T22:48:41.306150+00:00",
+    "last_printed_at_utc": "2026-05-26T22:50:43.682930+00:00"
+  },
+  {
+    "name": "Angelica M. Estabillo",
+    "role": "Operator",
+    "id_number": "2600321",
+    "print_count": 1,
+    "created_at_utc": "2026-05-27T06:22:36.728780+00:00",
+    "last_printed_at_utc": "2026-05-27T06:22:36.822719+00:00"
+  },
+  {
+    "name": "Jessica F. Reyes",
+    "role": "Operator",
+    "id_number": "2600363",
+    "print_count": 1,
+    "created_at_utc": "2026-05-27T11:02:24.230197+00:00",
+    "last_printed_at_utc": "2026-05-27T11:02:24.314288+00:00"
+  },
+  {
+    "name": "Jemar Roxas",
+    "role": "Operator",
+    "id_number": "2600361",
+    "print_count": 1,
+    "created_at_utc": "2026-06-02T08:00:53.675507+00:00",
+    "last_printed_at_utc": "2026-06-02T08:00:53.764560+00:00"
+  },
+  {
+    "name": "Merlinda Sy",
+    "role": "Operator",
+    "id_number": "2600721",
+    "print_count": 4,
+    "created_at_utc": "2026-06-23T07:59:16.132287+00:00",
+    "last_printed_at_utc": "2026-08-24T11:24:04.171452+00:00"
+  },
+  {
+    "name": "Christine P. Natividad",
+    "role": "Operator",
+    "id_number": "26-00711",
+    "print_count": 1,
+    "created_at_utc": "2026-06-24T10:49:03.983598+00:00",
+    "last_printed_at_utc": "2026-06-24T10:49:04.056462+00:00"
+  },
+  {
+    "name": "Arnulfo",
+    "role": "Operator",
+    "id_number": "26-00390",
+    "print_count": 1,
+    "created_at_utc": "2026-06-25T11:15:59.676614+00:00",
+    "last_printed_at_utc": "2026-06-25T11:15:59.745194+00:00"
+  },
+  {
+    "name": "Rea Liza",
+    "role": "Operator",
+    "id_number": "26-00633",
+    "print_count": 1,
+    "created_at_utc": "2026-06-25T22:55:02.090602+00:00",
+    "last_printed_at_utc": "2026-06-25T22:55:02.161108+00:00"
+  },
+  {
+    "name": "Reggielyn Deo",
+    "role": "Operator",
+    "id_number": "2600816",
+    "print_count": 1,
+    "created_at_utc": "2026-06-26T23:24:22.169404+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-06-26T23:24:22.246865+00:00",
+    "photo_updated_at_utc": ""
+  },
+  {
+    "name": "Veena",
+    "role": "Operator",
+    "id_number": "26-00851",
+    "print_count": 3,
+    "created_at_utc": "2026-06-27T12:17:20.023285+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-01T12:22:27.452153+00:00",
+    "photo_updated_at_utc": ""
+  },
+  {
+    "name": "Jessica Reyes",
+    "role": "Operator",
+    "id_number": "26-00363",
+    "print_count": 1,
+    "created_at_utc": "2026-07-02T00:20:23.879112+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-02T00:20:23.981507+00:00"
+  },
+  {
+    "name": "Mary Grace Araneta",
+    "role": "Operator",
+    "id_number": "26-00832",
+    "print_count": 1,
+    "created_at_utc": "2026-07-02T23:18:45.426964+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-02T23:18:45.503666+00:00"
+  },
+  {
+    "name": "John Paul Orias",
+    "role": "Operator",
+    "id_number": "26-00810",
+    "print_count": 1,
+    "created_at_utc": "2026-07-02T23:19:19.652269+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-02T23:19:19.723607+00:00"
+  },
+  {
+    "name": "Regine Rodrigo",
+    "role": "Operator",
+    "id_number": "26-00634",
+    "print_count": 2,
+    "created_at_utc": "2026-07-06T23:31:19.503897+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-29T12:52:18.943516+00:00"
+  },
+  {
+    "name": "Diecy Estor",
+    "role": "Operator",
+    "id_number": "26-00683",
+    "print_count": 2,
+    "created_at_utc": "2026-07-07T11:19:37.433127+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-20T12:20:40.891124+00:00"
+  },
+  {
+    "name": "jeremiah ayque",
+    "role": "Supervisor",
+    "id_number": "80058",
+    "print_count": 4,
+    "created_at_utc": "2026-07-08T08:37:44.539741+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-11T12:31:08.854495+00:00"
+  },
+  {
+    "name": "LALAINE MABAL",
+    "role": "Operator",
+    "id_number": "26-00710",
+    "print_count": 1,
+    "created_at_utc": "2026-07-09T11:25:19.206123+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-09T11:25:19.456884+00:00"
+  },
+  {
+    "name": "TEST OPERATOR",
+    "role": "Operator",
+    "id_number": "26-00125",
+    "print_count": 1,
+    "created_at_utc": "2026-07-11T08:14:02.962716+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-11T08:14:03.055279+00:00"
+  },
+  {
+    "name": "Beverlie Saavedra",
+    "role": "Operator",
+    "id_number": "26-00664",
+    "print_count": 1,
+    "created_at_utc": "2026-07-13T01:43:55.171766+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-13T01:43:55.392682+00:00"
+  },
+  {
+    "name": "VEENA",
+    "role": "Operator",
+    "id_number": "26-00815",
+    "print_count": 1,
+    "created_at_utc": "2026-07-14T23:38:00.431660+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-14T23:38:00.514053+00:00"
+  },
+  {
+    "name": "Ronald Gaufo",
+    "role": "Operator",
+    "id_number": "26-00827",
+    "print_count": 1,
+    "created_at_utc": "2026-07-17T23:22:53.375476+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-17T23:22:55.973305+00:00"
+  },
+  {
+    "name": "Jonna Mae",
+    "role": "Operator",
+    "id_number": "26-00318",
+    "print_count": 1,
+    "created_at_utc": "2026-07-21T14:00:57.569865+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-21T14:00:57.681796+00:00"
+  },
+  {
+    "name": "DARRELL BANEZ",
+    "role": "Operator",
+    "id_number": "26-00665",
+    "print_count": 0,
+    "created_at_utc": "2026-07-27T05:53:13.529769+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": ""
+  },
+  {
+    "name": "MAR V. CELIS",
+    "role": "Maintenance",
+    "id_number": "26-00492",
+    "print_count": 2,
+    "created_at_utc": "2026-07-29T02:37:28.669455+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-30T12:41:48.899398+00:00"
+  },
+  {
+    "name": "Mar Celis Jr",
+    "role": "Maintenance",
+    "id_number": "26-000492",
+    "print_count": 2,
+    "created_at_utc": "2026-07-29T02:49:50.325232+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-11T11:08:45.936440+00:00"
+  },
+  {
+    "name": "Reymond D. Morillo",
+    "role": "Operator",
+    "id_number": "26-00838",
+    "print_count": 1,
+    "created_at_utc": "2026-07-29T12:50:53.837915+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-29T12:50:53.926713+00:00"
+  },
+  {
+    "name": "Edelyn B. Antiola",
+    "role": "Operator",
+    "id_number": "26-00484",
+    "print_count": 1,
+    "created_at_utc": "2026-07-29T12:51:20.074952+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-29T12:51:20.196412+00:00"
+  },
+  {
+    "name": "ALEX JR. CATALINO",
+    "role": "Maintenance",
+    "id_number": "002",
+    "print_count": 4,
+    "created_at_utc": "2026-07-30T05:36:56.098301+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-05T15:40:39.864857+00:00"
+  },
+  {
+    "name": "Diana Valenzuela",
+    "role": "Operator",
+    "id_number": "26-00829",
+    "print_count": 1,
+    "created_at_utc": "2026-07-30T11:25:54.200632+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-30T11:25:54.304064+00:00"
+  },
+  {
+    "name": "RICA JANE BE",
+    "role": "Operator",
+    "id_number": "26-000827",
+    "print_count": 1,
+    "created_at_utc": "2026-07-31T05:46:46.821032+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-07-31T05:46:48.796510+00:00"
+  },
+  {
+    "name": "Romeo",
+    "role": "Maintenance",
+    "id_number": "10149",
+    "print_count": 8,
+    "created_at_utc": "2026-08-01T11:27:13.230918+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-28T09:11:55.021733+00:00"
+  },
+  {
+    "name": "Fernando",
+    "role": "Maintenance",
+    "id_number": "25-00147",
+    "print_count": 7,
+    "created_at_utc": "2026-08-01T11:35:56.478652+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-23T15:56:22.128673+00:00"
+  },
+  {
+    "name": "Test Maintenance",
+    "role": "Maintenance",
+    "id_number": "12345",
+    "print_count": 1,
+    "created_at_utc": "2026-08-03T00:14:40.035441+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-03T00:14:40.915314+00:00"
+  },
+  {
+    "name": "Jeremy Naño",
+    "role": "Operator",
+    "id_number": "26-00837",
+    "print_count": 2,
+    "created_at_utc": "2026-08-04T05:04:22.826251+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-04T05:05:33.759525+00:00"
+  },
+  {
+    "name": "Reymond Yarcia",
+    "role": "Maintenance",
+    "id_number": "40129",
+    "print_count": 6,
+    "created_at_utc": "2026-08-04T05:19:31.435915+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-19T02:15:32.037938+00:00"
+  },
+  {
+    "name": "Apipah Macapande",
+    "role": "Operator",
+    "id_number": "26-0828",
+    "print_count": 2,
+    "created_at_utc": "2026-08-04T11:19:06.343193+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-07T23:11:51.899197+00:00"
+  },
+  {
+    "name": "fatima",
+    "role": "Operator",
+    "id_number": "26-00833",
+    "print_count": 2,
+    "created_at_utc": "2026-08-06T00:35:53.289052+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-18T22:54:24.274174+00:00"
+  },
+  {
+    "name": "John Carlo",
+    "role": "Operator",
+    "id_number": "26-00976",
+    "print_count": 0,
+    "created_at_utc": "2026-08-06T01:19:56.906175+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": ""
+  },
+  {
+    "name": "Aidrouel Tanghal",
+    "role": "Operator",
+    "id_number": "26-00975",
+    "print_count": 1,
+    "created_at_utc": "2026-08-06T01:20:25.905463+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-07T09:31:54.649755+00:00"
+  },
+  {
+    "name": "Jiecel Sajib",
+    "role": "Operator",
+    "id_number": "26-00826",
+    "print_count": 1,
+    "created_at_utc": "2026-08-06T11:31:20.524726+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-06T11:31:20.682146+00:00"
+  },
+  {
+    "name": "Eligio Ric",
+    "role": "Operator",
+    "id_number": "26-00483",
+    "print_count": 1,
+    "created_at_utc": "2026-08-06T11:37:50.245186+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-06T11:37:50.389702+00:00"
+  },
+  {
+    "name": "Jomar Fidelino",
+    "role": "Operator",
+    "id_number": "26-00019",
+    "print_count": 1,
+    "created_at_utc": "2026-08-06T12:43:04.391212+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-06T12:43:04.547582+00:00"
+  },
+  {
+    "name": "Bryan James Godao",
+    "role": "Operator",
+    "id_number": "26-00602",
+    "print_count": 0,
+    "created_at_utc": "2026-08-06T23:08:17.940438+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": ""
+  },
+  {
+    "name": "Emma Yap",
+    "role": "Operator",
+    "id_number": "26-00819",
+    "print_count": 0,
+    "created_at_utc": "2026-08-06T23:09:16.303660+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": ""
+  },
+  {
+    "name": "MARIBELLE FERNANDEZ",
+    "role": "Operator",
+    "id_number": "26-00820",
+    "print_count": 2,
+    "created_at_utc": "2026-08-10T00:20:33.307625+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-18T11:41:32.449864+00:00"
+  },
+  {
+    "name": "Alexcid Bisnan",
+    "role": "Operator",
+    "id_number": "26-00836",
+    "print_count": 1,
+    "created_at_utc": "2026-08-11T11:39:29.808497+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-11T11:39:29.946684+00:00"
+  },
+  {
+    "name": "JOHN PAUL REGADILLO",
+    "role": "Operator",
+    "id_number": "26-00876",
+    "print_count": 1,
+    "created_at_utc": "2026-08-11T23:04:01.731286+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-11T23:04:01.847736+00:00"
+  },
+  {
+    "name": "Shalyn Joy Bello",
+    "role": "Operator",
+    "id_number": "26-00817",
+    "print_count": 0,
+    "created_at_utc": "2026-08-13T00:25:11.451786+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": ""
+  },
+  {
+    "name": "BENJIE GREGORIO",
+    "role": "Maintenance",
+    "id_number": "80038",
+    "print_count": 3,
+    "created_at_utc": "2026-08-13T06:14:13.503738+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-19T02:16:48.550457+00:00"
+  },
+  {
+    "name": "Hannah",
+    "role": "Operator",
+    "id_number": "26-00001",
+    "print_count": 1,
+    "created_at_utc": "2026-08-14T01:05:26.892619+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-14T01:05:29.308355+00:00"
+  },
+  {
+    "name": "Snoopy Von Peanuts",
+    "role": "Operator",
+    "id_number": "26-10000",
+    "print_count": 1,
+    "created_at_utc": "2026-08-17T09:13:58.995836+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-17T09:13:59.039330+00:00"
+  },
+  {
+    "name": "REYNALD SULAT",
+    "role": "Maintenance",
+    "id_number": "23-00727",
+    "print_count": 2,
+    "created_at_utc": "2026-08-17T12:50:20.853791+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-21T13:14:19.906904+00:00"
+  },
+  {
+    "name": "RONNEL GALANG",
+    "role": "Maintenance",
+    "id_number": "080033",
+    "print_count": 4,
+    "created_at_utc": "2026-08-18T14:42:54.895881+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-29T05:22:56.353489+00:00"
+  },
+  {
+    "name": "Loriely Azuela",
+    "role": "Operator",
+    "id_number": "26-00630",
+    "print_count": 1,
+    "created_at_utc": "2026-08-19T11:35:57.202199+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-08-19T11:35:57.303704+00:00"
+  },
+  {
+    "name": "Armel Navera",
+    "role": "Supervisor",
+    "id_number": "10154",
+    "print_count": 1,
+    "created_at_utc": "2026-09-01T00:16:02.524991+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-01T00:16:02.623016+00:00"
+  },
+  {
+    "name": "Annie",
+    "role": "Operator",
+    "id_number": "26-01042",
+    "print_count": 1,
+    "created_at_utc": "2026-09-03T04:39:45.655407+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-03T04:39:45.805941+00:00"
+  },
+  {
+    "name": "Rose Marie",
+    "role": "Operator",
+    "id_number": "26-01044",
+    "print_count": 1,
+    "created_at_utc": "2026-09-03T04:40:03.456316+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-03T04:40:03.550608+00:00"
+  },
+  {
+    "name": "Azizah",
+    "role": "Operator",
+    "id_number": "26-01043",
+    "print_count": 1,
+    "created_at_utc": "2026-09-03T04:40:19.916193+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-03T04:40:20.007553+00:00"
+  },
+  {
+    "name": "Jay Ar Delarie",
+    "role": "Operator",
+    "id_number": "26-00604",
+    "print_count": 1,
+    "created_at_utc": "2026-09-03T23:35:22.398267+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-03T23:35:22.499222+00:00"
+  },
+  {
+    "name": "Norlie Caballero",
+    "role": "Operator",
+    "id_number": "26-01016",
+    "print_count": 0,
+    "created_at_utc": "2026-09-07T01:38:03.148126+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": ""
+  },
+  {
+    "name": "Norlie Caballero",
+    "role": "Operator",
+    "id_number": "26-001016",
+    "print_count": 1,
+    "created_at_utc": "2026-09-07T01:38:16.088967+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-07T01:38:16.454189+00:00"
+  },
+  {
+    "name": "Nikka Lynne Logatoc",
+    "role": "Operator",
+    "id_number": "26-00666",
+    "print_count": 2,
+    "created_at_utc": "2026-09-07T11:41:05.860076+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-09T12:36:09.454803+00:00"
+  },
+  {
+    "name": "Charles John Tatoy",
+    "role": "Maintenance",
+    "id_number": "60024",
+    "print_count": 1,
+    "created_at_utc": "2026-09-08T09:58:27.123560+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-08T09:58:27.218708+00:00"
+  },
+  {
+    "name": "JOLINA LEGAZPI",
+    "role": "Operator",
+    "id_number": "26-00446",
+    "print_count": 1,
+    "created_at_utc": "2026-09-10T23:22:50.476626+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-10T23:22:50.584137+00:00"
+  },
+  {
+    "name": "MICHAEL L. MERJA",
+    "role": "Operator",
+    "id_number": "26-01223",
+    "print_count": 1,
+    "created_at_utc": "2026-09-15T14:45:26.148806+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-15T14:45:26.247642+00:00"
+  },
+  {
+    "name": "Rogielyn",
+    "role": "Operator",
+    "id_number": "26-00601",
+    "print_count": 1,
+    "created_at_utc": "2026-09-16T05:29:31.154014+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-16T05:29:31.350040+00:00"
+  },
+  {
+    "name": "Wilfredo Cortez II",
+    "role": "Operator",
+    "id_number": "26-01226",
+    "print_count": 1,
+    "created_at_utc": "2026-09-17T23:42:47.792163+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-17T23:42:47.904060+00:00"
+  },
+  {
+    "name": "GERALD BAYABAN",
+    "role": "Operator",
+    "id_number": "26-01227",
+    "print_count": 1,
+    "created_at_utc": "2026-09-18T12:39:44.864948+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-18T12:39:45.045021+00:00"
+  },
+  {
+    "name": "ABEGAIL PAGAY",
+    "role": "Operator",
+    "id_number": "26-00978",
+    "print_count": 1,
+    "created_at_utc": "2026-09-18T12:40:22.499996+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-18T12:40:22.656690+00:00"
+  },
+  {
+    "name": "Rodmark",
+    "role": "Operator",
+    "id_number": "2601220",
+    "print_count": 1,
+    "created_at_utc": "2026-09-18T23:20:43.352628+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-18T23:20:43.446852+00:00"
+  },
+  {
+    "name": "Aidrouel Tanghal",
+    "role": "Operator",
+    "id_number": "26-00982",
+    "department": "Production",
+    "print_count": 1,
+    "created_at_utc": "2026-09-22T11:21:22.283841+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-22T11:21:22.394091+00:00",
+    "breaktime_profile_synced_at_utc": "2026-10-13T01:16:35.634267+00:00"
+  },
+  {
+    "name": "Jean Chicogo",
+    "role": "Operator",
+    "id_number": "26-01232",
+    "print_count": 1,
+    "created_at_utc": "2026-09-22T12:06:32.362971+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-22T12:06:32.472883+00:00"
+  },
+  {
+    "name": "Usop Linog",
+    "role": "Operator",
+    "id_number": "26-01234",
+    "print_count": 1,
+    "created_at_utc": "2026-09-22T12:07:01.939093+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-22T12:07:02.051894+00:00"
+  },
+  {
+    "name": "PAUL BILARO",
+    "role": "Supervisor",
+    "id_number": "80024",
+    "print_count": 1,
+    "created_at_utc": "2026-09-23T23:17:15.875264+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-23T23:17:16.009053+00:00"
+  },
+  {
+    "name": "Tristan Paul Bilaro",
+    "role": "Maintenance",
+    "id_number": "080024",
+    "print_count": 2,
+    "created_at_utc": "2026-09-23T23:59:00.703188+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-03T12:03:43.867711+00:00"
+  },
+  {
+    "name": "Jordan Ramirez",
+    "role": "Operator",
+    "id_number": "26-01222",
+    "print_count": 1,
+    "created_at_utc": "2026-09-24T01:43:22.424678+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-24T01:43:22.516632+00:00"
+  },
+  {
+    "name": "Jobert Bigcas",
+    "role": "Maintenance",
+    "id_number": "60027",
+    "print_count": 1,
+    "created_at_utc": "2026-09-24T03:57:38.571139+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-24T03:57:38.674389+00:00"
+  },
+  {
+    "name": "Mark John Panilaga",
+    "role": "Maintenance",
+    "id_number": "60028",
+    "print_count": 1,
+    "created_at_utc": "2026-09-24T03:57:59.845602+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-09-24T03:57:59.972553+00:00"
+  },
+  {
+    "name": "Alexcid",
+    "role": "Supervisor",
+    "id_number": "26-0836",
+    "print_count": 1,
+    "created_at_utc": "2026-10-03T01:47:37.426238+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-03T01:47:37.606985+00:00"
+  },
+  {
+    "name": "Eric Tinguban",
+    "role": "Operator",
+    "id_number": "26-01224",
+    "print_count": 1,
+    "created_at_utc": "2026-10-03T03:37:37.831958+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-03T03:37:38.166749+00:00"
+  },
+  {
+    "name": "Jovan Bianson",
+    "role": "Supervisor",
+    "id_number": "23-0816",
+    "print_count": 1,
+    "created_at_utc": "2026-10-03T15:32:40.538812+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-03T15:32:40.631501+00:00"
+  },
+  {
+    "name": "Catherine Mahusay",
+    "role": "Operator",
+    "id_number": "26-01241",
+    "print_count": 1,
+    "created_at_utc": "2026-10-05T00:28:07.959093+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-05T00:28:08.078194+00:00"
+  },
+  {
+    "name": "Joan Lucena",
+    "role": "Operator",
+    "id_number": "26583",
+    "print_count": 2,
+    "created_at_utc": "2026-10-05T13:49:17.193049+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-09T11:44:32.111460+00:00",
+    "photo_updated_at_utc": ""
+  },
+  {
+    "name": "Daniel Penero",
+    "role": "Operator",
+    "id_number": "26-00831",
+    "print_count": 1,
+    "created_at_utc": "2026-10-06T07:27:19.975879+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-06T07:27:20.123644+00:00"
+  },
+  {
+    "name": "MARY JANE MILANTE",
+    "role": "Operator",
+    "id_number": "26-01239",
+    "print_count": 1,
+    "created_at_utc": "2026-10-06T13:30:38.256752+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-06T13:30:38.372524+00:00"
+  },
+  {
+    "name": "JEA DE JESUS",
+    "role": "Operator",
+    "id_number": "26-01243",
+    "print_count": 1,
+    "created_at_utc": "2026-10-06T13:31:15.265343+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-06T13:31:15.458173+00:00"
+  },
+  {
+    "name": "LAYNOR TOMAROMPONG",
+    "role": "Operator",
+    "id_number": "26-01245",
+    "print_count": 1,
+    "created_at_utc": "2026-10-07T00:11:16.210564+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-07T00:11:17.255293+00:00"
+  },
+  {
+    "name": "ALJHON PAZ",
+    "role": "Operator",
+    "id_number": "26-01246",
+    "print_count": 1,
+    "created_at_utc": "2026-10-07T01:22:28.322062+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-07T01:22:28.473360+00:00"
+  },
+  {
+    "name": "KARIZZ SANCHEZ",
+    "role": "Operator",
+    "id_number": "26-01242",
+    "print_count": 1,
+    "created_at_utc": "2026-10-07T01:23:00.838805+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-07T01:23:00.934553+00:00"
+  },
+  {
+    "name": "RAYMUND ABRASADO",
+    "role": "Operator",
+    "id_number": "26-01244",
+    "print_count": 1,
+    "created_at_utc": "2026-10-07T15:11:32.995818+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-07T15:11:33.144004+00:00"
+  },
+  {
+    "name": "Joan Dalisay",
+    "role": "Operator",
+    "id_number": "26-01249",
+    "print_count": 1,
+    "created_at_utc": "2026-10-08T02:55:33.447908+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-08T02:55:33.570238+00:00"
+  },
+  {
+    "name": "Joey Rose Sipe",
+    "role": "Operator",
+    "id_number": "26-01247",
+    "print_count": 1,
+    "created_at_utc": "2026-10-08T11:19:37.470613+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-08T11:19:37.581712+00:00"
+  },
+  {
+    "name": "Jhasien Villareal",
+    "role": "Operator",
+    "id_number": "26-01240",
+    "print_count": 1,
+    "created_at_utc": "2026-10-09T11:29:34.749987+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-09T11:29:34.853433+00:00"
+  },
+  {
+    "name": "Agnes F02",
+    "role": "Operator",
+    "id_number": "26538",
+    "print_count": 1,
+    "created_at_utc": "2026-10-09T11:30:07.528743+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-09T11:30:07.650147+00:00"
+  },
+  {
+    "name": "Cristina Narca",
+    "role": "Operator",
+    "id_number": "26-1253",
+    "print_count": 1,
+    "created_at_utc": "2026-10-09T23:23:22.022002+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-09T23:23:22.140698+00:00"
+  },
+  {
+    "name": "Lalaine Tan",
+    "role": "Operator",
+    "id_number": "26-01250",
+    "print_count": 1,
+    "created_at_utc": "2026-10-10T12:23:16.597255+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-10T12:23:16.702456+00:00"
+  },
+  {
+    "name": "Nelvic Erebi",
+    "role": "Operator",
+    "id_number": "26-01252",
+    "print_count": 1,
+    "created_at_utc": "2026-10-10T12:23:52.636400+00:00",
+    "photo_data_url": "",
+    "last_printed_at_utc": "2026-10-10T12:23:52.760673+00:00"
+  }
+]

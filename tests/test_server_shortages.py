@@ -246,7 +246,7 @@ class DashboardPartShortageTests(unittest.TestCase):
         self.assertEqual(result["count"], 1)
         self.assertEqual(result["details"][0]["shortage_qty"], 6)
 
-    def test_carryover_does_not_hide_current_shift_short_or_missing(self) -> None:
+    def test_carryover_balance_covers_current_shift_consumption(self) -> None:
         row = self._machine_308_row()
         row["production_session_id"] = "TEST-M309-CARRYOVER"
         row["raw_material_logs"] = [
@@ -264,9 +264,7 @@ class DashboardPartShortageTests(unittest.TestCase):
 
         result = dashboard_server._dashboard_product_part_shortages(row, include_prior_partials=False)
 
-        self.assertEqual(result["count"], 2)
-        self.assertAlmostEqual(result["details"][0]["shortage_qty"], 9.365)
-        self.assertAlmostEqual(result["details"][1]["shortage_qty"], 184.552)
+        self.assertEqual(result, {"count": 0, "names": [], "details": []})
 
     def test_replacement_with_enough_scanned_weight_is_not_short(self) -> None:
         row = self._machine_308_row()

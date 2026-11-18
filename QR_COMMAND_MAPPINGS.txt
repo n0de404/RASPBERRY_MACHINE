@@ -1,0 +1,348 @@
+RASPBERRY MACHINE - COMPLETE QR COMMAND MAPPINGS
+Client display version: v1.03.00
+Updated: 2026-11-07
+
+NOTES
+-----
+- Text commands are case-insensitive unless a section says otherwise.
+- Aliases on the same line perform the same action.
+- Some controls only work while their related screen or workflow is active.
+- Operator, Supervisor, QC, and Maintenance badge values are dynamic IDs synced
+  from server user profiles. The QR payload printed for a profile is the ID number.
+
+
+1. MAIN WORKFLOW COMMANDS
+-------------------------
+
+TEST MACHINE
+  testmachine~1
+  Result: Opens the isolated TEST MACHINE identity (TEST-MACHINE).
+
+FINISH JOB
+  finishjob
+  Result: Starts the finish-current-job review. Scanning it again while the
+  review is pending cancels that pending finish.
+
+FINISH OPERATOR SHIFT / HANDOFF
+  operatorshift
+  Result: Starts shift-end review and operator handoff. Scanning it again during
+  the pending review cancels the pending shift finish.
+
+CHANGE ACTIVE OPERATOR OR HELPER
+  changeoperator
+  Result: Opens the change-operator/helper selection. Scan the command again to
+  cancel. Select the crew position with a numeric QR, then scan the new operator.
+
+REFRESH RUNNING JOB DETAILS FROM SERVER
+  refreshjob
+  Result: Reloads configuration for all currently running jobs.
+
+CHANGE WORK ORDER
+  changeworkorder
+  Result: Starts the controlled work-order change workflow.
+
+CHANGE COLOR / CHANGE MOLD
+  changecolormold
+  changecolormold~1
+  Result: Opens one combined workflow. Scan num_1 for CHANGE COLOR or num_2
+  for CHANGE MOLD, then scan the target JOB QR. A valid Supervisor badge must
+  approve the preview. Scanning changecolormold again cancels the workflow.
+
+  CHANGE COLOR validation:
+  - Same product and same mold.
+  - Color must be different.
+
+  CHANGE MOLD validation:
+  - Mold must be different, or the product must be different when mold data is
+    unavailable.
+  - Same product with only a different color is rejected.
+
+  Valid changes park the current job without finishing it. Scanning a previously
+  parked job resumes its original session and totals. Finish Job closes the
+  current job and all parked color/mold jobs, but previews only the current job.
+
+
+2. JOB LINKAGE AND PREPACK COMMANDS
+-----------------------------------
+
+ADD/LINK JOB/UNLINK JOB
+  joblinkage
+  Result: Scan a JOB next. A job not yet linked is added; an existing linked
+  job is removed.
+
+
+3. PACK, BUTAL, VOID, AND REJECT COMMANDS
+-----------------------------------------
+
+SHOW VIRTUAL/AUTOMATIC PACK QR
+  virtualpackqr
+  Result: Enables the floating virtual PACK QR for the active job.
+
+PRINT OR REPRINT PACK/PRODUCT-PART QR
+  printqr
+  Result: Opens the QR print/reprint workflow. Scan the same command again to
+  cancel. In the workflow, num_1 selects JOB/PACK, num_2 selects PRODUCT PART,
+  and confirm approves a pending print.
+
+SIMPLE BUTAL
+  butal
+  Result: Records a Butal quantity of 1 unless another active workflow consumes it.
+
+VOID MODE
+  void
+  Result: Starts the applicable PACK, BUTAL, or REJECT void workflow.
+
+REJECT MODE
+  reject
+  Result: Starts reject entry; scan a reject reason QR next.
+
+REJECT SUMMARY
+  rejectsummary
+  Result: Opens or displays the reject summary.
+
+START-UP REJECT
+  startupreject
+  Result: Records one Start Up Reject.
+
+REJECT MODE NUMERIC REASONS
+  num_0  = NO REJECT VALUE (error; Reject mode remains open)
+  num_1  = BM = BURN MARK
+  num_2  = CS = COLOR STREAK
+  num_3  = CO = CONTAMINATION
+  num_4  = CR = CRACK/BRITTLE
+  num_5  = DI = DISCOLORATION
+  num_6  = EM = EJECTOR MARK
+  num_7  = FL = FLASHES
+  num_8  = FM = FLOW MARK / WRINKLE
+  num_9  = NO = NO SHOT
+  num_10 = OC = OVER-CUT
+  num_11 = SC = SCRATCH
+  num_12 = SS = SHORT SHOT
+  num_13 = SI = SILICONE MARK
+  num_14 = SK = SILVER STREAK
+  num_15 = SM = SINK MARK
+  num_16 = ST = STUCK
+  num_17 = VO = VOID
+  num_18 = WA = WARP
+  num_19 = WM = WATER MARK
+  num_20 = WL = WELD LINE
+  num_21 = SUR = START UP REJECT
+  num_22 = NO REJECT VALUE (error; Reject mode remains open)
+
+  The printed uppercase reject codes BM, CS, CO, CR, DI, EM, FL, FM, NO, OC,
+  SC, SS, SI, SK, SM, ST, VO, WA, WM, WL and SUR also remain accepted.
+
+MULTIPLIER
+  While normal production is ready, scan num_0..num_9 one digit at a time to
+  build a multiplier, then scan Reject, Start-up Reject, BUTAL, or VOID.
+  The multiplier applies to all reject reasons and to matching reject/BUTAL
+  records in Void mode. Scan backspace to edit or cancel to clear it.
+
+4. PRODUCTION DAILY REPORT / DOWNTIME COMMANDS
+-----------------------------------------------
+
+START PDR / DOWNTIME FLOW
+  pdrstart
+  Result: Starts the Production Daily Report / downtime workflow. Scan pdrstart
+  again while waiting for the first Maintenance/Line Technician scan to cancel.
+  Once actual downtime starts, pdrstart cannot discard that interval.
+
+PDR NUMERIC REASONS
+  num_0  = NO PDR VALUE (error; PDR selection remains open)
+  num_1  = Machine Issue/Breakdown/Repair
+  num_2  = Machine Adjustment - Parameters
+  num_3  = Material Issue/Delay/Drying
+  num_4  = Mold Issue/Repair/Cleaning
+  num_5  = No Manpower/Operator
+  num_6  = Material Color Change
+  num_7  = Mold Change
+  num_8  = Preventive Maintenance
+  num_9  = No production schedule
+  num_10 = Start-up/Shutdown (1st&Last Day)
+  num_11 = Shift Meeting/Shift Turn-over
+  num_12 = Mold / Color Testing
+  num_13 = Power interruption
+  num_14 = Robot Set-up/Adjustment
+  num_15 = Others
+  num_16 through num_22 = NO PDR VALUE (error; PDR selection remains open)
+
+
+5. SUPERVISOR AND MACHINE COUNTER COMMANDS
+-------------------------------------------
+
+OPEN SUPERVISOR REVIEW
+  svisorreview
+  Result: Opens cycle-time Supervisor Review. The flow then expects cycle-time
+  input/confirm and a registered Supervisor badge.
+
+MACHINE COUNTER OVERWRITE
+  machinecounteroverwrite
+  Result: Opens machine-counter overwrite. Enter digits, then scan a Supervisor
+  badge to apply the value.
+
+
+6. CREW, HELPER, AND RELIEVER COMMANDS
+--------------------------------------
+
+SHOW CREW LIST
+  crewlist
+  Result: Displays the current primary operator and helper list.
+
+ADD HELPER/MANPOWER / REMOVE
+  crewaddremove
+  Result: Scan an Operator badge next. If the operator is already a helper,
+  they are removed; otherwise they are added. Scan crewaddremove again to cancel.
+
+ADD OR CHANGE RELIEVER
+  relieverqr
+  Result: Starts reliever scan mode, or changes the reliever during an active
+  break. Scan the same control again to cancel.
+
+
+7. DISPLAY AND REVIEW COMMANDS
+-------------------------------
+
+RAW MATERIAL SUMMARY
+  showrawmats
+  Result: Toggles the raw-material summary panel.
+
+PRODUCTION HISTORY
+  prodhistory
+  Result: Toggles recent PACK, BUTAL, and REJECT history.
+
+PAGE NAVIGATION (only when a paged review/history is open)
+  next     = next page
+  prev     = previous page
+  previous = previous page
+  preview  = previous page
+
+CANCEL ACTIVE OPTIONAL WORKFLOW
+  cancel
+  Result: Cancels a pending PDR start, Void mode, Reject mode, pending BUTAL
+  assignment, or clears the current multiplier. It does not erase a PDR repair
+  interval that has already started.
+
+
+8. NUMPAD AND WORKFLOW CONTROL QRs
+----------------------------------
+
+STATE-DEPENDENT NUMBER QRs
+  num_0 through num_22
+
+  Rules:
+  - Numeric input screens (cycle time, machine counter, quantities and
+    multiplier) accept num_0 through num_9 one digit at a time.
+  - Choice screens accept only the numbers shown on that screen. num_0 is valid
+    when the prompt explicitly offers choice 0.
+  - Change Color / Mold accepts num_1 or num_2 only.
+  - Reject mode uses num_1 through num_21 as listed above.
+  - PDR reason selection uses num_1 through num_15 as listed above.
+  - A number outside the current state's range shows an error and leaves that
+    workflow open so the operator can scan again.
+  - num_0 has no Reject or PDR reason value.
+  - num_22 currently has no Reject or PDR reason value, but remains reserved
+    for a future choice/state mapping.
+
+
+BACKSPACE
+  backspace
+
+CLEAR CURRENT INPUT
+  clear
+  Erases all digits currently typed in the active input field.
+  It does not cancel or leave the active workflow.
+
+CONFIRM
+  confirm
+
+
+9. MACHINE QR MAPPINGS (uppercase exact codes)
+------------------------------------------------
+
+  M00001 = IMM 301
+  M00002 = IMM 302
+  M00003 = IMM 303
+  M00004 = IMM 304
+  M00005 = IMM 305
+  M00006 = IMM 306
+  M00007 = IMM 307
+  M00008 = IMM 308
+  M00009 = IMM 309
+  M00010 = IMM 310
+  M00011 = IMM 311
+  M00012 = IMM 312
+  M00013 = IMM 313
+  M00014 = IMM 314
+  M00015 = IMM 315
+  M00016 = IMM 316
+  M00017 = IMM 317
+  M00018 = IMM 318
+  M00019 = IMM 319
+  M00020 = IMM 320
+  M00021 = IMM 321
+  M00411 = IMM 411
+  M00412 = IMM 412
+  M00413 = IMM 413
+  M00414 = IMM 414
+  M00415 = IMM 415
+  M00416 = IMM 416
+  M00417 = IMM 417
+  M00418 = IMM 418
+  M00421 = IMM 421
+  M00422 = IMM 422
+  M00423 = IMM 423
+  M00424 = IMM 424
+  M00425 = IMM 425
+  M00426 = IMM 426
+  M00441 = IMM 441
+  M00442 = IMM 442
+  M00443 = IMM 443
+  M00444 = IMM 444
+
+MIXING MODE MACHINE QRs
+  MT301 or MT-301 = MT-301
+  MT302 or MT-302 = MT-302
+  MT303 or MT-303 = MT-303
+
+
+10. DYNAMIC BADGE QRs
+----------------------
+
+PROFILE QR PAYLOAD
+  <ID number only>
+  Result: The ID is resolved against the locally cached server profile and daily
+  assignment. Depending on role and active prompt, it can act as Operator,
+  Supervisor, QC, Maintenance, helper, reliever, or review approval.
+
+
+
+11. JOB AND MATERIAL QR FORMATS
+-------------------------------
+
+JOB URL QR
+  .../v1/jobs/<numeric_job_id>
+  Result: JOB with the numeric ID (leading zeroes removed).
+
+STRUCTURED JOB QR
+  O + 9 digits + 24 + 11-digit job/PO + 11 trailing digits
+  Example shape: O00000000024XXXXXXXXXXX00000000000
+  Result: JOB using the 11-digit job/PO segment after 24.
+
+
+
+STRUCTURED V2 RAW MATERIAL / PRODUCT-PART QR
+  Contains: V2, P<11 digits>, QRM<quantity>, I<11 digits>, T<11 digits>,
+  L<14-digit lot>-<PO/job digits>
+  Result: RAW MATERIAL / product-part scan.
+
+STRUCTURED V2 BUTAL QR
+  Contains: V2 and QB followed by an 11-character numeric quantity.
+  Result: BUTAL using the QB quantity.
+
+STRUCTURED V2 PACK QR
+  Contains: V2 and Q followed by an 11-character numeric quantity, and does not
+  contain QB.
+  Result: PACK using the Q quantity.
+
+
+END OF CURRENT QR COMMAND MAPPINGS

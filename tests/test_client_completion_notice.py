@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -36,6 +37,42 @@ class CompletionPackProjectionTests(unittest.TestCase):
         self.assertEqual(result["packs_remaining"], 0)
         self.assertEqual(result["projected_overrun"], 20)
 
+    def test_num_zero_is_input_digit_but_not_pdr_reason(self):
+        dummy = object()
+
+        self.assertEqual(ClientUI._numpad_digit_from_scan(dummy, "num_0"), "0")
+        self.assertIsNone(ClientUI._extract_production_reason_code(dummy, "num_0"))
+
+    def test_clear_is_a_numpad_command(self):
+        dummy = object()
+
+        self.assertEqual(ClientUI._numpad_command_from_scan(dummy, "clear"), "clear")
+
+    def test_clear_erases_butal_input_without_leaving_workflow(self):
+        state = SimpleNamespace(
+            pending_offline_qr_raw="",
+            pending_offline_qr_phase="",
+            waiting_cycle_time_confirm_popup=False,
+            waiting_machine_counter_overwrite_input=False,
+            waiting_initial_machine_counter_input=False,
+            waiting_initial_cycle_time_input=False,
+            waiting_butal_completion_carry_input=True,
+            waiting_cycle_time_input=False,
+            butal_completion_input="125",
+            reject_multiplier_input="",
+        )
+        status_messages = []
+        dummy = SimpleNamespace(state=state, status=SimpleNamespace(setText=status_messages.append))
+        dummy._refresh_ui = lambda: None
+        dummy._save_active_session_snapshot = lambda: None
+
+        cleared = ClientUI._clear_active_typed_input(dummy)
+
+        self.assertTrue(cleared)
+        self.assertEqual(state.butal_completion_input, "")
+        self.assertTrue(state.waiting_butal_completion_carry_input)
+        self.assertIn("same workflow", status_messages[-1])
+
 
 class StartupCompletionFenceTests(unittest.TestCase):
     def test_approved_partial_shift_does_not_close_production_session(self):
@@ -65,6 +102,40 @@ class StartupCompletionFenceTests(unittest.TestCase):
 
         self.assertEqual(result["remaining_qty"], 100)
         self.assertEqual(result["packs_remaining"], 0)
+
+    def test_parked_finish_event_uses_parked_production_session_id(self):
+        captured = {}
+        dummy = SimpleNamespace(
+            state=SimpleNamespace(
+                machine_code="M00014",
+                machine_name="IMM 314",
+                job_code="JOB-CURRENT",
+                job_name="Current Job",
+                job_started_at="2026-11-07T00:00:00+00:00",
+                operator_id="OP-1",
+                production_session_id="PS-CURRENT",
+            )
+        )
+        dummy._current_client_id = lambda: "RPI-TEST"
+        dummy._save_active_session_snapshot = lambda: None
+        dummy._legacy_production_session_id = lambda *args: "PS-LEGACY"
+        dummy._enqueue_server_event = lambda payload, silent=False: captured.update(payload) or True
+
+        accepted = ClientUI.push_event(
+            dummy,
+            {
+                "type": "FINISH_JOB",
+                "finished_job": {
+                    "job_code": "JOB-PARKED",
+                    "production_session_id": "PS-PARKED",
+                },
+            },
+            "FINISH PARKED JOB",
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(captured["production_session_id"], "PS-PARKED")
+        self.assertEqual(captured["event"]["production_session_id"], "PS-PARKED")
 
 
 if __name__ == "__main__":

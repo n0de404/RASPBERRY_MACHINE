@@ -1,0 +1,18 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const source = fs.readFileSync(require('node:path').join(__dirname, '../server/server.py'), 'utf8');
+const start = source.indexOf('  function machineSupervisorIndicator(');
+const end = source.indexOf('  function machineSupervisorActivityRows(', start);
+const machineSupervisorActivityRows = session => session.rows || [];
+eval(source.slice(start, end));
+const now = new Date(2026, 9, 6, 12);
+const job = {job_code:'JOB', job_started_at:new Date(2026, 9, 6, 8).toISOString(), supervisor_rotation_count:1};
+assert.equal(machineSupervisorIndicator(job, new Date(2026, 9, 6, 10)).state, 'rotation-only');
+assert.equal(machineSupervisorIndicator(job, now).state, 'overdue');
+const reviewed = {...job, rows:[{kind:'review', at:new Date(2026, 9, 6, 11, 15).toISOString()}]};
+assert.equal(machineSupervisorIndicator(reviewed, now).state, 'complete');
+assert.equal(machineSupervisorIndicator(reviewed, new Date(2026, 9, 6, 16)).state, 'overdue');
+assert.equal(machineSupervisorIndicator({...job, job_started_at:new Date(2026, 9, 6, 11, 30).toISOString()}, now).state, 'rotation-only');
+assert.equal(machineSupervisorIndicator({}, now).state, 'pending');
+assert.equal(machineSupervisorIndicator({...reviewed, rows:[...reviewed.rows, ...reviewed.rows, ...reviewed.rows]}, now).reviewCount, 3);
+console.log('PASS: supervisor colors, counts, and scheduled review deadlines');

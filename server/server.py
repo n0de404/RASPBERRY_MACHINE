@@ -10,6 +10,7 @@ import math
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import uuid
@@ -19,6 +20,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from copy import deepcopy
 from typing import Dict, Any, List, Optional
 from urllib import request as urllib_request
 from urllib import error as urllib_error
@@ -43,12 +45,23 @@ except Exception:
     pymysql = None
     DictCursor = None
 
+_CLIENT_MODULE_DIR = Path(__file__).resolve().parent.parent / "client"
+if str(_CLIENT_MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(_CLIENT_MODULE_DIR))
+from mappings import (  # noqa: E402
+    DEFAULT_QR_MAPPING_CONFIG,
+    validate_qr_mapping_config,
+)
+
 @asynccontextmanager
 async def _app_lifespan(app: FastAPI):
     global STATE_TICK_TASK
     await asyncio.to_thread(_migrate_active_session_activity_logs)
     if STATE_TICK_TASK is None or STATE_TICK_TASK.done():
         STATE_TICK_TASK = asyncio.create_task(_state_tick_loop())
+    # Warm the default Production Cards summary without delaying server start.
+    # The endpoint can still force a fresh calculation from its Refresh button.
+    asyncio.create_task(asyncio.to_thread(_cached_user_kpis, "all"))
     try:
         yield
     except asyncio.CancelledError:
@@ -1216,6 +1229,15 @@ def _load_history_summaries_sql(table_name: str) -> Optional[List[Dict[str, Any]
     conn = _sql_conn()
     if conn is None:
         return None
+    # These two tables contain very large raw JSON documents.  MySQL still has
+    # to inspect those documents to calculate the compact count columns, so the
+    # normal eight-second request timeout is too short.  Extend it only for
+    # this startup history read, then restore it before returning the pooled
+    # connection.  Regular dashboard/client queries keep their normal timeout.
+    timeout_connection = getattr(conn, "_raw", conn)
+    previous_read_timeout = getattr(timeout_connection, "_read_timeout", None)
+    if isinstance(previous_read_timeout, (int, float)):
+        timeout_connection._read_timeout = max(float(previous_read_timeout), 120.0)
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1259,6 +1281,8 @@ def _load_history_summaries_sql(table_name: str) -> Optional[List[Dict[str, Any]
         print(f"[SQL] Failed to load compact history from {safe_table}: {exc}")
         return None
     finally:
+        if isinstance(previous_read_timeout, (int, float)):
+            timeout_connection._read_timeout = previous_read_timeout
         conn.close()
 
 
@@ -2185,6 +2209,7 @@ DASHBOARD_HEAVY_SESSION_FIELDS = {
     "butal_scan_logs",
     "client_app_logs",
     "mixing_open_jobs",
+    "color_mold_sessions",
 }
 
 
@@ -2270,6 +2295,11 @@ class MachineSession:
     current_supervisor_review: Dict[str, Any] = None
     supervisor_review_logs: List[Dict[str, Any]] = None
     job_payload: Dict[str, Any] = None
+    color_mold_sessions: Dict[str, Dict[str, Any]] = None
+    color_mold_group_id: str = ""
+    change_supervisor_code: str = ""
+    change_supervisor_name: str = ""
+    change_supervisor_owners: List[Dict[str, Any]] = None
     linkage_enabled: bool = False
     linkage_job_code: Optional[str] = None
     linkage_job_name: Optional[str] = None
@@ -2310,6 +2340,8 @@ class MachineSession:
             dict(row) for row in (d["client_app_logs"] or [])[-1000:] if isinstance(row, dict)
         ]
         d["job_payload"] = d["job_payload"] or {}
+        d["color_mold_sessions"] = d["color_mold_sessions"] or {}
+        d["change_supervisor_owners"] = d["change_supervisor_owners"] or []
         d["linkage_job_payload"] = d["linkage_job_payload"] or {}
         d["linkage_jobs"] = d["linkage_jobs"] or []
         d["mixing_open_jobs"] = d["mixing_open_jobs"] or []
@@ -2494,8 +2526,47 @@ def _clear_active_session_job_keep_machine(sess: MachineSession) -> None:
     sess.production_session_id = None
     sess.operator_id = None
     sess.job_payload = {}
+    sess.color_mold_sessions = {}
+    sess.color_mold_group_id = ""
+    sess.change_supervisor_code = ""
+    sess.change_supervisor_name = ""
+    sess.change_supervisor_owners = []
     _reset_active_session_for_new_job_segment(sess, preserve_operator_shift_logs=False)
     sess.last_event = "NO JOB RUNNING"
+
+
+def _is_parked_color_mold_session(sess: MachineSession, production_session_id: Any) -> bool:
+    wanted = str(production_session_id or "").strip()
+    if not wanted:
+        return False
+    return any(
+        str(row.get("production_session_id") or "").strip() == wanted
+        for row in (sess.color_mold_sessions or {}).values()
+        if isinstance(row, dict)
+    )
+
+
+def _color_mold_snapshot_can_switch(
+    sess: MachineSession,
+    snap: Any,
+    incoming_session_id: Any,
+) -> bool:
+    """Prove that a client is swapping within one parked color/mold group."""
+    if not isinstance(snap, dict) or not str(incoming_session_id or "").strip():
+        return False
+    incoming_group = str(snap.get("color_mold_group_id") or "").strip()
+    current_group = str(sess.color_mold_group_id or "").strip()
+    current_session_id = str(sess.production_session_id or "").strip()
+    if not incoming_group or not current_group or incoming_group != current_group or not current_session_id:
+        return False
+    parked = snap.get("color_mold_sessions")
+    if not isinstance(parked, dict):
+        return False
+    return any(
+        str(row.get("production_session_id") or "").strip() == current_session_id
+        for row in parked.values()
+        if isinstance(row, dict)
+    )
 
 
 def _job_payload_identity_keys(payload: Any) -> set[str]:
@@ -2873,6 +2944,18 @@ def _session_from_active_snapshot(raw: Dict[str, Any]) -> Optional[MachineSessio
         current_supervisor_review=dict(raw.get("current_supervisor_review") or {}),
         supervisor_review_logs=list(raw.get("supervisor_review_logs") or []),
         job_payload=dict(raw.get("job_payload") or {}),
+        color_mold_sessions={
+            str(key): dict(value)
+            for key, value in dict(raw.get("color_mold_sessions") or {}).items()
+            if isinstance(value, dict)
+        },
+        color_mold_group_id=str(raw.get("color_mold_group_id") or ""),
+        change_supervisor_code=str(raw.get("change_supervisor_code") or ""),
+        change_supervisor_name=str(raw.get("change_supervisor_name") or ""),
+        change_supervisor_owners=[
+            dict(row) for row in (raw.get("change_supervisor_owners") or [])
+            if isinstance(row, dict)
+        ],
         linkage_enabled=bool(raw.get("linkage_enabled", False)),
         linkage_job_code=raw.get("linkage_job_code"),
         linkage_job_name=raw.get("linkage_job_name"),
@@ -4676,6 +4759,7 @@ def _kpi_presence_status(
     active_rows: List[Dict[str, Any]],
     history_rows: List[Dict[str, Any]],
     _availability: Dict[str, str],
+    include_history: bool = True,
 ) -> Dict[str, Any]:
     """Describe a person's current assignment and most recent role activity."""
     all_rows = [*active_rows, *history_rows]
@@ -4818,30 +4902,41 @@ def _kpi_presence_status(
                 "label": f"Last check on {machine}",
                 "shift_detail": f"Check this shift on {machine}",
             })
-        ordered_candidates = sorted(
-            [candidate for candidate in candidates if _kpi_activity_datetime(candidate.get("at_utc")) is not None],
-            key=lambda candidate: _kpi_activity_datetime(candidate.get("at_utc")) or datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
-        )
-        seen_activity = set()
-        for candidate in ordered_candidates:
-            activity_key = (
-                str(candidate.get("activity_type") or ""),
-                str(candidate.get("machine") or ""),
-                str(candidate.get("at_utc") or ""),
+        valid_candidates = [
+            candidate for candidate in candidates
+            if _kpi_activity_datetime(candidate.get("at_utc")) is not None
+        ]
+        if include_history:
+            ordered_candidates = sorted(
+                valid_candidates,
+                key=lambda candidate: _kpi_activity_datetime(candidate.get("at_utc")) or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
             )
-            if activity_key in seen_activity:
-                continue
-            seen_activity.add(activity_key)
-            result["supervisor_activity_history"].append({
-                "type": activity_key[0],
-                "machine": activity_key[1],
-                "machine_code": str((candidate.get("row") or {}).get("machine_code") or "").strip(),
-                "at_utc": activity_key[2],
-            })
-            if len(result["supervisor_activity_history"]) >= 1000:
-                break
-        latest = ordered_candidates[0] if ordered_candidates else {}
+            seen_activity = set()
+            for candidate in ordered_candidates:
+                activity_key = (
+                    str(candidate.get("activity_type") or ""),
+                    str(candidate.get("machine") or ""),
+                    str(candidate.get("at_utc") or ""),
+                )
+                if activity_key in seen_activity:
+                    continue
+                seen_activity.add(activity_key)
+                result["supervisor_activity_history"].append({
+                    "type": activity_key[0],
+                    "machine": activity_key[1],
+                    "machine_code": str((candidate.get("row") or {}).get("machine_code") or "").strip(),
+                    "at_utc": activity_key[2],
+                })
+                if len(result["supervisor_activity_history"]) >= 1000:
+                    break
+            latest = ordered_candidates[0] if ordered_candidates else {}
+        else:
+            latest = max(
+                valid_candidates,
+                key=lambda candidate: _kpi_activity_datetime(candidate.get("at_utc")) or datetime.min.replace(tzinfo=timezone.utc),
+                default={},
+            )
         if latest:
             row = latest["row"]
             activity_at = _kpi_activity_datetime(latest["at_utc"])
@@ -4915,7 +5010,12 @@ def _kpi_presence_status(
     return result
 
 
-def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
+def build_user_kpis(
+    role_filter: str = "all",
+    *,
+    profile_id: str = "",
+    include_details: bool = True,
+) -> Dict[str, Any]:
     """Build supportive per-user performance snapshots from server records.
 
     These metrics only count items visible in active/finished/archive data.  They
@@ -4924,6 +5024,7 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
     of follow-ups cannot define an employee's overall card.
     """
     role_filter_key = str(role_filter or "all").strip().casefold()
+    profile_id_key = str(profile_id or "").strip().casefold()
     history_rows = [r for r in [*FINISHED_JOBS, *ARCHIVED_JOBS] if isinstance(r, dict)]
     active_rows = [s.to_dict() for s in SESSIONS.values()]
     profiles = [p for p in PROFILES if isinstance(p, dict)]
@@ -4933,9 +5034,14 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
         profiles = [p for p in profiles if _profile_has_role(p, "supervisor")]
     elif role_filter_key not in ("", "all"):
         profiles = [p for p in profiles if _profile_has_role(p, role_filter_key)]
+    if profile_id_key:
+        profiles = [
+            profile for profile in profiles
+            if str(_profile_identity(profile).get("id_number") or "").strip().casefold() == profile_id_key
+        ]
 
     unassigned_supervisor_issues: List[Dict[str, Any]] = []
-    if role_filter_key not in ("operator", "operators"):
+    if not profile_id_key and role_filter_key not in ("operator", "operators"):
         for row in history_rows:
             review_status = str(row.get("review_status") or "").strip().upper()
             has_rejects = int(row.get("reject_total", 0) or 0) + int(row.get("startup_reject_total", 0) or 0) + int(row.get("no_shot_total", 0) or 0) > 0
@@ -5064,7 +5170,15 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
         }
         availability = _breaktime_profile_status(profile)
         out.update(availability)
-        out.update(_kpi_presence_status(profile, active_rows, history_rows, availability))
+        out.update(
+            _kpi_presence_status(
+                profile,
+                active_rows,
+                history_rows,
+                availability,
+                include_history=include_details,
+            )
+        )
 
         if is_operator:
             for row in user_rows:
@@ -5346,13 +5460,15 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
 
         tracked_history_rows = _unique_kpi_rows(tracked_history_rows)
         tracked_active_rows = _unique_kpi_rows(tracked_active_rows)
-        job_rows = [_kpi_job_summary(row, _issues_for_job(row), active=False) for row in tracked_history_rows]
-        active_job_rows = [_kpi_job_summary(row, _issues_for_job(row), active=True) for row in tracked_active_rows]
-        out["handled_jobs"] = [*active_job_rows, *job_rows][:80]
+        if include_details:
+            job_rows = [_kpi_job_summary(row, _issues_for_job(row), active=False) for row in tracked_history_rows]
+            active_job_rows = [_kpi_job_summary(row, _issues_for_job(row), active=True) for row in tracked_active_rows]
+            out["handled_jobs"] = [*active_job_rows, *job_rows][:80]
         out["activity_records"] = len(tracked_history_rows) + len(tracked_active_rows)
         out["rating_activity_records"] = int(rating_activity_records or 0)
         out["rating_basis"] = rating_basis
-        out["rating_components"] = rating_components
+        if include_details:
+            out["rating_components"] = rating_components
         activity_records = int(out["activity_records"] or 0)
         denominator = max(1, int(rating_activity_records or activity_records or 0))
         follow_up_rate = round(min(100.0, (out["missed_total"] / denominator) * 100.0), 2)
@@ -5372,7 +5488,11 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
         )
         out["kpi_rating_percent"] = rating
         out["rating_band"] = _kpi_rating_band(rating)
-        out["issues"] = out["issues"][:50]
+        if include_details:
+            out["issues"] = out["issues"][:50]
+        else:
+            out.pop("issues", None)
+            out.pop("supervisor_activity_history", None)
         items.append(out)
 
     items.sort(key=lambda x: (str(x.get("name") or "").casefold(), str(x.get("id_number") or "").casefold()))
@@ -5392,6 +5512,79 @@ def build_user_kpis(role_filter: str = "all") -> Dict[str, Any]:
     }
 
 
+USER_KPI_CACHE_TTL_SECONDS = 30.0
+USER_KPI_CACHE_LOCK = threading.RLock()
+USER_KPI_CACHE: Dict[str, Dict[str, Any]] = {}
+USER_KPI_CACHE_REFRESHING: set[str] = set()
+
+
+def _refresh_user_kpi_cache(
+    cache_key: str,
+    role_key: str,
+    profile_key: str,
+    include_details: bool,
+) -> None:
+    """Refresh an expired snapshot without making the dashboard wait for it."""
+    try:
+        payload = build_user_kpis(
+            role_filter=role_key,
+            profile_id=profile_key,
+            include_details=include_details,
+        )
+        with USER_KPI_CACHE_LOCK:
+            USER_KPI_CACHE[cache_key] = {
+                "stored_at": time.monotonic(),
+                "payload": payload,
+            }
+    finally:
+        with USER_KPI_CACHE_LOCK:
+            USER_KPI_CACHE_REFRESHING.discard(cache_key)
+
+
+def _cached_user_kpis(
+    role_filter: str = "all",
+    *,
+    profile_id: str = "",
+    include_details: bool = False,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Reuse short-lived KPI snapshots while preserving an explicit refresh path.
+
+    KPI calculation can involve a large history snapshot.  Never hold the cache
+    lock while calculating it: a slow database/history read must not block an
+    already-cached card response or a single-person detail request.
+    """
+    role_key = str(role_filter or "all").strip().casefold() or "all"
+    profile_key = str(profile_id or "").strip().casefold()
+    cache_key = f"{role_key}|{profile_key}|{'detail' if include_details else 'summary'}"
+    now = time.monotonic()
+    with USER_KPI_CACHE_LOCK:
+        cached = USER_KPI_CACHE.get(cache_key)
+        cached_payload = cached.get("payload") if isinstance(cached, dict) else None
+        if not force and isinstance(cached_payload, dict):
+            cache_age = now - float(cached.get("stored_at", 0.0) or 0.0)
+            if cache_age >= USER_KPI_CACHE_TTL_SECONDS and cache_key not in USER_KPI_CACHE_REFRESHING:
+                USER_KPI_CACHE_REFRESHING.add(cache_key)
+                threading.Thread(
+                    target=_refresh_user_kpi_cache,
+                    args=(cache_key, role_key, profile_key, include_details),
+                    name=f"user-kpi-refresh-{role_key}",
+                    daemon=True,
+                ).start()
+            # Fresh and stale snapshots are both safe to show.  An expired
+            # snapshot refreshes above, while the existing cards return now.
+            return cached_payload
+
+    payload = build_user_kpis(
+        role_filter=role_key,
+        profile_id=profile_key,
+        include_details=include_details,
+    )
+    with USER_KPI_CACHE_LOCK:
+        USER_KPI_CACHE[cache_key] = {"stored_at": time.monotonic(), "payload": payload}
+    return payload
+
+
 def _today_key_local() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -5409,9 +5602,74 @@ def save_daily_role_assignments(rows: Dict[str, Any]):
 
 
 def get_today_role_assignments() -> Dict[str, Any]:
+    # Permanent extra privileges are projected into the same dated payload
+    # consumed by existing clients. This keeps old clients compatible while
+    # the server remains the single place where assignment duration is set.
+    merged: Dict[str, Any] = {}
+    for profile in PROFILES:
+        if not isinstance(profile, dict):
+            continue
+        badge = str(profile.get("id_number") or "").strip()
+        extra = str(profile.get("extra_privilege") or "none").strip().lower()
+        if not badge or extra not in {"supervisor", "qc", "maintenance", "operator"}:
+            continue
+        company_role = _normalize_company_role(profile.get("company_role") or profile.get("role") or "")
+        merged[badge] = {
+            "name": str(profile.get("name") or badge).strip() or badge,
+            "rights": _combine_privileges(_base_privilege_from_company_role(company_role), extra),
+            "company_role": company_role,
+            "extra_privilege": extra,
+            "assignment_scope": "permanent",
+            "updated_at_utc": str(
+                profile.get("privilege_updated_at_utc")
+                or profile.get("updated_at_utc")
+                or profile.get("created_at_utc")
+                or ""
+            ),
+        }
     day = _today_key_local()
     bucket = DAILY_ROLE_ASSIGNMENTS.get(day)
-    return dict(bucket) if isinstance(bucket, dict) else {}
+    if isinstance(bucket, dict):
+        for badge, row in bucket.items():
+            if not isinstance(row, dict):
+                continue
+            merged[str(badge)] = {**row, "assignment_scope": "temporary"}
+    return merged
+
+
+def set_permanent_role_assignment(
+    badge_code: str,
+    extra_privilege: str,
+) -> bool:
+    badge = str(badge_code or "").strip()
+    extra = str(extra_privilege or "none").strip().lower()
+    if extra not in {"none", "supervisor", "qc", "maintenance", "operator"}:
+        return False
+    index = next(
+        (
+            i for i, profile in enumerate(PROFILES)
+            if isinstance(profile, dict) and str(profile.get("id_number") or "").strip() == badge
+        ),
+        -1,
+    )
+    if index < 0:
+        return False
+    profile = dict(PROFILES[index] or {})
+    profile["extra_privilege"] = extra
+    profile["privilege_updated_at_utc"] = (
+        utc_now().isoformat() if "utc_now" in globals() else datetime.now(timezone.utc).isoformat()
+    )
+    PROFILES[index] = profile
+    save_profiles(PROFILES)
+
+    # A permanent save takes effect immediately; remove a same-day temporary
+    # override for this badge so it cannot conceal the new permanent choice.
+    day = _today_key_local()
+    bucket = DAILY_ROLE_ASSIGNMENTS.get(day)
+    if isinstance(bucket, dict) and badge in bucket:
+        bucket.pop(badge, None)
+        save_daily_role_assignments(DAILY_ROLE_ASSIGNMENTS)
+    return True
 
 
 def set_today_role_assignment(
@@ -6569,25 +6827,36 @@ def _apply_test_machine_client_event(data: Dict[str, Any]) -> Dict[str, Any]:
         config["pack_count"] = max(0, int(event.get("post_pack_total", config["pack_count"] - 1) or 0))
         config["good_total"] = max(0, int(event.get("post_good_total", config["good_total"]) or 0))
     elif event_type == "REJECT_VOID":
-        supplied = event.get("reject_record") if isinstance(event.get("reject_record"), dict) else {}
-        reject_id = str(event.get("reject_scan_id") or supplied.get("reject_scan_id") or "").strip()
-        reason = str(event.get("reason") or supplied.get("reason_code") or "TEST_REJECT").strip().upper()
-        for idx in range(len(config["reject_logs"]) - 1, -1, -1):
-            row = config["reject_logs"][idx]
-            if reject_id and str(row.get("reject_scan_id") or "") != reject_id:
-                continue
-            if not reject_id and str(row.get("reason_code") or "").strip().upper() != reason:
-                continue
-            config["reject_logs"][idx] = {**row, **supplied, "voided": True, "voided_at": supplied.get("voided_at") or now}
-            break
-        entry_type = str(supplied.get("entry_type") or "").strip().upper()
-        if entry_type == "STARTUP_REJECT_SCAN" or reason == "SUR":
-            session_snapshot["startup_reject_total"] = max(0, int(session_snapshot.get("startup_reject_total", 0) or 0) - 1)
-        elif _canonical_reject_code(reason) == "NO":
-            session_snapshot["no_shot_total"] = max(0, int(session_snapshot.get("no_shot_total", 0) or 0) - 1)
-        else:
-            config["reject_total"] = max(0, config["reject_total"] - 1)
-        config["reject_breakdown"][reason] = max(0, int(config["reject_breakdown"].get(reason, 0) or 0) - 1)
+        supplied_rows = [
+            dict(row) for row in (event.get("void_records") or []) if isinstance(row, dict)
+        ]
+        if not supplied_rows:
+            supplied = event.get("reject_record") if isinstance(event.get("reject_record"), dict) else {}
+            supplied_rows = [dict(supplied)] if supplied else []
+        for supplied in supplied_rows:
+            reject_id = str(supplied.get("reject_scan_id") or "").strip()
+            reason = str(event.get("reason") or supplied.get("reason_code") or "TEST_REJECT").strip().upper()
+            for idx in range(len(config["reject_logs"]) - 1, -1, -1):
+                row = config["reject_logs"][idx]
+                if reject_id and str(row.get("reject_scan_id") or "") != reject_id:
+                    continue
+                if not reject_id and str(row.get("reason_code") or "").strip().upper() != reason:
+                    continue
+                config["reject_logs"][idx] = {
+                    **row,
+                    **supplied,
+                    "voided": True,
+                    "voided_at": supplied.get("voided_at") or now,
+                }
+                break
+        if "post_reject_total" in event:
+            config["reject_total"] = max(0, int(event.get("post_reject_total") or 0))
+        if "post_startup_reject_total" in event:
+            session_snapshot["startup_reject_total"] = max(0, int(event.get("post_startup_reject_total") or 0))
+        if "post_no_shot_total" in event:
+            session_snapshot["no_shot_total"] = max(0, int(event.get("post_no_shot_total") or 0))
+        if isinstance(event.get("post_reject_breakdown"), dict):
+            config["reject_breakdown"] = _canonical_reject_breakdown(event.get("post_reject_breakdown"))
     elif event_type == "BUTAL_VOID":
         session_snapshot["butal_total"] = max(0, int(event.get("post_butal_total", session_snapshot.get("butal_total", 0)) or 0))
         if isinstance(event.get("post_butal_by_job"), dict):
@@ -6631,6 +6900,42 @@ def _apply_test_machine_client_event(data: Dict[str, Any]) -> Dict[str, Any]:
     return SERVER_SETTINGS["test_machine"]
 
 
+_RETIRED_QR_MAPPING_COMMAND_IDS = {
+    "remove_job_linkage",
+    "prepack_linkage",
+    "pdr_done",
+    "pdr_cancel",
+    "butal_completion",
+}
+
+
+def _normalize_server_qr_mapping_config(config: Any) -> Dict[str, Any]:
+    normalized = deepcopy(config) if isinstance(config, dict) else deepcopy(DEFAULT_QR_MAPPING_CONFIG)
+    commands: List[Dict[str, Any]] = []
+    for raw_row in normalized.get("commands") or []:
+        if not isinstance(raw_row, dict):
+            continue
+        row = deepcopy(raw_row)
+        command_id = str(row.get("id") or "").strip()
+        if command_id in _RETIRED_QR_MAPPING_COMMAND_IDS:
+            continue
+        if command_id in {"pdr_start", "pdrstart"}:
+            row["id"] = "pdrstart"
+            row["handler_token"] = "pdrstart"
+            row["aliases"] = ["pdrstart"]
+        commands.append(row)
+    command_ids = {str(row.get("id") or "").strip() for row in commands}
+    if "no_shot" not in command_ids:
+        default_no_shot = next(
+            (deepcopy(row) for row in DEFAULT_QR_MAPPING_CONFIG.get("commands", []) if row.get("id") == "no_shot"),
+            None,
+        )
+        if default_no_shot is not None:
+            commands.append(default_no_shot)
+    normalized["commands"] = commands
+    return normalized
+
+
 def load_server_settings() -> Dict[str, Any]:
     raw = _load_server_settings_sql()
     if not isinstance(raw, dict):
@@ -6655,11 +6960,23 @@ def load_server_settings() -> Dict[str, Any]:
                 visible_machine_codes.append(code)
     else:
         visible_machine_codes = list(MACHINE_NAME_MAP.keys())
+    mapping_config = _normalize_server_qr_mapping_config(raw.get("qr_mapping_config"))
+    mapping_ok, _mapping_errors = validate_qr_mapping_config(mapping_config)
+    if not mapping_ok:
+        mapping_config = deepcopy(DEFAULT_QR_MAPPING_CONFIG)
+    mapping_config = _normalize_server_qr_mapping_config(mapping_config)
+    mapping_config["version"] = max(1, int(mapping_config.get("version") or 1))
+    mapping_history = [
+        deepcopy(row) for row in (raw.get("qr_mapping_history") or [])
+        if isinstance(row, dict)
+    ][-20:]
     return {
         "theme": str(raw.get("theme", "Default")).strip() or "Default",
         "qrgen_base_url": str(raw.get("qrgen_base_url", QRGEN_BASE_URL)).strip().rstrip("/"),
         "visible_machine_codes": visible_machine_codes,
         "test_machine": _normalize_test_machine_settings(raw.get("test_machine")),
+        "qr_mapping_config": mapping_config,
+        "qr_mapping_history": mapping_history,
     }
 
 
@@ -8971,11 +9288,12 @@ def _dashboard_product_part_shortages(row: Dict[str, Any], *, include_prior_part
                 used += max(0.0, _parse_number_like(raw.get("used_qty")))
         for raw in scans:
             source_is_carryover = "CARRYOVER" in str(raw.get("source") or "").upper()
-            # Carryover is a mirror of material scanned in an earlier shift,
-            # not a new delivery for the current shift. Whole-job totals use
-            # the hydrated prior rows when available; older snapshots without
-            # that history may use the carryover mirror as a fallback.
-            if source_is_carryover and (not include_prior_partials or prior_rows):
+            # Carryover is the unused balance made available to this shift, so
+            # it must cover current-shift consumption.  For whole-job totals,
+            # hydrated prior rows already contain the original scans and usage;
+            # only there do we skip the carryover mirror to avoid counting the
+            # same material twice.
+            if source_is_carryover and include_prior_partials and prior_rows:
                 continue
             if part_keys.intersection(_dashboard_material_identity_keys(raw)):
                 scanned += max(0.0, _parse_number_like(raw.get("qty") or raw.get("quantity")))
@@ -10736,7 +11054,7 @@ DASHBOARD_HTML = r"""
     .scan-capture-actions { margin-top: 12px; display: flex; justify-content: flex-end; gap: 8px; }
     .settings-overlay { position: fixed; inset: 0; background: rgba(15,23,42,0.30); backdrop-filter: blur(6px); display: none; align-items: center; justify-content: center; z-index: 1100; padding: 14px; }
     .settings-overlay.active { display: flex; }
-    .settings-card { width: min(840px, calc(100vw - 36px)); background: var(--ui-subtle); border: 1px solid var(--ui-border); border-radius: 18px; box-shadow: 0 24px 48px rgba(15,23,42,0.20); overflow: hidden; }
+    .settings-card { width: min(1080px, calc(100vw - 36px)); background: var(--ui-subtle); border: 1px solid var(--ui-border); border-radius: 18px; box-shadow: 0 24px 48px rgba(15,23,42,0.20); overflow: hidden; }
     .settings-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--ui-border); }
     .settings-head-title { font-weight: 800; color: var(--ui-text); }
     .settings-body { display: grid; grid-template-columns: 210px 1fr; min-height: 400px; }
@@ -10761,6 +11079,21 @@ DASHBOARD_HTML = r"""
     .settings-row input, .settings-row select { width: 100%; box-sizing: border-box; border: 1px solid var(--ui-border); border-radius: 10px; padding: 9px 10px; font: inherit; background: var(--ui-surface); }
     .settings-actions { margin-top: 12px; display: flex; justify-content: flex-end; gap: 8px; }
     .settings-note { font-size: 0.85rem; color: var(--ui-muted); line-height: 1.35; }
+    .mapping-tabs { display:flex; flex-wrap:wrap; gap:7px; padding:4px 0 2px; }
+    .mapping-tab { border:1px solid var(--ui-border); border-radius:999px; background:var(--ui-surface); color:var(--ui-muted); padding:7px 12px; font:inherit; font-size:.8rem; font-weight:800; cursor:pointer; }
+    .mapping-tab.active { border-color:var(--ui-accent); background:var(--ui-accent); color:var(--ui-on-accent); }
+    .mapping-panel { display:none; }
+    .mapping-panel.active { display:block; }
+    .mapping-table-wrap { max-height:430px; overflow:auto; border:1px solid var(--ui-border); border-radius:11px; background:var(--ui-surface); }
+    .mapping-table { width:100%; min-width:690px; border-collapse:collapse; }
+    .mapping-table th { position:sticky; top:0; z-index:2; padding:8px; background:var(--ui-subtle); color:var(--ui-muted); font-size:.72rem; text-align:left; text-transform:uppercase; letter-spacing:.03em; border-bottom:1px solid var(--ui-border); }
+    .mapping-table td { padding:7px 8px; border-bottom:1px solid var(--ui-border); vertical-align:middle; color:var(--ui-text); font-size:.8rem; }
+    .mapping-table tr:last-child td { border-bottom:0; }
+    .mapping-table input[type="text"], .mapping-table input[type="number"] { width:100%; min-width:70px; box-sizing:border-box; border:1px solid var(--ui-border); border-radius:7px; padding:7px 8px; background:var(--ui-surface); color:var(--ui-text); font:inherit; }
+    .mapping-table input[type="checkbox"] { width:17px; height:17px; accent-color:var(--ui-accent); }
+    .mapping-table .mapping-qr-value { min-width:220px; }
+    .mapping-id { font-weight:850; color:var(--ui-text); }
+    .mapping-meta { margin-top:3px; color:var(--ui-muted); font-size:.68rem; overflow-wrap:anywhere; }
     .test-machine-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:8px; }
     .test-machine-action-card { border:1px solid var(--ui-border); border-radius:12px; background:var(--ui-surface); padding:12px; display:grid; gap:9px; }
     .test-machine-action-card h4 { margin:0; color:var(--ui-text); }
@@ -12377,6 +12710,7 @@ DASHBOARD_HTML = r"""
           <button id="settingsNavClients" class="settings-nav-btn" type="button">Clients &amp; IP</button>
           <button id="settingsNavInventory" class="settings-nav-btn" type="button">Inventory</button>
           <button id="settingsNavApi" class="settings-nav-btn" type="button">API Configuration</button>
+          <button id="settingsNavMappings" class="settings-nav-btn" type="button">QR Mappings</button>
           <button id="settingsNavProfile" class="settings-nav-btn" type="button">Profile</button>
         </div>
         <div class="settings-content">
@@ -12521,7 +12855,7 @@ DASHBOARD_HTML = r"""
               <div class="settings-note">This is used by Request Print (`/api/qrgen/pending-request`) forwarding to your QR system.</div>
               <div class="settings-row" style="margin-top:8px;">
                 <label>Product Items Cache (used by QR/product selection)</label>
-                <input id="settingsProductsCount" type="text" readonly value="Loading..." />
+                <input id="settingsProductsCount" type="text" readonly value="Not loaded automatically" />
               </div>
               <div class="settings-row">
                 <label>Products Cache Updated</label>
@@ -12537,12 +12871,46 @@ DASHBOARD_HTML = r"""
               </div>
               <div class="settings-row">
                 <label>Products Cache Status</label>
-                <input id="settingsProductsStatus" type="text" readonly value="-" />
+                <input id="settingsProductsStatus" type="text" readonly value="Press Update Product Items to refresh manually" />
               </div>
               <div class="settings-actions">
                 <button id="settingsProductsRefreshBtn" class="btn-secondary" type="button">Update Product Items</button>
                 <button id="serverSettingsSaveBtn" class="btn-primary" type="button">Apply Settings</button>
               </div>
+            </div>
+          </div>
+          <div id="settingsPageMappings" class="settings-page">
+            <div class="settings-form">
+              <div class="settings-note"><strong>Live QR mapping configuration.</strong> Each command has exactly one QR value. Edit the fields below; published changes are downloaded by updated clients without rebuilding.</div>
+              <div class="settings-row"><label>Published Version</label><input id="settingsMappingVersion" type="text" readonly value="Loading..." /></div>
+              <textarea id="settingsMappingEditor" hidden></textarea>
+              <div class="mapping-tabs">
+                <button class="mapping-tab active" data-mapping-tab="commands" type="button">QR Commands</button>
+                <button class="mapping-tab" data-mapping-tab="reject" type="button">Reject num_0–num_22</button>
+                <button class="mapping-tab" data-mapping-tab="pdr" type="button">PDR num_0–num_22</button>
+              </div>
+              <div id="settingsMappingCommandsPanel" class="mapping-panel active">
+                <div class="mapping-table-wrap"><table class="mapping-table"><thead><tr><th>On</th><th>Command</th><th>Display label</th><th>QR value</th></tr></thead><tbody id="settingsMappingCommandsBody"></tbody></table></div>
+              </div>
+              <div id="settingsMappingRejectPanel" class="mapping-panel">
+                <div class="mapping-table-wrap"><table class="mapping-table"><thead><tr><th>On</th><th>Number</th><th>Direct QR code</th><th>Reject description</th></tr></thead><tbody id="settingsMappingRejectBody"></tbody></table></div>
+              </div>
+              <div id="settingsMappingPdrPanel" class="mapping-panel">
+                <div class="mapping-table-wrap"><table class="mapping-table"><thead><tr><th>On</th><th>Number</th><th>Code</th><th>PDR description</th></tr></thead><tbody id="settingsMappingPdrBody"></tbody></table></div>
+              </div>
+              <div class="settings-row"><label>Supervisor/Admin Badge</label><input id="settingsMappingBadge" type="password" placeholder="Scan badge before publish or rollback" /></div>
+              <div class="settings-row"><label>Rollback Version</label><select id="settingsMappingHistory"><option value="">No history loaded</option></select></div>
+              <div class="settings-actions">
+                <button id="settingsMappingRefreshBtn" class="btn-secondary" type="button">Refresh</button>
+                <button id="settingsMappingValidateBtn" class="btn-secondary" type="button">Validate</button>
+                <button id="settingsMappingExportBtn" class="btn-secondary" type="button">Export JSON</button>
+                <button id="settingsMappingImportBtn" class="btn-secondary" type="button">Import JSON</button>
+                <button id="settingsMappingDefaultsBtn" class="btn-secondary" type="button">Load Defaults</button>
+                <button id="settingsMappingRollbackBtn" class="btn-secondary" type="button">Rollback</button>
+                <button id="settingsMappingPublishBtn" class="btn-primary" type="button">Publish Mappings</button>
+                <input id="settingsMappingImportFile" type="file" accept="application/json,.json" hidden />
+              </div>
+              <div id="settingsMappingStatus" class="settings-note">Load the current mapping configuration to begin.</div>
             </div>
           </div>
           <div id="settingsPageProfile" class="settings-page">
@@ -12571,7 +12939,7 @@ DASHBOARD_HTML = r"""
   <div id="dailyRolesOverlay" class="settings-overlay">
     <div class="settings-card" style="width:min(760px, calc(100vw - 36px));">
       <div class="settings-head">
-        <div class="settings-head-title">Today Supervisor / QC Rights</div>
+        <div class="settings-head-title">Supervisor / QC Rights</div>
         <button id="dailyRolesCloseBtn" class="overlay-close" type="button">Close</button>
       </div>
       <div class="settings-content" style="padding:14px;">
@@ -12589,7 +12957,14 @@ DASHBOARD_HTML = r"""
             <input id="dailyRoleCompanyRoleInput" type="text" placeholder="Auto-detected from Profile" readonly />
           </div>
           <div class="settings-row">
-            <label>Add Temporary Privilege (Today Only)</label>
+            <label>Assignment Duration</label>
+            <select id="dailyRoleScopeSelect">
+              <option value="temporary">Temporary (Today Only)</option>
+              <option value="permanent">Permanent</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label>Add Privilege</label>
             <select id="dailyRoleExtraPrivilegeSelect">
               <option value="none">None</option>
               <option value="supervisor">Add Supervisor Privilege</option>
@@ -12599,13 +12974,13 @@ DASHBOARD_HTML = r"""
             </select>
           </div>
           <div class="settings-row">
-            <label>Effective Privilege for Today</label>
+            <label>Effective Privilege</label>
             <input id="dailyRoleEffectiveRightsInput" type="text" readonly value="Viewer" />
           </div>
           <div class="settings-actions">
-            <button id="dailyRolesSaveBtn" class="btn-primary" type="button">Save Today Role</button>
+            <button id="dailyRolesSaveBtn" class="btn-primary" type="button">Save Role</button>
           </div>
-          <div class="settings-note">Base privilege is from the saved profile role. Add a temporary privilege only for today when someone is covering another function. Daily assignments reset by date automatically.</div>
+          <div class="settings-note">Temporary assignments reset by date. Permanent assignments stay on the saved server profile and are automatically sent to existing clients through their normal role sync.</div>
         </div>
         <div id="dailyRolesList" class="people-role-list" style="margin-top:14px;"></div>
       </div>
@@ -12635,6 +13010,7 @@ DASHBOARD_HTML = r"""
   const settingsNavClients = document.getElementById("settingsNavClients");
   const settingsNavInventory = document.getElementById("settingsNavInventory");
   const settingsNavApi = document.getElementById("settingsNavApi");
+  const settingsNavMappings = document.getElementById("settingsNavMappings");
   const settingsNavProfile = document.getElementById("settingsNavProfile");
   const settingsPageGeneral = document.getElementById("settingsPageGeneral");
   const settingsPageTheme = document.getElementById("settingsPageTheme");
@@ -12643,7 +13019,30 @@ DASHBOARD_HTML = r"""
   const settingsPageClients = document.getElementById("settingsPageClients");
   const settingsPageInventory = document.getElementById("settingsPageInventory");
   const settingsPageApi = document.getElementById("settingsPageApi");
+  const settingsPageMappings = document.getElementById("settingsPageMappings");
   const settingsPageProfile = document.getElementById("settingsPageProfile");
+  const settingsMappingVersion = document.getElementById("settingsMappingVersion");
+  const settingsMappingEditor = document.getElementById("settingsMappingEditor");
+  const settingsMappingCommandsBody = document.getElementById("settingsMappingCommandsBody");
+  const settingsMappingRejectBody = document.getElementById("settingsMappingRejectBody");
+  const settingsMappingPdrBody = document.getElementById("settingsMappingPdrBody");
+  const settingsMappingTabs = Array.from(document.querySelectorAll("[data-mapping-tab]"));
+  const settingsMappingPanels = {
+    commands: document.getElementById("settingsMappingCommandsPanel"),
+    reject: document.getElementById("settingsMappingRejectPanel"),
+    pdr: document.getElementById("settingsMappingPdrPanel"),
+  };
+  const settingsMappingBadge = document.getElementById("settingsMappingBadge");
+  const settingsMappingHistory = document.getElementById("settingsMappingHistory");
+  const settingsMappingRefreshBtn = document.getElementById("settingsMappingRefreshBtn");
+  const settingsMappingValidateBtn = document.getElementById("settingsMappingValidateBtn");
+  const settingsMappingExportBtn = document.getElementById("settingsMappingExportBtn");
+  const settingsMappingImportBtn = document.getElementById("settingsMappingImportBtn");
+  const settingsMappingImportFile = document.getElementById("settingsMappingImportFile");
+  const settingsMappingDefaultsBtn = document.getElementById("settingsMappingDefaultsBtn");
+  const settingsMappingRollbackBtn = document.getElementById("settingsMappingRollbackBtn");
+  const settingsMappingPublishBtn = document.getElementById("settingsMappingPublishBtn");
+  const settingsMappingStatus = document.getElementById("settingsMappingStatus");
   const settingsServerHost = document.getElementById("settingsServerHost");
   const settingsThemeSelect = document.getElementById("settingsThemeSelect");
   const settingsQrApiBaseUrl = document.getElementById("settingsQrApiBaseUrl");
@@ -12687,6 +13086,7 @@ DASHBOARD_HTML = r"""
   const dailyRoleBadgeInput = document.getElementById("dailyRoleBadgeInput");
   const dailyRoleNameInput = document.getElementById("dailyRoleNameInput");
   const dailyRoleCompanyRoleInput = document.getElementById("dailyRoleCompanyRoleInput");
+  const dailyRoleScopeSelect = document.getElementById("dailyRoleScopeSelect");
   const dailyRoleExtraPrivilegeSelect = document.getElementById("dailyRoleExtraPrivilegeSelect");
   const dailyRoleEffectiveRightsInput = document.getElementById("dailyRoleEffectiveRightsInput");
   const dailyRolesSaveBtn = document.getElementById("dailyRolesSaveBtn");
@@ -13110,6 +13510,7 @@ DASHBOARD_HTML = r"""
   let reviewSlideIndex = 0;
   let overlayReviewMode = "job";
   let serverSettingsState = { theme: "Default", qrgen_base_url: "" };
+  let qrMappingState = { config: null, defaults: null, history: [] };
   let dailyRolesState = {};
   let settingsProfilesState = [];
   let settingsInventoryState = [];
@@ -15262,6 +15663,7 @@ DASHBOARD_HTML = r"""
       clients: [settingsNavClients, settingsPageClients],
       inventory: [settingsNavInventory, settingsPageInventory],
       api: [settingsNavApi, settingsPageApi],
+      mappings: [settingsNavMappings, settingsPageMappings],
       profile: [settingsNavProfile, settingsPageProfile],
     };
     Object.entries(map).forEach(([k, pair]) => {
@@ -15534,6 +15936,158 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     }
   }
 
+  function mappingAttr(value){
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+  }
+
+  function mappingSingleQr(value){
+    if(!Array.isArray(value)) return "";
+    return String(value.find(x => String(x || "").trim()) || "").trim();
+  }
+
+  function renderQrMappingTables(config){
+    const commands = Array.isArray(config?.commands) ? config.commands : [];
+    const rejectRows = Array.isArray(config?.reject_reasons) ? config.reject_reasons : [];
+    const pdrRows = Array.isArray(config?.pdr_reasons) ? config.pdr_reasons : [];
+    if(settingsMappingCommandsBody){
+      settingsMappingCommandsBody.innerHTML = commands.map((row, index) => `
+        <tr data-mapping-command-index="${index}">
+          <td><input class="mapping-enabled" type="checkbox" ${row.enabled !== false ? "checked" : ""} aria-label="Enable ${mappingAttr(row.label || row.id)}" /></td>
+          <td><div class="mapping-id">${esc(row.id || `Command ${index + 1}`)}</div><div class="mapping-meta">${esc(row.kind || "")} · handler: ${esc(row.handler_token || "-")}</div></td>
+          <td><input class="mapping-label" type="text" value="${mappingAttr(row.label || "")}" /></td>
+          <td><input class="mapping-qr-value" type="text" value="${mappingAttr(mappingSingleQr(row.aliases))}" placeholder="One QR value only" /></td>
+        </tr>`).join("");
+    }
+    if(settingsMappingRejectBody){
+      settingsMappingRejectBody.innerHTML = rejectRows.map((row, index) => `
+        <tr data-mapping-reject-index="${index}">
+          <td><input class="mapping-enabled" type="checkbox" ${row.enabled !== false ? "checked" : ""} /></td>
+          <td><input class="mapping-number" type="number" min="0" max="22" value="${Number(row.number ?? 0)}" /></td>
+          <td><input class="mapping-code" type="text" value="${mappingAttr(row.code || "")}" /></td>
+          <td><input class="mapping-label" type="text" value="${mappingAttr(row.label || "")}" /></td>
+        </tr>`).join("");
+    }
+    if(settingsMappingPdrBody){
+      settingsMappingPdrBody.innerHTML = pdrRows.map((row, index) => `
+        <tr data-mapping-pdr-index="${index}">
+          <td><input class="mapping-enabled" type="checkbox" ${row.enabled !== false ? "checked" : ""} /></td>
+          <td><input class="mapping-number" type="number" min="0" max="22" value="${Number(row.number ?? 0)}" /></td>
+          <td><input class="mapping-code" type="text" value="${mappingAttr(row.code || "")}" /></td>
+          <td><input class="mapping-label" type="text" value="${mappingAttr(row.label || "")}" /></td>
+        </tr>`).join("");
+    }
+  }
+
+  function loadMappingConfigIntoTables(config){
+    const cloned = JSON.parse(JSON.stringify(config || {}));
+    qrMappingState.config = cloned;
+    if(settingsMappingEditor) settingsMappingEditor.value = JSON.stringify(cloned, null, 2);
+    renderQrMappingTables(cloned);
+  }
+
+  function qrMappingEditorPayload(){
+    try{
+      const value = JSON.parse(JSON.stringify(qrMappingState.config || {}));
+      if(!value || typeof value !== "object" || Array.isArray(value)) throw new Error("No mapping configuration is loaded");
+      settingsMappingCommandsBody?.querySelectorAll("[data-mapping-command-index]").forEach(tr => {
+        const row = value.commands[Number(tr.dataset.mappingCommandIndex)];
+        if(!row) return;
+        row.enabled = !!tr.querySelector(".mapping-enabled")?.checked;
+        row.label = tr.querySelector(".mapping-label")?.value.trim() || "";
+        const qrValue = tr.querySelector(".mapping-qr-value")?.value.trim() || "";
+        row.aliases = qrValue ? [qrValue] : [];
+      });
+      settingsMappingRejectBody?.querySelectorAll("[data-mapping-reject-index]").forEach(tr => {
+        const row = value.reject_reasons[Number(tr.dataset.mappingRejectIndex)];
+        if(!row) return;
+        row.enabled = !!tr.querySelector(".mapping-enabled")?.checked;
+        row.number = Number(tr.querySelector(".mapping-number")?.value);
+        row.code = tr.querySelector(".mapping-code")?.value.trim() || "";
+        row.label = tr.querySelector(".mapping-label")?.value.trim() || "";
+        row.aliases = [];
+      });
+      settingsMappingPdrBody?.querySelectorAll("[data-mapping-pdr-index]").forEach(tr => {
+        const row = value.pdr_reasons[Number(tr.dataset.mappingPdrIndex)];
+        if(!row) return;
+        row.enabled = !!tr.querySelector(".mapping-enabled")?.checked;
+        row.number = Number(tr.querySelector(".mapping-number")?.value);
+        row.code = tr.querySelector(".mapping-code")?.value.trim() || "";
+        row.label = tr.querySelector(".mapping-label")?.value.trim() || "";
+      });
+      if(settingsMappingEditor) settingsMappingEditor.value = JSON.stringify(value, null, 2);
+      return value;
+    }catch(err){
+      if(settingsMappingStatus) settingsMappingStatus.textContent = `Unable to read mapping table: ${err.message || err}`;
+      return null;
+    }
+  }
+
+  function renderQrMappingUi(payload){
+    qrMappingState = payload || {config:null, defaults:null, history:[]};
+    const config = qrMappingState.config || {};
+    if(settingsMappingVersion) settingsMappingVersion.value = `v${Number(config.version || 1)} | ${config.updated_by || "Initial defaults"} | ${config.updated_at_utc || "-"}`;
+    loadMappingConfigIntoTables(config);
+    if(settingsMappingHistory){
+      const rows = Array.isArray(qrMappingState.history) ? qrMappingState.history : [];
+      settingsMappingHistory.innerHTML = rows.length
+        ? `<option value="">Choose a version...</option>${rows.map(row => `<option value="${Number(row.version || 0)}">v${Number(row.version || 0)} - ${esc(row.updated_by || "Unknown")} - ${esc(row.updated_at_utc || "")}</option>`).join("")}`
+        : `<option value="">No earlier versions</option>`;
+    }
+    if(settingsMappingStatus) settingsMappingStatus.textContent = "Mappings loaded. Validate before publishing.";
+  }
+
+  async function loadQrMappingsUi(){
+    if(settingsMappingStatus) settingsMappingStatus.textContent = "Loading mappings...";
+    try{
+      const resp = await fetch("/api/qr-mappings");
+      const body = await resp.json();
+      if(!resp.ok || !body.ok) throw new Error(body.error || `HTTP ${resp.status}`);
+      renderQrMappingUi(body);
+    }catch(err){
+      if(settingsMappingStatus) settingsMappingStatus.textContent = `Mapping load failed: ${err.message || err}`;
+    }
+  }
+
+  async function validateQrMappingsUi(){
+    const config = qrMappingEditorPayload();
+    if(!config) return false;
+    const resp = await fetch("/api/qr-mappings/validate", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({config})});
+    const body = await resp.json().catch(() => ({}));
+    if(settingsMappingStatus) settingsMappingStatus.textContent = body.ok ? "Validation passed. Ready to publish." : `Validation failed: ${(body.errors || [body.error || "Unknown error"]).join(" | ")}`;
+    return !!body.ok;
+  }
+
+  async function publishQrMappingsUi(){
+    const config = qrMappingEditorPayload();
+    if(!config) return;
+    const badge_code = (settingsMappingBadge?.value || "").trim();
+    if(!badge_code){ if(settingsMappingStatus) settingsMappingStatus.textContent = "Scan a Supervisor/Admin badge before publishing."; return; }
+    if(!(await validateQrMappingsUi())) return;
+    const resp = await fetch("/api/qr-mappings", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({config, badge_code})});
+    const body = await resp.json().catch(() => ({}));
+    if(!resp.ok || !body.ok){ if(settingsMappingStatus) settingsMappingStatus.textContent = `Publish failed: ${body.error || resp.status}`; return; }
+    if(settingsMappingBadge) settingsMappingBadge.value = "";
+    await loadQrMappingsUi();
+    if(settingsMappingStatus) settingsMappingStatus.textContent = `Published version ${Number(body.config?.version || 0)}. Updated clients will sync automatically.`;
+  }
+
+  async function rollbackQrMappingsUi(){
+    const version = Number(settingsMappingHistory?.value || 0);
+    const badge_code = (settingsMappingBadge?.value || "").trim();
+    if(!version || !badge_code){ if(settingsMappingStatus) settingsMappingStatus.textContent = "Choose a history version and scan a Supervisor/Admin badge."; return; }
+    const resp = await fetch("/api/qr-mappings/rollback", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({version, badge_code})});
+    const body = await resp.json().catch(() => ({}));
+    if(!resp.ok || !body.ok){ if(settingsMappingStatus) settingsMappingStatus.textContent = `Rollback failed: ${body.error || resp.status}`; return; }
+    if(settingsMappingBadge) settingsMappingBadge.value = "";
+    await loadQrMappingsUi();
+    if(settingsMappingStatus) settingsMappingStatus.textContent = `Rolled back v${version} as new version v${Number(body.config?.version || 0)}.`;
+  }
+
   async function loadServerSettingsUi(applyTheme = true){
     settingsServerHost && (settingsServerHost.value = location.origin);
     try {
@@ -15554,7 +16108,6 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       renderTestMachineSettings(serverSettingsState.test_machine);
       renderMachinePicker();
     } catch {}
-    await loadProductsSettingsInfo(false);
   }
 
   async function loadProductsSettingsInfo(forceRefresh = false){
@@ -15812,13 +16365,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       return;
     }
     dailyRolesList.innerHTML = `
-      <div class="people-role-row head"><div>Name</div><div>Badge</div><div>Base Role</div><div>Privilege</div><div>Updated</div></div>
+      <div class="people-role-row head"><div>Name</div><div>Badge</div><div>Base Role</div><div>Privilege / Duration</div><div>Updated</div></div>
       ${rows.map(([badge, item]) => `
         <div class="people-role-row">
           <div>${esc(item?.name || "-")}</div>
           <div>${esc(badge)}</div>
           <div>${esc(item?.company_role || "-")}</div>
-          <div><span class="people-role-pill">${esc(privilegeLabel(item?.rights || ""))}</span></div>
+          <div><span class="people-role-pill">${esc(privilegeLabel(item?.rights || ""))}</span><br><small>${item?.assignment_scope === "permanent" ? "Permanent" : "Today only"}</small></div>
           <div>${esc(fmtDateLocal(item?.updated_at_utc || ""))}</div>
         </div>
       `).join("")}
@@ -15840,6 +16393,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const profile = findSettingsProfileById(badge);
     const company_role = normalizeCompanyRoleLabel(profile?.role || "");
     const extra_privilege = (dailyRoleExtraPrivilegeSelect?.value || "none").trim().toLowerCase();
+    const assignment_scope = (dailyRoleScopeSelect?.value || "temporary").trim().toLowerCase();
     const name = (dailyRoleNameInput?.value || "").trim() || String(profile?.name || "").trim() || knownPersonNameFromBadge(badge) || badge;
     if(!badge){
       alert("Scan QR badge first.");
@@ -15852,7 +16406,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const resp = await fetch("/api/daily-roles", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ badge_code: badge, name, company_role, extra_privilege }),
+      body: JSON.stringify({ badge_code: badge, name, company_role, extra_privilege, assignment_scope }),
     });
     const out = await resp.json();
     if(!out.ok){
@@ -15861,7 +16415,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     }
     dailyRolesState = out.items || {};
     renderDailyRolesList(dailyRolesState);
-    alert("Today role saved.");
+    alert(assignment_scope === "permanent" ? "Permanent role saved." : "Today role saved.");
   }
 
   function openQrScanCaptureOverlay(){
@@ -16418,6 +16972,16 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const totalReject = productionReject + startupReject;
     const totalMade = good + butal + totalReject;
     const rejectRate = totalMade > 0 ? `${((totalReject / totalMade) * 100).toFixed(2)}%` : "0.00%";
+    const activePackRows = (Array.isArray(item.product_pack_history_logs) ? item.product_pack_history_logs : [])
+      .filter(pack => pack && typeof pack === "object" && !pack.voided);
+    const packQrIndices = activePackRows
+      .map(pack => Number(pack.index ?? pack.pack_index ?? pack.pack_sequence))
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+    const packQrSeries = packQrIndices.length
+      ? `${packQrIndices[0]}-${packQrIndices[packQrIndices.length - 1]}`
+      : "-";
+    const packQrScanCount = activePackRows.length || Math.max(0, Number(item.pack_count || 0));
     const started = item.started_at_utc || item.job_started_at || "";
     const ended = item.ended_at_utc || item.finished_at_utc || "";
     const endedDate = ended ? new Date(ended) : null;
@@ -16437,6 +17001,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       ["System Code", item.product_sku || job.product_sku || job.sku || "-"],
       ["Cycle Time", item.cycle_time_current || details.std_cycle_time || job.custom_09 || "-"],
       ["Actual Output", item.total_good ?? item.partial_qty ?? (good + butal)],
+      ["Pack QR Scans", `${packQrScanCount}${packQrSeries !== "-" ? ` (Series ${packQrSeries})` : ""}`],
       ["No. of Cavities", details.no_of_cavity || "-"],
       ["Product", item.product_name || job.product_name || item.job_name || "-"],
       ["Remarks", item.approved_remarks || item.change_remarks || ""],
@@ -16608,11 +17173,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
 
   function linkedJobsForShift(row){
     const item = (row && typeof row === "object") ? row : {};
+    const currentCode = String(item.job_code || "").trim();
     const rows = (Array.isArray(item.linkage_jobs) ? item.linkage_jobs : [])
       .filter(linked => linked && typeof linked === "object")
-      .map(linked => ({...linked}));
+      .map(linked => ({...linked}))
+      .filter(linked => String(linked.job_code || "").trim() !== currentCode);
     const primaryCode = String(item.linkage_job_code || "").trim();
-    if(primaryCode && !rows.some(linked => String(linked.job_code || "").trim() === primaryCode)){
+    if(primaryCode && primaryCode !== currentCode && !rows.some(linked => String(linked.job_code || "").trim() === primaryCode)){
       rows.push({
         job_code: primaryCode,
         job_name: item.linkage_job_name || primaryCode,
@@ -18793,11 +19360,35 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     card.style.height = `${Math.max(680, requiredHeight)}px`;
   }
 
-  function openUserKpiDetail(index){
-    const row = Array.isArray(userKpiItemsState) ? userKpiItemsState[index] : null;
+  async function openUserKpiDetail(index){
+    let row = Array.isArray(userKpiItemsState) ? userKpiItemsState[index] : null;
     if(!row || !userKpiDetailOverlay || !userKpiDetailPerson || !userKpiDetailBody) return;
     const detailCard = userKpiDetailOverlay.querySelector(".user-kpi-detail-card");
     if(detailCard) detailCard.style.height = "";
+    if(row._detail_loaded !== true){
+      if(row._detail_loading === true) return;
+      row._detail_loading = true;
+      userKpiDetailPerson.innerHTML = `
+        ${userKpiAvatarHtml(row, "user-kpi-detail-avatar")}
+        <div><div id="userKpiDetailName" class="user-kpi-detail-name">${esc(row.name || row.id_number || "-")}</div><div class="user-kpi-detail-sub"><span class="user-kpi-detail-chip">${esc(row.id_number || "-")}</span></div></div>
+      `;
+      userKpiDetailBody.innerHTML = '<div class="placeholder">Loading Production Card details...</div>';
+      userKpiDetailOverlay.setAttribute("data-open-user-index", String(index));
+      userKpiDetailOverlay.classList.add("active");
+      try{
+        const response = await fetch(`/api/user-kpis/${encodeURIComponent(row.id_number || "")}`);
+        const payload = await response.json().catch(() => ({}));
+        if(!response.ok || payload.ok === false || !payload.item){
+          throw new Error(payload.error || payload.detail || `HTTP ${response.status}`);
+        }
+        row = {...row, ...payload.item, _detail_loaded:true, _detail_loading:false};
+        userKpiItemsState[index] = row;
+      }catch(err){
+        row._detail_loading = false;
+        userKpiDetailBody.innerHTML = `<div class="placeholder">Failed to load Production Card details: ${esc(err?.message || err)}</div>`;
+        return;
+      }
+    }
     const status = kpiStatus(row);
     const jobs = Array.isArray(row.handled_jobs) ? row.handled_jobs : [];
     const firstJob = jobs[0] || null;
@@ -19044,20 +19635,22 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     });
   }
 
-  async function loadUserKpis(role = userKpiRoleState){
+  async function loadUserKpis(role = userKpiRoleState, force = false){
     if(!userKpiTableWrap || userKpiLoading) return;
     userKpiRoleState = role || "all";
     userKpiLoading = true;
-    userKpiTableWrap.innerHTML = '<div class="placeholder">Loading Production Cards...</div>';
+    const hadItems = Array.isArray(userKpiItemsState) && userKpiItemsState.length > 0;
+    if(!hadItems) userKpiTableWrap.innerHTML = '<div class="placeholder">Loading Production Cards...</div>';
     try{
-      const r = await fetch(`/api/user-kpis?role=${encodeURIComponent(userKpiRoleState)}`);
+      const r = await fetch(`/api/user-kpis?role=${encodeURIComponent(userKpiRoleState)}&force=${force ? "true" : "false"}`);
       const data = await r.json().catch(() => ({}));
       if(!r.ok || data.ok === false){
         throw new Error(data.error || data.detail || `HTTP ${r.status}`);
       }
       renderUserKpis(data);
     }catch(err){
-      userKpiTableWrap.innerHTML = `<div class="placeholder">Failed to load Production Cards: ${esc(err?.message || err)}</div>`;
+      if(!hadItems) userKpiTableWrap.innerHTML = `<div class="placeholder">Failed to load Production Cards: ${esc(err?.message || err)}</div>`;
+      else console.warn("Production Cards refresh failed", err);
     }finally{
       userKpiLoading = false;
     }
@@ -22814,7 +23407,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     });
   });
   if(userKpiRefreshBtn){
-    userKpiRefreshBtn.addEventListener("click", () => loadUserKpis(userKpiRoleState));
+    userKpiRefreshBtn.addEventListener("click", () => loadUserKpis(userKpiRoleState, true));
   }
   if(userKpiDateBtn){
     userKpiDateBtn.textContent = new Date().toLocaleDateString("en-US", {
@@ -23040,6 +23633,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       if(dailyRoleBadgeInput) dailyRoleBadgeInput.value = "";
       if(dailyRoleNameInput) dailyRoleNameInput.value = "";
       if(dailyRoleCompanyRoleInput) dailyRoleCompanyRoleInput.value = "";
+      if(dailyRoleScopeSelect) dailyRoleScopeSelect.value = "temporary";
       if(dailyRoleExtraPrivilegeSelect) dailyRoleExtraPrivilegeSelect.value = "none";
       if(dailyRoleEffectiveRightsInput) dailyRoleEffectiveRightsInput.value = "Viewer";
       await loadSettingsProfilesUi();
@@ -23122,6 +23716,13 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       if(known && dailyRoleNameInput && !dailyRoleNameInput.value.trim()){
         dailyRoleNameInput.value = known;
       }
+      const existing = dailyRolesState && dailyRolesState[badge];
+      const scope = dailyRoleScopeSelect?.value || "temporary";
+      if(dailyRoleExtraPrivilegeSelect && existing?.assignment_scope === scope){
+        dailyRoleExtraPrivilegeSelect.value = existing?.extra_privilege || "none";
+      }else if(dailyRoleExtraPrivilegeSelect){
+        dailyRoleExtraPrivilegeSelect.value = scope === "permanent" ? (profile?.extra_privilege || "none") : "none";
+      }
       refreshDailyRoleDerivedUi();
       dailyRoleExtraPrivilegeSelect?.focus();
     });
@@ -23130,6 +23731,18 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
       refreshDailyRoleDerivedUi();
     });
   }
+  dailyRoleScopeSelect?.addEventListener("change", () => {
+    const badge = (dailyRoleBadgeInput?.value || "").trim();
+    const profile = findSettingsProfileById(badge);
+    const existing = dailyRolesState && dailyRolesState[badge];
+    const scope = dailyRoleScopeSelect?.value || "temporary";
+    if(dailyRoleExtraPrivilegeSelect){
+      dailyRoleExtraPrivilegeSelect.value = existing?.assignment_scope === scope
+        ? (existing?.extra_privilege || "none")
+        : (scope === "permanent" ? (profile?.extra_privilege || "none") : "none");
+    }
+    refreshDailyRoleDerivedUi();
+  });
   dailyRoleExtraPrivilegeSelect?.addEventListener("change", refreshDailyRoleDerivedUi);
   dailyRolesSaveBtn?.addEventListener("click", saveDailyRoleUi);
   if(serverSettingsCloseBtn) serverSettingsCloseBtn.addEventListener("click", () => serverSettingsOverlay?.classList.remove("active"));
@@ -23145,7 +23758,54 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   settingsNavClients?.addEventListener("click", async () => { await loadSettingsClientsUi(); showServerSettingsPage("clients"); });
   settingsNavInventory?.addEventListener("click", async () => { showServerSettingsPage("inventory"); await loadSettingsInventoryUi(); });
   settingsNavApi?.addEventListener("click", () => showServerSettingsPage("api"));
+  settingsNavMappings?.addEventListener("click", async () => { showServerSettingsPage("mappings"); await loadQrMappingsUi(); });
   settingsNavProfile?.addEventListener("click", async () => { await loadSettingsProfilesUi(); showServerSettingsPage("profile"); });
+  settingsMappingRefreshBtn?.addEventListener("click", loadQrMappingsUi);
+  settingsMappingValidateBtn?.addEventListener("click", validateQrMappingsUi);
+  settingsMappingPublishBtn?.addEventListener("click", publishQrMappingsUi);
+  settingsMappingRollbackBtn?.addEventListener("click", rollbackQrMappingsUi);
+  settingsMappingTabs.forEach(tab => tab.addEventListener("click", () => {
+    const key = tab.dataset.mappingTab || "commands";
+    settingsMappingTabs.forEach(item => item.classList.toggle("active", item === tab));
+    Object.entries(settingsMappingPanels).forEach(([name, panel]) => panel?.classList.toggle("active", name === key));
+  }));
+  settingsMappingDefaultsBtn?.addEventListener("click", () => {
+    if(!qrMappingState.defaults){
+      if(settingsMappingStatus) settingsMappingStatus.textContent = "Defaults are not loaded yet. Press Refresh first.";
+      return;
+    }
+    loadMappingConfigIntoTables(qrMappingState.defaults);
+    if(settingsMappingStatus) settingsMappingStatus.textContent = "Defaults loaded into the tables. Validate and publish to activate them.";
+  });
+  settingsMappingExportBtn?.addEventListener("click", () => {
+    const config = qrMappingEditorPayload();
+    if(!config) return;
+    const blob = new Blob([JSON.stringify(config, null, 2)], {type:"application/json"});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `qr-mappings-v${Number(config.version || 1)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    if(settingsMappingStatus) settingsMappingStatus.textContent = "Mapping JSON exported.";
+  });
+  settingsMappingImportBtn?.addEventListener("click", () => settingsMappingImportFile?.click());
+  settingsMappingImportFile?.addEventListener("change", async () => {
+    const file = settingsMappingImportFile.files?.[0];
+    if(!file) return;
+    try{
+      const parsed = JSON.parse(await file.text());
+      if(!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Top-level value must be an object");
+      loadMappingConfigIntoTables(parsed);
+      if(settingsMappingStatus) settingsMappingStatus.textContent = "Mapping JSON imported into the tables. Validate before publishing.";
+    }catch(err){
+      if(settingsMappingStatus) settingsMappingStatus.textContent = `Import failed: ${err.message || err}`;
+    }finally{
+      settingsMappingImportFile.value = "";
+    }
+  });
   settingsProfilesRefreshBtn?.addEventListener("click", async () => {
     if(settingsProfilesCount) settingsProfilesCount.value = "Refreshing...";
     await loadSettingsProfilesUi();
@@ -23820,10 +24480,9 @@ Archive warning: ${e}`;
   // Apply saved dashboard theme/settings immediately on page load.
   loadServerSettingsUi(true).catch(() => {});
 
-  // Load the local product cache on page load so the overlay opens fast.
-  // A fresh catalog download remains available through Settings >
-  // Update Product Items; avoid repeating that expensive request per reload.
-  loadProducts(false).catch(() => {});
+  // Product data is intentionally not requested during dashboard startup.
+  // It is read from cache only when a product-selection workflow is opened,
+  // or downloaded from BMS when Update Product Items is pressed manually.
 </script>
 </body>
 </html>
@@ -24812,8 +25471,29 @@ def api_profiles_operators():
 
 
 @APP.get("/api/user-kpis")
-def api_user_kpis(role: str = "all"):
-    return {"ok": True, **build_user_kpis(role_filter=role)}
+def api_user_kpis(role: str = "all", force: bool = False):
+    return {
+        "ok": True,
+        **_cached_user_kpis(
+            role_filter=role,
+            include_details=False,
+            force=force,
+        ),
+    }
+
+
+@APP.get("/api/user-kpis/{profile_id}")
+def api_user_kpi_detail(profile_id: str, force: bool = False):
+    payload = _cached_user_kpis(
+        role_filter="all",
+        profile_id=profile_id,
+        include_details=True,
+        force=force,
+    )
+    items = payload.get("items") if isinstance(payload, dict) else []
+    if not isinstance(items, list) or not items:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "Production Card profile not found."})
+    return {"ok": True, "item": items[0], "generated_at_utc": payload.get("generated_at_utc")}
 
 
 @APP.get("/api/breaktime/users")
@@ -25449,6 +26129,23 @@ def _apply_embedded_session_snapshot(sess: MachineSession, snap: Any, machine_co
     if isinstance(snap.get("job_payload"), dict):
         sess.job_payload = dict(snap.get("job_payload") or {})
         _fill_session_product_identity(sess)
+    if isinstance(snap.get("color_mold_sessions"), dict):
+        sess.color_mold_sessions = {
+            str(key): dict(value)
+            for key, value in dict(snap.get("color_mold_sessions") or {}).items()
+            if isinstance(value, dict)
+        }
+    if "color_mold_group_id" in snap:
+        sess.color_mold_group_id = str(snap.get("color_mold_group_id") or "")
+    if "change_supervisor_code" in snap:
+        sess.change_supervisor_code = str(snap.get("change_supervisor_code") or "")
+    if "change_supervisor_name" in snap:
+        sess.change_supervisor_name = str(snap.get("change_supervisor_name") or "")
+    if isinstance(snap.get("change_supervisor_owners"), list):
+        sess.change_supervisor_owners = [
+            dict(row) for row in snap.get("change_supervisor_owners") or []
+            if isinstance(row, dict)
+        ]
     if isinstance(snap.get("linkage_jobs"), list):
         sess.linkage_jobs = [dict(row) for row in snap.get("linkage_jobs") or [] if isinstance(row, dict)]
     if isinstance(snap.get("mixing_open_jobs"), list):
@@ -25709,6 +26406,29 @@ def _append_reject_event_records(
 def _apply_reject_void_event(sess: MachineSession, event: Dict[str, Any]) -> bool:
     """Void one reject ledger row and its matching aggregate atomically."""
     ev = event if isinstance(event, dict) else {}
+    void_records = [
+        dict(row)
+        for row in (ev.get("void_records") or [])
+        if isinstance(row, dict)
+    ]
+    if void_records:
+        for record in void_records:
+            single_event = {
+                "reason": record.get("reason_code") or ev.get("reason"),
+                "reject_record": record,
+                "reject_scan_id": record.get("reject_scan_id"),
+            }
+            if not _apply_reject_void_event(sess, single_event):
+                return False
+        if "post_reject_total" in ev:
+            sess.reject_total = max(0, int(ev.get("post_reject_total") or 0))
+        if "post_startup_reject_total" in ev:
+            sess.startup_reject_total = max(0, int(ev.get("post_startup_reject_total") or 0))
+        if "post_no_shot_total" in ev:
+            sess.no_shot_total = max(0, int(ev.get("post_no_shot_total") or 0))
+        if isinstance(ev.get("post_reject_breakdown"), dict):
+            sess.reject_breakdown = _canonical_reject_breakdown(ev.get("post_reject_breakdown"))
+        return True
     supplied = ev.get("reject_record") if isinstance(ev.get("reject_record"), dict) else {}
     reject_scan_id = str(ev.get("reject_scan_id") or supplied.get("reject_scan_id") or "").strip()
     reason = str(ev.get("reason") or supplied.get("reason_code") or "").strip().upper()
@@ -25838,35 +26558,89 @@ def _apply_product_part_void_event(sess: MachineSession, event: Dict[str, Any]) 
 
 
 def _apply_butal_void_event(sess: MachineSession, event: Dict[str, Any]) -> bool:
-    """Apply one compact BUTAL void, preserving its audit row as voided."""
+    """Apply compact BUTAL voids, preserving every audit row as voided."""
     ev = event if isinstance(event, dict) else {}
-    record = ev.get("void_record") if isinstance(ev.get("void_record"), dict) else {}
-    wanted_raw = str(record.get("raw_scan") or "").strip()
-    wanted_time = str(record.get("scanned_at") or "").strip()
+    records = [
+        dict(row)
+        for row in (ev.get("void_records") or [])
+        if isinstance(row, dict)
+    ]
+    if not records:
+        record = ev.get("void_record") if isinstance(ev.get("void_record"), dict) else {}
+        if record:
+            records = [dict(record)]
     rows = [dict(row) for row in (sess.butal_scan_logs or []) if isinstance(row, dict)]
-    matched = False
-    for idx in range(len(rows) - 1, -1, -1):
-        row = rows[idx]
-        if wanted_raw and str(row.get("raw_scan") or "").strip() != wanted_raw:
-            continue
-        if wanted_time and str(row.get("scanned_at") or "").strip() != wanted_time:
-            continue
-        rows[idx] = {**row, **record, "voided": True}
-        matched = True
-        break
-    if not matched and record:
-        rows.append({**record, "voided": True})
+    for record in records:
+        wanted_raw = str(record.get("raw_scan") or "").strip()
+        wanted_time = str(record.get("scanned_at") or "").strip()
+        matched = False
+        for idx in range(len(rows) - 1, -1, -1):
+            row = rows[idx]
+            if wanted_raw and str(row.get("raw_scan") or "").strip() != wanted_raw:
+                continue
+            if wanted_time and str(row.get("scanned_at") or "").strip() != wanted_time:
+                continue
+            rows[idx] = {**row, **record, "voided": True}
+            matched = True
+            break
+        if not matched:
+            rows.append({**record, "voided": True})
     sess.butal_scan_logs = rows
     if "post_butal_total" in ev:
         sess.butal_total = max(0, int(ev.get("post_butal_total") or 0))
     else:
-        sess.butal_total = max(0, int(sess.butal_total or 0) - int(record.get("qty") or 0))
+        removed_qty = sum(max(0, int(row.get("qty") or 0)) for row in records)
+        sess.butal_total = max(0, int(sess.butal_total or 0) - removed_qty)
     if isinstance(ev.get("post_butal_by_job"), dict):
         sess.butal_by_job = {
             str(key): max(0, int(value or 0))
             for key, value in dict(ev.get("post_butal_by_job") or {}).items()
         }
     return True
+
+
+def _apply_job_linkage_removed_event(sess: MachineSession, event: Dict[str, Any]) -> None:
+    """Remove a linked job and accept the client's exact remaining linkage state."""
+    ev = event if isinstance(event, dict) else {}
+    removed_code = str(ev.get("removed_job_code") or "").strip()
+    removed_name = str(ev.get("removed_job_name") or "").strip()
+    if isinstance(ev.get("post_linkage_jobs"), list):
+        sess.linkage_jobs = [
+            dict(row) for row in (ev.get("post_linkage_jobs") or []) if isinstance(row, dict)
+        ]
+    else:
+        sess.linkage_jobs = [
+            row for row in (sess.linkage_jobs or [])
+            if isinstance(row, dict)
+            and not (
+                removed_code
+                and str(row.get("job_code") or "").strip().casefold() == removed_code.casefold()
+            )
+            and not (
+                not removed_code
+                and removed_name
+                and str(row.get("job_name") or "").strip().casefold() == removed_name.casefold()
+            )
+        ]
+    sess.linkage_enabled = bool(
+        ev.get("post_linkage_enabled", bool(sess.linkage_jobs))
+    )
+    if "post_linkage_job_code" in ev:
+        sess.linkage_job_code = ev.get("post_linkage_job_code")
+        sess.linkage_job_name = ev.get("post_linkage_job_name")
+        sess.linkage_job_payload = (
+            dict(ev.get("post_linkage_job_payload") or {})
+            if isinstance(ev.get("post_linkage_job_payload"), dict)
+            else {}
+        )
+    elif (
+        not sess.linkage_jobs
+        or str(sess.linkage_job_code or "").strip().casefold() == removed_code.casefold()
+    ):
+        primary = sess.linkage_jobs[-1] if sess.linkage_jobs else {}
+        sess.linkage_job_code = primary.get("job_code")
+        sess.linkage_job_name = primary.get("job_name")
+        sess.linkage_job_payload = primary.get("job_payload") or {}
 
 
 PACK_COUNTER_EVENT_TYPES = {"PACK", "LAST_SHIFT_BUTAL_PACK", "BUTAL_COMPLETION_PACK"}
@@ -25889,6 +26663,68 @@ def _session_has_pack_counter_event(sess: MachineSession, pack_key: str) -> bool
         and _pack_history_record_key(row, sess.production_session_id) == key
         for row in (sess.product_pack_history_logs or [])
     )
+
+
+def _apply_linkage_pack_allocation(sess: MachineSession, event: Dict[str, Any]) -> bool:
+    """Apply the linked-job share carried by one compact PACK event.
+
+    Offline clients replay PACK events without a full session snapshot.  The
+    aggregate ``pack_qty``/``qty`` fields update the main job, while this
+    allocation updates the linked output job from the same accepted scan.
+    """
+    ev = event if isinstance(event, dict) else {}
+    allocation = ev.get("linkage_output_allocation")
+    if not isinstance(allocation, dict):
+        pack_record = ev.get("pack_record") if isinstance(ev.get("pack_record"), dict) else {}
+        allocation = pack_record.get("linkage_output_allocation")
+    if not isinstance(allocation, dict) or not bool(allocation.get("special")):
+        return False
+
+    output_by_job = (
+        allocation.get("job_output_qty")
+        if isinstance(allocation.get("job_output_qty"), dict)
+        else {}
+    )
+
+    def job_key(value: Any) -> str:
+        return str(value or "").strip().casefold()
+
+    mode = str(allocation.get("mode") or "").strip().upper()
+    receiving_code = job_key(
+        allocation.get("routed_job_code")
+        if mode == "MULTI_OUTPUT"
+        else allocation.get("packing_job_code")
+    )
+    if not receiving_code:
+        return False
+
+    changed = False
+    updated_rows: List[Dict[str, Any]] = []
+    for source in sess.linkage_jobs or []:
+        if not isinstance(source, dict):
+            continue
+        row = dict(source)
+        code = job_key(row.get("job_code"))
+        if code == receiving_code:
+            output_qty = 0
+            for allocation_code, value in output_by_job.items():
+                if job_key(allocation_code) == code:
+                    try:
+                        output_qty = max(0, int(float(value or 0)))
+                    except (TypeError, ValueError):
+                        output_qty = 0
+                    break
+            row["linkage_output_role"] = "OUTPUT" if mode == "MULTI_OUTPUT" else "PACKING"
+            row["linkage_pack_count"] = max(0, int(row.get("linkage_pack_count") or 0) + 1)
+            row["linkage_good_total"] = max(
+                0,
+                int(row.get("linkage_good_total") or 0) + output_qty,
+            )
+            changed = True
+        updated_rows.append(row)
+    if changed:
+        sess.linkage_jobs = updated_rows
+    return changed
 
 
 def _session_sync_can_adopt_newer_segment(
@@ -26510,6 +27346,13 @@ async def api_event(req: Request):
     segment_start_event = ev_type in {
         "JOB_SET", "JOB_STUB_SET", "COLOR_CHANGE_JOB_SET", "MOLD_CHANGE_JOB_SET"
     }
+    parked_color_mold_resume = bool(
+        ev_type in {"COLOR_CHANGE_JOB_SET", "MOLD_CHANGE_JOB_SET"}
+        and (
+            _is_parked_color_mold_session(sess, incoming_session_id)
+            or _color_mold_snapshot_can_switch(sess, session_snapshot, incoming_session_id)
+        )
+    )
     finish_event = ev_type in {"FINISH_SHIFT", "FINISH_JOB"}
     closing_session_id = incoming_session_id or (current_session_id if finish_event else "")
     if incoming_session_id and incoming_session_id in CLOSED_PRODUCTION_SESSION_IDS:
@@ -26566,6 +27409,7 @@ async def api_event(req: Request):
             or _session_sync_can_adopt_newer_segment(
                 sess, session_snapshot, incoming_session_id, client_id, machine_code
             )
+            or _color_mold_snapshot_can_switch(sess, session_snapshot, incoming_session_id)
         )
     ):
         previous_session_id = current_session_id
@@ -26622,7 +27466,7 @@ async def api_event(req: Request):
             session_snapshot.get("job_started_at") or data.get("event_created_at_utc")
         )
         current_started = _parse_iso_utc(sess.job_started_at)
-        if current_started is not None and (
+        if not parked_color_mold_resume and current_started is not None and (
             incoming_started is None or incoming_started <= current_started
         ):
             return JSONResponse(
@@ -26635,6 +27479,17 @@ async def api_event(req: Request):
                     "session": _session_protocol_payload(sess),
                 },
                 status_code=409,
+            )
+        if parked_color_mold_resume:
+            _append_server_app_log(
+                "parked_color_mold_session_resumed",
+                {
+                    "client_id": client_id,
+                    "machine_code": machine_code,
+                    "previous_production_session_id": current_session_id,
+                    "production_session_id": incoming_session_id,
+                    "event_type": ev_type,
+                },
             )
     if (
         current_session_id
@@ -27013,25 +27868,7 @@ async def api_event(req: Request):
     elif ev_type == "JOB_LINKAGE_REMOVED":
         removed_code = str(ev.get("removed_job_code") or "").strip()
         removed_name = str(ev.get("removed_job_name") or "").strip()
-        sess.linkage_jobs = [
-            row for row in (sess.linkage_jobs or [])
-            if isinstance(row, dict)
-            and not (
-                removed_code
-                and str(row.get("job_code") or "").strip().casefold() == removed_code.casefold()
-            )
-            and not (
-                not removed_code
-                and removed_name
-                and str(row.get("job_name") or "").strip().casefold() == removed_name.casefold()
-            )
-        ]
-        sess.linkage_enabled = bool(sess.linkage_jobs)
-        if str(sess.linkage_job_code or "").strip().casefold() == removed_code.casefold():
-            primary = sess.linkage_jobs[-1] if sess.linkage_jobs else {}
-            sess.linkage_job_code = primary.get("job_code")
-            sess.linkage_job_name = primary.get("job_name")
-            sess.linkage_job_payload = primary.get("job_payload") or {}
+        _apply_job_linkage_removed_event(sess, ev)
         _append_server_app_log(
             "job_linkage_removed",
             {
@@ -27044,6 +27881,12 @@ async def api_event(req: Request):
         )
     elif ev_type in ("JOB_SET", "JOB_STUB_SET", "COLOR_CHANGE_JOB_SET", "MOLD_CHANGE_JOB_SET"):
         _reset_active_session_for_new_job_segment(sess, preserve_operator_shift_logs=(ev_type in ("COLOR_CHANGE_JOB_SET", "MOLD_CHANGE_JOB_SET")))
+        if ev_type in ("JOB_SET", "JOB_STUB_SET"):
+            sess.color_mold_sessions = {}
+            sess.color_mold_group_id = ""
+            sess.change_supervisor_code = ""
+            sess.change_supervisor_name = ""
+            sess.change_supervisor_owners = []
         sess.production_session_id = incoming_session_id or _legacy_production_session_id(
             machine_code,
             data.get("job_code") or data.get("job_name"),
@@ -27178,6 +28021,20 @@ async def api_event(req: Request):
                 if isinstance(snap.get("job_payload"), dict):
                     sess.job_payload = dict(snap.get("job_payload") or {})
                     _fill_session_product_identity(sess)
+                if isinstance(snap.get("color_mold_sessions"), dict):
+                    sess.color_mold_sessions = {
+                        str(key): dict(value)
+                        for key, value in dict(snap.get("color_mold_sessions") or {}).items()
+                        if isinstance(value, dict)
+                    }
+                sess.color_mold_group_id = str(snap.get("color_mold_group_id", sess.color_mold_group_id) or "")
+                sess.change_supervisor_code = str(snap.get("change_supervisor_code", sess.change_supervisor_code) or "")
+                sess.change_supervisor_name = str(snap.get("change_supervisor_name", sess.change_supervisor_name) or "")
+                if isinstance(snap.get("change_supervisor_owners"), list):
+                    sess.change_supervisor_owners = [
+                        dict(row) for row in snap.get("change_supervisor_owners") or []
+                        if isinstance(row, dict)
+                    ]
                 if isinstance(snap.get("linkage_jobs"), list):
                     sess.linkage_jobs = [dict(row) for row in snap.get("linkage_jobs") or [] if isinstance(row, dict)]
                 sess.linkage_enabled = bool(snap.get("linkage_enabled", bool(sess.linkage_jobs)))
@@ -27394,6 +28251,7 @@ async def api_event(req: Request):
             )
 
     if ev_type in PACK_COUNTER_EVENT_TYPES:
+        _apply_linkage_pack_allocation(sess, ev)
         _append_pack_counter_event_record(sess, ev, data.get("event_created_at_utc"))
 
     if ev_type not in ("SESSION_SYNC", "HEARTBEAT", "FINISH_JOB", "FINISH_SHIFT"):
@@ -28768,8 +29626,140 @@ def api_server_settings():
             "qrgen_base_url": current_qrgen_base_url(),
             "visible_machine_codes": SERVER_SETTINGS.get("visible_machine_codes", []),
             "test_machine": _normalize_test_machine_settings(SERVER_SETTINGS.get("test_machine")),
+            "qr_mapping_version": int((SERVER_SETTINGS.get("qr_mapping_config") or {}).get("version") or 1),
         },
     }
+
+
+def _qr_mapping_actor(badge_code: Any) -> Optional[Dict[str, str]]:
+    badge = str(badge_code or "").strip()
+    profile = _find_profile_by_id_number(badge) if badge else None
+    if not isinstance(profile, dict):
+        return None
+    role = str(profile.get("role") or profile.get("company_role") or "").strip()
+    extra = str(profile.get("extra_privilege") or "").strip().lower()
+    authorized = (
+        "admin" in role.lower()
+        or "supervisor" in role.lower()
+        or extra in {"supervisor", "both", "supervisor + qc"}
+    )
+    if not authorized:
+        today = get_today_role_assignments().get(badge, {})
+        rights = str((today or {}).get("rights") or "").strip().lower()
+        authorized = "supervisor" in rights or "admin" in rights or rights == "both"
+    if not authorized:
+        return None
+    return {
+        "badge_code": badge,
+        "name": str(profile.get("name") or badge).strip(),
+        "role": role or ("Supervisor" if extra == "supervisor" else "Administration"),
+    }
+
+
+def _qr_mapping_history_summaries() -> List[Dict[str, Any]]:
+    return [
+        {
+            "version": int(row.get("version") or 0),
+            "updated_at_utc": row.get("updated_at_utc"),
+            "updated_by": row.get("updated_by"),
+            "updated_by_badge": row.get("updated_by_badge"),
+        }
+        for row in reversed(SERVER_SETTINGS.get("qr_mapping_history") or [])
+        if isinstance(row, dict)
+    ]
+
+
+@APP.get("/api/qr-mappings")
+def api_qr_mappings():
+    return {
+        "ok": True,
+        "config": deepcopy(SERVER_SETTINGS.get("qr_mapping_config") or DEFAULT_QR_MAPPING_CONFIG),
+        "history": _qr_mapping_history_summaries(),
+        "defaults": deepcopy(DEFAULT_QR_MAPPING_CONFIG),
+    }
+
+
+@APP.post("/api/qr-mappings/validate")
+async def api_qr_mappings_validate(req: Request):
+    data = await req.json()
+    config = data.get("config") if isinstance(data, dict) else None
+    ok, errors = validate_qr_mapping_config(config)
+    return JSONResponse(
+        {"ok": ok, "errors": errors},
+        status_code=200 if ok else 400,
+    )
+
+
+@APP.post("/api/qr-mappings")
+async def api_qr_mappings_save(req: Request):
+    global SERVER_SETTINGS
+    data = await req.json()
+    actor = _qr_mapping_actor(data.get("badge_code"))
+    if actor is None:
+        return JSONResponse(
+            {"ok": False, "error": "A registered Supervisor or Administration badge is required."},
+            status_code=403,
+        )
+    candidate = _normalize_server_qr_mapping_config(data.get("config")) if isinstance(data.get("config"), dict) else None
+    ok, errors = validate_qr_mapping_config(candidate)
+    if not ok:
+        return JSONResponse({"ok": False, "error": "Mapping validation failed.", "errors": errors}, status_code=400)
+    current = deepcopy(SERVER_SETTINGS.get("qr_mapping_config") or DEFAULT_QR_MAPPING_CONFIG)
+    next_version = max(1, int(current.get("version") or 1) + 1)
+    now = utc_now().isoformat()
+    candidate["version"] = next_version
+    candidate["updated_at_utc"] = now
+    candidate["updated_by"] = actor["name"]
+    candidate["updated_by_badge"] = actor["badge_code"]
+    history = [
+        deepcopy(row) for row in (SERVER_SETTINGS.get("qr_mapping_history") or [])
+        if isinstance(row, dict)
+    ]
+    history.append(current)
+    SERVER_SETTINGS = {
+        **SERVER_SETTINGS,
+        "qr_mapping_config": candidate,
+        "qr_mapping_history": history[-20:],
+    }
+    save_server_settings(SERVER_SETTINGS)
+    _append_server_app_log(
+        "qr_mapping_published",
+        {"version": next_version, **actor},
+    )
+    return {"ok": True, "config": deepcopy(candidate), "history": _qr_mapping_history_summaries()}
+
+
+@APP.post("/api/qr-mappings/rollback")
+async def api_qr_mappings_rollback(req: Request):
+    global SERVER_SETTINGS
+    data = await req.json()
+    actor = _qr_mapping_actor(data.get("badge_code"))
+    if actor is None:
+        return JSONResponse({"ok": False, "error": "A registered Supervisor or Administration badge is required."}, status_code=403)
+    try:
+        target_version = int(data.get("version"))
+    except Exception:
+        return JSONResponse({"ok": False, "error": "A valid history version is required."}, status_code=400)
+    target = next(
+        (deepcopy(row) for row in (SERVER_SETTINGS.get("qr_mapping_history") or []) if isinstance(row, dict) and int(row.get("version") or 0) == target_version),
+        None,
+    )
+    if target is None:
+        return JSONResponse({"ok": False, "error": "Mapping history version not found."}, status_code=404)
+    target = _normalize_server_qr_mapping_config(target)
+    current = deepcopy(SERVER_SETTINGS.get("qr_mapping_config") or DEFAULT_QR_MAPPING_CONFIG)
+    next_version = max(1, int(current.get("version") or 1) + 1)
+    target["version"] = next_version
+    target["updated_at_utc"] = utc_now().isoformat()
+    target["updated_by"] = actor["name"]
+    target["updated_by_badge"] = actor["badge_code"]
+    target["rollback_from_version"] = target_version
+    history = [deepcopy(row) for row in (SERVER_SETTINGS.get("qr_mapping_history") or []) if isinstance(row, dict)]
+    history.append(current)
+    SERVER_SETTINGS = {**SERVER_SETTINGS, "qr_mapping_config": target, "qr_mapping_history": history[-20:]}
+    save_server_settings(SERVER_SETTINGS)
+    _append_server_app_log("qr_mapping_rollback", {"version": next_version, "rollback_from": target_version, **actor})
+    return {"ok": True, "config": deepcopy(target), "history": _qr_mapping_history_summaries()}
 
 
 @APP.get("/api/daily-roles")
@@ -28799,6 +29789,12 @@ async def api_daily_roles_save(req: Request):
             {"ok": False, "error": "extra_privilege must be none, supervisor, qc, maintenance, or operator"},
             status_code=400,
         )
+    assignment_scope = str(data.get("assignment_scope", "temporary") or "temporary").strip().lower()
+    if assignment_scope not in ("temporary", "permanent"):
+        return JSONResponse(
+            {"ok": False, "error": "assignment_scope must be temporary or permanent"},
+            status_code=400,
+        )
     rights = _combine_privileges(_base_privilege_from_company_role(company_role), extra_privilege)
     # Name fallback from profile/static maps if available, otherwise use incoming/displayed badge.
     person_name = (
@@ -28808,13 +29804,17 @@ async def api_daily_roles_save(req: Request):
         or QC_BADGES.get(badge_code)
         or badge_code
     )
-    set_today_role_assignment(
-        badge_code,
-        person_name,
-        rights,
-        company_role=company_role,
-        extra_privilege=extra_privilege,
-    )
+    if assignment_scope == "permanent":
+        if not set_permanent_role_assignment(badge_code, extra_privilege):
+            return JSONResponse({"ok": False, "error": "Failed to save permanent role"}, status_code=500)
+    else:
+        set_today_role_assignment(
+            badge_code,
+            person_name,
+            rights,
+            company_role=company_role,
+            extra_privilege=extra_privilege,
+        )
     return {"ok": True, "date": _today_key_local(), "items": get_today_role_assignments()}
 
 
@@ -28850,6 +29850,8 @@ async def api_server_settings_save(req: Request):
         "qrgen_base_url": qrgen_base_url,
         "visible_machine_codes": visible_machine_codes,
         "test_machine": test_machine,
+        "qr_mapping_config": deepcopy(SERVER_SETTINGS.get("qr_mapping_config") or DEFAULT_QR_MAPPING_CONFIG),
+        "qr_mapping_history": deepcopy(SERVER_SETTINGS.get("qr_mapping_history") or []),
     }
     save_server_settings(SERVER_SETTINGS)
     await broadcast_state()
@@ -28994,6 +29996,8 @@ async def api_finished_jobs_review(req: Request):
                 return JSONResponse({"ok": False, "error": "total_good must be an integer"}, status_code=400)
         else:
             row["total_good"] = int(row.get("good_total", 0) or 0) + int(row.get("butal_total", 0) or 0)
+        if str(row.get("record_type") or "").strip().upper() == "SHIFT_PARTIAL":
+            row["partial_qty"] = int(row.get("total_good", 0) or 0)
 
         if "reject_breakdown" in changes:
             rb = changes.get("reject_breakdown")

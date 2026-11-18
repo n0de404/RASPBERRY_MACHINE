@@ -1,0 +1,301 @@
+[
+  {
+    "host": "192.168.13.24",
+    "result": {
+      "pids": [
+        32765,
+        32766
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "82458f51fa51c7fa",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.13.19",
+    "result": {
+      "pids": [
+        73679,
+        73680
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "de788862f2c049d5",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00002",
+          "job_code": "119049",
+          "pack_count": 15,
+          "good_total": 360
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.13.17",
+    "result": {
+      "pids": [
+        107835,
+        107836
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "8919427b752147e6",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00004",
+          "job_code": "118619",
+          "pack_count": 20,
+          "good_total": 240
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.13.11",
+    "result": {
+      "pids": [
+        108575,
+        108576
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "6c971604ab65efee",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00006",
+          "job_code": "119435",
+          "pack_count": 5,
+          "good_total": 250
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.13.15",
+    "result": {
+      "pids": [
+        26700,
+        26701
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "9239cc6f912fafcd",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00007",
+          "job_code": "119280",
+          "pack_count": 0,
+          "good_total": 0
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.13.13",
+    "result": {
+      "pids": [
+        107467,
+        107468
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "15322377b7040979",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00010",
+          "job_code": "119039",
+          "pack_count": 0,
+          "good_total": 0
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.13.16",
+    "result": {
+      "pids": [
+        108157,
+        108158
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "59e126f01e4e1919",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00011",
+          "job_code": "119511",
+          "pack_count": 4,
+          "good_total": 240
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.13.14",
+    "result": {
+      "pids": [
+        108189,
+        108190
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "32c42bb0d6f7a282",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00015",
+          "job_code": "119872",
+          "pack_count": 5,
+          "good_total": 125
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.13.26",
+    "result": {
+      "pids": [
+        11078,
+        11079
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "a857ccf7b9ac6b3f",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00413",
+          "job_code": "119374",
+          "pack_count": 11,
+          "good_total": 396
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.13.25",
+    "error": "timed out"
+  },
+  {
+    "host": "192.168.13.12",
+    "result": {
+      "pids": [
+        34582,
+        34583
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "611b66de42f6c111",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00008",
+          "job_code": "119051",
+          "pack_count": 12,
+          "good_total": 432
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.11.147",
+    "result": {
+      "pids": [
+        104389,
+        104390
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "9d03fc4c0b119ff3",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00009",
+          "job_code": "119034",
+          "pack_count": 7,
+          "good_total": 175
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.10.167",
+    "result": {
+      "pids": [
+        107910,
+        107911
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "40db3eec666d07d9",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00014",
+          "job_code": "119371",
+          "pack_count": 24,
+          "good_total": 288
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  },
+  {
+    "host": "192.168.11.20",
+    "result": {
+      "pids": [
+        93429,
+        93430
+      ],
+      "fixed_binary": true,
+      "binary_sha256": "b7d641971c9fb7a8",
+      "data": "/home/user/.local/share/raspberry-machine-client",
+      "queue": 0,
+      "queue_errors": [],
+      "sessions": [
+        {
+          "machine_code": "M00001",
+          "job_code": "116290",
+          "pack_count": 4,
+          "good_total": 292
+        },
+        {
+          "machine_code": "M00005",
+          "job_code": null,
+          "pack_count": 0,
+          "good_total": 0
+        }
+      ],
+      "traceback_after_restart": false
+    }
+  }
+]

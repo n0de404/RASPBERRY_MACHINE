@@ -1,0 +1,111 @@
+diff --git a/client/client.py b/client/client.py
+--- a/client/client.py
++++ b/client/client.py
+@@ -11,6 +11,7 @@ import threading
+ import time
+ import math
++from decimal import Decimal, InvalidOperation
+ import queue
+ import uuid
+ from collections import deque
+@@ -16495,6 +16496,16 @@ class ClientUI(QWidget):
+         except Exception:
+             return 1
+ 
++    def _butal_scan_quantity(self, value: Any, multiplier: int) -> Optional[int]:
++        """Multiply before converting to piece counts; never silently truncate."""
++        try:
++            total = Decimal(str(value)) * Decimal(str(multiplier))
++            if total.is_finite() and total > 0 and total == total.to_integral_value():
++                return int(total)
++        except (InvalidOperation, ValueError, TypeError):
++            pass
++        return None
++
+     def _clear_reject_multiplier(self):
+         self.state.reject_multiplier_input = ""
+ 
+@@ -21560,7 +21571,8 @@ class ClientUI(QWidget):
+         self._save_active_session_snapshot()
+         self.push_event(
+-            {"type": "BUTAL", "qty": qty, "assigned_job_code": job_code, "assigned_job_name": job_name},
++            {"type": "BUTAL", "qty": qty, "assigned_job_code": job_code, "assigned_job_name": job_name,
++             "butal_record": dict(scan_row)},
+             f"BUTAL +{qty} {job_name or job_code}",
+         )
+         return True
+@@ -23190,7 +23202,9 @@ class ClientUI(QWidget):
+             self._assign_pending_butal_to_job(target)
+             return
+-        reviewer = self._reviewer_from_scan(raw_s) if res_pre is None else None
++        # A personal badge may also be in the legacy operator map. Resolve its
++        # current privileges before treating it as an operator handoff.
++        reviewer = self._reviewer_from_scan(raw_s) if res_pre is None or res_pre.kind == "OPERATOR" else None
+         if reviewer is not None:
+             reviewer_can_supervisor = str(reviewer.get("can_supervisor", "0")) == "1"
+             in_downtime_flow = (
+@@ -23210,7 +23224,7 @@ class ClientUI(QWidget):
+                 if reviewer_can_supervisor:
+                     checked_at_utc = datetime.now(timezone.utc).isoformat()
+-                    self.push_event(
++                    queued = self.push_event(
+                         {
+                             "type": "SUPERVISOR_ROTATION_CHECK",
+                             "checked_at_utc": checked_at_utc,
+@@ -23222,6 +23236,13 @@ class ClientUI(QWidget):
+                         silent=True,
+                         defer_snapshot=True,
+                     )
++                    name = reviewer.get("name") or reviewer.get("code") or "Supervisor"
++                    if queued:
++                        self.status.setText(f"Supervisor rotation check recorded: {name}. Queued for server delivery.")
++                        self._show_info_overlay("SUPERVISOR ROTATION CHECK", f"{name}\nCheck recorded and queued for server delivery.", hide_ms=2500)
++                    else:
++                        self.status.setText("Supervisor rotation check could not be saved. Please scan again.")
++                        self._show_invalid_overlay("Rotation check was not saved. Please scan again.")
+                     return
+                 if not reviewer_can_supervisor:
+                     self.status.setText("Authorized badge scanned. No supervisor action pending.")
+@@ -26268,9 +26289,13 @@ class ClientUI(QWidget):
+ 
+             if res.kind == "BUTAL":
+-                base_qty = int(res.qty or 0)
++                base_qty = res.qty or 0
+                 multiplier = self._reject_multiplier_value()
+-                qty = base_qty * multiplier
++                qty = self._butal_scan_quantity(base_qty, multiplier)
++                if qty is None:
++                    self.status.setText("BUTAL not counted: quantity × multiplier must be a positive whole piece count.")
++                    self._show_invalid_overlay("Invalid BUTAL quantity. Adjust the multiplier or scan a whole-piece quantity.")
++                    return
+                 if s.linkage_enabled and (s.linkage_jobs or []):
+                     s.waiting_butal_job_assignment = True
+                     s.pending_butal_qty = qty
+@@ -26318,7 +26343,7 @@ class ClientUI(QWidget):
+                 self._refresh_ui()
+                 self._pulse_card(self.cardStatButal)
+                 self._pulse_card(self.cardStatTotalGood)
+-                self.push_event({"type": "BUTAL", "qty": qty}, f"BUTAL +{qty}")
++                self.push_event({"type": "BUTAL", "qty": qty, "butal_record": dict(s.butal_scan_logs[-1])}, f"BUTAL +{qty}")
+                 return
+ 
+         self.status.setText(f"Scan handled: {res.kind}")
+diff --git a/server/server.py b/server/server.py
+--- a/server/server.py
++++ b/server/server.py
+@@ -26665,6 +26665,16 @@ async def api_event(req: Request):
+             rows[assigned_job_code] = int(rows.get(assigned_job_code, 0) or 0) + qty
+             sess.butal_by_job = rows
++        # Compact production events must retain their history as well as the
++        # counter. Recovery/void screens cannot depend on a later full sync.
++        if qty > 0:
++            record = dict(ev.get("butal_record") or {}) if isinstance(ev.get("butal_record"), dict) else {}
++            record.update({"qty": qty, "voided": False, "event_id": event_id})
++            record.setdefault("scanned_at", data.get("event_created_at_utc") or utc_now().isoformat())
++            record.setdefault("assigned_job_code", assigned_job_code)
++            record.setdefault("assigned_job_name", ev.get("assigned_job_name") or sess.job_name)
++            record.setdefault("source", "BUTAL")
++            sess.butal_scan_logs = list(sess.butal_scan_logs or []) + [record]
+     elif ev_type in {"REJECT", "STARTUP_REJECT"}:
+         appended_rejects = _append_reject_event_records(
+             sess,

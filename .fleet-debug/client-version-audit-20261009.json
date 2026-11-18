@@ -1,0 +1,643 @@
+[
+  {
+    "host": "192.168.13.24",
+    "result": {
+      "source": {
+        "sha256": "4c9168a95194c738",
+        "modified_utc": "2026-10-05T05:54:10.776612+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 1109,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 1306,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "5da0621790b6546e",
+        "modified_utc": "2026-10-08T11:28:12.549167+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      }
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.13.19",
+    "result": {
+      "source": {
+        "sha256": "6e351b88ea2ef2a2",
+        "modified_utc": "2026-10-05T05:53:01.774701+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 1091,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 1283,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "561f1106da32d622",
+        "modified_utc": "2026-10-05T05:55:19.028641+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00002",
+          "machine_name": "IMM 302",
+          "pack_count": 12,
+          "good_total": 288,
+          "job_code": "119049"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.13.17",
+    "result": {
+      "source": {
+        "sha256": "6e351b88ea2ef2a2",
+        "modified_utc": "2026-10-05T05:53:00.016601+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 12702,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 12703,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "d0e9f20256e6706b",
+        "modified_utc": "2026-10-05T05:55:10.286207+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00004",
+          "machine_name": "IMM 304",
+          "pack_count": 19,
+          "good_total": 228,
+          "job_code": "118619"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.13.11",
+    "result": {
+      "source": {
+        "sha256": "6e351b88ea2ef2a2",
+        "modified_utc": "2026-10-05T05:53:04.112253+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 12539,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 12540,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "ff271e088f1e33ed",
+        "modified_utc": "2026-10-05T05:55:14.785605+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00006",
+          "machine_name": "IMM 306",
+          "pack_count": 5,
+          "good_total": 250,
+          "job_code": "119435"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.13.15",
+    "result": {
+      "source": {
+        "sha256": "6e351b88ea2ef2a2",
+        "modified_utc": "2026-10-05T05:52:59.692829+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 1109,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 1304,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "9c1c8985612df65b",
+        "modified_utc": "2026-10-05T05:55:11.794487+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00007",
+          "machine_name": "IMM 307",
+          "pack_count": 0,
+          "good_total": 0,
+          "job_code": "119280"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.13.13",
+    "result": {
+      "source": {
+        "sha256": "6e351b88ea2ef2a2",
+        "modified_utc": "2026-10-05T05:53:00.189829+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 12307,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 12308,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "75db4e1b78b8ff04",
+        "modified_utc": "2026-10-05T05:55:16.962759+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00010",
+          "machine_name": "IMM 310",
+          "pack_count": 0,
+          "good_total": 0,
+          "job_code": "119039"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.13.16",
+    "result": {
+      "source": {
+        "sha256": "6e351b88ea2ef2a2",
+        "modified_utc": "2026-10-05T05:52:59.815084+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 12264,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 12265,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "76efd71b6d5a982a",
+        "modified_utc": "2026-10-05T05:55:10.981383+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00011",
+          "machine_name": "IMM 311",
+          "pack_count": 3,
+          "good_total": 180,
+          "job_code": "119511"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.13.14",
+    "result": {
+      "source": {
+        "sha256": "6e351b88ea2ef2a2",
+        "modified_utc": "2026-10-05T05:52:59.917194+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 12350,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 12351,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "8d162d70106567a9",
+        "modified_utc": "2026-10-05T05:55:09.447874+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00015",
+          "machine_name": "IMM 315",
+          "pack_count": 4,
+          "good_total": 100,
+          "job_code": "119872"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.13.26",
+    "result": {
+      "source": {
+        "sha256": "6e351b88ea2ef2a2",
+        "modified_utc": "2026-10-05T05:52:59.307442+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 1369,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 1558,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "1e7d885c6d230425",
+        "modified_utc": "2026-10-05T05:55:11.004850+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00413",
+          "machine_name": "IMM 413",
+          "pack_count": 9,
+          "good_total": 324,
+          "job_code": "119374"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.13.25",
+    "error": "TimeoutError: timed out"
+  },
+  {
+    "host": "192.168.13.12",
+    "result": {
+      "source": {
+        "sha256": "05bfe6a3bdab0a94",
+        "modified_utc": "2026-10-03T04:09:53.066544+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 1113,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 1307,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "9c72bc86a4a3a2b0",
+        "modified_utc": "2026-10-03T04:12:11.226864+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [
+        [
+          "AVERAGE_WEIGHT_RECEIVED",
+          2
+        ],
+        [
+          "CYCLE_TIME_CONFIRMED",
+          2
+        ],
+        [
+          "FINISH_JOB",
+          2
+        ],
+        [
+          "FINISH_SHIFT",
+          4
+        ],
+        [
+          "JOB_SET",
+          3
+        ],
+        [
+          "MACHINE_STATUS",
+          3
+        ],
+        [
+          "OPERATOR_SET",
+          3
+        ],
+        [
+          "PACK",
+          144
+        ],
+        [
+          "PRODUCTION_DAILY_REPORT",
+          1
+        ],
+        [
+          "PRODUCTION_DAILY_REPORT_RESOLVED",
+          1
+        ],
+        [
+          "RAW_MATERIAL",
+          142
+        ],
+        [
+          "REJECT_REVIEW_CONFIRM",
+          2
+        ],
+        [
+          "SESSION_RESUME",
+          1
+        ],
+        [
+          "SESSION_SYNC",
+          17
+        ],
+        [
+          "STARTUP_REJECT",
+          8
+        ],
+        [
+          "SUPERVISOR_REVIEW",
+          4
+        ],
+        [
+          "SUPERVISOR_ROTATION_CHECK",
+          1
+        ]
+      ],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00008",
+          "machine_name": "IMM 308",
+          "pack_count": 9,
+          "good_total": 324,
+          "job_code": "119051"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.11.147",
+    "result": {
+      "source": {
+        "sha256": "6e351b88ea2ef2a2",
+        "modified_utc": "2026-10-05T05:53:00.497694+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 8965,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 8966,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "a9b89ec5eebc5495",
+        "modified_utc": "2026-10-05T05:55:11.019628+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00009",
+          "machine_name": "IMM 309",
+          "pack_count": 7,
+          "good_total": 175,
+          "job_code": "119034"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.10.167",
+    "result": {
+      "source": {
+        "sha256": "6e351b88ea2ef2a2",
+        "modified_utc": "2026-10-05T05:53:00.297288+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 12338,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 12339,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "6ea275fd6ff59086",
+        "modified_utc": "2026-10-05T05:55:14.690068+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00014",
+          "machine_name": "IMM 314",
+          "pack_count": 20,
+          "good_total": 240,
+          "job_code": "119371"
+        }
+      ]
+    },
+    "error": ""
+  },
+  {
+    "host": "192.168.11.20",
+    "result": {
+      "source": {
+        "sha256": "05bfe6a3bdab0a94",
+        "modified_utc": "2026-10-03T04:09:53.909440+00:00",
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true
+      },
+      "processes": [
+        {
+          "pid": 1382,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        },
+        {
+          "pid": 1607,
+          "executable": "/home/user/Raspberry_Machine/client/dist/RaspberryMachineClient"
+        }
+      ],
+      "binary": {
+        "sha256": "434b463b8ba6f7c5",
+        "modified_utc": "2026-10-03T04:12:14.953984+00:00"
+      },
+      "built_features": {
+        "compact_void": false,
+        "offline_linkage": false,
+        "max_merge": true,
+        "authoritative_ack": true
+      },
+      "queue": [],
+      "void_queue": [],
+      "sessions": [
+        {
+          "machine_code": "M00001",
+          "machine_name": "IMM 301",
+          "pack_count": 4,
+          "good_total": 292,
+          "job_code": "116290"
+        },
+        {
+          "machine_code": "M00005",
+          "machine_name": "IMM 305",
+          "pack_count": 0,
+          "good_total": 0,
+          "job_code": null
+        }
+      ]
+    },
+    "error": ""
+  }
+]

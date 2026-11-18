@@ -46,10 +46,15 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy,
     QGraphicsDropShadowEffect, QGraphicsBlurEffect, QGraphicsOpacityEffect, QProgressBar, QPushButton, QComboBox, QScrollArea, QStackedWidget,
-    QLineEdit, QInputDialog, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox
+    QLineEdit, QInputDialog, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QPlainTextEdit
 )
 
-from mappings import parse_scan, ScanResult, MACHINE_MAP, REJECT_REASON_MAP
+from mappings import (
+    parse_scan, ScanResult, MACHINE_MAP, REJECT_REASON_MAP,
+    DEFAULT_QR_MAPPING_CONFIG, apply_qr_mapping_config, active_qr_mapping_config,
+    resolve_mapped_scan, numeric_context_mapping, qr_mapping_config_to_text,
+    qr_mapping_config_from_text,
+)
 from runtime_store import ClientRuntimeStore
 from ui_theme import APP_STYLESHEET
 
@@ -109,7 +114,7 @@ ACTIVE_MACHINE_SESSIONS_FILE = CLIENT_ACTIVE_MACHINE_SESSIONS_FILE
 SERVER_EVENT_QUEUE_FILE = os.path.join(DATABASE_DIR, "server_event_queue.json")
 SERVER_CONFIRMED_SESSIONS_FILE = os.path.join(DATABASE_DIR, "server_confirmed_sessions.json")
 SERVER_SYNC_PROTOCOL_VERSION = 2
-CLIENT_DISPLAY_VERSION = "v1.02.01"
+CLIENT_DISPLAY_VERSION = "v1.04.00"
 SCANNED_PACK_QR_KEYS_FILE = os.path.join(DATABASE_DIR, "scanned_pack_qr_keys.json")
 INVALID_SCAN_GIF = os.environ.get(
     "MACHINE_INVALID_SCAN_GIF",
@@ -131,6 +136,7 @@ SHIFT_CARRYOVER_FILE = os.path.join(DATABASE_DIR, "shift_carryover.json")
 SQL_CONFIG_FILE = os.path.join(DATABASE_DIR, "sql_config.json")
 APP_LOGS_FILE = os.path.join(DATABASE_DIR, "app_logs.json")
 CLIENT_SETTINGS_FILE = os.path.join(DATABASE_DIR, "client_settings.json")
+QR_MAPPING_CACHE_FILE = os.path.join(DATABASE_DIR, "qr_mapping_cache.json")
 DAILY_ROLE_ASSIGNMENTS_FILE = os.path.join(DATABASE_DIR, "daily_role_assignments.json")
 RUNTIME_STORE = ClientRuntimeStore(DATABASE_DIR)
 RUNTIME_STORE.migrate_legacy_json(
@@ -1525,6 +1531,12 @@ REJECT_DETAIL_ITEMS = [
 REJECT_DETAIL_CODES = {code for code, _label in REJECT_DETAIL_ITEMS}
 REJECT_DETAIL_LABEL_TO_CODE = {label.upper(): code for code, label in REJECT_DETAIL_ITEMS}
 
+NUMERIC_REJECT_REASON_MAP = {
+    index: code
+    for index, (code, _label) in enumerate(REJECT_DETAIL_ITEMS, start=1)
+}
+NUMERIC_REJECT_REASON_MAP[21] = "SUR"
+
 
 def _canonical_reject_code(reason_code: Optional[str]) -> str:
     """Return the stable reject bucket while retaining raw codes in audit logs."""
@@ -1574,6 +1586,38 @@ PRODUCTION_DAILY_REPORT_ITEMS = [
     ("14", "Robot Set-up/Adjustment"),
     ("15", "Others"),
 ]
+
+
+def _apply_runtime_qr_mapping_config(config: Any) -> bool:
+    ok, _errors = apply_qr_mapping_config(config)
+    if not ok:
+        return False
+    reject_rows = numeric_context_mapping("reject")
+    NUMERIC_REJECT_REASON_MAP.clear()
+    NUMERIC_REJECT_REASON_MAP.update({number: str(row.get("code") or "").strip().upper() for number, row in reject_rows.items()})
+    pdr_rows = numeric_context_mapping("pdr")
+    if pdr_rows:
+        PRODUCTION_DAILY_REPORT_ITEMS[:] = [
+            (str(row.get("code") or number).strip().zfill(2), str(row.get("label") or "").strip())
+            for number, row in sorted(pdr_rows.items())
+        ]
+    return True
+
+
+def _load_cached_qr_mapping_config() -> Dict[str, Any]:
+    try:
+        with open(QR_MAPPING_CACHE_FILE, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        if isinstance(cached, dict) and _apply_runtime_qr_mapping_config(cached):
+            return cached
+    except Exception:
+        pass
+    fallback = copy.deepcopy(DEFAULT_QR_MAPPING_CONFIG)
+    _apply_runtime_qr_mapping_config(fallback)
+    return fallback
+
+
+QR_MAPPING_CONFIG: Dict[str, Any] = _load_cached_qr_mapping_config()
 
 PDR_REASON_ICON_FILES = {
     "01": "breakdown.png",
@@ -1728,6 +1772,7 @@ class ClientState:
     raw_material_logs: List[Dict[str, Any]] = None
     raw_material_unique_keys: Set[str] = None
     offline_qr_type_rules: Dict[str, str] = None
+    offline_linkage_relation_rules: Dict[str, bool] = None
     pending_offline_qr_raw: str = ""
     pending_offline_qr_phase: str = ""
     pending_offline_main_qty_input: str = ""
@@ -1745,6 +1790,11 @@ class ClientState:
     waiting_linkage_job_scan: bool = False
     waiting_color_change_job_scan: bool = False
     pending_color_change_reason: str = ""
+    color_mold_sessions: Dict[str, Dict[str, Any]] = None
+    color_mold_group_id: str = ""
+    change_supervisor_code: str = ""
+    change_supervisor_name: str = ""
+    change_supervisor_owners: List[Dict[str, Any]] = None
     linkage_enabled: bool = False
     linkage_job_code: Optional[str] = None
     linkage_job_name: Optional[str] = None
@@ -1796,6 +1846,8 @@ class ClientState:
             self.raw_material_unique_keys = set()
         if self.offline_qr_type_rules is None:
             self.offline_qr_type_rules = {}
+        if self.offline_linkage_relation_rules is None:
+            self.offline_linkage_relation_rules = {}
         if self.product_pack_history_logs is None:
             self.product_pack_history_logs = []
         if self.product_pack_history_keys is None:
@@ -1824,6 +1876,10 @@ class ClientState:
             self.linkage_jobs = []
         if self.operator_shift_logs is None:
             self.operator_shift_logs = []
+        if self.color_mold_sessions is None:
+            self.color_mold_sessions = {}
+        if self.change_supervisor_owners is None:
+            self.change_supervisor_owners = []
         if self.cycle_time_change_logs is None:
             self.cycle_time_change_logs = []
         if self.operator_shift_baseline_reject_breakdown is None:
@@ -3496,6 +3552,7 @@ class ClientUI(QWidget):
     server_closed_session_received = pyqtSignal(str, str)
     virtual_pack_reservation_received = pyqtSignal(dict)
     job_configurations_received = pyqtSignal(dict)
+    qr_mapping_received = pyqtSignal(dict)
 
     @staticmethod
     def _load_digital_font_family() -> str:
@@ -3545,13 +3602,18 @@ class ClientUI(QWidget):
         self._reprint_qr_phase = ""
         self._reprint_product_parts: List[Dict[str, Any]] = []
         self._color_change_options: List[Dict[str, Any]] = []
+        self._pending_color_mold_change: Optional[Dict[str, Any]] = None
         self._info_overlay_size = QSize(560, 150)
         self._choice_overlay_render_token = 0
+        self._compact_choice_overlay_cache_key = None
         self._digital_font_family = self._load_digital_font_family()
         self._identity_sync_lock = threading.Lock()
         self._identity_sync_inflight = False
         self._identity_sync_last_attempt = 0.0
         self._identity_sync_last_ok = 0.0
+        self._qr_mapping_sync_lock = threading.Lock()
+        self._qr_mapping_sync_inflight = False
+        self.qr_mapping_received.connect(self._apply_server_qr_mapping_payload)
         self._server_weight_poll_lock = threading.Lock()
         self._server_weight_poll_inflight = False
         self._last_server_weight_marker = ""
@@ -4115,7 +4177,9 @@ QWidget#ClientUIRoot {{
             " background: transparent;"
             "}"
         )
-        self.cardJobDetailsOuter.setMinimumHeight(370)
+        # This panel now occupies the former Raw Materials Consumption area on
+        # the left, so give the 11-row table the full height of that slot.
+        self.cardJobDetailsOuter.setMinimumHeight(440)
         self.cardJobDetailsOuter.setMaximumHeight(470)
         self.cardJobDetailsOuter.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
 
@@ -4479,7 +4543,12 @@ QWidget#ClientUIRoot {{
         rawOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         rawFrame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         rawFrame.setMinimumHeight(150)
-        rawDowntimeCol.addWidget(rawOuter, 1)
+        # Raw-material consumption is no longer part of the dashboard layout.
+        # Keep the widget owned and hidden because the live scan refresh still
+        # updates its labels for state compatibility.
+        rawOuter.setParent(self)
+        rawOuter.hide()
+        self.rawMaterialsConsumptionOuter = rawOuter
 
         downtimeOuter = QFrame()
         downtimeOuter.setObjectName("RightCardOuter")
@@ -4553,10 +4622,9 @@ QWidget#ClientUIRoot {{
             "QFrame#DowntimeMirrorHeader QLabel { color: #edf0f4; }"
         )
         downtimeOuterLay.addWidget(downtimeFrame)
-        downtimeOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        downtimeOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        downtimeOuter.setMaximumHeight(220)
         downtimeFrame.setMinimumHeight(150)
-
-        rawDowntimeCol.addWidget(downtimeOuter, 1)
 
         linkageOuter = QFrame()
         linkageOuter.setObjectName("RightCardOuter")
@@ -4878,11 +4946,14 @@ QWidget#ClientUIRoot {{
         self.historyRowOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.productionHistoryOuter, self.historyPackCol = _make_history_card("Production", "Pack/Good/Butal/Reject")
-        self.partsHistoryOuter, self.historyRawCol = _make_history_card("Parts History", "Raw Materials (Recent)")
+        self.partsHistoryOuter, self.historyRawCol = _make_history_card("Product Parts History", "Product Parts (Recent)")
         self.actionsHistoryOuter, self.historyActionCol = _make_history_card("Last Action", "Last Actions")
         self.historyRowOuter.layout().addWidget(self.productionHistoryOuter, 1)
         self.historyRowOuter.layout().addWidget(self.partsHistoryOuter, 1)
         self.historyRowOuter.layout().addWidget(self.actionsHistoryOuter, 1)
+        # The right column no longer carries the tall Product Parts table, so
+        # use the released space for clearer history and last-action lists.
+        self.historyRowOuter.setMinimumHeight(300)
 
         self.rightTopRow = QWidget()
         self.rightTopRow.setStyleSheet("background: transparent;")
@@ -4892,21 +4963,18 @@ QWidget#ClientUIRoot {{
         self.rightTopRow.layout().addWidget(linkageOuter, 2)
         self.rightTopRow.layout().addWidget(qtyOuter, 1)
 
-        # Show Linkage above Product Parts in the right panel.
+        # Keep the operational monitors together: Linkage/Job Quantity first,
+        # followed immediately by the Downtime Monitor.
         rightLayout.addWidget(self.rightTopRow)
         rightLayout.addSpacing(6)
-        rightLayout.addWidget(self.cardJobDetailsOuter)
+        rightLayout.addWidget(downtimeOuter)
         rightLayout.addSpacing(6)
         rightLayout.addWidget(self.historyRowOuter, 1)
 
-        # Swap positions: place Raw Materials + Cycle Monitor where Job Details used to be.
-        rawCycleSwapWrap = QWidget()
-        rawCycleSwapWrap.setLayout(rawDowntimeCol)
-        rawCycleSwapWrap.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        rawCycleSwapWrap.setMinimumHeight(440)
-        rawCycleSwapWrap.setStyleSheet("background: transparent;")
-        self.rawCycleSwapWrap = rawCycleSwapWrap
-        grid.addWidget(rawCycleSwapWrap, 3, 0, 1, 2)
+        # Product Parts replaces the removed Raw Materials Consumption panel
+        # in the left-bottom dashboard slot.
+        self.rawCycleSwapWrap = self.cardJobDetailsOuter
+        grid.addWidget(self.cardJobDetailsOuter, 3, 0, 1, 2)
 
         contentRow = QHBoxLayout()
         contentRow.setContentsMargins(0, 0, 0, 0)
@@ -4976,6 +5044,117 @@ QWidget#ClientUIRoot {{
         self.choiceCardsWidget.layout().setVerticalSpacing(8)
         self.choiceCardsWidget.hide()
         self.invalidTextBand.layout().addWidget(self.choiceCardsWidget, 0, Qt.AlignmentFlag.AlignCenter)
+
+        # Dedicated offline product-part confirmation. This stays separate
+        # from generic information text so long SKUs and both scan choices
+        # remain immediately readable.
+        self.productPartPromptWidget = QWidget()
+        self.productPartPromptWidget.setObjectName("ProductPartPromptWidget")
+        self.productPartPromptWidget.setStyleSheet("background: transparent; border: none;")
+        self.productPartPromptWidget.setLayout(QVBoxLayout())
+        self.productPartPromptWidget.layout().setContentsMargins(8, 2, 8, 8)
+        self.productPartPromptWidget.layout().setSpacing(10)
+
+        self.productPartPromptQuestion = QLabel(
+            "A part QR was scanned.\nDoes this part belong to the current product?"
+        )
+        self.productPartPromptQuestion.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productPartPromptQuestion.setWordWrap(True)
+        self.productPartPromptQuestion.setStyleSheet(
+            "background: transparent; border: none; color: #ecfeff; "
+            "font-size: 19px; font-weight: 900;"
+        )
+
+        self.productPartSkuCaption = QLabel("SCANNED PART")
+        self.productPartSkuCaption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productPartSkuCaption.setStyleSheet(
+            "background: transparent; border: none; color: #bae6fd; "
+            "font-size: 14px; font-weight: 900;"
+        )
+        self.productPartSkuLabel = QLabel("-")
+        self.productPartSkuLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.productPartSkuLabel.setWordWrap(True)
+        self.productPartSkuLabel.setMinimumHeight(54)
+        self.productPartSkuLabel.setStyleSheet(
+            "background: #e0f2fe; color: #082f49; border: 2px solid #7dd3fc; "
+            "border-radius: 5px; padding: 7px 12px; font-weight: 900;"
+        )
+
+        product_part_actions = QWidget()
+        product_part_actions.setStyleSheet("background: transparent; border: none;")
+        product_part_actions.setLayout(QHBoxLayout())
+        product_part_actions.layout().setContentsMargins(0, 0, 0, 0)
+        product_part_actions.layout().setSpacing(12)
+
+        def _make_product_part_action_card(
+            object_name: str,
+            number: str,
+            action: str,
+            detail: str,
+            background: str,
+            border: str,
+            detail_background: str,
+        ) -> QFrame:
+            card = QFrame()
+            card.setObjectName(object_name)
+            card.setMinimumHeight(112)
+            card.setStyleSheet(
+                f"QFrame#{object_name} {{ background: {background}; border: 3px solid {border}; "
+                "border-radius: 8px; }} QLabel { background: transparent; border: none; color: white; }"
+            )
+            card.setLayout(QHBoxLayout())
+            card.layout().setContentsMargins(10, 8, 10, 8)
+            card.layout().setSpacing(10)
+
+            number_label = QLabel(number)
+            number_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            number_label.setFixedWidth(58)
+            number_label.setStyleSheet(
+                "background: transparent; border: none; border-right: 2px solid rgba(255,255,255,0.88); "
+                "color: white; font-size: 42px; font-weight: 900; padding-right: 8px;"
+            )
+
+            copy_wrap = QWidget()
+            copy_wrap.setStyleSheet("background: transparent; border: none;")
+            copy_wrap.setLayout(QVBoxLayout())
+            copy_wrap.layout().setContentsMargins(0, 2, 0, 2)
+            copy_wrap.layout().setSpacing(6)
+            action_label = QLabel(action)
+            action_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            action_label.setWordWrap(True)
+            action_label.setStyleSheet(
+                "background: transparent; border: none; color: white; font-size: 18px; font-weight: 900;"
+            )
+            detail_label = QLabel(detail)
+            detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            detail_label.setWordWrap(True)
+            detail_label.setStyleSheet(
+                f"background: {detail_background}; border: none; border-radius: 4px; "
+                "color: white; font-size: 13px; font-weight: 800; padding: 5px;"
+            )
+            copy_wrap.layout().addWidget(action_label, 1)
+            copy_wrap.layout().addWidget(detail_label)
+            card.layout().addWidget(number_label)
+            card.layout().addWidget(copy_wrap, 1)
+            return card
+
+        self.productPartYesCard = _make_product_part_action_card(
+            "ProductPartYesCard", "1", "YES, INCLUDE PART", "Confirm this part",
+            "#15803d", "#86efac", "#166534",
+        )
+        self.productPartNoCard = _make_product_part_action_card(
+            "ProductPartNoCard", "0", "NO, REJECT QR", "This part is not included",
+            "#dc2626", "#fca5a5", "#991b1b",
+        )
+        product_part_actions.layout().addWidget(self.productPartYesCard, 1)
+        product_part_actions.layout().addWidget(self.productPartNoCard, 1)
+
+        self.productPartPromptWidget.layout().addWidget(self.productPartPromptQuestion)
+        self.productPartPromptWidget.layout().addWidget(self.productPartSkuCaption)
+        self.productPartPromptWidget.layout().addWidget(self.productPartSkuLabel)
+        self.productPartPromptWidget.layout().addWidget(product_part_actions)
+        self.productPartPromptWidget.hide()
+        self.invalidTextBand.layout().addWidget(self.productPartPromptWidget)
         self.invalidOverlay.layout().addWidget(self.invalidTextBand)
         self.invalidOverlay.hide()
 
@@ -6042,6 +6221,7 @@ QWidget#ClientUIRoot {{
         self._pending_shift_review_linked_payloads: List[Dict[str, Any]] = []
         self._pending_final_review_payload: Optional[Dict[str, Any]] = None
         self._pending_final_review_linked_payloads: List[Dict[str, Any]] = []
+        self._pending_final_review_hidden_payloads: List[Dict[str, Any]] = []
         self._finish_shift_cancel_snapshot: Optional[Dict[str, Any]] = None
         self._pending_finish_shift_clear_choice = False
         self._pending_finish_shift_turnover_snapshot: Optional[Dict[str, Any]] = None
@@ -6081,6 +6261,10 @@ QWidget#ClientUIRoot {{
         self.settingsBtnApi.setObjectName("SettingsNavButton")
         self.settingsBtnApi.setCheckable(True)
         self.settingsBtnApi.setProperty("app_log_name", "Settings API Config")
+        self.settingsBtnMappings = QPushButton("QR Mappings")
+        self.settingsBtnMappings.setObjectName("SettingsNavButton")
+        self.settingsBtnMappings.setCheckable(True)
+        self.settingsBtnMappings.setProperty("app_log_name", "Settings QR Mappings")
         self.settingsBtnLogs = QPushButton("App Logs")
         self.settingsBtnLogs.setObjectName("SettingsNavButton")
         self.settingsBtnLogs.setCheckable(True)
@@ -6090,6 +6274,7 @@ QWidget#ClientUIRoot {{
         self.settingsNav.layout().addWidget(self.settingsBtnGraphics)
         self.settingsNav.layout().addWidget(self.settingsBtnDisplay)
         self.settingsNav.layout().addWidget(self.settingsBtnApi)
+        self.settingsNav.layout().addWidget(self.settingsBtnMappings)
         self.settingsNav.layout().addWidget(self.settingsBtnLogs)
         self.settingsNav.layout().addStretch(1)
 
@@ -6445,6 +6630,42 @@ QWidget#ClientUIRoot {{
         ):
             w.setVisible(False)
 
+        self.settingsMappingsSection = QWidget()
+        self.settingsMappingsSection.setObjectName("SettingsPage")
+        self.settingsMappingsSection.setLayout(QVBoxLayout())
+        self.settingsMappingsSection.layout().setContentsMargins(0, 0, 0, 0)
+        self.settingsMappingsSection.layout().setSpacing(8)
+        self.qrMappingInfoLabel = QLabel(
+            "Lightweight text mapping: QR Name = QR Payload. Edit only the value after =, then validate and publish."
+        )
+        self.qrMappingInfoLabel.setObjectName("MetaLabel")
+        self.qrMappingInfoLabel.setWordWrap(True)
+        self.qrMappingVersionLabel = QLabel(
+            f"Published version: {int(QR_MAPPING_CONFIG.get('version') or 1)}"
+        )
+        self.qrMappingVersionLabel.setObjectName("MetaValue")
+        self.qrMappingEditor = QPlainTextEdit()
+        self.qrMappingEditor.setPlainText(qr_mapping_config_to_text(QR_MAPPING_CONFIG))
+        self.qrMappingEditor.setMinimumHeight(430)
+        self.qrMappingEditor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.qrMappingBadgeInput = QLineEdit()
+        self.qrMappingBadgeInput.setPlaceholderText("Scan Supervisor/Admin badge to publish")
+        self.qrMappingRefreshBtn = QPushButton("Refresh from Server")
+        self.qrMappingValidateBtn = QPushButton("Validate Mappings")
+        self.qrMappingPublishBtn = QPushButton("Publish Mappings")
+        for button in (self.qrMappingRefreshBtn, self.qrMappingValidateBtn, self.qrMappingPublishBtn):
+            button.setObjectName("SettingToggle")
+        mapping_actions = QHBoxLayout()
+        mapping_actions.addWidget(self.qrMappingRefreshBtn)
+        mapping_actions.addWidget(self.qrMappingValidateBtn)
+        mapping_actions.addWidget(self.qrMappingPublishBtn)
+        mapping_actions.addStretch(1)
+        self.settingsMappingsSection.layout().addWidget(self.qrMappingInfoLabel)
+        self.settingsMappingsSection.layout().addWidget(self.qrMappingVersionLabel)
+        self.settingsMappingsSection.layout().addWidget(self.qrMappingEditor, 1)
+        self.settingsMappingsSection.layout().addWidget(self.qrMappingBadgeInput)
+        self.settingsMappingsSection.layout().addLayout(mapping_actions)
+
         self.settingsLogsSection = QWidget()
         self.settingsLogsSection.setObjectName("SettingsPage")
         self.settingsLogsSection.setLayout(QVBoxLayout())
@@ -6485,6 +6706,7 @@ QWidget#ClientUIRoot {{
         self.settingsBtnGraphics.clicked.connect(lambda: self._show_settings_section("graphics"))
         self.settingsBtnDisplay.clicked.connect(lambda: self._show_settings_section("display"))
         self.settingsBtnApi.clicked.connect(lambda: self._show_settings_section("api"))
+        self.settingsBtnMappings.clicked.connect(lambda: self._show_settings_section("mappings"))
         self.settingsBtnLogs.clicked.connect(lambda: self._show_settings_section("logs"))
         self.graphicsModeToggle.modeChanged.connect(self._apply_graphics_settings)
         self.displayApplyBtn.clicked.connect(self._apply_display_settings)
@@ -6493,11 +6715,17 @@ QWidget#ClientUIRoot {{
             lambda _checked=False: self._refresh_all_running_job_details(manual=True)
         )
         self.apiApplyBtn.clicked.connect(self._apply_api_settings)
+        self.qrMappingRefreshBtn.clicked.connect(
+            lambda _checked=False: self._refresh_qr_mappings_from_server(force=True)
+        )
+        self.qrMappingValidateBtn.clicked.connect(self._validate_qr_mapping_editor)
+        self.qrMappingPublishBtn.clicked.connect(self._publish_qr_mapping_editor)
         self.settingsContent.layout().addLayout(self.settingsContentTop)
         self.settingsContent.layout().addWidget(self.settingsContentDivider)
         self.settingsScrollContent.layout().addWidget(self.settingsGraphicsSection)
         self.settingsScrollContent.layout().addWidget(self.settingsDisplaySection)
         self.settingsScrollContent.layout().addWidget(self.settingsApiSection)
+        self.settingsScrollContent.layout().addWidget(self.settingsMappingsSection)
         self.settingsScrollContent.layout().addWidget(self.settingsLogsSection)
         self.settingsScrollContent.layout().addStretch(1)
         self.settingsScroll.setWidget(self.settingsScrollContent)
@@ -6720,6 +6948,9 @@ QWidget#ClientUIRoot {{
         self.identitySyncTimer.timeout.connect(lambda: self._trigger_identity_cache_sync(force=False))
         self.identitySyncTimer.start(max(3000, IDENTITY_SYNC_INTERVAL_MS))
         QTimer.singleShot(250, lambda: self._trigger_identity_cache_sync(force=True))
+        # Pull the published QR registry at startup. If the server is offline,
+        # the validated local cache loaded above remains active.
+        QTimer.singleShot(900, lambda: self._refresh_qr_mappings_from_server(force=True))
         self.finishShiftSyncTimer = QTimer(self)
         self.finishShiftSyncTimer.timeout.connect(lambda: self.sync_local_finish_shifts_to_server(force=False))
         self.finishShiftSyncTimer.start(30000)
@@ -7144,6 +7375,7 @@ QWidget#ClientUIRoot {{
     def _show_invalid_overlay(self, reason: str = ""):
         self._info_overlay_compact = False
         self.choiceCardsWidget.hide()
+        self.productPartPromptWidget.hide()
         self.invalidReasonLabel.show()
         msg = str(reason or "").strip()
         expected = self._expected_scan_instruction()
@@ -7184,6 +7416,7 @@ QWidget#ClientUIRoot {{
         """Show a non-blocking operator prompt without stealing scanner input."""
         self._info_overlay_compact = True
         self.choiceCardsWidget.hide()
+        self.productPartPromptWidget.hide()
         self.invalidReasonLabel.show()
         self._invalid_hide_timer.stop()
         if self._invalid_movie is not None:
@@ -7222,32 +7455,126 @@ QWidget#ClientUIRoot {{
         if int(hide_ms or 0) > 0:
             self._invalid_hide_timer.start(max(2500, int(hide_ms)))
 
+    def _show_product_part_confirmation_overlay(self, sku: str):
+        """Show the scanner-owned yes/no prompt for an unknown product QR."""
+        self._info_overlay_compact = True
+        self._invalid_hide_timer.stop()
+        if self._invalid_movie is not None:
+            self._invalid_movie.stop()
+        self.invalidGifLabel.hide()
+        self.invalidReasonLabel.hide()
+        self.choiceCardsWidget.hide()
+        self.productPartPromptWidget.show()
+
+        self.invalidOverlay.setStyleSheet(
+            "background: rgba(14,116,144,0.82); border: 3px solid rgba(103,232,249,0.95); "
+            "border-radius: 8px;"
+        )
+        self.invalidTextBand.setStyleSheet(
+            "QFrame#InvalidTextBand { background: rgba(8,47,73,0.98); "
+            "border: none; border-radius: 6px; }"
+        )
+        self.invalidTextLabel.setText("VERIFY SCANNED PART")
+        self.invalidTextLabel.setStyleSheet(
+            "background: #082f73; border: none; color: #ffffff; "
+            "font-size: 27px; font-weight: 900; padding: 8px;"
+        )
+
+        safe_sku = str(sku or "").strip() or "SKU NOT AVAILABLE"
+        self.productPartSkuLabel.setText(safe_sku)
+
+        available_w = max(1, self.width() - 24)
+        panel_w = min(max(700, int(self.width() * 0.76)), available_w)
+        panel_h = min(max(390, int(self.height() * 0.56)), max(1, self.height() - 24))
+        self._info_overlay_size = QSize(panel_w, panel_h)
+
+        # Fit the complete SKU before allowing wrapping. This preserves long
+        # identifiers without hiding their distinguishing suffix.
+        sku_width = max(260, panel_w - 90)
+        sku_font = QFont(self.productPartSkuLabel.font())
+        sku_font.setBold(True)
+        sku_font.setPixelSize(34)
+        while (
+            sku_font.pixelSize() > 15
+            and QFontMetrics(sku_font).horizontalAdvance(safe_sku) > sku_width
+        ):
+            sku_font.setPixelSize(sku_font.pixelSize() - 1)
+        self.productPartSkuLabel.setFont(sku_font)
+        self.productPartSkuLabel.setMaximumWidth(max(300, panel_w - 54))
+
+        self.invalidTextBand.setMinimumWidth(0)
+        self._position_invalid_overlay()
+        self.invalidOverlay.show()
+        self.invalidOverlay.raise_()
+        self.invalidOverlay.layout().activate()
+
     def _show_choice_cards_overlay(
         self,
         title: str,
         choices: List[Dict[str, Any]],
         *,
         footer: str = "",
+        compact: bool = False,
         _stabilize_first_open: bool = True,
     ):
         """Show compact numbered scan choices without clipping long instructions."""
+        self.productPartPromptWidget.hide()
         safe_choices = [row for row in choices if isinstance(row, dict)]
-        if _stabilize_first_open:
+        compact_cache_key = (
+            self.width(),
+            self.height(),
+            str(title or ""),
+            str(footer or ""),
+            tuple(
+                (
+                    int(row.get("number") or idx),
+                    str(row.get("name") or f"Option {idx}").strip(),
+                )
+                for idx, row in enumerate(safe_choices, start=1)
+            ),
+        )
+        if compact and self._compact_choice_overlay_cache_key == compact_cache_key:
+            # _hide_invalid_overlay() clears compact mode when Reject is
+            # cancelled. Restore it before positioning the cached panel or Qt
+            # recalculates the reopen using the small generic-error geometry.
+            self._info_overlay_compact = True
+            self._invalid_hide_timer.stop()
+            if self._invalid_movie is not None:
+                self._invalid_movie.stop()
+            self.invalidGifLabel.hide()
+            self.invalidReasonLabel.hide()
+            self.choiceCardsWidget.show()
+            self._position_invalid_overlay()
+            self.invalidOverlay.show()
+            self.invalidOverlay.raise_()
+            self.invalidOverlay.update()
+            return
+        if _stabilize_first_open and not compact:
             self._choice_overlay_render_token += 1
         render_token = int(self._choice_overlay_render_token or 0)
         available_panel_w = max(1, self.width() - 24)
         available_cards_w = max(1, available_panel_w - 54)
-        columns = min(4, max(1, len(safe_choices)))
+        if compact:
+            # Reject choices are always 1..21.  Use three rows on landscape
+            # displays and three columns on portrait displays so every choice
+            # remains inside the visible panel after display rotation/resizing.
+            preferred_columns = 7 if self.width() >= self.height() else 3
+            columns = min(preferred_columns, max(1, len(safe_choices)))
+        else:
+            columns = min(4, max(1, len(safe_choices)))
         # Never create more fixed-width columns than the visible client can
         # contain. Narrow displays automatically fall back to 3, 2, or 1.
-        while columns > 1 and (columns * 150 + (columns - 1) * 8) > available_cards_w:
+        minimum_target_width = 78 if compact else 150
+        while columns > 1 and (columns * minimum_target_width + (columns - 1) * 8) > available_cards_w:
             columns -= 1
-        minimum_card_width = min(150, available_cards_w)
+        minimum_card_width = min(minimum_target_width, available_cards_w)
         computed_card_width = max(
             1,
             (available_cards_w - (columns - 1) * 8 - 8) // columns,
         )
-        card_width = min(210, max(minimum_card_width, computed_card_width))
+        card_width = min(190 if compact else 210, max(minimum_card_width, computed_card_width))
+        card_height = 64 if compact else 116
+        row_stride = 72 if compact else 132
         row_count = max(1, (len(safe_choices) + columns - 1) // columns)
         accents = ("#22d3ee", "#60a5fa", "#a78bfa", "#f59e0b")
         grid = self.choiceCardsWidget.layout()
@@ -7259,33 +7586,58 @@ QWidget#ClientUIRoot {{
                 widget.deleteLater()
         for idx, row in enumerate(safe_choices, start=1):
             name = str(row.get("name") or f"Option {idx}").strip()
-            info = str(row.get("info") or "").strip()
-            accent = accents[(idx - 1) % len(accents)]
+            option_number = int(row.get("number") or idx)
+            accent = "#64748b" if compact else accents[(idx - 1) % len(accents)]
             card = QFrame()
             card.setObjectName(f"ScanChoiceCard{idx}")
-            card.setFixedSize(card_width, 116)
-            card.setStyleSheet(
-                f"QFrame#ScanChoiceCard{idx} {{ background: #0f172a; border: 2px solid {accent}; border-radius: 5px; }}"
-                "QLabel { background: transparent; border: none; }"
-            )
-            card.setLayout(QVBoxLayout())
-            card.layout().setContentsMargins(9, 7, 9, 7)
-            card.layout().setSpacing(4)
+            card.setFixedSize(card_width, card_height)
+            if compact:
+                card.setStyleSheet(
+                    f"QFrame#ScanChoiceCard{idx} {{ background: transparent; border: none; }}"
+                    "QLabel { border-radius: 3px; }"
+                )
+            else:
+                card.setStyleSheet(
+                    f"QFrame#ScanChoiceCard{idx} {{ background: #0f172a; border: 2px solid {accent}; border-radius: 5px; }}"
+                    "QLabel { background: transparent; border: none; }"
+                )
+            card.setLayout(QHBoxLayout() if compact else QVBoxLayout())
+            card.layout().setContentsMargins(0 if compact else 9, 0 if compact else 7, 0 if compact else 9, 0 if compact else 7)
+            card.layout().setSpacing(5 if compact else 4)
             name_label = QLabel(name)
             name_label.setWordWrap(True)
-            name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            name_label.setStyleSheet("color: #f8fafc; font-size: 15px; font-weight: 900;")
-            info_label = QLabel(info or " ")
-            info_label.setWordWrap(True)
-            info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            info_label.setStyleSheet("color: #cbd5e1; font-size: 12px; font-weight: 700;")
-            scan_label = QLabel(f"SCAN  num_{idx}")
-            scan_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            scan_label.setMinimumHeight(28)
-            scan_label.setStyleSheet("background: #083344; color: #67e8f9; font-size: 14px; font-weight: 900; border-radius: 3px;")
-            card.layout().addWidget(name_label, 1)
-            card.layout().addWidget(info_label, 1)
-            card.layout().addWidget(scan_label)
+            if compact:
+                number_label = QLabel(str(option_number))
+                number_label.setFixedSize(38, card_height)
+                number_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                number_label.setStyleSheet(
+                    "background: #e5e7eb; color: #111827; border: 1px solid #64748b; "
+                    "font-size: 15px; font-weight: 900; border-radius: 3px;"
+                )
+                name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                name_label.setFixedSize(max(1, card_width - 43), card_height)
+                name_font_px = 11 if card_width < 135 or len(name) > 18 else 12
+                name_label.setStyleSheet(
+                    "background: #111827; color: #f8fafc; border: 1px solid #64748b; "
+                    f"font-size: {name_font_px}px; font-weight: 900; border-radius: 3px; padding: 3px;"
+                )
+                card.layout().addWidget(number_label)
+                card.layout().addWidget(name_label, 1)
+            else:
+                info = str(row.get("info") or "").strip()
+                name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                name_label.setStyleSheet("color: #f8fafc; font-size: 15px; font-weight: 900;")
+                info_label = QLabel(info or " ")
+                info_label.setWordWrap(True)
+                info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                info_label.setStyleSheet("color: #cbd5e1; font-size: 12px; font-weight: 700;")
+                scan_label = QLabel(f"{option_number}  •  SCAN num_{option_number}")
+                scan_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                scan_label.setMinimumHeight(28)
+                scan_label.setStyleSheet("background: #083344; color: #67e8f9; font-size: 14px; font-weight: 900; border-radius: 3px;")
+                card.layout().addWidget(name_label, 1)
+                card.layout().addWidget(info_label, 1)
+                card.layout().addWidget(scan_label)
             grid.addWidget(card, (idx - 1) // columns, (idx - 1) % columns)
         if footer:
             footer_label = QLabel(str(footer).strip())
@@ -7295,21 +7647,31 @@ QWidget#ClientUIRoot {{
             grid.addWidget(footer_label, max(1, (len(safe_choices) + columns - 1) // columns), 0, 1, columns)
         cards_content_w = columns * card_width + max(0, columns - 1) * 8 + 8
         card_w = min(available_panel_w, max(min(440, available_panel_w), cards_content_w + 36))
-        card_h = min(max(1, self.height() - 24), 105 + row_count * 132 + (42 if footer else 0))
+        card_h = min(max(1, self.height() - 24), (88 if compact else 105) + row_count * row_stride + (42 if footer else 0))
         self._info_overlay_compact = True
         self._invalid_hide_timer.stop()
         if self._invalid_movie is not None:
             self._invalid_movie.stop()
         self.invalidGifLabel.hide()
-        self.invalidOverlay.setStyleSheet("background: rgba(14,116,144,0.78); border: 2px solid rgba(103,232,249,0.90); border-radius: 4px;")
-        self.invalidTextBand.setStyleSheet("QFrame#InvalidTextBand { background: rgba(8,47,73,0.97); border: none; border-radius: 3px; }")
+        if compact:
+            self.invalidOverlay.setStyleSheet(
+                "background: #111827; border: 2px solid #64748b; border-radius: 4px;"
+            )
+            self.invalidTextBand.setStyleSheet(
+                "QFrame#InvalidTextBand { background: #111827; border: none; border-radius: 3px; }"
+            )
+        else:
+            self.invalidOverlay.setStyleSheet("background: rgba(14,116,144,0.78); border: 2px solid rgba(103,232,249,0.90); border-radius: 4px;")
+            self.invalidTextBand.setStyleSheet("QFrame#InvalidTextBand { background: rgba(8,47,73,0.97); border: none; border-radius: 3px; }")
         self.invalidTextLabel.setText(str(title or "SELECT OPTION").strip().upper())
-        self.invalidTextLabel.setStyleSheet("background: transparent; border: none; color: #ecfeff; font-size: 26px; font-weight: 900;")
+        self.invalidTextLabel.setStyleSheet(
+            f"background: transparent; border: none; color: #f8fafc; font-size: {21 if compact else 26}px; font-weight: 900;"
+        )
         self.invalidReasonLabel.hide()
         choice_width = max(1, min(max(1, card_w - 36), available_cards_w))
         self.choiceCardsWidget.setMinimumWidth(choice_width)
         self.choiceCardsWidget.setMaximumWidth(choice_width)
-        self.choiceCardsWidget.setMinimumHeight(row_count * 124 + (38 if footer else 0))
+        self.choiceCardsWidget.setMinimumHeight(row_count * (card_height + 8) + (38 if footer else 0))
         self.choiceCardsWidget.show()
         self._info_overlay_size = QSize(card_w, card_h)
         grid.invalidate()
@@ -7324,9 +7686,14 @@ QWidget#ClientUIRoot {{
         self.choiceCardsWidget.ensurePolished()
         self.invalidTextBand.ensurePolished()
         self.invalidOverlay.ensurePolished()
-        self.choiceCardsWidget.repaint()
-        self.invalidTextBand.repaint()
-        self.invalidOverlay.repaint()
+        if compact:
+            self._compact_choice_overlay_cache_key = compact_cache_key
+            self.choiceCardsWidget.update()
+            self.invalidOverlay.update()
+        else:
+            self.choiceCardsWidget.repaint()
+            self.invalidTextBand.repaint()
+            self.invalidOverlay.repaint()
         # On the first opening, Qt may defer geometry calculation because the
         # card container was hidden. Run two queued layout passes so the first
         # scan gets the same stable result as reopening the prompt.
@@ -7341,8 +7708,9 @@ QWidget#ClientUIRoot {{
             self._position_invalid_overlay()
             self.invalidOverlay.raise_()
         QTimer.singleShot(0, _finish_first_layout_pass)
-        QTimer.singleShot(40, _finish_first_layout_pass)
-        if _stabilize_first_open:
+        if not compact:
+            QTimer.singleShot(40, _finish_first_layout_pass)
+        if _stabilize_first_open and not compact:
             stable_title = str(title or "SELECT OPTION")
             stable_choices = [dict(row) for row in safe_choices]
             stable_footer = str(footer or "")
@@ -7356,12 +7724,41 @@ QWidget#ClientUIRoot {{
                     stable_title,
                     stable_choices,
                     footer=stable_footer,
+                    compact=compact,
                     _stabilize_first_open=False,
                 )
 
             # This automatic rebuild is equivalent to the previously working
             # cancel-and-reopen path, while keeping the same active scan phase.
             QTimer.singleShot(90, _rebuild_first_open_menu)
+
+    def _show_reject_reason_choices_overlay(self):
+        choices = []
+        for number, row in sorted(numeric_context_mapping("reject").items()):
+            if number <= 0:
+                continue
+            choices.append(
+                {
+                    "number": number,
+                    "name": str(row.get("label") or row.get("code") or f"Reject {number}").strip(),
+                }
+            )
+        self._show_choice_cards_overlay(
+            "SELECT REJECT DETAIL",
+            choices,
+            compact=True,
+        )
+
+    def _prewarm_reject_reason_choices_overlay(self):
+        """Build the reusable reject menu after fullscreen layout, before its first scan."""
+        if self.invalidOverlay.isVisible():
+            return
+        self._show_reject_reason_choices_overlay()
+        self._hide_invalid_overlay()
+
+    def _restore_reject_choices_if_waiting(self):
+        if bool(self.state.waiting_reject_reason):
+            self._show_reject_reason_choices_overlay()
 
     def _recovery_snapshot_int(self, snap: Optional[Dict[str, Any]], key: str, fallback: Any = 0) -> int:
         if not isinstance(snap, dict):
@@ -9484,6 +9881,7 @@ QWidget#ClientUIRoot {{
     def _hide_final_job_review_overlay(self):
         self._pending_final_review_payload = None
         self._pending_final_review_linked_payloads = []
+        self._pending_final_review_hidden_payloads = []
         self.finishTitle.setText("FINISHING JOB")
         self.finishStatus.setText("Processing...")
         self.finishReviewHint.hide()
@@ -9562,6 +9960,9 @@ QWidget#ClientUIRoot {{
         linked_payloads = [
             dict(row) for row in (self._pending_final_review_linked_payloads or []) if isinstance(row, dict)
         ]
+        linked_payloads.extend(
+            dict(row) for row in (self._pending_final_review_hidden_payloads or []) if isinstance(row, dict)
+        )
         reviewer_name = self._safe_text(reviewer.get("name"), self._safe_text(reviewer_badge))
         reviewer_code = self._safe_text(reviewer.get("code"), self._safe_text(reviewer_badge))
         reviewer_role = self._safe_text(reviewer.get("role"), "SUPERVISOR")
@@ -10389,10 +10790,13 @@ QWidget#ClientUIRoot {{
         elif s.waiting_initial_cycle_qc_confirm:
             self._set_banner_text("Initial setup: Scan QC badge to confirm cycle time")
         elif s.pending_offline_qr_raw:
-            if str(s.pending_offline_qr_phase or "").upper() == "ASK_MAIN_QTY":
+            offline_phase = str(s.pending_offline_qr_phase or "").upper()
+            if offline_phase == "ASK_MAIN_QTY":
                 self._set_banner_text(
-                    f"Main job qty: {s.pending_offline_main_qty_input or '0'} — scan digits then confirm"
+                    f"Main job qty: {s.pending_offline_main_qty_input or '0'} - scan digits then confirm"
                 )
+            elif offline_phase == "ASK_LINKED_RELATED":
+                self._set_banner_text("Related jobs? num_1 BOTH jobs / num_0 QR job only")
             else:
                 self._set_banner_text("Is this a PRODUCT PART? num_1 YES or num_0 NO / REJECT")
         elif s.waiting_void_scan:
@@ -11333,6 +11737,10 @@ QWidget#ClientUIRoot {{
             "butal_scan_logs": list((s.butal_scan_logs or [])[butal_from:]),
             "reject_review_logs": list((s.reject_review_logs or [])[review_from:]),
             "supervisor_review_logs": list(s.supervisor_review_logs or []),
+            "color_mold_group_id": str(s.color_mold_group_id or ""),
+            "change_supervisor_code": str(s.change_supervisor_code or ""),
+            "change_supervisor_name": str(s.change_supervisor_name or ""),
+            "change_supervisor_owners": [dict(row) for row in (s.change_supervisor_owners or []) if isinstance(row, dict)],
             "reprint_qr_logs": list(s.reprint_qr_logs or []),
             "production_adjustment_logs": list((s.production_adjustment_logs or [])[adjustment_from:]),
             "action_logs": list(getattr(self, "_action_logs", []) or []),
@@ -11464,6 +11872,30 @@ QWidget#ClientUIRoot {{
             filtered.append(row)
         return filtered
 
+    @staticmethod
+    def _pack_history_output_totals(rows: Any) -> tuple[int, int]:
+        """Return authoritative scan count and output from a filtered PACK ledger."""
+        pack_count = 0
+        good_total = 0
+        for row in (rows or []):
+            if not isinstance(row, dict) or bool(row.get("voided")):
+                continue
+            try:
+                qty = int(
+                    row.get("completed_pack_qty")
+                    or row.get("good_qty")
+                    or row.get("qty_q")
+                    or row.get("scanned_pack_qty")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                qty = 0
+            if qty <= 0:
+                continue
+            pack_count += 1
+            good_total += qty
+        return pack_count, good_total
+
     def _build_linked_operator_shift_payloads(self, main_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         s = self.state
         linked_rows = list(s.linkage_jobs or [])
@@ -11486,6 +11918,9 @@ QWidget#ClientUIRoot {{
                 shift_pack_rows,
                 linked_payload.get("job_code"),
             )
+            ledger_pack_count, ledger_good_total = self._pack_history_output_totals(
+                linked_payload["product_pack_history_logs"]
+            )
             linked_butal_total = self._shift_butal_qty_for_job(row.get("job_code"))
             if self.state.prepack_mode_enabled or row.get("prepack_component"):
                 linked_payload["pack_count"] = int(row.get("prepack_units") or 0)
@@ -11494,12 +11929,12 @@ QWidget#ClientUIRoot {{
                 linked_payload["prepack_share_qty"] = int(row.get("prepack_share_qty") or 0)
                 linked_payload["prepack_pack_qty"] = int(row.get("prepack_pack_qty") or self.state.prepack_pack_qty or 0)
             elif str(row.get("linkage_output_role") or "").strip().upper() in ("PACKING", "CHECKING", "OUTPUT"):
-                linked_payload["pack_count"] = int(row.get("linkage_pack_count") or 0)
-                linked_payload["good_total"] = int(row.get("linkage_good_total") or 0)
+                linked_payload["pack_count"] = ledger_pack_count or int(row.get("linkage_pack_count") or 0)
+                linked_payload["good_total"] = ledger_good_total or int(row.get("linkage_good_total") or 0)
                 linked_payload["linkage_output_role"] = str(row.get("linkage_output_role") or "").strip().upper()
             elif self._multi_output_linkage_enabled():
-                linked_payload["pack_count"] = int(row.get("linkage_pack_count") or 0)
-                linked_payload["good_total"] = int(row.get("linkage_good_total") or 0)
+                linked_payload["pack_count"] = ledger_pack_count or int(row.get("linkage_pack_count") or 0)
+                linked_payload["good_total"] = ledger_good_total or int(row.get("linkage_good_total") or 0)
                 linked_payload["linkage_output_role"] = "OUTPUT"
             else:
                 linked_payload["pack_count"] = int(main_payload.get("pack_count") or 0)
@@ -11771,6 +12206,9 @@ QWidget#ClientUIRoot {{
             "raw_material_scans": list(s.raw_material_scans or []),
             "raw_material_logs": list(s.raw_material_logs or []),
             "offline_qr_type_rules": dict(s.offline_qr_type_rules or {}),
+            "offline_linkage_relation_rules": dict(
+                s.offline_linkage_relation_rules or {}
+            ),
             "pending_offline_qr_raw": str(s.pending_offline_qr_raw or ""),
             "pending_offline_qr_phase": str(s.pending_offline_qr_phase or ""),
             "pending_offline_main_qty_input": str(s.pending_offline_main_qty_input or ""),
@@ -11800,6 +12238,17 @@ QWidget#ClientUIRoot {{
             "waiting_linkage_job_scan": bool(s.waiting_linkage_job_scan),
             "waiting_color_change_job_scan": bool(s.waiting_color_change_job_scan),
             "pending_color_change_reason": str(s.pending_color_change_reason or ""),
+            "color_mold_sessions": {
+                str(key): dict(value)
+                for key, value in (s.color_mold_sessions or {}).items()
+                if str(key).strip() and isinstance(value, dict)
+            },
+            "color_mold_group_id": str(s.color_mold_group_id or ""),
+            "change_supervisor_code": str(s.change_supervisor_code or ""),
+            "change_supervisor_name": str(s.change_supervisor_name or ""),
+            "change_supervisor_owners": [
+                dict(row) for row in (s.change_supervisor_owners or []) if isinstance(row, dict)
+            ],
             "linkage_enabled": bool(s.linkage_enabled),
             "linkage_job_code": s.linkage_job_code,
             "linkage_job_name": s.linkage_job_name,
@@ -12387,7 +12836,7 @@ QWidget#ClientUIRoot {{
                 if key in server_snap:
                     merged[key] = server_snap.get(key)
         elif ack_event_type == "BUTAL_VOID":
-            for key in ("butal_total", "butal_by_job"):
+            for key in ("butal_total", "butal_by_job", "butal_scan_logs"):
                 if key in server_snap:
                     merged[key] = server_snap.get(key)
         elif ack_event_type == "REJECT_VOID":
@@ -12990,6 +13439,13 @@ QWidget#ClientUIRoot {{
             for key, value in dict(snap.get("offline_qr_type_rules") or {}).items()
             if str(key).strip() and str(value).strip().upper() in ("PACK", "PRODUCT_PART")
         }
+        s.offline_linkage_relation_rules = {
+            str(key): bool(value)
+            for key, value in dict(
+                snap.get("offline_linkage_relation_rules") or {}
+            ).items()
+            if str(key).strip()
+        }
         s.pending_offline_qr_raw = str(snap.get("pending_offline_qr_raw") or "")
         s.pending_offline_qr_phase = str(snap.get("pending_offline_qr_phase") or "")
         s.pending_offline_main_qty_input = str(
@@ -13020,6 +13476,17 @@ QWidget#ClientUIRoot {{
         s.waiting_linkage_job_scan = bool(snap.get("waiting_linkage_job_scan"))
         s.waiting_color_change_job_scan = bool(snap.get("waiting_color_change_job_scan"))
         s.pending_color_change_reason = str(snap.get("pending_color_change_reason") or "")
+        s.color_mold_sessions = {
+            str(key): dict(value)
+            for key, value in dict(snap.get("color_mold_sessions") or {}).items()
+            if str(key).strip() and isinstance(value, dict)
+        }
+        s.color_mold_group_id = str(snap.get("color_mold_group_id") or "")
+        s.change_supervisor_code = str(snap.get("change_supervisor_code") or "")
+        s.change_supervisor_name = str(snap.get("change_supervisor_name") or "")
+        s.change_supervisor_owners = [
+            dict(row) for row in (snap.get("change_supervisor_owners") or []) if isinstance(row, dict)
+        ]
         s.linkage_enabled = bool(snap.get("linkage_enabled"))
         s.linkage_job_code = snap.get("linkage_job_code")
         s.linkage_job_name = snap.get("linkage_job_name")
@@ -13221,6 +13688,13 @@ QWidget#ClientUIRoot {{
             "product_name": product_identity.get("product_name", ""),
             "operator_id": s.operator_id,
             "operator_name": self._operator_display_name(s.operator_id),
+            "color_mold_group_id": str(s.color_mold_group_id or ""),
+            "color_mold_group_role": "CURRENT" if s.color_mold_group_id else "",
+            "change_supervisor_code": str(s.change_supervisor_code or ""),
+            "change_supervisor_name": str(s.change_supervisor_name or ""),
+            "change_supervisor_owners": [
+                dict(row) for row in (s.change_supervisor_owners or []) if isinstance(row, dict)
+            ],
             "pack_count": int(s.pack_count or 0),
             "good_total": int(s.good_total or 0),
             "butal_total": int(main_butal_total or 0),
@@ -13349,6 +13823,64 @@ QWidget#ClientUIRoot {{
             )
         return payload
 
+    def _build_color_mold_finished_payloads(self) -> List[Dict[str, Any]]:
+        """Build final records for parked color/mold sessions without changing the active preview."""
+        rows: List[Dict[str, Any]] = []
+        finished_at = datetime.now(timezone.utc).isoformat()
+        for snap in (self.state.color_mold_sessions or {}).values():
+            if not isinstance(snap, dict) or not str(snap.get("job_code") or "").strip():
+                continue
+            payload = {
+                "record_type": RECORD_TYPE_FINAL_JOB,
+                "finished_at_utc": finished_at,
+                "client_id": str(snap.get("client_id") or self._current_client_id()),
+                "machine_code": snap.get("machine_code") or self.state.machine_code,
+                "machine_name": snap.get("machine_name") or self.state.machine_name,
+                "job_code": snap.get("job_code"),
+                "job_name": snap.get("job_name") or snap.get("job_code"),
+                "production_session_id": snap.get("production_session_id"),
+                "operator_id": snap.get("operator_id"),
+                "operator_name": self._operator_display_name(snap.get("operator_id")),
+                "pack_count": int(snap.get("pack_count") or snap.get("pack_total") or 0),
+                "good_total": int(snap.get("good_total") or 0),
+                "butal_total": int(snap.get("butal_total") or 0),
+                "reject_total": int(snap.get("reject_total") or 0),
+                "total_good": int(snap.get("good_total") or 0) + int(snap.get("butal_total") or 0),
+                "reject_breakdown": dict(snap.get("reject_breakdown") or {}),
+                "startup_reject_total": int(snap.get("startup_reject_total") or 0),
+                "no_shot_total": int(snap.get("no_shot_total") or 0),
+                "raw_sacks_count": int(snap.get("raw_sacks_count") or 0),
+                "raw_material_scans": list(snap.get("raw_material_scans") or []),
+                "raw_material_logs": list(snap.get("raw_material_logs") or []),
+                "product_pack_history_logs": list(snap.get("product_pack_history_logs") or []),
+                "butal_scan_logs": list(snap.get("butal_scan_logs") or []),
+                "reject_review_logs": list(snap.get("reject_review_logs") or []),
+                "production_adjustment_logs": list(snap.get("production_adjustment_logs") or []),
+                "operator_shift_logs": list(snap.get("operator_shift_logs") or []),
+                "job_payload": dict(snap.get("job_payload") or {}),
+                "cycle_time_current": snap.get("cycle_time_current"),
+                "machine_counter_start": snap.get("machine_counter_shift_start"),
+                "machine_counter_end": snap.get("machine_counter_current"),
+                "machine_counter_overwrite_logs": list(snap.get("machine_counter_overwrite_logs") or []),
+                "pdr_downtime_logs": list(snap.get("pdr_downtime_logs") or []),
+                "pdr_reason_segments": list(snap.get("pdr_reason_segments") or []),
+                "supervisor_review_logs": list(snap.get("supervisor_review_logs") or []),
+                "break_sessions": list(snap.get("break_sessions") or []),
+                "crew_members": list(snap.get("crew_members") or []),
+                "manpower_count": (1 if snap.get("operator_id") else 0) + len(list(snap.get("crew_members") or [])),
+                "review_status": REVIEW_STATUS_CLOSED,
+                "partial_qty": int(snap.get("good_total") or 0) + int(snap.get("butal_total") or 0),
+                "color_mold_group_id": str(snap.get("color_mold_group_id") or self.state.color_mold_group_id or ""),
+                "color_mold_group_role": "PARKED",
+                "change_supervisor_code": str(snap.get("change_supervisor_code") or ""),
+                "change_supervisor_name": str(snap.get("change_supervisor_name") or ""),
+                "change_supervisor_owners": [dict(row) for row in (snap.get("change_supervisor_owners") or []) if isinstance(row, dict)],
+            }
+            identity = self._job_product_identity_from_payload(payload["job_payload"])
+            payload.update(identity)
+            rows.append(payload)
+        return rows
+
     def _build_linked_finished_job_payloads(self, main_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         s = self.state
         linked_rows = list(s.linkage_jobs or [])
@@ -13454,6 +13986,7 @@ QWidget#ClientUIRoot {{
         s.waiting_void_butal_scan = False
         s.waiting_void_reject_scan = False
         s.offline_qr_type_rules = {}
+        s.offline_linkage_relation_rules = {}
         s.pending_offline_qr_raw = ""
         s.pending_offline_qr_phase = ""
         s.pending_offline_main_qty_input = ""
@@ -13557,6 +14090,12 @@ QWidget#ClientUIRoot {{
         s.waiting_linkage_job_scan = False
         s.waiting_color_change_job_scan = False
         s.pending_color_change_reason = ""
+        s.color_mold_sessions = {}
+        s.color_mold_group_id = ""
+        s.change_supervisor_code = ""
+        s.change_supervisor_name = ""
+        s.change_supervisor_owners = []
+        self._pending_color_mold_change = None
         s.linkage_enabled = False
         s.linkage_job_code = None
         s.linkage_job_name = None
@@ -13753,13 +14292,27 @@ QWidget#ClientUIRoot {{
 
     def _extract_production_reason_code(self, raw: str) -> Optional[str]:
         raw_code = str(raw or "").strip()
+        num_match = re.fullmatch(r"num_(\d{1,2})", raw_code.lower())
+        if num_match:
+            raw_code = num_match.group(1)
         if raw_code.isdigit():
             idx = int(raw_code)
-            if 1 <= idx <= len(PRODUCTION_DAILY_REPORT_ITEMS):
-                return f"{idx:02d}"
+            mapped = numeric_context_mapping("pdr").get(idx)
+            if isinstance(mapped, dict):
+                return str(mapped.get("code") or idx).strip().zfill(2)
             return None
         normalized_reason = re.sub(r"[^A-Z0-9]+", "", raw_code.upper())
         if normalized_reason:
+            for number, row in numeric_context_mapping("pdr").items():
+                code = str(row.get("code") or number).strip().zfill(2)
+                label = str(row.get("label") or "").strip()
+                aliases = [str(value or "").strip() for value in (row.get("aliases") or [])]
+                if any(
+                    normalized_reason == re.sub(r"[^A-Z0-9]+", "", candidate.upper())
+                    for candidate in [code, label, *aliases]
+                    if candidate
+                ):
+                    return code
             for code, label in PRODUCTION_DAILY_REPORT_ITEMS:
                 if normalized_reason == re.sub(r"[^A-Z0-9]+", "", str(label or "").upper()):
                     return code
@@ -14027,6 +14580,7 @@ QWidget#ClientUIRoot {{
         self.status.setText("PDR start cancelled. Continue current job.")
         self._refresh_ui()
         self._save_active_session_snapshot()
+        self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (PDR START CANCELLED)")
         return True
 
     def _begin_initial_cycle_time_setup(self):
@@ -14557,19 +15111,26 @@ QWidget#ClientUIRoot {{
         is_graphics = section == "graphics"
         is_display = section == "display"
         is_api = section == "api"
+        is_mappings = section == "mappings"
         is_logs = section == "logs"
         self.settingsBtnGraphics.setChecked(is_graphics)
         self.settingsBtnDisplay.setChecked(is_display)
         self.settingsBtnApi.setChecked(is_api)
+        self.settingsBtnMappings.setChecked(is_mappings)
         self.settingsBtnLogs.setChecked(is_logs)
         self.settingsGraphicsSection.setVisible(is_graphics)
         self.settingsDisplaySection.setVisible(is_display)
         self.settingsApiSection.setVisible(is_api)
+        self.settingsMappingsSection.setVisible(is_mappings)
         self.settingsLogsSection.setVisible(is_logs)
         if is_graphics:
             self.settingsContentTitle.setText("Graphics")
         elif is_display:
             self.settingsContentTitle.setText("Display")
+        elif is_mappings:
+            self.settingsContentTitle.setText("QR Mappings")
+            self.qrMappingEditor.setPlainText(qr_mapping_config_to_text(QR_MAPPING_CONFIG))
+            self._refresh_qr_mappings_from_server(force=True)
         elif is_logs:
             self.settingsContentTitle.setText("App Logs")
             self._refresh_app_logs_table(force=True)
@@ -14959,15 +15520,14 @@ QWidget#ClientUIRoot {{
             hide_ms=0,
         )
 
-    def _handle_remove_job_linkage_scan(self, res: Any, raw_s: str) -> bool:
-        if not bool(getattr(self, "_remove_job_linkage_mode", False)):
-            return False
-        candidates = {self._normalize_job_code(res.value)}
-        if isinstance(res.meta, dict):
-            candidates.add(self._normalize_job_code(res.meta.get("po_number")))
+    def _linked_job_index_for_scan(self, res: Any, raw_s: str) -> Optional[int]:
+        candidates = {self._normalize_job_code(getattr(res, "value", ""))}
+        meta = getattr(res, "meta", None)
+        if isinstance(meta, dict):
+            candidates.add(self._normalize_job_code(meta.get("po_number")))
         candidates.add(self._normalize_job_code(raw_s))
         candidates.discard("")
-        index = next(
+        return next(
             (
                 i for i, row in enumerate(self.state.linkage_jobs or [])
                 if isinstance(row, dict)
@@ -14978,27 +15538,45 @@ QWidget#ClientUIRoot {{
             ),
             None,
         )
-        if index is None:
-            self.status.setText("That JOB is not linked to the current main job.")
-            self._show_invalid_overlay("Scan one of the linked JOB QRs shown in the list.")
-            return True
 
-        removed = self.state.linkage_jobs.pop(index)
+    def _remove_linked_job_at_index(self, index: int, *, linkage_toggle: bool = False) -> bool:
+        rows = self.state.linkage_jobs or []
+        if index < 0 or index >= len(rows) or not isinstance(rows[index], dict):
+            return False
+        removed = rows.pop(index)
         removed_code = str(removed.get("job_code") or "").strip()
         removed_name = str(removed.get("job_name") or removed_code or "linked job").strip()
-        remaining = [row for row in (self.state.linkage_jobs or []) if isinstance(row, dict)]
+        remaining = [row for row in rows if isinstance(row, dict)]
+        self.state.linkage_jobs = remaining
         self.state.linkage_enabled = bool(remaining)
-        if self._normalize_job_code(self.state.linkage_job_code) == self._normalize_job_code(removed_code):
+        if (
+            not remaining
+            or self._normalize_job_code(self.state.linkage_job_code)
+            == self._normalize_job_code(removed_code)
+        ):
             primary = remaining[-1] if remaining else {}
             self.state.linkage_job_code = primary.get("job_code")
             self.state.linkage_job_name = primary.get("job_name")
             self.state.linkage_job_payload = primary.get("job_payload") or {}
         if self._normalize_job_code(self.state.prepack_active_job_code) == self._normalize_job_code(removed_code):
-            self.state.prepack_active_job_code = (remaining[0].get("job_code") if remaining else None)
-        self._offline_pack_main_qty_overrides.pop(self._normalize_job_code(removed_code), None)
+            self.state.prepack_active_job_code = remaining[0].get("job_code") if remaining else None
+        getattr(self, "_offline_pack_main_qty_overrides", {}).pop(
+            self._normalize_job_code(removed_code), None
+        )
         self._remove_job_linkage_mode = False
+        self.state.waiting_linkage_job_scan = False
+        self._clear_pending_linked_job_api_retry()
+        self._resolved_linked_job_api_retry = None
         self._hide_invalid_overlay()
-        self.status.setText(f"Job linkage removed: {removed_name}. Main job and production history were preserved.")
+        if linkage_toggle:
+            self.status.setText(
+                f"Job linkage removed: {removed_name}. "
+                "Scan Job Linkage again to add or remove another job."
+            )
+        else:
+            self.status.setText(
+                f"Job linkage removed: {removed_name}. Main job and production history were preserved."
+            )
         self._job_parts_table_refresh_key = ""
         self._refresh_ui(force=True)
         self._save_active_session_snapshot()
@@ -15008,10 +15586,25 @@ QWidget#ClientUIRoot {{
                 "type": "JOB_LINKAGE_REMOVED",
                 "removed_job_code": removed_code,
                 "removed_job_name": removed_name,
+                "post_linkage_enabled": bool(remaining),
+                "post_linkage_jobs": [dict(row) for row in remaining],
+                "post_linkage_job_code": self.state.linkage_job_code,
+                "post_linkage_job_name": self.state.linkage_job_name,
+                "post_linkage_job_payload": dict(self.state.linkage_job_payload or {}),
             },
             f"JOB LINKAGE REMOVED {removed_name}",
         )
         return True
+
+    def _handle_remove_job_linkage_scan(self, res: Any, raw_s: str) -> bool:
+        if not bool(getattr(self, "_remove_job_linkage_mode", False)):
+            return False
+        index = self._linked_job_index_for_scan(res, raw_s)
+        if index is None:
+            self.status.setText("That JOB is not linked to the current main job.")
+            self._show_invalid_overlay("Scan one of the linked JOB QRs shown in the list.")
+            return True
+        return self._remove_linked_job_at_index(index)
 
     def _handle_change_work_order_job_scan(self, res: Any, raw_s: str) -> bool:
         phase = str(getattr(self, "_change_work_order_phase", "") or "").upper()
@@ -16950,9 +17543,14 @@ QWidget#ClientUIRoot {{
         s = self.state
         if not str(s.reject_multiplier_input or "").strip():
             return
-        if raw_l.startswith("num_") and raw_l[-1:].isdigit():
+        if self._numpad_digit_from_scan(raw_l) is not None:
             return
         if raw_l == "backspace":
+            return
+        parsed = parse_scan(raw_l)
+        if parsed is not None and parsed.kind in (
+            "REJECT_TRIGGER", "REJECT_REASON", "STARTUP_REJECT", "BUTAL", "VOID_TRIGGER"
+        ):
             return
         self._clear_reject_multiplier()
 
@@ -17458,14 +18056,45 @@ QWidget#ClientUIRoot {{
         current_color = self._normalized_identity_text(current_identity.get("color"))
         new_color = self._normalized_identity_text(new_identity.get("color"))
         color_changed = bool(current_color and new_color and current_color != new_color)
-        reason = "COLOR_CHANGE" if same_product else "MOLD_CHANGE"
-        if same_product and not color_changed:
-            reason = "COLOR_CHANGE"
+        current_mold = self._normalized_identity_text(current_identity.get("mold"))
+        new_mold = self._normalized_identity_text(new_identity.get("mold"))
+        mold_changed = bool(current_mold and new_mold and current_mold != new_mold)
+        same_mold = bool(current_mold and new_mold and current_mold == new_mold)
+        reason = "MOLD_CHANGE" if mold_changed or not same_product else "COLOR_CHANGE"
+        valid = False
+        error = ""
+        if requested == "COLOR_CHANGE":
+            if not same_product:
+                error = "Change Color requires the same product. This JOB belongs to a different product/mold."
+            elif not current_color or not new_color:
+                error = "Change Color requires color data on both the current and scanned JOB."
+            elif not color_changed:
+                error = "Change Color requires a different color. The scanned JOB has the same color."
+            elif mold_changed:
+                error = "Change Color cannot also change the mold. Scan a JOB with the same product and mold."
+            else:
+                valid = True
+        else:
+            if same_mold:
+                error = "Change Mold requires a different mold. The scanned JOB uses the same mold."
+            elif current_mold and new_mold and not mold_changed:
+                error = "Change Mold requires a different mold."
+            elif not current_mold or not new_mold:
+                if same_product:
+                    error = "Change Mold cannot accept the same product with only a color change."
+                else:
+                    valid = True
+            else:
+                valid = True
         return {
             "reason": reason,
             "requested_reason": requested,
             "same_product": same_product,
             "color_changed": color_changed,
+            "mold_changed": mold_changed,
+            "same_mold": same_mold,
+            "valid": valid,
+            "error": error,
             "current": current_identity,
             "new": new_identity,
         }
@@ -18467,6 +19096,7 @@ QWidget#ClientUIRoot {{
         s.waiting_void_butal_scan = False
         s.waiting_void_reject_scan = False
         s.offline_qr_type_rules = {}
+        s.offline_linkage_relation_rules = {}
         s.pending_offline_qr_raw = ""
         s.pending_offline_qr_phase = ""
         s.pending_offline_main_qty_input = ""
@@ -19846,6 +20476,7 @@ QWidget#ClientUIRoot {{
         raw_text = str(raw_scan or "").strip()
         command = raw_text.lower()
         commands = {
+            "changeoperator",
             "changeoperator~1",
             "change_operator~1",
             "operatorchange~1",
@@ -19970,7 +20601,7 @@ QWidget#ClientUIRoot {{
         command = raw_text.lower()
         if self._handle_change_operator_scan(raw_text):
             return True
-        if command in ("reliever~1", "relief~1", "relieveradd~1"):
+        if command in ("relieverqr", "reliever~1", "relief~1", "relieveradd~1"):
             if not (self.state.machine_code and self.state.job_code and self.state.operator_id):
                 self._reliever_action_mode = False
                 self.status.setText("Complete MACHINE, JOB, and primary OPERATOR before adding a reliever.")
@@ -19991,8 +20622,24 @@ QWidget#ClientUIRoot {{
                 hide_ms=0,
             )
             return True
-        if command == "crewlist~1":
+        if command in ("crewlist", "crewlist~1"):
             self._show_crew_list()
+            return True
+        if command == "crewaddremove":
+            if not (self.state.machine_code and self.state.job_code and self.state.operator_id):
+                self.status.setText("Complete MACHINE, JOB, and primary OPERATOR before changing helpers.")
+                self._show_invalid_overlay("Set the primary operator before changing helpers.")
+                return True
+            self._crew_action_mode = "" if self._crew_action_mode == "TOGGLE" else "TOGGLE"
+            if not self._crew_action_mode:
+                self.status.setText("Add/remove helper cancelled.")
+                return True
+            self.status.setText("Add/remove helper: scan an Operator QR. Existing helper removes; new helper adds.")
+            self._show_info_overlay(
+                "ADD / REMOVE HELPER",
+                "SCAN AN OPERATOR QR\n\nExisting helper: REMOVE\nNew helper: ADD\n\nScan crewaddremove again to cancel.",
+                hide_ms=0,
+            )
             return True
         if command == "crewadd~1":
             self._set_crew_action_mode("ADD")
@@ -20001,7 +20648,7 @@ QWidget#ClientUIRoot {{
             self._set_crew_action_mode("REMOVE")
             return True
         mode = str(getattr(self, "_crew_action_mode", "") or "").strip().upper()
-        if mode not in ("ADD", "REMOVE"):
+        if mode not in ("ADD", "REMOVE", "TOGGLE"):
             return False
         operator = self._operator_from_scan(raw_text)
         pending_validation = False
@@ -20028,6 +20675,8 @@ QWidget#ClientUIRoot {{
             (index for index, row in enumerate(helpers) if self._crew_member_code(row) == operator_code),
             -1,
         )
+        if mode == "TOGGLE":
+            mode = "REMOVE" if existing_index >= 0 else "ADD"
         if mode == "ADD":
             if operator_code == primary_code:
                 self.status.setText("Primary operator is already included in manpower.")
@@ -20576,30 +21225,186 @@ QWidget#ClientUIRoot {{
 
     def _handle_color_change_number_choice(self, raw_text: str) -> bool:
         s = self.state
-        match = re.fullmatch(r"(?:num_)?([1-9]\d*)", str(raw_text or "").strip().lower())
-        if not (s.waiting_color_change_job_scan and match and self._color_change_options):
+        match = re.fullmatch(r"(?:num_)?([0-9]+)", str(raw_text or "").strip().lower())
+        if not (s.waiting_color_change_job_scan and match):
             return False
         choice = int(match.group(1))
-        if choice > len(self._color_change_options):
+        phase = str(s.pending_color_change_reason or "").strip().upper()
+        if phase == "CHOOSE_TYPE":
+            if choice not in (1, 2):
+                self.status.setText("Change color/mold: scan num_1 for COLOR or num_2 for MOLD.")
+                self._show_invalid_overlay("Only num_1 (Change Color) or num_2 (Change Mold) is valid here.")
+                return True
+            s.pending_color_change_reason = "COLOR_CHANGE" if choice == 1 else "MOLD_CHANGE"
+            label = "CHANGE COLOR" if choice == 1 else "CHANGE MOLD"
+            self._hide_invalid_overlay()
+            self._show_info_overlay(
+                label,
+                "Scan the target JOB QR.\n\n"
+                "Scan changecolormold~1 again to cancel.",
+                hide_ms=0,
+            )
+            self.status.setText(f"{label} selected. Scan the target JOB QR.")
+            self._save_active_session_snapshot()
+            return True
+        if phase in ("COLOR_CHANGE", "MOLD_CHANGE"):
             self._show_invalid_overlay(
-                f"Choose num_1 to num_{len(self._color_change_options)}, or scan a new JOB QR."
+                "A change type is already selected. Scan the target JOB QR, or scan changecolormold~1 to cancel."
             )
             return True
-        option = self._color_change_options[choice - 1]
-        reason_key = str(s.pending_color_change_reason or "COLOR_CHANGE").strip().upper()
-        if str(option.get("kind") or "").strip().lower() == "segment":
-            segment = option.get("segment")
-            if isinstance(segment, dict):
-                self._color_change_options = []
-                self._change_color_to_existing_shift_segment(segment, reason=reason_key)
-                return True
-        s.waiting_color_change_job_scan = False
-        s.pending_color_change_reason = ""
+        return False
+
+    def _show_color_mold_type_prompt(self, message: str = "") -> None:
+        self.state.waiting_color_change_job_scan = True
+        self.state.pending_color_change_reason = "CHOOSE_TYPE"
         self._color_change_options = []
-        self._hide_invalid_overlay()
-        self.status.setText("Change cancelled. Continuing current job.")
+        self._pending_color_mold_change = None
+        self._show_choice_cards_overlay(
+            "CHANGE COLOR / MOLD",
+            [
+                {"name": "CHANGE COLOR", "info": "Same product, different color"},
+                {"name": "CHANGE MOLD", "info": "Different product / mold"},
+            ],
+            footer="Scan num_1 or num_2. Scan changecolormold~1 again to cancel.",
+        )
+        self.status.setText(message or "Choose num_1 for Change Color or num_2 for Change Mold.")
         self._refresh_ui()
         self._save_active_session_snapshot()
+
+    def _cancel_color_mold_workflow(self) -> None:
+        self.state.waiting_color_change_job_scan = False
+        self.state.pending_color_change_reason = ""
+        self._color_change_options = []
+        self._pending_color_mold_change = None
+        self._hide_invalid_overlay()
+        self.status.setText("Change color/mold cancelled. Continue the current job.")
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+
+    def _reject_color_mold_target(self, message: str) -> None:
+        self._pending_color_mold_change = None
+        self.state.pending_color_change_reason = "CHOOSE_TYPE"
+        self.status.setText(message)
+        self._show_invalid_overlay(
+            f"{message}\n\nChoose again: num_1 CHANGE COLOR or num_2 CHANGE MOLD."
+        )
+        self._save_active_session_snapshot()
+
+    def _add_change_supervisor_owner(self, reviewer: Dict[str, Any]) -> None:
+        code = str(reviewer.get("code") or "").strip()
+        name = str(reviewer.get("name") or code).strip()
+        role = str(reviewer.get("role") or "SUPERVISOR").strip()
+        owners = [dict(row) for row in (self.state.change_supervisor_owners or []) if isinstance(row, dict)]
+        if not any(str(row.get("code") or "").strip() == code for row in owners):
+            owners.append({"code": code, "name": name, "role": role, "added_at_utc": datetime.now(timezone.utc).isoformat()})
+        self.state.change_supervisor_code = code
+        self.state.change_supervisor_name = name
+        self.state.change_supervisor_owners = owners
+
+    def _park_active_color_mold_session(self, pool: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        key = self._normalize_job_code(self.state.job_code)
+        if not key:
+            return pool
+        snapshot = self._state_to_active_snapshot()
+        snapshot["waiting_color_change_job_scan"] = False
+        snapshot["pending_color_change_reason"] = ""
+        snapshot["color_mold_sessions"] = {}
+        updated = {str(k): dict(v) for k, v in (pool or {}).items() if isinstance(v, dict)}
+        updated[key] = snapshot
+        return updated
+
+    def _stage_color_mold_change_preview(self, job_data: Dict[str, Any], change_info: Dict[str, Any]) -> None:
+        reason = str(change_info.get("requested_reason") or "COLOR_CHANGE").strip().upper()
+        label = "CHANGE MOLD" if reason == "MOLD_CHANGE" else "CHANGE COLOR"
+        current = change_info.get("current") if isinstance(change_info.get("current"), dict) else {}
+        target = change_info.get("new") if isinstance(change_info.get("new"), dict) else {}
+        target_key = self._normalize_job_code(job_data.get("job_code"))
+        existing = isinstance((self.state.color_mold_sessions or {}).get(target_key), dict)
+        self._pending_color_mold_change = {
+            "job_data": dict(job_data),
+            "change_info": dict(change_info),
+            "existing": existing,
+        }
+        self._show_info_overlay(
+            f"{label} PREVIEW",
+            f"Current JOB: {self.state.job_name or self.state.job_code or '-'}\n"
+            f"Target JOB: {job_data.get('job_name') or job_data.get('job_code') or '-'}\n"
+            f"Product: {current.get('product_name') or current.get('product_sku') or '-'} -> "
+            f"{target.get('product_name') or target.get('product_sku') or '-'}\n"
+            f"Color: {current.get('color') or '-'} -> {target.get('color') or '-'}\n"
+            f"Mold: {current.get('mold') or '-'} -> {target.get('mold') or '-'}\n"
+            f"Target session: {'RESUME SAVED SESSION' if existing else 'CREATE NEW SESSION'}\n\n"
+            "Scan a Supervisor QR to approve.\n"
+            "Scan changecolormold~1 to cancel.",
+            hide_ms=0,
+        )
+        self.status.setText(f"{label} preview ready. Scan Supervisor QR to approve.")
+
+    def _apply_pending_color_mold_change(self, reviewer: Dict[str, Any]) -> bool:
+        pending = self._pending_color_mold_change if isinstance(self._pending_color_mold_change, dict) else None
+        if not pending:
+            return False
+        job_data = pending.get("job_data") if isinstance(pending.get("job_data"), dict) else {}
+        change_info = pending.get("change_info") if isinstance(pending.get("change_info"), dict) else {}
+        reason = str(change_info.get("requested_reason") or "COLOR_CHANGE").strip().upper()
+        label = "Mold change" if reason == "MOLD_CHANGE" else "Color change"
+        self._add_change_supervisor_owner(reviewer)
+        shift_payload = self._finalize_current_operator_shift(reason, emit_event=False)
+        if shift_payload is None:
+            self.status.setText(f"{label} failed: no active operator shift to save.")
+            return False
+        pool = self._park_active_color_mold_session(dict(self.state.color_mold_sessions or {}))
+        target_key = self._normalize_job_code(job_data.get("job_code"))
+        saved = pool.pop(target_key, None)
+        group_id = str(self.state.color_mold_group_id or "") or f"CMG-{uuid.uuid4().hex.upper()}"
+        if isinstance(saved, dict):
+            self._restore_state_from_snapshot(saved)
+            self.state.color_mold_sessions = pool
+        else:
+            machine_code = self.state.machine_code
+            machine_name = self.state.machine_name
+            self._reset_production_for_color_change_segment()
+            self.state.machine_code = machine_code
+            self.state.machine_name = machine_name
+            self.state.job_code = str(job_data.get("job_code") or "").strip()
+            self.state.job_name = str(job_data.get("job_name") or self.state.job_code or "").strip()
+            self.state.job_payload = dict(job_data.get("job_payload") or {})
+            target_identity = self._job_product_identity_from_payload(self.state.job_payload)
+            self.state.product_id = str(target_identity.get("product_id") or "")
+            self.state.product_sku = str(target_identity.get("product_sku") or "")
+            self.state.product_name = str(target_identity.get("product_name") or "")
+            self.state.job_started_at = datetime.now(timezone.utc).isoformat()
+            self.state.production_session_id = self._new_production_session_id()
+            self.state.color_mold_sessions = pool
+            self.state.change_supervisor_owners = []
+        self.state.color_mold_group_id = group_id
+        self._add_change_supervisor_owner(reviewer)
+        self.state.operator_id = None
+        self.state.operator_qr_payload = ""
+        self.state.operator_pending_server_validation = False
+        self.state.crew_members = []
+        self.state.active_scan_operator_id = None
+        self._reset_relief_state(keep_history=False)
+        self.state.waiting_color_change_job_scan = False
+        self.state.pending_color_change_reason = ""
+        self._pending_color_mold_change = None
+        self._color_change_options = []
+        event_type = "MOLD_CHANGE_JOB_SET" if reason == "MOLD_CHANGE" else "COLOR_CHANGE_JOB_SET"
+        supervisor = {
+            "code": reviewer.get("code"), "name": reviewer.get("name"), "role": reviewer.get("role")
+        }
+        self._hide_invalid_overlay()
+        self._refresh_ui(force=True)
+        self._save_active_session_snapshot(force=True)
+        self.push_event(
+            {"type": event_type, "job_payload": self.state.job_payload, "change_classification": change_info, "supervisor": supervisor},
+            f"{label.upper()} JOB {self.state.job_name or self.state.job_code}",
+        )
+        self.sync_session_snapshot_to_server(f"SESSION SNAPSHOT SYNC ({label.upper()})")
+        self.status.setText(
+            f"{label} approved by {reviewer.get('name') or reviewer.get('code')}. "
+            f"Job {self.state.job_name or self.state.job_code} is ready; scan OPERATOR QR."
+        )
         return True
 
     def _start_reprint_qr_flow(self):
@@ -21288,6 +22093,11 @@ QWidget#ClientUIRoot {{
         low = key.lower()
         self._restore_visible_initial_prompt_state()
         s = self.state
+        if low in ("cancel", "cancel~1"):
+            return False
+        parsed_toggle = parse_scan(key)
+        if parsed_toggle is not None and self._is_own_trigger_active(parsed_toggle):
+            return False
         input_mode = bool(
             s.waiting_initial_cycle_time_input
             or s.waiting_initial_machine_counter_input
@@ -21296,6 +22106,8 @@ QWidget#ClientUIRoot {{
             or s.waiting_cycle_time_input
             or s.waiting_cycle_time_confirm_popup
             or s.waiting_butal_completion_carry_input
+            or bool(s.pending_offline_qr_raw)
+            or bool(str(s.reject_multiplier_input or "").strip())
             or bool(getattr(self, "_pending_finish_shift_clear_choice", False))
             or bool(str(self.__dict__.get("_change_operator_phase", "") or "").strip())
         )
@@ -21303,13 +22115,13 @@ QWidget#ClientUIRoot {{
         # deduplication is appropriate for production labels, not numpad keys.
         if input_mode and (
             self._numpad_digit_from_scan(low) is not None
-            or self._numpad_command_from_scan(low) in ("backspace", "confirm")
+            or self._numpad_command_from_scan(low) in ("backspace", "clear", "confirm")
         ):
             return False
         if (
             (low in ("finishjob", "finishjob~1", "jobfinish") and self._pending_final_review_payload)
             or (
-                low in ("operatorshift~1", "operator_shift~1", "shiftchange~1")
+                low in ("operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1")
                 and (s.waiting_shift_end_machine_counter_input or self._operator_shift_flash_active)
             )
         ):
@@ -21331,8 +22143,208 @@ QWidget#ClientUIRoot {{
 
     def _numpad_command_from_scan(self, raw: Any) -> str:
         low = str(raw or "").strip().lower()
-        match = re.fullmatch(r"(backspace|confirm)(?:~1)?", low)
+        match = re.fullmatch(r"(backspace|clear|confirm)(?:~1)?", low)
         return match.group(1) if match else ""
+
+    def _clear_active_typed_input(self) -> bool:
+        """Erase the active numeric input without leaving its workflow."""
+        s = self.state
+        if s.pending_offline_qr_raw and str(s.pending_offline_qr_phase or "").upper() == "ASK_MAIN_QTY":
+            s.pending_offline_main_qty_input = ""
+            self._show_offline_qr_prompt("ASK_MAIN_QTY")
+        elif s.waiting_cycle_time_confirm_popup and int(s.cycle_time_confirm_phase or 1) == 1:
+            s.cycle_time_new_input = ""
+            self.resolveNewCycle.setText("Cycle Time: ")
+            self._supervisor_input_cursor_on = True
+            self._refresh_reject_summary_overlay()
+        elif s.waiting_machine_counter_overwrite_input:
+            s.machine_counter_input = ""
+            self.resolveNewCycle.setText(self._format_machine_counter_input_text())
+        elif s.waiting_initial_machine_counter_input:
+            s.machine_counter_input = ""
+            self.resolveNewCycle.setText(self._format_machine_counter_input_text())
+            self._ensure_initial_setup_prompt_visible()
+        elif bool(getattr(s, "waiting_shift_end_machine_counter_input", False)):
+            s.machine_counter_input = ""
+            self.resolveNewCycle.setText(self._format_machine_counter_input_text())
+        elif s.waiting_initial_cycle_time_input:
+            s.cycle_time_new_input = ""
+            self._update_cycle_input_display()
+            self._ensure_initial_setup_prompt_visible()
+        elif s.waiting_butal_completion_carry_input:
+            s.butal_completion_input = ""
+        elif s.waiting_cycle_time_input:
+            s.cycle_time_new_input = ""
+            self._update_cycle_input_display()
+            self._refresh_downtime_panel()
+        elif str(s.reject_multiplier_input or "").strip():
+            self._clear_reject_multiplier()
+        else:
+            return False
+
+        self.status.setText("Current input cleared. Continue scanning in the same workflow.")
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        return True
+
+    def _cancel_active_scan_mode(self) -> bool:
+        """Cancel the currently pending QR workflow without changing production data."""
+        s = self.state
+
+        if isinstance(getattr(self, "_pending_final_review_payload", None), dict):
+            self._cancel_pending_finish_job()
+            return True
+        if bool(getattr(self, "_operator_shift_flash_active", False)):
+            self._cancel_pending_finish_shift()
+            return True
+        if bool(getattr(s, "waiting_shift_end_machine_counter_input", False)):
+            self._cancel_pending_finish_shift()
+            return True
+        if isinstance(getattr(self, "_pending_color_mold_change", None), dict):
+            self._cancel_color_mold_workflow()
+            return True
+        if self._cancel_pending_pdr_start():
+            return True
+
+        message = ""
+        if s.waiting_void_scan:
+            self._clear_void_modes()
+            self._clear_reject_multiplier()
+            message = "Void mode cancelled."
+        elif s.waiting_reject_reason:
+            s.waiting_reject_reason = False
+            self._clear_reject_multiplier()
+            message = "Reject mode cancelled."
+        elif (
+            s.waiting_butal_completion_carry_input
+            or s.waiting_butal_completion_butal_scan
+            or s.waiting_butal_completion_pack_scan
+        ):
+            self._clear_butal_completion_mode()
+            message = "Butal completion mode cancelled."
+        elif s.waiting_butal_job_assignment:
+            self._clear_pending_butal_assignment()
+            message = "Butal assignment cancelled."
+        elif s.waiting_color_change_job_scan:
+            self._cancel_color_mold_workflow()
+            return True
+        elif s.waiting_linkage_job_scan:
+            s.waiting_linkage_job_scan = False
+            self._clear_pending_linked_job_api_retry()
+            self._resolved_linked_job_api_retry = None
+            s.linkage_enabled = bool(s.linkage_jobs)
+            message = "Job linkage scanning cancelled. Existing linked jobs were retained."
+        elif str(getattr(self, "_change_work_order_phase", "") or "").strip():
+            self._change_work_order_phase = ""
+            self._change_work_order_target = None
+            message = "Change Work Order mode cancelled."
+        elif bool(getattr(self, "_remove_job_linkage_mode", False)):
+            self._remove_job_linkage_mode = False
+            message = "Remove Job Linkage mode cancelled."
+        elif str(getattr(self, "_change_operator_phase", "") or "").strip():
+            self._cancel_change_operator_mode()
+            self._save_active_session_snapshot()
+            return True
+        elif str(getattr(self, "_crew_action_mode", "") or "").strip():
+            self._crew_action_mode = ""
+            message = "Manpower mode cancelled."
+        elif bool(getattr(self, "_reliever_action_mode", False)):
+            self._reliever_action_mode = False
+            message = "Reliever mode cancelled."
+        elif (
+            str(getattr(self, "_reprint_qr_phase", "") or "").strip()
+            or isinstance(getattr(self, "_pending_print_pack_qr", None), dict)
+        ):
+            self._cancel_reprint_qr_flow()
+            self._refresh_ui()
+            self._save_active_session_snapshot()
+            return True
+        elif s.pending_offline_qr_raw:
+            self._clear_offline_qr_prompt()
+            message = "QR classification cancelled."
+        elif s.waiting_machine_counter_overwrite_input or s.waiting_machine_counter_overwrite_supervisor:
+            s.waiting_machine_counter_overwrite_input = False
+            s.waiting_machine_counter_overwrite_supervisor = False
+            s.machine_counter_overwrite_pending_value = None
+            s.machine_counter_input = ""
+            self._hide_resolve_overlay()
+            message = "Machine-counter overwrite cancelled."
+        elif s.supervisor_review_open or s.waiting_cycle_time_confirm_popup:
+            self._close_supervisor_review_snapshot(action="CANCEL", resolved=False)
+            self._hide_cycle_time_confirm_popup()
+            self._hide_supervisor_review()
+            self._hide_reject_summary_overlay()
+            message = "Supervisor review cancelled."
+        elif str(getattr(self, "_mixing_pending_job_raw", "") or "").strip():
+            self._mixing_pending_job_raw = ""
+            message = "Mixing job assignment cancelled."
+        elif str(s.reject_multiplier_input or "").strip():
+            self._clear_reject_multiplier()
+            message = "Multiplier input cancelled."
+        else:
+            return False
+
+        self._hide_invalid_overlay()
+        self.status.setText(message)
+        self._refresh_ui()
+        self._save_active_session_snapshot()
+        return True
+
+    def _is_own_trigger_active(self, result: ScanResult) -> bool:
+        """Return whether this command is the trigger for the active QR mode."""
+        s = self.state
+        kind = str(result.kind or "")
+        active_for_kind = {
+            "REJECT_TRIGGER": bool(s.waiting_reject_reason),
+            "VOID_TRIGGER": bool(s.waiting_void_scan),
+            "BUTAL_COMPLETION_TRIGGER": bool(
+                s.waiting_butal_completion_carry_input
+                or s.waiting_butal_completion_butal_scan
+                or s.waiting_butal_completion_pack_scan
+            ),
+            "PRODUCTION_DAILY_REPORT_TRIGGER": bool(
+                s.waiting_production_report_reason
+                or s.waiting_downtime_start_maintenance
+                or s.waiting_pdr_maintenance_reason
+            ),
+            "COLOR_CHANGE_TRIGGER": bool(
+                s.waiting_color_change_job_scan
+                or isinstance(getattr(self, "_pending_color_mold_change", None), dict)
+            ),
+            "JOB_LINKAGE_TRIGGER": bool(s.waiting_linkage_job_scan),
+            "CHANGE_WORK_ORDER_TRIGGER": bool(
+                str(getattr(self, "_change_work_order_phase", "") or "").strip()
+            ),
+            "JOB_LINKAGE_REMOVE_TRIGGER": bool(
+                getattr(self, "_remove_job_linkage_mode", False)
+            ),
+            "CHANGE_OPERATOR_TRIGGER": bool(
+                str(getattr(self, "_change_operator_phase", "") or "").strip()
+            ),
+            "PRINT_NEXT_PACK_QR_TRIGGER": bool(
+                str(getattr(self, "_reprint_qr_phase", "") or "").strip()
+                or isinstance(getattr(self, "_pending_print_pack_qr", None), dict)
+            ),
+            "MACHINE_COUNTER_OVERWRITE_TRIGGER": bool(
+                s.waiting_machine_counter_overwrite_input
+                or s.waiting_machine_counter_overwrite_supervisor
+            ),
+            "SUPERVISOR_REVIEW_TRIGGER": bool(
+                s.supervisor_review_open or s.waiting_cycle_time_confirm_popup
+            ),
+            "OPERATOR_SHIFT_TRIGGER": bool(
+                getattr(self, "_operator_shift_flash_active", False)
+                or getattr(s, "waiting_shift_end_machine_counter_input", False)
+            ),
+        }
+        return bool(active_for_kind.get(kind, False))
+
+    def _cancel_mode_from_own_trigger(self, raw_scan: str) -> bool:
+        """Toggle an active QR mode off when its own command is scanned again."""
+        result = parse_scan(raw_scan)
+        if result is None or not self._is_own_trigger_active(result):
+            return False
+        return self._cancel_active_scan_mode()
 
     def _pack_scan_cooldown_seconds_for_qty(self, qty: Any) -> float:
         # PACK lockout is a fixed operator-configured interval.  It must not
@@ -21887,6 +22899,7 @@ QWidget#ClientUIRoot {{
         total_qty: Any,
         main_qty_override: Optional[int] = None,
         routed_job_code: Optional[str] = None,
+        related_to_main: Optional[bool] = None,
     ) -> Optional[Dict[str, Any]]:
         try:
             pack_qty = max(0, int(total_qty or 0))
@@ -21909,12 +22922,16 @@ QWidget#ClientUIRoot {{
                 return None
             output_by_job = {code: 0 for code in known_codes}
             output_by_job[route_code] = pack_qty
+            credit_main = bool(related_to_main) or route_code == main_code
+            if credit_main and main_code:
+                output_by_job[main_code] = pack_qty
             return {
                 "special": True,
                 "mode": "MULTI_OUTPUT",
-                "main_qty": pack_qty if route_code == main_code else 0,
+                "main_qty": pack_qty if credit_main else 0,
                 "full_pack_qty": pack_qty,
                 "routed_job_code": route_code,
+                "related_to_main": bool(related_to_main),
                 "packing_job_code": "",
                 "checking_job_codes": [],
                 "job_output_qty": output_by_job,
@@ -22444,6 +23461,20 @@ QWidget#ClientUIRoot {{
             pass
         return True
 
+    def _offline_product_part_display_sku(self, raw_scan: str) -> str:
+        """Return the best readable product identifier available offline."""
+        parsed = self._extract_pack_history_fields(raw_scan)
+        if not isinstance(parsed, dict):
+            return "SKU NOT AVAILABLE"
+        product_id = str(
+            parsed.get("product_p") or parsed.get("product_id") or ""
+        ).strip()
+        normalized_id = (
+            (product_id.lstrip("0") or "0") if product_id.isdigit() else product_id
+        )
+        sku = self._lookup_product_sku(normalized_id) if normalized_id else ""
+        return str(sku or normalized_id or "SKU NOT AVAILABLE").strip()
+
     def _show_offline_qr_prompt(self, phase: str):
         phase_key = str(phase or "").upper()
         if phase_key == "ASK_MAIN_QTY":
@@ -22453,9 +23484,24 @@ QWidget#ClientUIRoot {{
                 f"Entered: {entered or '0'}. Scan num_0..num_9, then scan confirm. "
                 "The QR's full quantity stays on the first linked packing work order."
             )
+        elif phase_key == "ASK_LINKED_RELATED":
+            title = "RELATED JOBS?"
+            message = (
+                "Scan num_1 for YES: this PACK will count on both the linked job "
+                "and the main job, and later PACKs use the same choice. "
+                "Scan num_0 for NO: count it only on the job encoded in the QR."
+            )
         else:
-            title = "PRODUCT PART?"
-            message = "Scan num_1 for YES. Scan num_0 for NO and reject this QR."
+            sku = self._offline_product_part_display_sku(
+                self.state.pending_offline_qr_raw
+            )
+            self.status.setText(
+                f"VERIFY SCANNED PART — {sku}. "
+                "Scan num_1 to include this part or num_0 to reject this QR."
+            )
+            self._show_product_part_confirmation_overlay(sku)
+            self._refresh_ui()
+            return
         self.status.setText(f"{title} {message}")
         self._show_info_overlay(title, message)
         self._refresh_ui()
@@ -22590,6 +23636,11 @@ QWidget#ClientUIRoot {{
             unique_key = str(removed.get("unique_key") or "").strip()
             if unique_key:
                 s.raw_material_unique_keys.discard(unique_key)
+            # The next scan is a legitimate re-add after a successful void,
+            # not a duplicate transport delivery of the void scan itself.
+            transport_key = re.sub(r"\s+", "", wanted_raw).strip()
+            if transport_key:
+                getattr(self, "_recent_scan_seen", {}).pop(transport_key, None)
             material_name = str(removed.get("material_name") or removed.get("material") or "Product Part").strip()
             for scan_index in range(len(s.raw_material_scans or []) - 1, -1, -1):
                 if str(s.raw_material_scans[scan_index]).strip() == material_name:
@@ -22614,9 +23665,12 @@ QWidget#ClientUIRoot {{
             return True
         return False
 
-    def _void_butal_scan(self, raw_scan: str, qty: int) -> bool:
+    def _void_butal_scan(self, raw_scan: str, qty: int, multiplier: int = 1) -> bool:
         s = self.state
         self._last_voided_butal_record = None
+        self._last_voided_butal_records = []
+        voided_rows: List[Dict[str, Any]] = []
+        remaining = max(1, int(multiplier or 1))
         for row in reversed(list(s.butal_scan_logs or [])):
             if not isinstance(row, dict):
                 continue
@@ -22642,6 +23696,13 @@ QWidget#ClientUIRoot {{
             self.log_last(self._format_butal_history_action_text(row, voided=True))
             self.status.setText(f"Butal voided: -{void_qty}")
             self._last_voided_butal_record = dict(row)
+            voided_rows.append(dict(row))
+            remaining -= 1
+            if remaining <= 0:
+                break
+        if voided_rows:
+            self._last_voided_butal_records = voided_rows
+            self.status.setText(f"Butal voided: {len(voided_rows)} scan(s).")
             return True
         return False
 
@@ -22675,9 +23736,12 @@ QWidget#ClientUIRoot {{
             rows.append(dict(row))
         return rows
 
-    def _void_reject_scan(self, raw_scan: str) -> bool:
+    def _void_reject_scan(self, raw_scan: str, multiplier: int = 1) -> bool:
         s = self.state
         self._last_voided_reject_record = None
+        self._last_voided_reject_records = []
+        voided_rows: List[Dict[str, Any]] = []
+        remaining = max(1, int(multiplier or 1))
         supervisor_name = str(s.supervisor_review_actor_name or s.supervisor_name or "").strip()
         target_reason = str(raw_scan or "").strip().upper()
         for row in reversed(list(s.reject_review_logs or [])):
@@ -22724,11 +23788,14 @@ QWidget#ClientUIRoot {{
                     self.lblReject.add_points(-1)
                 self.log_last(self._format_reject_history_action_text(row, voided=True))
                 self.status.setText(f"Reject voided: {reason_code}")
-            return True
+            voided_rows.append(dict(row))
+            remaining -= 1
+            if remaining <= 0:
+                break
 
         # Older clients sent only the aggregate REJECT delta to the server.
-        # If that left a positive counter without a ledger row, create one
-        # explicit recovery/void record so the correction remains auditable.
+        # If that left positive counters without ledger rows, create enough
+        # explicit recovery/void records to honor the requested multiplier.
         entry_type = "STARTUP_REJECT_SCAN" if target_reason == "SUR" else "REJECT_SCAN"
         bucket_code = self._reject_detail_bucket_code(target_reason)
         available = (
@@ -22736,47 +23803,57 @@ QWidget#ClientUIRoot {{
             if entry_type == "STARTUP_REJECT_SCAN"
             else int((s.reject_breakdown or {}).get(bucket_code, 0) or 0)
         )
-        if available <= 0:
-            return False
-        now_utc = datetime.now(timezone.utc).isoformat()
-        recovered = {
-            "reject_scan_id": f"RS-RECOVERED-{uuid.uuid4().hex.upper()}",
-            "entry_type": entry_type,
-            "reason_code": target_reason,
-            "reason_text": "Start Up Reject" if target_reason == "SUR" else REJECT_REASON_MAP.get(target_reason, target_reason),
-            "raw_scan": target_reason,
-            "operator": str(s.operator_id or "").strip() or "-",
-            "operator_name": self._operator_display_name(s.operator_id),
-            **self._scan_owner_context(),
-            "scanned_at": now_utc,
-            "voided": True,
-            "voided_at": now_utc,
-            "voided_by": supervisor_name or "-",
-            "counter_only_recovery": True,
-        }
-        s.reject_review_logs.append(recovered)
-        self._last_voided_reject_record = dict(recovered)
-        if entry_type == "STARTUP_REJECT_SCAN":
-            s.startup_reject_total = max(0, int(s.startup_reject_total or 0) - 1)
-            adjustment_kind = "STARTUP_REJECT"
-        else:
-            if bucket_code == "NO":
-                s.no_shot_total = max(0, int(s.no_shot_total or 0) - 1)
+        recovery_count = min(max(0, remaining), max(0, available))
+        for _ in range(recovery_count):
+            now_utc = datetime.now(timezone.utc).isoformat()
+            recovered = {
+                "reject_scan_id": f"RS-RECOVERED-{uuid.uuid4().hex.upper()}",
+                "entry_type": entry_type,
+                "reason_code": target_reason,
+                "reason_text": "Start Up Reject" if target_reason == "SUR" else REJECT_REASON_MAP.get(target_reason, target_reason),
+                "raw_scan": target_reason,
+                "operator": str(s.operator_id or "").strip() or "-",
+                "operator_name": self._operator_display_name(s.operator_id),
+                **self._scan_owner_context(),
+                "scanned_at": now_utc,
+                "voided": True,
+                "voided_at": now_utc,
+                "voided_by": supervisor_name or "-",
+                "counter_only_recovery": True,
+            }
+            s.reject_review_logs.append(recovered)
+            voided_rows.append(dict(recovered))
+            self._last_voided_reject_record = dict(recovered)
+            self.log_last(self._format_reject_history_action_text(recovered, voided=True))
+
+        if recovery_count:
+            if entry_type == "STARTUP_REJECT_SCAN":
+                s.startup_reject_total = max(0, int(s.startup_reject_total or 0) - recovery_count)
+                adjustment_kind = "STARTUP_REJECT"
             else:
-                s.reject_total = max(0, int(s.reject_total or 0) - 1)
-                self.lblReject.add_points(-1)
-            s.reject_breakdown[bucket_code] = max(0, int(s.reject_breakdown.get(bucket_code, 0)) - 1)
-            adjustment_kind = "REJECT"
-        self._sync_machine_counter_current()
-        self._append_adjustment_log(
-            adjustment_kind,
-            "VOID_COUNTER_ONLY_RECOVERY",
-            {"reason_code": target_reason, "qty": 1, "supervisor_name": supervisor_name},
-        )
-        self.log_last(self._format_reject_history_action_text(recovered, voided=True))
-        self.status.setText(f"Reject voided from recovered counter: {target_reason}")
+                if bucket_code == "NO":
+                    s.no_shot_total = max(0, int(s.no_shot_total or 0) - recovery_count)
+                else:
+                    s.reject_total = max(0, int(s.reject_total or 0) - recovery_count)
+                    self.lblReject.add_points(-recovery_count)
+                s.reject_breakdown[bucket_code] = max(
+                    0,
+                    int(s.reject_breakdown.get(bucket_code, 0)) - recovery_count,
+                )
+                adjustment_kind = "REJECT"
+            self._sync_machine_counter_current()
+            self._append_adjustment_log(
+                adjustment_kind,
+                "VOID_COUNTER_ONLY_RECOVERY",
+                {"reason_code": target_reason, "qty": recovery_count, "supervisor_name": supervisor_name},
+            )
+
+        if not voided_rows:
+            return False
+        self._last_voided_reject_records = [dict(row) for row in voided_rows]
+        self._last_voided_reject_record = dict(voided_rows[-1])
+        self.status.setText(f"Reject voided: {target_reason} x{len(voided_rows)}")
         return True
-        return False
 
     def _scan_display_text(self, res, raw: str) -> str:
         if res is None:
@@ -23003,8 +24080,11 @@ QWidget#ClientUIRoot {{
         if prereq:
             return prereq
         if s.pending_offline_qr_raw:
-            if str(s.pending_offline_qr_phase or "").upper() == "ASK_MAIN_QTY":
+            offline_phase = str(s.pending_offline_qr_phase or "").upper()
+            if offline_phase == "ASK_MAIN_QTY":
                 return 'Scan num_0 to num_9 for the main-job quantity, then scan "confirm".'
+            if offline_phase == "ASK_LINKED_RELATED":
+                return "Are the linked and main jobs related? Scan num_1 for BOTH or num_0 for QR job only."
             return "Is this a PRODUCT PART? Scan num_1 for YES or num_0 to reject it."
         if s.waiting_machine_counter_overwrite_input:
             return "Scan num_0 to num_9 for the new counter, then scan a Supervisor badge."
@@ -23121,8 +24201,11 @@ QWidget#ClientUIRoot {{
         if s.prepack_mode_enabled:
             return "MULTI-COLOR PREPACK: scan component JOB or generic PACK QR"
         if s.pending_offline_qr_raw:
-            if str(s.pending_offline_qr_phase or "").upper() == "ASK_MAIN_QTY":
+            offline_phase = str(s.pending_offline_qr_phase or "").upper()
+            if offline_phase == "ASK_MAIN_QTY":
                 return "OFFLINE QR: scan quantity digits, then CONFIRM"
+            if offline_phase == "ASK_LINKED_RELATED":
+                return "OFFLINE LINKAGE: num_1 BOTH jobs / num_0 QR job only"
             return "OFFLINE QR: num_1 PRODUCT PART / num_0 reject"
         if s.waiting_machine_counter_overwrite_input:
             return "COUNTER OVERWRITE: scan digits, then Supervisor badge"
@@ -23477,10 +24560,22 @@ QWidget#ClientUIRoot {{
 
     def on_scanned(self, raw: str):
         raw_s = str(raw or "").strip()
+        mapped_raw = resolve_mapped_scan(raw_s)
+        if mapped_raw is None:
+            self.status.setText("This QR command is disabled or no longer mapped.")
+            self._show_invalid_overlay("Refresh QR mappings or scan a currently configured command.")
+            return
+        raw_s = mapped_raw
         if self._should_ignore_duplicate_transport_scan(raw_s):
             # A discarded transport duplicate must never leave an active
             # initial-setup state with its input panel hidden behind a refresh.
             self._ensure_initial_setup_prompt_visible()
+            return
+        # CANCEL is universal and must run before a modal/review branch can
+        # consume it as an invalid response.
+        if raw_s.lower() in ("cancel", "cancel~1") and self._cancel_active_scan_mode():
+            return
+        if self._cancel_mode_from_own_trigger(raw_s):
             return
         self._scan_feedback_context_active = True
         QTimer.singleShot(50, lambda: setattr(self, "_scan_feedback_context_active", False))
@@ -23508,7 +24603,7 @@ QWidget#ClientUIRoot {{
             if pending_shift:
                 raw_s = str(raw).strip()
                 raw_l = raw_s.lower()
-                if raw_l in ("operatorshift~1", "operator_shift~1", "shiftchange~1"):
+                if raw_l in ("operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"):
                     self._cancel_pending_finish_shift()
                     return
                 if raw_l in ("next", "prev", "previous", "preview"):
@@ -23533,6 +24628,18 @@ QWidget#ClientUIRoot {{
         raw_s = str(raw).strip()
         raw_l = raw_s.lower()
         s = self.state
+        if isinstance(self._pending_color_mold_change, dict):
+            pending_trigger = parse_scan(raw_s)
+            if pending_trigger is not None and pending_trigger.kind == "COLOR_CHANGE_TRIGGER":
+                self._cancel_color_mold_workflow()
+                return
+            reviewer = self._reviewer_from_scan(raw_s)
+            if reviewer is None or str(reviewer.get("can_supervisor", "0")) != "1":
+                self.status.setText("Change preview is open. Scan a valid Supervisor QR or changecolormold~1 to cancel.")
+                self._show_invalid_overlay("Only a registered Supervisor can approve this color/mold change.")
+                return
+            self._apply_pending_color_mold_change(reviewer)
+            return
         # A new operator scan supersedes any pending redraw from the previous
         # invalid reprint input. A fresh invalid result will schedule its own.
         self._reprint_prompt_restore_context = ""
@@ -23542,6 +24649,10 @@ QWidget#ClientUIRoot {{
         # through to the reject multiplier.
         self._restore_visible_initial_prompt_state()
         self._repair_initial_setup_state()
+        if self._numpad_command_from_scan(raw_s) == "clear":
+            if not self._clear_active_typed_input():
+                self.status.setText("Nothing typed to clear. The current workflow is unchanged.")
+            return
         if raw_s:
             self._append_app_log("SCAN", f"QR scanned: {raw_s}")
         if self._handle_crew_control_scan(raw_s):
@@ -23690,8 +24801,9 @@ QWidget#ClientUIRoot {{
             pending_raw = str(s.pending_offline_qr_raw or "").strip()
             phase = str(s.pending_offline_qr_phase or "ASK_PART").strip().upper()
             if phase == "ASK_MAIN_QTY":
-                if raw_l.startswith("num_") and raw_l[-1:].isdigit():
-                    s.pending_offline_main_qty_input += raw_l[-1]
+                input_digit = self._numpad_digit_from_scan(raw_s)
+                if input_digit is not None:
+                    s.pending_offline_main_qty_input += input_digit
                     self._show_offline_qr_prompt("ASK_MAIN_QTY")
                     self._save_active_session_snapshot()
                     return
@@ -23728,6 +24840,32 @@ QWidget#ClientUIRoot {{
                 self.status.setText(
                     f"Offline allocation saved: main job +{main_qty}; "
                     f"first linked packing job +{full_qty}."
+                )
+                self._save_active_session_snapshot()
+                self._reprocess_offline_qr(pending_raw)
+                return
+            if phase == "ASK_LINKED_RELATED":
+                choice = None
+                if raw_l in ("num_1", "1"):
+                    choice = True
+                elif raw_l in ("num_0", "0"):
+                    choice = False
+                if choice is None:
+                    self._show_offline_qr_prompt("ASK_LINKED_RELATED")
+                    return
+                scanned_job_code = self._extract_job_code_from_pack_qr(pending_raw)
+                relation_key = self._offline_linkage_relation_key(scanned_job_code)
+                if not relation_key:
+                    self._clear_offline_qr_prompt()
+                    self.status.setText("The linked-job relationship could not be identified.")
+                    self._show_invalid_overlay("Rescan the PACK after checking the linked job.")
+                    return
+                s.offline_linkage_relation_rules[relation_key] = choice
+                self._clear_offline_qr_prompt()
+                self.status.setText(
+                    "Offline linkage saved: PACKs count on both jobs."
+                    if choice
+                    else "Offline linkage saved: PACKs count only on the QR job."
                 )
                 self._save_active_session_snapshot()
                 self._reprocess_offline_qr(pending_raw)
@@ -23865,8 +25003,9 @@ QWidget#ClientUIRoot {{
         if s.waiting_cycle_time_confirm_popup:
             phase = int(s.cycle_time_confirm_phase or 1)
             if phase == 1:
-                if raw_l.startswith("num_") and raw_l[-1:].isdigit():
-                    s.cycle_time_new_input += raw_l[-1]
+                input_digit = self._numpad_digit_from_scan(raw_s)
+                if input_digit is not None:
+                    s.cycle_time_new_input += input_digit
                     self.resolveNewCycle.setText(f"Cycle Time: {s.cycle_time_new_input}")
                     self._supervisor_input_cursor_on = True
                     self._refresh_reject_summary_overlay()
@@ -23927,7 +25066,29 @@ QWidget#ClientUIRoot {{
             )
             return
 
+        # Reject/void state owns num_1..num_21 as reason choices. Invalid
+        # numbers stay in the same mode so the operator can scan again.
+        state_choice = re.fullmatch(r"num_(\d+)", raw_l)
+        if state_choice and (s.waiting_reject_reason or s.waiting_void_scan):
+            choice = int(state_choice.group(1))
+            reason_code = NUMERIC_REJECT_REASON_MAP.get(choice)
+            if not reason_code:
+                self.status.setText("This number is not valid in reject/void mode. Scan num_1..num_21.")
+                self._show_invalid_overlay("Out of scope: reject and void modes accept only num_1 through num_21.")
+                if s.waiting_reject_reason:
+                    QTimer.singleShot(4200, self._restore_reject_choices_if_waiting)
+                return
+            raw_s = reason_code
+            raw_l = reason_code.lower()
+
         res_pre = parse_scan(raw_s)
+        if res_pre is not None and res_pre.kind == "BUTAL_COMPLETION_TRIGGER" and (
+            s.waiting_butal_completion_carry_input
+            or s.waiting_butal_completion_butal_scan
+            or s.waiting_butal_completion_pack_scan
+        ):
+            self._cancel_active_scan_mode()
+            return
         if res_pre is not None and res_pre.kind == "JOB_API_REFRESH_TRIGGER":
             if not s.job_code:
                 self.status.setText("No running job to refresh.")
@@ -23980,7 +25141,7 @@ QWidget#ClientUIRoot {{
             self._save_active_session_snapshot()
             return
         if s.waiting_butal_job_assignment:
-            if raw_l in ("cancel", "cancel~1", "void", "clear"):
+            if raw_l in ("cancel", "cancel~1", "void"):
                 self._clear_pending_butal_assignment()
                 self.status.setText("Butal assignment cancelled.")
                 self._refresh_ui()
@@ -24143,7 +25304,7 @@ QWidget#ClientUIRoot {{
             self._change_finish_review_page(1 if raw_l == "next" else -1)
             return
 
-        if raw_l == "prodhistory~1":
+        if raw_l in ("prodhistory", "prodhistory~1"):
             if self.productHistoryOverlay.isVisible():
                 self._hide_product_history_overlay()
                 self.status.setText("Product PACK history closed.")
@@ -24221,15 +25382,16 @@ QWidget#ClientUIRoot {{
             return
 
         if s.waiting_shift_end_machine_counter_input:
-            if raw_l in ("operatorshift~1", "operator_shift~1", "shiftchange~1"):
+            if raw_l in ("operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"):
                 self._cancel_pending_finish_shift()
                 return
             self._open_finish_shift_review()
             return
 
         if s.waiting_initial_cycle_time_input:
-            if raw_l.startswith("num_") and raw_l[-1:].isdigit():
-                s.cycle_time_new_input += raw_l[-1]
+            input_digit = self._numpad_digit_from_scan(raw_s)
+            if input_digit is not None:
+                s.cycle_time_new_input += input_digit
                 self._update_cycle_input_display()
                 self._ensure_initial_setup_prompt_visible()
                 self._save_active_session_snapshot()
@@ -24260,8 +25422,9 @@ QWidget#ClientUIRoot {{
             return
 
         if s.waiting_butal_completion_carry_input:
-            if raw_l.startswith("num_") and raw_l[-1:].isdigit():
-                s.butal_completion_input += raw_l[-1]
+            input_digit = self._numpad_digit_from_scan(raw_s)
+            if input_digit is not None:
+                s.butal_completion_input += input_digit
                 self.status.setText(f"BUTAL completion carried qty: {s.butal_completion_input}. Scan confirm.")
                 self._save_active_session_snapshot()
                 return
@@ -24288,9 +25451,10 @@ QWidget#ClientUIRoot {{
             self.status.setText("BUTAL completion: scan carried qty with num_ digits, backspace, confirm.")
             return
 
-        if raw_l.startswith("num_") and raw_l[-1:].isdigit():
+        input_digit = self._numpad_digit_from_scan(raw_s)
+        if input_digit is not None:
             if self.can_accept_production_scans() or s.waiting_reject_reason:
-                if self._append_reject_multiplier_digit(raw_l[-1]):
+                if self._append_reject_multiplier_digit(input_digit):
                     self.status.setText(
                         f"Multiplier set: x{self._reject_multiplier_value()}. Scan SUR, NO, BUTAL, or backspace to edit."
                     )
@@ -24471,6 +25635,13 @@ QWidget#ClientUIRoot {{
             self.status.setText("No pending PDR start to cancel.")
             return
 
+        if res_pre and res_pre.kind == "PRODUCTION_DAILY_REPORT_TRIGGER":
+            # The same QR toggles off only the pending start. Once Maintenance
+            # starts the actual downtime interval, PDR must be completed rather
+            # than discarded.
+            if self._cancel_pending_pdr_start():
+                return
+
         if res_pre and res_pre.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
             self.status.setText(
                 "PDR completion requires a Maintenance or Line Technician badge. Scan it when the repair is done."
@@ -24524,7 +25695,11 @@ QWidget#ClientUIRoot {{
             code = self._extract_production_reason_code(raw_s)
             reason = self._production_reason_text(code) if code else None
             if not code or not reason:
-                self.status.setText("PDR validation: scan valid reason QR (01-15).")
+                if re.fullmatch(r"num_\d+", raw_l):
+                    self.status.setText("PDR reason out of scope. Scan num_1..num_15; num_0 has no PDR value.")
+                    self._show_invalid_overlay("PDR accepts num_1 through num_15 only. num_0 is reserved for input or prompts that explicitly offer choice 0.")
+                else:
+                    self.status.setText("PDR validation: scan valid reason QR (01-15).")
                 return
             stopped_repair_duration = self._stopped_pdr_repair_duration()
             if stopped_repair_duration is not None:
@@ -24653,8 +25828,9 @@ QWidget#ClientUIRoot {{
 
         # Resolution step 1: Cycle time input via num_0..num_9, backspace, confirm
         if s.waiting_cycle_time_input and not prejob_pdr_job_scan:
-            if raw_l.startswith("num_") and raw_l[-1:].isdigit():
-                s.cycle_time_new_input += raw_l[-1]
+            input_digit = self._numpad_digit_from_scan(raw_s)
+            if input_digit is not None:
+                s.cycle_time_new_input += input_digit
                 self._update_cycle_input_display()
                 self._refresh_downtime_panel()
                 self._save_active_session_snapshot()
@@ -24945,7 +26121,7 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Invalid operator QR: badge is not registered as Operator.")
                 self._show_invalid_overlay("Operator badge is not registered on server.")
                 return
-        if res is None and str(s.reject_multiplier_input or "").strip() and raw_l != "backspace" and not (raw_l.startswith("num_") and raw_l[-1:].isdigit()):
+        if res is None and str(s.reject_multiplier_input or "").strip() and raw_l != "backspace" and self._numpad_digit_from_scan(raw_l) is None:
             self._clear_reject_multiplier()
             self._refresh_ui()
         if self._handle_color_change_number_choice(raw_l):
@@ -24954,11 +26130,19 @@ QWidget#ClientUIRoot {{
             self.status.setText("Unknown or invalid QR.")
             self._show_invalid_overlay("QR not recognized.")
             return
-        if not (
-            res.kind == "STARTUP_REJECT"
-            or res.kind == "BUTAL"
-            or (res.kind == "REJECT_REASON" and str(res.value or "").strip().upper() == "NO")
+        # Re-scanning a mode's own command toggles that mode off, matching
+        # the existing Void, linkage, color/mold, and work-order behavior.
+        if res.kind == "REJECT_TRIGGER" and s.waiting_reject_reason:
+            self._cancel_active_scan_mode()
+            return
+        if res.kind == "BUTAL_COMPLETION_TRIGGER" and (
+            s.waiting_butal_completion_carry_input
+            or s.waiting_butal_completion_butal_scan
+            or s.waiting_butal_completion_pack_scan
         ):
+            self._cancel_active_scan_mode()
+            return
+        if res.kind not in ("REJECT_TRIGGER", "REJECT_REASON", "STARTUP_REJECT", "BUTAL", "VOID_TRIGGER"):
             self._consume_reject_multiplier_if_inapplicable(raw_l)
         suppress_scan_log = bool(
             s.waiting_void_scan and res.kind in ("PACK", "BUTAL", "REJECT_REASON", "STARTUP_REJECT")
@@ -24974,13 +26158,7 @@ QWidget#ClientUIRoot {{
             return
 
         if s.waiting_color_change_job_scan and res.kind == "COLOR_CHANGE_TRIGGER":
-            s.waiting_color_change_job_scan = False
-            s.pending_color_change_reason = ""
-            self._color_change_options = []
-            self._hide_invalid_overlay()
-            self.status.setText("Change color/mold cancelled. Continue current job.")
-            self._refresh_ui()
-            self._save_active_session_snapshot()
+            self._cancel_color_mold_workflow()
             return
 
         if s.waiting_linkage_job_scan and res.kind == "JOB_LINKAGE_TRIGGER":
@@ -24997,19 +26175,23 @@ QWidget#ClientUIRoot {{
             return
 
         if s.waiting_color_change_job_scan and res.kind not in ("JOB", "JOB_STUB"):
+            if str(s.pending_color_change_reason or "").upper() == "CHOOSE_TYPE":
+                self.status.setText("Choose num_1 for Change Color or num_2 for Change Mold.")
+                self._show_invalid_overlay("Choose num_1 CHANGE COLOR or num_2 CHANGE MOLD.")
+                return
             mode_label = "MOLD CHANGE" if str(s.pending_color_change_reason or "").upper() == "MOLD_CHANGE" else "COLOR CHANGE"
-            choice_hint = (
-                f"num_1 to num_{len(self._color_change_options)}, or "
-                if self._color_change_options else ""
-            )
-            self.status.setText(f"{mode_label} mode active. Scan {choice_hint}a JOB QR.")
-            self._show_invalid_overlay(f"Scan {choice_hint}a JOB QR / job order to continue.")
+            self.status.setText(f"{mode_label} mode active. Scan the target JOB QR.")
+            self._show_invalid_overlay("Scan a JOB QR, or scan changecolormold~1 to cancel.")
             return
 
         if s.waiting_production_report_reason and not prejob_pdr_job_scan:
             code = self._extract_production_reason_code(raw_s)
             if not code:
-                self.status.setText("Production Daily Report: scan valid reason QR (01-15).")
+                if re.fullmatch(r"num_\d+", raw_l):
+                    self.status.setText("PDR reason out of scope. Scan num_1..num_15; num_0 has no PDR value.")
+                    self._show_invalid_overlay("PDR accepts num_1 through num_15 only. num_0 is reserved for input or prompts that explicitly offer choice 0.")
+                else:
+                    self.status.setText("Production Daily Report: scan valid reason QR (01-15).")
                 return
             reason_map = {k: v for k, v in PRODUCTION_DAILY_REPORT_ITEMS}
             reason = reason_map.get(code)
@@ -25121,10 +26303,13 @@ QWidget#ClientUIRoot {{
                     self.status.setText("Supervisor review void only allows REJECT scans.")
                     return
                 voided_kind = ""
-                if self._void_pack_scan(raw_s):
-                    voided_kind = "PACK"
-                elif self._void_product_part_scan(raw_s):
+                # Manually confirmed product parts use PACK-format QR labels.
+                # Prefer the exact product-part history match so rescanning the
+                # same label removes that item instead of any PACK entry.
+                if self._void_product_part_scan(raw_s):
                     voided_kind = "PRODUCT_PART"
+                elif self._void_pack_scan(raw_s):
+                    voided_kind = "PACK"
                 if not voided_kind:
                     self.status.setText("PACK / PRODUCT PART not found in active history. Nothing was voided.")
                     self._show_invalid_overlay("This QR was not found in PACK or PRODUCT PART scan history.")
@@ -25155,17 +26340,25 @@ QWidget#ClientUIRoot {{
                 if s.supervisor_review_open and not s.cycle_time_pending_supervisor:
                     self.status.setText("Supervisor review void only allows REJECT scans.")
                     return
-                if not self._void_butal_scan(raw_s, int(res.qty or 0)):
+                void_multiplier = self._reject_multiplier_value()
+                if not self._void_butal_scan(raw_s, int(res.qty or 0), void_multiplier):
                     self.status.setText("BUTAL scan not found in history. Nothing was voided.")
                     self._show_invalid_overlay("This BUTAL QR was not found in scan history.")
                     return
                 self._clear_void_modes()
+                self._clear_reject_multiplier()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 self.push_event(
                     {
                         "type": "BUTAL_VOID",
                         "void_record": dict(getattr(self, "_last_voided_butal_record", {}) or {}),
+                        "void_records": [
+                            dict(row)
+                            for row in (getattr(self, "_last_voided_butal_records", []) or [])
+                            if isinstance(row, dict)
+                        ],
+                        "void_count": len(getattr(self, "_last_voided_butal_records", []) or []),
                         "post_butal_total": int(s.butal_total or 0),
                         "post_butal_by_job": dict(s.butal_by_job or {}),
                     },
@@ -25174,21 +26367,34 @@ QWidget#ClientUIRoot {{
                 )
                 return
             if res.kind in ("REJECT_REASON", "STARTUP_REJECT"):
-                void_raw = "SUR" if res.kind == "STARTUP_REJECT" else str(raw_s).strip().upper()
-                if not self._void_reject_scan(void_raw):
+                void_raw = "SUR" if res.kind == "STARTUP_REJECT" else str(res.value or raw_s).strip().upper()
+                void_multiplier = self._reject_multiplier_value()
+                if not self._void_reject_scan(void_raw, void_multiplier):
                     self.status.setText("Reject scan not found in history. Nothing was voided.")
                     self._show_invalid_overlay("That reject entry was not found in scan history.")
                     return
                 self._clear_void_modes()
+                self._clear_reject_multiplier()
                 self._refresh_ui()
                 self._save_active_session_snapshot()
                 voided_reject_record = dict(getattr(self, "_last_voided_reject_record", {}) or {})
+                voided_reject_records = [
+                    dict(row)
+                    for row in (getattr(self, "_last_voided_reject_records", []) or [])
+                    if isinstance(row, dict)
+                ]
                 self.push_event(
                     {
                         "type": "REJECT_VOID",
                         "reason": void_raw,
                         "reject_record": voided_reject_record,
                         "reject_scan_id": str(voided_reject_record.get("reject_scan_id") or ""),
+                        "void_records": voided_reject_records,
+                        "void_count": len(voided_reject_records),
+                        "post_reject_total": int(s.reject_total or 0),
+                        "post_startup_reject_total": int(s.startup_reject_total or 0),
+                        "post_no_shot_total": int(s.no_shot_total or 0),
+                        "post_reject_breakdown": dict(s.reject_breakdown or {}),
                     },
                     f"REJECT VOID {void_raw}",
                     defer_snapshot=True,
@@ -25450,33 +26656,9 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Cannot change job segment while reject/downtime flow is active.")
                 self._show_invalid_overlay("Finish the active reject/downtime flow first.")
                 return
-            reason_key = "MOLD_CHANGE" if isinstance(res.meta, dict) and str(res.meta.get("reason") or "").upper() == "MOLD_CHANGE" else "COLOR_CHANGE"
-            s.waiting_color_change_job_scan = True
-            s.pending_color_change_reason = reason_key
             s.waiting_linkage_job_scan = False
             self._clear_pending_butal_assignment()
-            mode_label = "MOLD CHANGE" if reason_key == "MOLD_CHANGE" else "COLOR CHANGE"
-            saved_options = self._build_recovery_session_options_from_state()
-            self._color_change_options = list(saved_options)
-            if saved_options:
-                self._show_session_recovery_options_prompt(
-                    saved_options,
-                    title=mode_label,
-                    headline=f"{len(saved_options)} job option(s) available. Scan the number shown on a card.",
-                    footer=(
-                        f"Scan num_1 to num_{len(saved_options)}, or scan a new JOB QR / job order."
-                    ),
-                )
-            else:
-                self._show_info_overlay(
-                    mode_label,
-                    "Scan the new JOB QR / job order to continue.\n"
-                    "Scan the change color/mold QR again to cancel.",
-                    hide_ms=0,
-                )
-            self.status.setText(f"{mode_label} mode active. Scan JOB QR for a saved session or a new job order.")
-            self._refresh_ui()
-            self._save_active_session_snapshot()
+            self._show_color_mold_type_prompt()
             return
 
         if res.kind == "FINISH_JOB":
@@ -25513,6 +26695,22 @@ QWidget#ClientUIRoot {{
                         f"Main job (1 of {total_jobs_in_group}) with {len(self.state.linkage_jobs or [])} linked job(s)."
                     )
             linked_finished_payloads = self._build_linked_finished_job_payloads(finished_payload)
+            existing_session_ids = {
+                str(row.get("production_session_id") or "")
+                for row in [finished_payload, *linked_finished_payloads]
+                if isinstance(row, dict)
+            }
+            hidden_color_mold_payloads: List[Dict[str, Any]] = []
+            for parked_payload in self._build_color_mold_finished_payloads():
+                parked_session_id = str(parked_payload.get("production_session_id") or "")
+                if parked_session_id and parked_session_id in existing_session_ids:
+                    continue
+                hidden_color_mold_payloads.append(parked_payload)
+                if parked_session_id:
+                    existing_session_ids.add(parked_session_id)
+            # Parked color/mold jobs are closed together, but the operator and
+            # supervisor review only the currently displayed job as requested.
+            self._pending_final_review_hidden_payloads = hidden_color_mold_payloads
             self.status.setText('Finish job summary opened. Scan "next" / "prev", then scan Supervisor QR to approve; scan Finish Job QR to cancel.')
             self._finish_pending_clear = False
             self._show_final_job_review_overlay(finished_payload, linked_finished_payloads)
@@ -25641,7 +26839,7 @@ QWidget#ClientUIRoot {{
                 if not reason_text:
                     reason_text = REJECT_REASON_MAP.get(reason_code, reason_code)
                 bucket_code = self._reject_detail_bucket_code(reason_code)
-                qty = self._reject_multiplier_value() if bucket_code == "NO" else 1
+                qty = self._reject_multiplier_value()
                 reject_records = self._append_reject_scan_records(reason_code, reason_text, qty)
                 if bucket_code == "NO":
                     s.no_shot_total += qty
@@ -25652,6 +26850,7 @@ QWidget#ClientUIRoot {{
                     s.reject_breakdown[bucket_code] = s.reject_breakdown.get(bucket_code, 0) + qty
                 s.waiting_reject_reason = False
                 self._clear_reject_multiplier()
+                self._hide_invalid_overlay()
                 self.status.setText(f"Reject recorded: {reason_code} x{qty}" if qty > 1 else f"Reject recorded: {reason_code}")
                 if bucket_code != "NO":
                     self.lblReject.add_points(qty)
@@ -25671,6 +26870,7 @@ QWidget#ClientUIRoot {{
                 self._sync_machine_counter_current()
                 s.waiting_reject_reason = False
                 self._clear_reject_multiplier()
+                self._hide_invalid_overlay()
                 self.status.setText(f"Start Up Reject recorded x{qty}." if qty > 1 else "Start Up Reject recorded.")
                 self._refresh_ui()
                 self.push_event(
@@ -25925,42 +27125,41 @@ QWidget#ClientUIRoot {{
                 return
             if s.waiting_color_change_job_scan:
                 if not (s.machine_code and s.job_code and s.operator_id):
-                    s.waiting_color_change_job_scan = False
-                    s.pending_color_change_reason = ""
-                    self.status.setText("Change cancelled: complete current session first.")
-                    self._refresh_ui()
-                    self._save_active_session_snapshot()
+                    self._cancel_color_mold_workflow()
+                    self.status.setText("Change cancelled: complete the current MACHINE, JOB, and OPERATOR session first.")
+                    return
+                requested_reason = str(s.pending_color_change_reason or "").strip().upper()
+                if requested_reason not in ("COLOR_CHANGE", "MOLD_CHANGE"):
+                    self._show_color_mold_type_prompt("Choose num_1 for Change Color or num_2 for Change Mold before scanning a JOB.")
                     return
                 job_data = self._resolve_scanned_job_data(res, raw_s, "Getting next job data from BMS...")
                 if not isinstance(job_data, dict):
-                    self.status.setText("Change cancelled: unable to read new job.")
-                    self._show_invalid_overlay("Unable to read new job QR.")
+                    self._reject_color_mold_target("Unable to read the target JOB. Choose the change type and scan again.")
                     return
                 new_job_code = str(job_data.get("job_code") or "").strip()
                 if self._normalize_job_code(new_job_code) == self._normalize_job_code(s.job_code):
-                    s.waiting_color_change_job_scan = False
-                    s.pending_color_change_reason = ""
-                    self.status.setText("Change cancelled. Continuing current job.")
-                    self._refresh_ui()
-                    self._save_active_session_snapshot()
+                    self._reject_color_mold_target("The scanned JOB is already active. Choose again and scan a different JOB.")
                     return
-                requested_reason = str(s.pending_color_change_reason or "COLOR_CHANGE").strip().upper()
                 change_info = self._classify_job_change_reason(s.job_payload or {}, job_data.get("job_payload") if isinstance(job_data.get("job_payload"), dict) else {}, requested_reason)
-                reason_key = str(change_info.get("reason") or requested_reason or "COLOR_CHANGE").strip().upper()
-                existing_segment = self._find_shift_segment_for_job(self._normalize_job_code(new_job_code))
-                if isinstance(existing_segment, dict):
-                    self._hide_invalid_overlay()
-                    self._change_color_to_existing_shift_segment(existing_segment, reason=reason_key)
+                if not bool(change_info.get("valid")):
+                    self._reject_color_mold_target(str(change_info.get("error") or "The scanned JOB does not match the selected change type."))
                     return
                 self._hide_invalid_overlay()
                 job_data["change_classification"] = change_info
-                self._change_color_to_job(job_data, reason=reason_key)
+                self._stage_color_mold_change_preview(job_data, change_info)
                 return
             if s.waiting_linkage_job_scan:
                 if not (s.machine_code and s.job_code and s.operator_id):
                     s.waiting_linkage_job_scan = False
                     self.status.setText("Linkage cancelled: complete current session first.")
                     self._refresh_ui()
+                    return
+                existing_link_index = self._linked_job_index_for_scan(res, raw_s)
+                if existing_link_index is not None:
+                    self._remove_linked_job_at_index(
+                        existing_link_index,
+                        linkage_toggle=True,
+                    )
                     return
                 linked_job_code = ""
                 linked_job_name = ""
@@ -26088,9 +27287,10 @@ QWidget#ClientUIRoot {{
                         # server lookup timed out but an empty row was accepted.
                         s.linkage_jobs.pop(existing_link_index)
                     else:
-                        self.status.setText("Linked job already added. Scan another JOB or scan PACK/BUTAL to continue.")
-                        self._show_invalid_overlay("Linked job QR already scanned.")
-                        self._refresh_ui()
+                        self._remove_linked_job_at_index(
+                            existing_link_index,
+                            linkage_toggle=True,
+                        )
                         return
                 s.linkage_enabled = True
                 s.linkage_job_code = linked_job_code
@@ -26150,8 +27350,8 @@ QWidget#ClientUIRoot {{
                     self._select_prepack_component_job(matched_row.get("job_code"))
                     return
             if s.machine_code and s.job_code and s.operator_id:
-                self.status.setText('Scan "changecolor~1" or "changemold~1" before scanning the next job.')
-                self._show_invalid_overlay("Use change color/change mold QR first.")
+                self.status.setText('Scan "changecolormold~1" before scanning the next job.')
+                self._show_invalid_overlay("Use the combined change color/mold QR first.")
                 return
             if s.machine_code and s.job_code and not s.operator_id:
                 self.status.setText("Invalid scan: scan OPERATOR badge for the current job first.")
@@ -26633,6 +27833,7 @@ QWidget#ClientUIRoot {{
                 self._hide_production_overlay()
                 self.status.setText("Reject mode enabled. Scan reason code now.")
                 self._refresh_ui()
+                self._show_reject_reason_choices_overlay()
                 self.push_event({"type": "REJECT_MODE"}, "REJECT MODE")
                 return
 
@@ -26786,6 +27987,14 @@ QWidget#ClientUIRoot {{
                         and self._normalize_job_code(row.get("job_code"))
                     )
                 )
+                offline_related_to_main: Optional[bool] = None
+                relation_key = self._offline_linkage_relation_key(routed_job_code)
+                if offline_mode and multi_output_mode and relation_key:
+                    relation_rules = s.offline_linkage_relation_rules or {}
+                    if relation_key not in relation_rules:
+                        self._start_offline_qr_prompt(raw_s, "ASK_LINKED_RELATED")
+                        return
+                    offline_related_to_main = bool(relation_rules[relation_key])
                 if (
                     offline_mode
                     and s.linkage_enabled
@@ -26800,6 +28009,7 @@ QWidget#ClientUIRoot {{
                     qty,
                     main_qty_override=offline_main_qty_override,
                     routed_job_code=routed_job_code,
+                    related_to_main=offline_related_to_main,
                 )
                 if pack_allocation is None:
                     if multi_output_mode:
@@ -27203,8 +28413,139 @@ QWidget#ClientUIRoot {{
 
         self.status.setText(f"Scan handled: {res.kind}")
         self._refresh_ui()
+    def _refresh_qr_mappings_from_server(self, force: bool = False) -> bool:
+        now = time.monotonic()
+        last_sync = float(getattr(self, "_last_qr_mapping_sync", 0.0) or 0.0)
+        if not force and now - last_sync < 60.0:
+            return False
+        server_url = str(self.client_config.get("server_url", SERVER_URL)).strip().rstrip("/")
+        if not server_url:
+            return False
+        with self._qr_mapping_sync_lock:
+            if self._qr_mapping_sync_inflight:
+                return False
+            self._qr_mapping_sync_inflight = True
+        self._last_qr_mapping_sync = now
+        client_id = self._current_client_id()
+
+        def worker():
+            payload: Dict[str, Any] = {"force": bool(force)}
+            try:
+                response = requests.get(
+                    f"{server_url}/api/qr-mappings",
+                    headers={"X-Client-ID": client_id},
+                    timeout=2.5,
+                )
+                response.raise_for_status()
+                body = response.json()
+                config = body.get("config") if isinstance(body, dict) else None
+                if not isinstance(config, dict):
+                    raise ValueError("Server returned no QR mapping configuration")
+                payload["config"] = config
+            except Exception as exc:
+                payload["error"] = type(exc).__name__
+            finally:
+                with self._qr_mapping_sync_lock:
+                    self._qr_mapping_sync_inflight = False
+                self.qr_mapping_received.emit(payload)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _apply_server_qr_mapping_payload(self, payload: Dict[str, Any]):
+        global QR_MAPPING_CONFIG
+        config = payload.get("config") if isinstance(payload, dict) else None
+        if not isinstance(config, dict) or not _apply_runtime_qr_mapping_config(config):
+            if bool((payload or {}).get("force")):
+                reason = str((payload or {}).get("error") or "invalid configuration")
+                self.status.setText(f"QR mapping refresh failed: {reason}")
+            return
+        QR_MAPPING_CONFIG = copy.deepcopy(config)
+        try:
+            os.makedirs(os.path.dirname(QR_MAPPING_CACHE_FILE), exist_ok=True)
+            tmp_path = f"{QR_MAPPING_CACHE_FILE}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(QR_MAPPING_CONFIG, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, QR_MAPPING_CACHE_FILE)
+        except Exception:
+            pass
+
+    def _offline_linkage_relation_key(self, routed_job_code: Any) -> str:
+        main_code = self._normalize_job_code(self.state.job_code)
+        linked_code = self._normalize_job_code(routed_job_code)
+        if not main_code or not linked_code or main_code == linked_code:
+            return ""
+        return f"{main_code}|{linked_code}"
+        if hasattr(self, "qrMappingVersionLabel"):
+            self.qrMappingVersionLabel.setText(
+                f"Published version: {int(QR_MAPPING_CONFIG.get('version') or 1)}"
+            )
+        if bool(payload.get("force")) and hasattr(self, "qrMappingEditor"):
+            self.qrMappingEditor.setPlainText(qr_mapping_config_to_text(QR_MAPPING_CONFIG))
+        self._append_app_log(
+            "SETTINGS",
+            f"QR mapping version {int(QR_MAPPING_CONFIG.get('version') or 1)} loaded from server",
+        )
+
+    def _mapping_editor_payload(self) -> Optional[Dict[str, Any]]:
+        value, errors = qr_mapping_config_from_text(
+            self.qrMappingEditor.toPlainText(),
+            QR_MAPPING_CONFIG,
+        )
+        if value is None:
+            self.status.setText("Mapping format error: " + "; ".join(errors[:3]))
+            return None
+        return value
+
+    def _validate_qr_mapping_editor(self):
+        config = self._mapping_editor_payload()
+        if config is None:
+            return
+        ok, errors = apply_qr_mapping_config(config)
+        if not ok:
+            self.status.setText("Mapping validation failed: " + "; ".join(errors[:3]))
+            _apply_runtime_qr_mapping_config(QR_MAPPING_CONFIG)
+            return
+        _apply_runtime_qr_mapping_config(QR_MAPPING_CONFIG)
+        self.status.setText("QR mappings are valid. Publish to make them active for all clients.")
+
+    def _publish_qr_mapping_editor(self):
+        global QR_MAPPING_CONFIG
+        config = self._mapping_editor_payload()
+        if config is None:
+            return
+        badge_code = self.qrMappingBadgeInput.text().strip()
+        if not badge_code:
+            self.status.setText("Scan or enter an authorized Supervisor/Admin badge before publishing.")
+            return
+        server_url = str(self.client_config.get("server_url", SERVER_URL)).strip().rstrip("/")
+        try:
+            response = requests.post(
+                f"{server_url}/api/qr-mappings",
+                json={"config": config, "badge_code": badge_code},
+                headers={"X-Client-ID": self._current_client_id()},
+                timeout=5.0,
+            )
+            body = response.json()
+            if response.status_code >= 400 or not bool(body.get("ok")):
+                self.status.setText(f"QR mapping publish failed: {body.get('error') or response.status_code}")
+                return
+            published = body.get("config")
+            if isinstance(published, dict):
+                QR_MAPPING_CONFIG = copy.deepcopy(published)
+                _apply_runtime_qr_mapping_config(QR_MAPPING_CONFIG)
+                self.qrMappingEditor.setPlainText(qr_mapping_config_to_text(QR_MAPPING_CONFIG))
+                self.qrMappingVersionLabel.setText(
+                    f"Published version: {int(QR_MAPPING_CONFIG.get('version') or 1)}"
+                )
+            self.qrMappingBadgeInput.clear()
+            self.status.setText("QR mappings published. Clients will receive them automatically without rebuilding.")
+        except Exception as exc:
+            self.status.setText(f"QR mapping publish failed: {type(exc).__name__}: {exc}")
+
     def send_heartbeat(self):
         if self.state.machine_code:
+            self._refresh_qr_mappings_from_server(force=False)
             self._refresh_offline_linkage_details()
             self._resolve_pending_operator_profile()
             self.push_event(
@@ -28305,7 +29646,18 @@ QWidget#ClientUIRoot {{
                 "client_activity_logs",
                 self._pending_server_activity_logs(80),
             )
-        session_id = str(s.production_session_id or "").strip()
+        state_session_id = str(s.production_session_id or "").strip()
+        finished_row = event_payload.get("finished_job")
+        finished_session_id = (
+            str(finished_row.get("production_session_id") or "").strip()
+            if isinstance(finished_row, dict)
+            else ""
+        )
+        session_id = str(event_payload.get("production_session_id") or "").strip()
+        if not session_id and event_type in ("FINISH_JOB", "FINISH_SHIFT"):
+            session_id = finished_session_id
+        if not session_id:
+            session_id = state_session_id
         if s.job_code and not session_id:
             session_id = self._legacy_production_session_id(
                 s.machine_code, s.job_code, s.job_started_at, self._current_client_id()
@@ -28313,7 +29665,6 @@ QWidget#ClientUIRoot {{
             s.production_session_id = session_id
         if session_id:
             event_payload.setdefault("production_session_id", session_id)
-            finished_row = event_payload.get("finished_job")
             if isinstance(finished_row, dict):
                 finished_row = dict(finished_row)
                 finished_row.setdefault("production_session_id", session_id)
@@ -28363,6 +29714,7 @@ def main():
     w = ClientUI()
     w.setWindowState(Qt.WindowState.WindowFullScreen)
     w.showFullScreen()
+    QTimer.singleShot(0, w._prewarm_reject_reason_choices_overlay)
     sys.exit(app.exec())
 
 
