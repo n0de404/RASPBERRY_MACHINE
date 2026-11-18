@@ -135,8 +135,11 @@ class _MixingScannerFilter(production_client.ScannerFilter):
     # structured payload together.
     IDLE_COMPLETE_MS = 250
 
-    def __init__(self, plain_digit_numpad_enabled=None):
-        super().__init__(plain_digit_numpad_enabled=plain_digit_numpad_enabled)
+    def __init__(self, plain_digit_numpad_enabled=None, keyboard_input_enabled=None):
+        super().__init__(
+            plain_digit_numpad_enabled=plain_digit_numpad_enabled,
+            keyboard_input_enabled=keyboard_input_enabled,
+        )
         self._idle_complete_timer = production_client.QTimer(self)
         self._idle_complete_timer.setSingleShot(True)
         self._idle_complete_timer.timeout.connect(self._emit_buffered_scan)
@@ -992,7 +995,7 @@ class MixingClientUI(production_client.ClientUI):
             if pending_shift:
                 if self._should_ignore_duplicate_transport_scan(raw_s):
                     return True
-                if raw_l in ("operatorshift~1", "operator_shift~1", "shiftchange~1"):
+                if raw_l in ("finishshift", "operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"):
                     self._cancel_pending_finish_shift()
                     return True
                 if raw_l in ("next", "prev", "previous", "preview"):
@@ -2421,7 +2424,10 @@ class MixingClientUI(production_client.ClientUI):
         self.filter = _MixingScannerFilter(
             plain_digit_numpad_enabled=lambda: bool(
                 mode == "serial" or self._serial_scanner_connected
-            )
+            ),
+            keyboard_input_enabled=lambda _target=None: bool(
+                hasattr(self, "settingsOverlay") and self.settingsOverlay.isVisible()
+            ),
         )
         app = production_client.QApplication.instance()
         if app is not None:

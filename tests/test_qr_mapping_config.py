@@ -74,6 +74,26 @@ class QrMappingConfigurationTests(unittest.TestCase):
         self.assertEqual(row["aliases"], ["pdrstart"])
         self.assertEqual(parse_scan("pdrstart").kind, "PRODUCTION_DAILY_REPORT_TRIGGER")
 
+    def test_finish_shift_uses_finishshift_as_its_canonical_payload(self):
+        row = next(row for row in DEFAULT_QR_MAPPING_CONFIG["commands"] if row["id"] == "operator_shift")
+
+        self.assertEqual(row["handler_token"], "finishshift")
+        self.assertEqual(row["aliases"][0], "finishshift")
+        self.assertEqual(resolve_mapped_scan("finishshift"), "finishshift")
+        self.assertEqual(parse_scan("finishshift").kind, "OPERATOR_SHIFT_TRIGGER")
+
+    def test_custom_finish_shift_mapping_uses_existing_workflow(self):
+        config = deepcopy(DEFAULT_QR_MAPPING_CONFIG)
+        row = next(row for row in config["commands"] if row["id"] == "operator_shift")
+        row["aliases"] = ["end-my-shift"]
+
+        ok, errors = apply_qr_mapping_config(config)
+
+        self.assertTrue(ok, errors)
+        self.assertEqual(resolve_mapped_scan("end-my-shift"), "finishshift")
+        self.assertEqual(parse_scan("end-my-shift").kind, "OPERATOR_SHIFT_TRIGGER")
+        self.assertIsNone(resolve_mapped_scan("operatorshift~1"))
+
     def test_no_shot_has_direct_and_numeric_mappings(self):
         row = next(row for row in DEFAULT_QR_MAPPING_CONFIG["commands"] if row["id"] == "no_shot")
         self.assertEqual(row["aliases"], ["NO"])

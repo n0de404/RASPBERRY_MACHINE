@@ -59,7 +59,7 @@ class ColorMoldAndNumericStateMappingTests(unittest.TestCase):
 
     def test_plain_reject_void_and_butal_controls_follow_mapping_sheet(self):
         expected = {
-            "operatorshift": "OPERATOR_SHIFT_TRIGGER",
+            "finishshift": "OPERATOR_SHIFT_TRIGGER",
             "changeoperator": "CHANGE_OPERATOR_TRIGGER",
             "refreshjob": "JOB_API_REFRESH_TRIGGER",
             "changeworkorder": "CHANGE_WORK_ORDER_TRIGGER",

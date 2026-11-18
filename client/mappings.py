@@ -85,7 +85,7 @@ REJECT_REASON_CANONICAL_MAP: Dict[str, str] = {
 _COMMAND_DEFAULTS: List[Dict[str, Any]] = [
     {"id": "test_machine", "label": "Test Machine", "handler_token": "testmachine~1", "kind": "MACHINE", "value": "TEST MACHINE", "aliases": ["testmachine~1"]},
     {"id": "finish_job", "label": "Finish Job", "handler_token": "finishjob", "kind": "FINISH_JOB", "value": "Finish current job session", "aliases": ["finishjob", "finishjob~1", "jobfinish"]},
-    {"id": "operator_shift", "label": "Finish Operator Shift", "handler_token": "operatorshift", "kind": "OPERATOR_SHIFT_TRIGGER", "value": "Finish shift", "aliases": ["operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"]},
+    {"id": "operator_shift", "label": "Finish Operator Shift", "handler_token": "finishshift", "kind": "OPERATOR_SHIFT_TRIGGER", "value": "Finish shift", "aliases": ["finishshift", "operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"]},
     {"id": "change_operator", "label": "Change Operator", "handler_token": "changeoperator", "kind": "CHANGE_OPERATOR_TRIGGER", "value": "Change operator or helper", "aliases": ["changeoperator", "changeoperator~1", "change_operator~1", "operatorchange~1", "operator_change~1"]},
     {"id": "refresh_job", "label": "Refresh Job Details", "handler_token": "refreshjob", "kind": "JOB_API_REFRESH_TRIGGER", "value": "Refresh all running job details", "aliases": ["refreshjob", "refreshjobapi~1", "refresh_job_api~1", "refreshjobs~1", "jobrefresh~1"]},
     {"id": "void", "label": "Void Mode", "handler_token": "void", "kind": "VOID_TRIGGER", "value": "Void mode", "aliases": ["void", "void~1", "voidscan~1", "voidqr~1", "voidpack~1", "void_pack~1", "packvoid~1", "voidbutal~1", "void_butal~1", "butalvoid~1", "voidreject~1", "void_reject~1", "rejectvoid~1"]},
@@ -548,7 +548,7 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
         )
 
     # Operator handoff trigger
-    if s_l in ("operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"):
+    if s_l in ("finishshift", "operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"):
         return ScanResult(kind="OPERATOR_SHIFT_TRIGGER", raw=raw, value="Finish shift")
     if s_l in (
         "changeoperator", "changeoperator~1",

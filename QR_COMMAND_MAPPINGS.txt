@@ -24,7 +24,7 @@ FINISH JOB
   review is pending cancels that pending finish.
 
 FINISH OPERATOR SHIFT / HANDOFF
-  operatorshift
+  finishshift
   Result: Starts shift-end review and operator handoff. Scanning it again during
   the pending review cancels the pending shift finish.
 

@@ -2313,10 +2313,11 @@ class ScannerFilter(QObject):
     reject_details_requested = pyqtSignal()
     job_api_refresh_requested = pyqtSignal()
 
-    def __init__(self, plain_digit_numpad_enabled=None):
+    def __init__(self, plain_digit_numpad_enabled=None, keyboard_input_enabled=None):
         super().__init__()
         self._buf = []
         self._plain_digit_numpad_enabled = plain_digit_numpad_enabled
+        self._keyboard_input_enabled = keyboard_input_enabled
 
     def _plain_digit_numpad_is_enabled(self) -> bool:
         enabled = self._plain_digit_numpad_enabled
@@ -2325,9 +2326,39 @@ class ScannerFilter(QObject):
         except Exception:
             return False
 
+    def _keyboard_input_is_enabled(self, target=None) -> bool:
+        enabled = self._keyboard_input_enabled
+        try:
+            if not callable(enabled):
+                return bool(enabled)
+            try:
+                return bool(enabled(target))
+            except TypeError:
+                return bool(enabled())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_text_input_target(obj) -> bool:
+        widget = obj
+        while widget is not None:
+            if isinstance(widget, (QLineEdit, QPlainTextEdit)):
+                return True
+            parent_widget = getattr(widget, "parentWidget", None)
+            widget = parent_widget() if callable(parent_widget) else None
+        return False
+
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
             key = event.key()
+
+            # Settings is a normal keyboard mode. Release the complete event
+            # stream before any kiosk shortcut/scanner handling so editing,
+            # focus navigation, Backspace, Enter, arrows, and digits all work.
+            if self._keyboard_input_is_enabled(obj):
+                self._buf.clear()
+                return False
+
             media_shortcuts = {
                 Qt.Key.Key_Home: self.packing_guide_requested,
                 Qt.Key.Key_HomePage: self.packing_guide_requested,
@@ -2341,11 +2372,6 @@ class ScannerFilter(QObject):
                 shortcut_signal.emit()
                 return True
 
-            # Settings text boxes must keep normal editing behaviour. Operator
-            # keypad/scanner input is captured everywhere else in the kiosk,
-            # including when a full-screen overlay currently owns focus.
-            if isinstance(obj, QLineEdit):
-                return False
             modifiers = event.modifiers()
 
             if key == Qt.Key.Key_F3 and bool(modifiers & Qt.KeyboardModifier.AltModifier):
@@ -3680,7 +3706,7 @@ class ClientUI(QWidget):
         self._ui_scale_bases: Dict[int, Dict[str, Any]] = {}
         self._ui_layout_scale_bases: Dict[int, Dict[str, Any]] = {}
         self._product_history_page = 0
-        self._product_history_page_size = 15
+        self._product_history_page_size = 14
         self._product_catalog_name_by_id: Optional[Dict[str, str]] = None
         self._product_catalog_sku_by_id: Optional[Dict[str, str]] = None
         self._product_catalog_default_qty_by_id: Optional[Dict[str, float]] = None
@@ -4447,14 +4473,14 @@ QWidget#ClientUIRoot {{
         self.rightMaintenance.setObjectName("RightMonitorValue")
         self.rightSupervisor = QLabel("Supervisor: ")
         self.rightSupervisor.setObjectName("RightMonitorValue")
-        self.rightSupervisorLeft = QLabel("Supervisor: -")
-        self.rightSupervisorLeft.setObjectName("RightMonitorValue")
+        self.rightPdrCount = QLabel("PDR Count: 0")
+        self.rightPdrCount.setObjectName("RightMonitorValue")
         for downtime_field in (
             self.rightDowntimeTimer,
             self.rightDowntimeReason,
             self.rightStartupReject,
             self.rightMaintenance,
-            self.rightSupervisorLeft,
+            self.rightPdrCount,
             self.rightSupervisor,
         ):
             downtime_field.setMinimumHeight(38)
@@ -4592,7 +4618,7 @@ QWidget#ClientUIRoot {{
         downtimeGrid.addWidget(self.rightDowntimeReason, 0, 1)
         downtimeGrid.addWidget(self.rightStartupReject, 1, 0)
         downtimeGrid.addWidget(self.rightMaintenance, 1, 1)
-        downtimeGrid.addWidget(self.rightSupervisorLeft, 2, 0)
+        downtimeGrid.addWidget(self.rightPdrCount, 2, 0)
         downtimeGrid.addWidget(self.rightSupervisor, 2, 1)
         downtimeGrid.setRowStretch(0, 1)
         downtimeGrid.setRowStretch(1, 1)
@@ -4929,10 +4955,10 @@ QWidget#ClientUIRoot {{
                 "QFrame#HistoryMirrorHeader QLabel#RightTitle { color: #edf0f4; }"
                 "QFrame#HistoryMirrorHeader QLabel { color: #edf0f4; }"
                 "QWidget#HistoryMirrorContent { background: transparent; border: none; }"
-                "QFrame#HistoryCol { background: rgba(77,81,89,165); border: 1px solid rgba(132,137,148,110); border-radius: 12px; }"
-                "QFrame#HistoryLatestCard { background: rgba(102,106,114,200); border: 1px solid rgba(132,137,148,110); border-radius: 10px; }"
+                "QFrame#HistoryCol { background: transparent; border: none; border-radius: 0px; }"
+                "QFrame#HistoryLatestCard { background: transparent; border: none; border-radius: 0px; }"
                 "QFrame#HistoryRecentPanel { background: transparent; border: none; }"
-                "QFrame#HistoryRecentRow { background: rgba(102,106,114,188); border: 1px solid rgba(132,137,148,90); border-radius: 10px; }"
+                "QFrame#HistoryRecentRow { background: rgba(102,106,114,188); border: none; border-radius: 10px; }"
             )
             outer_lay.addWidget(frame, 1)
             return outer, col
@@ -4945,11 +4971,18 @@ QWidget#ClientUIRoot {{
         self.historyRowOuter.layout().setSpacing(6)
         self.historyRowOuter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        self.productionHistoryOuter, self.historyPackCol = _make_history_card("Production", "Pack/Good/Butal/Reject")
-        self.partsHistoryOuter, self.historyRawCol = _make_history_card("Product Parts History", "Product Parts (Recent)")
+        self.combinedHistoryOuter, self.historyCombinedCol = _make_history_card(
+            "Production & Product Parts History",
+            "Production & Product Parts",
+        )
+        # Compatibility aliases keep the floating QR/history helpers attached
+        # to the new combined card without duplicating visible widgets.
+        self.productionHistoryOuter = self.combinedHistoryOuter
+        self.partsHistoryOuter = self.combinedHistoryOuter
+        self.historyPackCol = self.historyCombinedCol
+        self.historyRawCol = self.historyCombinedCol
         self.actionsHistoryOuter, self.historyActionCol = _make_history_card("Last Action", "Last Actions")
-        self.historyRowOuter.layout().addWidget(self.productionHistoryOuter, 1)
-        self.historyRowOuter.layout().addWidget(self.partsHistoryOuter, 1)
+        self.historyRowOuter.layout().addWidget(self.combinedHistoryOuter, 2)
         self.historyRowOuter.layout().addWidget(self.actionsHistoryOuter, 1)
         # The right column no longer carries the tall Product Parts table, so
         # use the released space for clearer history and last-action lists.
@@ -5052,36 +5085,72 @@ QWidget#ClientUIRoot {{
         self.productPartPromptWidget.setObjectName("ProductPartPromptWidget")
         self.productPartPromptWidget.setStyleSheet("background: transparent; border: none;")
         self.productPartPromptWidget.setLayout(QVBoxLayout())
-        self.productPartPromptWidget.layout().setContentsMargins(8, 2, 8, 8)
-        self.productPartPromptWidget.layout().setSpacing(10)
+        self.productPartPromptWidget.layout().setContentsMargins(8, 4, 8, 6)
+        self.productPartPromptWidget.layout().setSpacing(8)
+
+        product_part_header = QWidget()
+        product_part_header.setStyleSheet("background:transparent; border:none;")
+        product_part_header.setFixedHeight(34)
+        product_part_header.setLayout(QHBoxLayout())
+        product_part_header.layout().setContentsMargins(0, 0, 0, 0)
+        product_part_header.layout().setSpacing(12)
+
+        def _make_product_part_alert_badge() -> QLabel:
+            badge = QLabel("!")
+            badge.setFixedSize(34, 34)
+            badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            badge.setStyleSheet(
+                "background:#d43a42; color:#ffffff; border:none; border-radius:17px; "
+                "font-size:22px; font-weight:800;"
+            )
+            return badge
+
+        product_part_title = QLabel("Verify scanned part")
+        product_part_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        product_part_title.setStyleSheet(
+            "background:transparent; border:none; color:#eef2f8; font-size:28px; font-weight:700;"
+        )
+        product_part_header.layout().addStretch(1)
+        product_part_header.layout().addWidget(_make_product_part_alert_badge())
+        product_part_header.layout().addWidget(product_part_title)
+        product_part_header.layout().addWidget(_make_product_part_alert_badge())
+        product_part_header.layout().addStretch(1)
 
         self.productPartPromptQuestion = QLabel(
-            "A part QR was scanned.\nDoes this part belong to the current product?"
+            "A part QR was scanned. Does this part belong to the current product?"
         )
         self.productPartPromptQuestion.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.productPartPromptQuestion.setWordWrap(True)
+        self.productPartPromptQuestion.setFixedHeight(22)
         self.productPartPromptQuestion.setStyleSheet(
-            "background: transparent; border: none; color: #ecfeff; "
-            "font-size: 19px; font-weight: 900;"
+            "background:transparent; border:none; color:#c3ccdb; font-size:16px;"
         )
 
+        self.productPartSkuBox = QFrame()
+        self.productPartSkuBox.setFixedHeight(52)
+        self.productPartSkuBox.setStyleSheet(
+            "background:#1c212b; border:1px solid #364052; border-radius:8px;"
+        )
+        self.productPartSkuBox.setLayout(QVBoxLayout())
+        self.productPartSkuBox.layout().setContentsMargins(12, 4, 12, 6)
+        self.productPartSkuBox.layout().setSpacing(0)
         self.productPartSkuCaption = QLabel("SCANNED PART")
         self.productPartSkuCaption.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.productPartSkuCaption.setStyleSheet(
-            "background: transparent; border: none; color: #bae6fd; "
-            "font-size: 14px; font-weight: 900;"
+            "background:transparent; border:none; color:#9aa6ba; font-size:12px; font-weight:600;"
         )
         self.productPartSkuLabel = QLabel("-")
         self.productPartSkuLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.productPartSkuLabel.setWordWrap(True)
-        self.productPartSkuLabel.setMinimumHeight(54)
+        self.productPartSkuLabel.setWordWrap(False)
         self.productPartSkuLabel.setStyleSheet(
-            "background: #e0f2fe; color: #082f49; border: 2px solid #7dd3fc; "
-            "border-radius: 5px; padding: 7px 12px; font-weight: 900;"
+            "background:transparent; color:#eef2f8; border:none; font-size:22px; font-weight:700;"
         )
+        self.productPartSkuBox.layout().addWidget(self.productPartSkuCaption)
+        self.productPartSkuBox.layout().addWidget(self.productPartSkuLabel)
 
         product_part_actions = QWidget()
         product_part_actions.setStyleSheet("background: transparent; border: none;")
+        product_part_actions.setFixedHeight(64)
         product_part_actions.setLayout(QHBoxLayout())
         product_part_actions.layout().setContentsMargins(0, 0, 0, 0)
         product_part_actions.layout().setSpacing(12)
@@ -5097,40 +5166,40 @@ QWidget#ClientUIRoot {{
         ) -> QFrame:
             card = QFrame()
             card.setObjectName(object_name)
-            card.setMinimumHeight(112)
+            card.setFixedHeight(64)
             card.setStyleSheet(
-                f"QFrame#{object_name} {{ background: {background}; border: 3px solid {border}; "
-                "border-radius: 8px; }} QLabel { background: transparent; border: none; color: white; }"
+                f"QFrame#{object_name} {{ background:#1c212b; border:1px solid #364052; "
+                "border-radius:10px; }} QLabel { background:transparent; border:none; color:#eef2f8; }"
             )
             card.setLayout(QHBoxLayout())
-            card.layout().setContentsMargins(10, 8, 10, 8)
-            card.layout().setSpacing(10)
+            card.layout().setContentsMargins(0, 0, 0, 0)
+            card.layout().setSpacing(0)
 
             number_label = QLabel(number)
             number_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            number_label.setFixedWidth(58)
+            number_label.setFixedSize(52, 62)
             number_label.setStyleSheet(
-                "background: transparent; border: none; border-right: 2px solid rgba(255,255,255,0.88); "
-                "color: white; font-size: 42px; font-weight: 900; padding-right: 8px;"
+                f"background:{background}; border:none; border-right:2px solid #4a5468; "
+                "border-top-left-radius:9px; border-bottom-left-radius:9px; "
+                "color:#ffffff; font-size:28px; font-weight:700;"
             )
 
             copy_wrap = QWidget()
             copy_wrap.setStyleSheet("background: transparent; border: none;")
             copy_wrap.setLayout(QVBoxLayout())
-            copy_wrap.layout().setContentsMargins(0, 2, 0, 2)
-            copy_wrap.layout().setSpacing(6)
+            copy_wrap.layout().setContentsMargins(10, 6, 10, 6)
+            copy_wrap.layout().setSpacing(0)
             action_label = QLabel(action)
             action_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             action_label.setWordWrap(True)
             action_label.setStyleSheet(
-                "background: transparent; border: none; color: white; font-size: 18px; font-weight: 900;"
+                "background:transparent; border:none; color:#eef2f8; font-size:17px; font-weight:700;"
             )
             detail_label = QLabel(detail)
             detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             detail_label.setWordWrap(True)
             detail_label.setStyleSheet(
-                f"background: {detail_background}; border: none; border-radius: 4px; "
-                "color: white; font-size: 13px; font-weight: 800; padding: 5px;"
+                "background:transparent; border:none; color:#9aa6ba; font-size:13px; padding:0px;"
             )
             copy_wrap.layout().addWidget(action_label, 1)
             copy_wrap.layout().addWidget(detail_label)
@@ -5140,18 +5209,18 @@ QWidget#ClientUIRoot {{
 
         self.productPartYesCard = _make_product_part_action_card(
             "ProductPartYesCard", "1", "YES, INCLUDE PART", "Confirm this part",
-            "#15803d", "#86efac", "#166534",
+            "#168447", "#168447", "#168447",
         )
         self.productPartNoCard = _make_product_part_action_card(
             "ProductPartNoCard", "0", "NO, REJECT QR", "This part is not included",
-            "#dc2626", "#fca5a5", "#991b1b",
+            "#b3262d", "#b3262d", "#b3262d",
         )
         product_part_actions.layout().addWidget(self.productPartYesCard, 1)
         product_part_actions.layout().addWidget(self.productPartNoCard, 1)
 
+        self.productPartPromptWidget.layout().addWidget(product_part_header)
         self.productPartPromptWidget.layout().addWidget(self.productPartPromptQuestion)
-        self.productPartPromptWidget.layout().addWidget(self.productPartSkuCaption)
-        self.productPartPromptWidget.layout().addWidget(self.productPartSkuLabel)
+        self.productPartPromptWidget.layout().addWidget(self.productPartSkuBox)
         self.productPartPromptWidget.layout().addWidget(product_part_actions)
         self.productPartPromptWidget.hide()
         self.invalidTextBand.layout().addWidget(self.productPartPromptWidget)
@@ -5653,29 +5722,21 @@ QWidget#ClientUIRoot {{
         self.productHistoryOverlay = QFrame(self)
         self.productHistoryOverlay.setObjectName("PackHistoryOverlay")
         self.productHistoryOverlay.setLayout(QVBoxLayout())
-        self.productHistoryOverlay.layout().setContentsMargins(12, 10, 12, 10)
-        self.productHistoryOverlay.layout().setSpacing(8)
+        self.productHistoryOverlay.layout().setContentsMargins(18, 16, 18, 14)
+        self.productHistoryOverlay.layout().setSpacing(10)
         self.productHistoryOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignTop)
         self.productHistoryOverlay.setStyleSheet(
             "QFrame#PackHistoryOverlay {"
-            " background: qradialgradient(cx:0.5, cy:0.30, radius:1.15, fx:0.5, fy:0.16,"
-            "   stop:0 rgba(120,124,134,236), stop:0.38 rgba(72,76,84,240), stop:1 rgba(24,26,31,246));"
-            " border: 1px solid rgba(93,98,108,0.98);"
-            " border-radius: 18px;"
+            " background:#2b2f3a; border:1px solid #4a5468; border-radius:18px;"
             "}"
             "QFrame#PackHistoryHeaderBand {"
-            " background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
-            "   stop:0 rgba(17,24,39,0.98), stop:0.55 rgba(30,41,59,0.98), stop:1 rgba(51,65,85,0.98));"
-            " border: 1px solid rgba(148,163,184,0.28);"
-            " border-radius: 16px;"
+            " background:transparent; border:none; border-radius:0px;"
             "}"
             "QFrame#PackHistoryStatsBand {"
-            " background: transparent;"
-            " border: none;"
-            " border-radius: 14px;"
+            " background:#1c212b; border:1px solid #364052; border-radius:10px;"
             "}"
-            "QLabel#PackHistoryHeaderTitle { color:#f8fafc; font-size:20px; font-weight:900; }"
-            "QLabel#PackHistoryHeaderSub { color:#cbd5e1; font-size:12px; font-weight:800; }"
+            "QLabel#PackHistoryHeaderTitle { color:#eef2f8; font-size:30px; font-weight:700; }"
+            "QLabel#PackHistoryHeaderSub { color:#9aa6ba; font-size:17px; font-weight:400; }"
             "QLabel#PackHistoryChip {"
             " color:#e2e8f0; background: transparent;"
             " border: none; border-radius: 12px;"
@@ -5683,36 +5744,21 @@ QWidget#ClientUIRoot {{
             "}"
             "QWidget#PackHistoryTitleRow, QWidget#PackHistoryTopChips { background: transparent; border: none; }"
             "QWidget#PackHistoryColumns { background: transparent; border: none; }"
-            "QLabel#PackHistoryStatCardTitle { color:#cbd5e1; font-size:11px; font-weight:800; }"
-            "QLabel#PackHistoryStatCardValue { color:#f8fafc; font-size:15px; font-weight:900; }"
+            "QLabel#PackHistoryStatCardTitle { color:#9aa6ba; font-size:13px; font-weight:500; }"
+            "QLabel#PackHistoryStatCardValue { color:#eef2f8; font-size:20px; font-weight:700; }"
             "QFrame#PackHistoryStatCard {"
-            " background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "   stop:0 rgba(98,102,110,0.70), stop:1 rgba(50,53,60,0.82));"
-            " border: 1px solid rgba(148,163,184,0.28);"
-            " border-radius: 12px;"
+            " background:#1c212b; border:1px solid #364052; border-radius:8px;"
             "}"
             "QFrame#PackHistoryStatCardMissing {"
-            " background: qlineargradient(x1:0,y1:0,x2:1,y2:1,"
-            "   stop:0 rgba(127,29,29,0.88), stop:1 rgba(185,28,28,0.80));"
-            " border: 1px solid rgba(239,68,68,0.30);"
-            " border-radius: 12px;"
+            " background:#3a1d22; border:1px solid #7a2f38; border-radius:8px;"
             "}"
-            "QLabel#PackHistoryHint { color:#c5cad2; font-size:11px; font-weight:700; }"
-            "QLabel#PackHistoryPageInfo { color:#e2e8f0; font-size:12px; font-weight:800; }"
+            "QLabel#PackHistoryHint { color:#9aa6ba; font-size:15px; font-weight:400; }"
+            "QLabel#PackHistoryPageInfo { color:#eef2f8; background:#262d3a; border:1px solid #364052; border-radius:13px; padding:2px 14px; font-size:17px; font-weight:600; }"
             "QTableWidget#PackHistoryTable {"
-            " background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "   stop:0 rgba(78,83,92,0.92), stop:1 rgba(36,39,45,0.96));"
-            " alternate-background-color: rgba(70,74,82,0.94);"
-            " border: 1px solid rgba(148,163,184,0.34);"
-            " border-radius: 14px;"
-            " color: #f8fafc;"
-            " padding: 4px;"
+            " background:#1c212b; alternate-background-color:#1c212b; border:none; border-radius:0px; color:#eef2f8; padding:0px;"
             "}"
             "QTableWidget#PackHistoryTable::item {"
-            " background: transparent;"
-            " border-bottom: 1px solid rgba(148,163,184,0.20);"
-            " padding: 8px 12px;"
-            " font-size: 14px;"
+            " background:#262d3a; border:none; border-radius:6px; padding:4px 9px; font-size:16px;"
             "}"
             "QHeaderView::section { background: transparent; border: none; padding: 0px; margin: 0px; }"
         )
@@ -5737,9 +5783,16 @@ QWidget#ClientUIRoot {{
         )
         self.productHistoryTitle = QLabel("Production History")
         self.productHistoryTitle.setObjectName("PackHistoryHeaderTitle")
+        self.productHistorySubtitle = QLabel("Recent pack, butal and reject scans.")
+        self.productHistorySubtitle.setObjectName("PackHistoryHeaderSub")
+        self.productHistoryPageInfo = QLabel("Page 1 of 1")
+        self.productHistoryPageInfo.setObjectName("PackHistoryPageInfo")
         self.productHistoryIcon.hide()
         titleRow.layout().addWidget(self.productHistoryTitle, 0, Qt.AlignmentFlag.AlignVCenter)
+        titleRow.layout().addSpacing(8)
+        titleRow.layout().addWidget(self.productHistorySubtitle, 1, Qt.AlignmentFlag.AlignVCenter)
         titleRow.layout().addStretch(1)
+        titleRow.layout().addWidget(self.productHistoryPageInfo, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.productHistoryTopChips = QWidget()
         self.productHistoryTopChips.setObjectName("PackHistoryTopChips")
@@ -5792,6 +5845,8 @@ QWidget#ClientUIRoot {{
             table.verticalHeader().setVisible(False)
             table.verticalHeader().setDefaultSectionSize(30)
             table.setSortingEnabled(False)
+            table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             table.horizontalHeader().setStretchLastSection(True)
             table.horizontalHeader().setMinimumSectionSize(70)
             table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
@@ -5817,7 +5872,7 @@ QWidget#ClientUIRoot {{
         self.productHistoryColumns.layout().setSpacing(8)
         self.productHistoryColumns.layout().addWidget(self.productHistoryPackSection, 1)
         self.productHistoryColumns.layout().addWidget(self.productHistoryButalSection, 1)
-        self.productHistoryColumns.layout().addWidget(self.productHistoryRejectSection, 1)
+        self.productHistoryColumns.layout().addWidget(self.productHistoryRejectSection, 2)
 
         self.productHistoryStatsBand = QFrame()
         self.productHistoryStatsBand.setObjectName("PackHistoryStatsBand")
@@ -5840,19 +5895,16 @@ QWidget#ClientUIRoot {{
         self.productHistoryMetricQtyCard, self.productHistoryMetricQtyValue = _make_ph_stat("Total Quantity", "0")
         self.productHistoryMetricMissingCard, self.productHistoryMetricMissingValue = _make_ph_stat("Missing Labels", "-")
         self.productHistoryMetricMissingCard.setObjectName("PackHistoryStatCardMissing")
-        self.productHistoryPageInfo = QLabel("Page 1 of 1")
-        self.productHistoryPageInfo.setObjectName("PackHistoryPageInfo")
         self.productHistoryMetricProductCard.hide()
         self.productHistoryStatsBand.layout().addWidget(self.productHistoryMetricLabelsCard)
         self.productHistoryStatsBand.layout().addWidget(self.productHistoryMetricQtyCard)
         self.productHistoryStatsBand.layout().addWidget(self.productHistoryMetricMissingCard)
         self.productHistoryStatsBand.layout().addStretch(1)
-        self.productHistoryStatsBand.layout().addWidget(self.productHistoryPageInfo, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.productHistoryStatsBand.layout().addWidget(self.productHistoryHint, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.productHistoryOverlay.layout().addWidget(self.productHistoryHeaderBand)
         self.productHistoryOverlay.layout().addWidget(self.productHistoryColumns, 1)
         self.productHistoryOverlay.layout().addWidget(self.productHistoryStatsBand)
-        self.productHistoryOverlay.layout().addWidget(self.productHistoryHint)
         self._product_history_shadow = QGraphicsDropShadowEffect(self.productHistoryOverlay)
         self._product_history_shadow.setBlurRadius(26)
         self._product_history_shadow.setOffset(0, 10)
@@ -6007,25 +6059,22 @@ QWidget#ClientUIRoot {{
         self.finishOverlay = QFrame(self)
         self.finishOverlay.setObjectName("ProductionOverlay")
         self.finishOverlay.setLayout(QVBoxLayout())
-        self.finishOverlay.layout().setContentsMargins(14, 10, 14, 10)
-        self.finishOverlay.layout().setSpacing(6)
+        self.finishOverlay.layout().setContentsMargins(18, 16, 18, 14)
+        self.finishOverlay.layout().setSpacing(10)
         self.finishOverlay.layout().setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishTitle = QLabel("FINISHING JOB")
-        self.finishTitle.setStyleSheet("color: #f8fafc; font-size: 20px; font-weight: 900; background: transparent; border: none;")
-        self.finishTitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.finishTitle.setObjectName("FinishReviewTitle")
+        self.finishTitle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.finishStatus = QLabel("Processing...")
-        self.finishStatus.setStyleSheet("color: #dbeafe; font-size: 12px; font-weight: 800; background: transparent; border: none;")
-        self.finishStatus.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.finishStatus.setObjectName("FinishReviewSubtitle")
+        self.finishStatus.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.finishReviewHint = QLabel(
             'Scan "next" / "prev" QR to move the review, then scan Supervisor QR to approve.'
         )
-        self.finishReviewHint.setStyleSheet(
-            "color: #ffffff; font-size: 14px; font-weight: 900;"
-            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(85,167,245,230), stop:1 rgba(48,118,193,238));"
-            "border: 1px solid rgba(191,219,254,120); border-radius: 14px; padding: 6px 12px;"
-        )
+        self.finishReviewHint.setObjectName("FinishReviewHint")
         self.finishReviewHint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.finishReviewHint.setWordWrap(True)
+        self.finishReviewHint.setWordWrap(False)
+        self.finishReviewHint.setFixedHeight(32)
         self.finishReviewHint.hide()
         self.finishProgressBar = QProgressBar()
         self.finishProgressBar.setRange(0, 100)
@@ -6040,12 +6089,13 @@ QWidget#ClientUIRoot {{
         self.finishSummaryScroll.layout().setContentsMargins(0, 0, 0, 0)
         self.finishSummaryScroll.layout().setSpacing(0)
         self.finishSummaryBody = QWidget()
+        self.finishSummaryBody.setStyleSheet("background:#2b2f3a; border:none;")
         self.finishSummaryBody.setLayout(QVBoxLayout())
         self.finishSummaryBody.layout().setContentsMargins(0, 0, 0, 0)
         self.finishSummaryBody.layout().setSpacing(0)
         self.finishSummaryStack = QStackedWidget()
         self.finishSummaryStack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.finishSummaryStack.setStyleSheet("background: transparent; border: none;")
+        self.finishSummaryStack.setStyleSheet("background:#2b2f3a; border:none;")
         self.finishSummaryScroll.layout().addWidget(self.finishSummaryBody)
         self.finishSummaryBody.layout().addWidget(self.finishSummaryStack)
         self.finishSummaryScroll.hide()
@@ -6054,9 +6104,18 @@ QWidget#ClientUIRoot {{
         self._finish_review_stack_indices: List[int] = [0]
         self._finish_review_extra_pages: List[QWidget] = []
         self.finishReviewPageInfo = QLabel("Page 1 of 1")
-        self.finishReviewPageInfo.setStyleSheet("color:#dbeafe; font-size:13px; font-weight:900; background:transparent; border:none;")
+        self.finishReviewPageInfo.setObjectName("FinishReviewPagePill")
         self.finishReviewPageInfo.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.finishReviewPageInfo.hide()
+
+        self.finishHeaderRow = QWidget()
+        self.finishHeaderRow.setObjectName("FinishReviewHeader")
+        self.finishHeaderRow.setLayout(QHBoxLayout())
+        self.finishHeaderRow.layout().setContentsMargins(0, 0, 0, 0)
+        self.finishHeaderRow.layout().setSpacing(12)
+        self.finishHeaderRow.layout().addWidget(self.finishTitle)
+        self.finishHeaderRow.layout().addWidget(self.finishStatus, 1)
+        self.finishHeaderRow.layout().addWidget(self.finishReviewPageInfo)
 
         self.finishSummaryCards: Dict[str, QLabel] = {}
         finish_card_grid = QGridLayout()
@@ -6065,9 +6124,7 @@ QWidget#ClientUIRoot {{
         finish_card_grid.setVerticalSpacing(6)
         self.finishSummaryOverviewSection = QFrame()
         self.finishSummaryOverviewSection.setStyleSheet(
-            "QFrame {"
-            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(103,107,115,220), stop:1 rgba(56,59,66,230));"
-            "border: 1px solid rgba(148,163,184,0.38); border-radius: 14px; }"
+            "QFrame { background:transparent; border:none; }"
         )
         self.finishSummaryOverviewSection.setLayout(finish_card_grid)
         self.finishSummaryOverviewSection.layout().setContentsMargins(7, 7, 7, 7)
@@ -6080,11 +6137,9 @@ QWidget#ClientUIRoot {{
             card = QFrame()
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             card.setStyleSheet(
-                "QFrame {"
-                "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(103,107,115,220), stop:1 rgba(56,59,66,230));"
-                "border: 1px solid rgba(148,163,184,0.32); border-radius: 12px; }"
-                "QLabel[role='title'] { color: #cbd5e1; font-size: 12px; font-weight: 900; background: transparent; border: none; }"
-                "QLabel[role='value'] { color: #f8fafc; font-size: 18px; font-weight: 900; background: transparent; border: none; }"
+                "QFrame { background:#1c212b; border:1px solid #364052; border-radius:8px; }"
+                "QLabel[role='title'] { color:#9aa6ba; font-size:14px; font-weight:500; background:transparent; border:none; }"
+                "QLabel[role='value'] { color:#eef2f8; font-size:22px; font-weight:700; background:transparent; border:none; }"
             )
             card.setLayout(QVBoxLayout())
             card.layout().setContentsMargins(10, 8, 10, 8)
@@ -6098,29 +6153,37 @@ QWidget#ClientUIRoot {{
             value_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             card.layout().addWidget(title_lbl)
             card.layout().addWidget(value_lbl, 1)
-            finish_card_grid.addWidget(card, idx // 4, idx % 4)
+            if idx < 4:
+                column, span = ((0, 2), (2, 2), (4, 4), (8, 4))[idx]
+                finish_card_grid.addWidget(card, 0, column, 1, span)
+            else:
+                counter_index = idx - 4
+                finish_card_grid.addWidget(card, 1 + (counter_index // 6), (counter_index % 6) * 2, 1, 2)
             self.finishSummaryCards[title] = value_lbl
-        for r in range(4):
+        for r in range(3):
             finish_card_grid.setRowStretch(r, 1)
-        for c in range(4):
+        for c in range(12):
             finish_card_grid.setColumnStretch(c, 1)
 
         self.finishReviewJobDetails = self._make_finish_summary_table(
             "Job Details",
-            ["Entry"],
+            ["Entry", "Entry"],
         )
+        self.finishReviewJobDetails._finish_hide_header = True
         self.finishReviewCounters = self._make_finish_summary_table(
             "Production Counters",
-            ["Entry"],
+            ["Entry", "Entry"],
         )
+        self.finishReviewCounters._finish_hide_header = True
         self.finishReviewRejects = self._make_finish_summary_table(
             "Reject Details",
             ["Entry"],
         )
         self.finishReviewDowntime = self._make_finish_summary_table(
             "Downtime / Approval",
-            ["Entry"],
+            ["Entry", "Entry"],
         )
+        self.finishReviewDowntime._finish_hide_header = True
         self.finishReviewPartialPayload = self._make_finish_summary_table(
             "Partial Payload",
             ["Entry"],
@@ -6133,6 +6196,11 @@ QWidget#ClientUIRoot {{
             "Raw Materials",
             ["Material", "Qty", "Index", "Total", "Lot", "PO", "Scanned At"],
         )
+        self.finishReviewCycleHistory = self._make_finish_summary_table(
+            "Cycle Time Change History",
+            ["#", "Changed At", "Before", "After", "Source", "Confirmed By", "Role"],
+        )
+        self.finishReviewCycleHistory._finish_stretch_rows = False
         self.finishReviewPageOne = QWidget()
         self.finishReviewPageOne.setLayout(QVBoxLayout())
         self.finishReviewPageOne.layout().setContentsMargins(0, 0, 0, 0)
@@ -6150,8 +6218,8 @@ QWidget#ClientUIRoot {{
         self.finishReviewPageFour.layout().setContentsMargins(0, 0, 0, 0)
         self.finishReviewPageFour.layout().setSpacing(6)
         for page in (self.finishReviewPageOne, self.finishReviewPageTwo, self.finishReviewPageThree, self.finishReviewPageFour):
-            page.setAutoFillBackground(True)
-            page.setStyleSheet("background: rgba(37,42,50,245); border: none;")
+            page.setAutoFillBackground(False)
+            page.setStyleSheet("background:#2b2f3a; border:none;")
         self.finishSummaryStack.addWidget(self.finishReviewPageOne)
         self.finishSummaryStack.addWidget(self.finishReviewPageTwo)
         self.finishSummaryStack.addWidget(self.finishReviewPageThree)
@@ -6176,18 +6244,20 @@ QWidget#ClientUIRoot {{
         self.finishSuccessRow.layout().addWidget(self.finishCross, 0, Qt.AlignmentFlag.AlignVCenter)
         self.finishSuccessRow.layout().addWidget(self.finishDoneText, 0, Qt.AlignmentFlag.AlignVCenter)
         self.finishSuccessRow.hide()
-        self.finishOverlay.layout().addWidget(self.finishTitle)
-        self.finishOverlay.layout().addWidget(self.finishStatus)
+        self.finishOverlay.layout().addWidget(self.finishHeaderRow)
         self.finishOverlay.layout().addWidget(self.finishReviewHint)
-        self.finishOverlay.layout().addWidget(self.finishReviewPageInfo)
         self.finishOverlay.layout().addWidget(self.finishProgressBar, 0, Qt.AlignmentFlag.AlignCenter)
         self.finishOverlay.layout().addWidget(self.finishSummaryScroll, 1)
         self.finishOverlay.layout().addWidget(self.finishSuccessRow, 0, Qt.AlignmentFlag.AlignCenter)
-        self.finishOverlay.setStyleSheet(
+        self._finish_review_stylesheet = (
             "QFrame#ProductionOverlay {"
-            "background: qradialgradient(cx:0.5, cy:0.12, radius:1.2, fx:0.5, fy:0.02,"
-            "stop:0 rgba(112,116,124,242), stop:0.38 rgba(70,74,82,244), stop:1 rgba(24,26,31,248));"
-            "border: 1px solid rgba(124,130,140,235); border-radius: 0px; }"
+            "background:#2b2f3a; border:1px solid #4a5468; border-radius:18px; font-family:'Segoe UI'; }"
+            "QFrame#ProductionOverlay QLabel { font-family:'Segoe UI'; }"
+            "QWidget#FinishReviewHeader { background:transparent; border:none; }"
+            "QLabel#FinishReviewTitle { color:#eef2f8; font-size:30px; font-weight:700; background:transparent; border:none; }"
+            "QLabel#FinishReviewSubtitle { color:#9aa6ba; font-size:17px; background:transparent; border:none; }"
+            "QLabel#FinishReviewPagePill { color:#eef2f8; background:#262d3a; border:1px solid #364052; border-radius:13px; padding:2px 14px; font-size:17px; font-weight:600; }"
+            "QLabel#FinishReviewHint { color:#fff; background:#3b8ee8; border:none; border-radius:8px; font-size:17px; font-weight:600; padding:2px 10px; }"
             "QWidget#FinishSuccessRow { background: transparent; border: none; }"
             "QLabel#FinishDoneText { background: transparent; border: none; }"
             "QProgressBar {"
@@ -6196,6 +6266,11 @@ QWidget#ClientUIRoot {{
             "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16a34a, stop:1 #22c55e);"
             "border-radius: 8px; }"
         )
+        self.finishOverlay.setStyleSheet(self._finish_review_stylesheet)
+        for label in self.finishOverlay.findChildren(QLabel):
+            label_font = QFont(label.font())
+            label_font.setFamily("Segoe UI")
+            label.setFont(label_font)
         self.finishOverlay.hide()
         self.finishOverlay.raise_()
         self._finish_anim_timer = QTimer(self)
@@ -6646,6 +6721,10 @@ QWidget#ClientUIRoot {{
         self.qrMappingVersionLabel.setObjectName("MetaValue")
         self.qrMappingEditor = QPlainTextEdit()
         self.qrMappingEditor.setPlainText(qr_mapping_config_to_text(QR_MAPPING_CONFIG))
+        self._qr_mapping_editor_dirty = False
+        self.qrMappingEditor.textChanged.connect(
+            lambda: setattr(self, "_qr_mapping_editor_dirty", True)
+        )
         self.qrMappingEditor.setMinimumHeight(430)
         self.qrMappingEditor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.qrMappingBadgeInput = QLineEdit()
@@ -7374,6 +7453,7 @@ QWidget#ClientUIRoot {{
 
     def _show_invalid_overlay(self, reason: str = ""):
         self._info_overlay_compact = False
+        self.invalidTextLabel.show()
         self.choiceCardsWidget.hide()
         self.productPartPromptWidget.hide()
         self.invalidReasonLabel.show()
@@ -7415,6 +7495,7 @@ QWidget#ClientUIRoot {{
     def _show_info_overlay(self, title: str, message: str, *, hide_ms: int = 0):
         """Show a non-blocking operator prompt without stealing scanner input."""
         self._info_overlay_compact = True
+        self.invalidTextLabel.show()
         self.choiceCardsWidget.hide()
         self.productPartPromptWidget.hide()
         self.invalidReasonLabel.show()
@@ -7465,27 +7546,20 @@ QWidget#ClientUIRoot {{
         self.invalidReasonLabel.hide()
         self.choiceCardsWidget.hide()
         self.productPartPromptWidget.show()
+        self.invalidTextLabel.hide()
 
         self.invalidOverlay.setStyleSheet(
-            "background: rgba(14,116,144,0.82); border: 3px solid rgba(103,232,249,0.95); "
-            "border-radius: 8px;"
+            "background:#2b2f3a; border:1px solid #4a5468; border-radius:18px;"
         )
         self.invalidTextBand.setStyleSheet(
-            "QFrame#InvalidTextBand { background: rgba(8,47,73,0.98); "
-            "border: none; border-radius: 6px; }"
+            "QFrame#InvalidTextBand { background:#2b2f3a; border:none; border-radius:16px; }"
         )
-        self.invalidTextLabel.setText("VERIFY SCANNED PART")
-        self.invalidTextLabel.setStyleSheet(
-            "background: #082f73; border: none; color: #ffffff; "
-            "font-size: 27px; font-weight: 900; padding: 8px;"
-        )
-
         safe_sku = str(sku or "").strip() or "SKU NOT AVAILABLE"
         self.productPartSkuLabel.setText(safe_sku)
 
         available_w = max(1, self.width() - 24)
-        panel_w = min(max(700, int(self.width() * 0.76)), available_w)
-        panel_h = min(max(390, int(self.height() * 0.56)), max(1, self.height() - 24))
+        panel_w = min(640, available_w)
+        panel_h = min(240, max(1, self.height() - 24))
         self._info_overlay_size = QSize(panel_w, panel_h)
 
         # Fit the complete SKU before allowing wrapping. This preserves long
@@ -7493,7 +7567,7 @@ QWidget#ClientUIRoot {{
         sku_width = max(260, panel_w - 90)
         sku_font = QFont(self.productPartSkuLabel.font())
         sku_font.setBold(True)
-        sku_font.setPixelSize(34)
+        sku_font.setPixelSize(22)
         while (
             sku_font.pixelSize() > 15
             and QFontMetrics(sku_font).horizontalAdvance(safe_sku) > sku_width
@@ -7518,6 +7592,7 @@ QWidget#ClientUIRoot {{
         _stabilize_first_open: bool = True,
     ):
         """Show compact numbered scan choices without clipping long instructions."""
+        self.invalidTextLabel.show()
         self.productPartPromptWidget.hide()
         safe_choices = [row for row in choices if isinstance(row, dict)]
         compact_cache_key = (
@@ -7535,18 +7610,31 @@ QWidget#ClientUIRoot {{
         )
         if compact and self._compact_choice_overlay_cache_key == compact_cache_key:
             # _hide_invalid_overlay() clears compact mode when Reject is
-            # cancelled. Restore it before positioning the cached panel or Qt
-            # recalculates the reopen using the small generic-error geometry.
+            # cancelled. A generic invalid scan can also replace this widget's
+            # title and red background after prewarming, so restore the full
+            # reject-detail appearance—not only the cached choice tiles.
             self._info_overlay_compact = True
             self._invalid_hide_timer.stop()
             if self._invalid_movie is not None:
                 self._invalid_movie.stop()
             self.invalidGifLabel.hide()
             self.invalidReasonLabel.hide()
+            self.productPartPromptWidget.hide()
+            self.invalidOverlay.setStyleSheet(
+                "background:#2b2f3a; border:1px solid #4a5468; border-radius:18px;"
+            )
+            self.invalidTextBand.setStyleSheet(
+                "QFrame#InvalidTextBand { background:#2b2f3a; border:none; border-radius:16px; }"
+            )
+            self.invalidTextLabel.setText(str(title or "SELECT OPTION").strip().title())
+            self.invalidTextLabel.setStyleSheet(
+                "background:transparent; border:none; color:#eef2f8; font-size:30px; font-weight:700;"
+            )
             self.choiceCardsWidget.show()
             self._position_invalid_overlay()
             self.invalidOverlay.show()
             self.invalidOverlay.raise_()
+            self.invalidOverlay.layout().activate()
             self.invalidOverlay.update()
             return
         if _stabilize_first_open and not compact:
@@ -7555,16 +7643,15 @@ QWidget#ClientUIRoot {{
         available_panel_w = max(1, self.width() - 24)
         available_cards_w = max(1, available_panel_w - 54)
         if compact:
-            # Reject choices are always 1..21.  Use three rows on landscape
-            # displays and three columns on portrait displays so every choice
-            # remains inside the visible panel after display rotation/resizing.
-            preferred_columns = 7 if self.width() >= self.height() else 3
+            # Match the supplied reject-detail card: five columns on landscape
+            # and a compact three-column fallback on portrait displays.
+            preferred_columns = 5 if self.width() >= self.height() else 3
             columns = min(preferred_columns, max(1, len(safe_choices)))
         else:
             columns = min(4, max(1, len(safe_choices)))
         # Never create more fixed-width columns than the visible client can
         # contain. Narrow displays automatically fall back to 3, 2, or 1.
-        minimum_target_width = 78 if compact else 150
+        minimum_target_width = 180 if compact else 150
         while columns > 1 and (columns * minimum_target_width + (columns - 1) * 8) > available_cards_w:
             columns -= 1
         minimum_card_width = min(minimum_target_width, available_cards_w)
@@ -7572,9 +7659,9 @@ QWidget#ClientUIRoot {{
             1,
             (available_cards_w - (columns - 1) * 8 - 8) // columns,
         )
-        card_width = min(190 if compact else 210, max(minimum_card_width, computed_card_width))
-        card_height = 64 if compact else 116
-        row_stride = 72 if compact else 132
+        card_width = min(225 if compact else 210, max(minimum_card_width, computed_card_width))
+        card_height = 84 if compact else 116
+        row_stride = 94 if compact else 132
         row_count = max(1, (len(safe_choices) + columns - 1) // columns)
         accents = ("#22d3ee", "#60a5fa", "#a78bfa", "#f59e0b")
         grid = self.choiceCardsWidget.layout()
@@ -7593,8 +7680,8 @@ QWidget#ClientUIRoot {{
             card.setFixedSize(card_width, card_height)
             if compact:
                 card.setStyleSheet(
-                    f"QFrame#ScanChoiceCard{idx} {{ background: transparent; border: none; }}"
-                    "QLabel { border-radius: 3px; }"
+                    f"QFrame#ScanChoiceCard{idx} {{ background:#1c212b; border:1px solid #364052; border-radius:10px; }}"
+                    "QLabel { border:none; }"
                 )
             else:
                 card.setStyleSheet(
@@ -7608,18 +7695,18 @@ QWidget#ClientUIRoot {{
             name_label.setWordWrap(True)
             if compact:
                 number_label = QLabel(str(option_number))
-                number_label.setFixedSize(38, card_height)
+                number_label.setFixedSize(58, card_height - 2)
                 number_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 number_label.setStyleSheet(
-                    "background: #e5e7eb; color: #111827; border: 1px solid #64748b; "
-                    "font-size: 15px; font-weight: 900; border-radius: 3px;"
+                    "background:#b3262d; color:#ffffff; border:none; border-right:2px solid #4a5468; "
+                    "font-size:26px; font-weight:700; border-top-left-radius:9px; border-bottom-left-radius:9px;"
                 )
                 name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                name_label.setFixedSize(max(1, card_width - 43), card_height)
-                name_font_px = 11 if card_width < 135 or len(name) > 18 else 12
+                name_label.setFixedSize(max(1, card_width - 60), card_height - 2)
+                name_font_px = 16 if card_width < 200 or len(name) > 18 else 18
                 name_label.setStyleSheet(
-                    "background: #111827; color: #f8fafc; border: 1px solid #64748b; "
-                    f"font-size: {name_font_px}px; font-weight: 900; border-radius: 3px; padding: 3px;"
+                    "background:#1c212b; color:#9aa6ba; border:none; "
+                    f"font-size:{name_font_px}px; font-weight:600; padding:4px 8px;"
                 )
                 card.layout().addWidget(number_label)
                 card.layout().addWidget(name_label, 1)
@@ -7647,7 +7734,7 @@ QWidget#ClientUIRoot {{
             grid.addWidget(footer_label, max(1, (len(safe_choices) + columns - 1) // columns), 0, 1, columns)
         cards_content_w = columns * card_width + max(0, columns - 1) * 8 + 8
         card_w = min(available_panel_w, max(min(440, available_panel_w), cards_content_w + 36))
-        card_h = min(max(1, self.height() - 24), (88 if compact else 105) + row_count * row_stride + (42 if footer else 0))
+        card_h = min(max(1, self.height() - 24), (104 if compact else 105) + row_count * row_stride + (42 if footer else 0))
         self._info_overlay_compact = True
         self._invalid_hide_timer.stop()
         if self._invalid_movie is not None:
@@ -7655,17 +7742,20 @@ QWidget#ClientUIRoot {{
         self.invalidGifLabel.hide()
         if compact:
             self.invalidOverlay.setStyleSheet(
-                "background: #111827; border: 2px solid #64748b; border-radius: 4px;"
+                "background:#2b2f3a; border:1px solid #4a5468; border-radius:18px;"
             )
             self.invalidTextBand.setStyleSheet(
-                "QFrame#InvalidTextBand { background: #111827; border: none; border-radius: 3px; }"
+                "QFrame#InvalidTextBand { background:#2b2f3a; border:none; border-radius:16px; }"
             )
         else:
             self.invalidOverlay.setStyleSheet("background: rgba(14,116,144,0.78); border: 2px solid rgba(103,232,249,0.90); border-radius: 4px;")
             self.invalidTextBand.setStyleSheet("QFrame#InvalidTextBand { background: rgba(8,47,73,0.97); border: none; border-radius: 3px; }")
-        self.invalidTextLabel.setText(str(title or "SELECT OPTION").strip().upper())
+        self.invalidTextLabel.setText(
+            str(title or "SELECT OPTION").strip().title() if compact
+            else str(title or "SELECT OPTION").strip().upper()
+        )
         self.invalidTextLabel.setStyleSheet(
-            f"background: transparent; border: none; color: #f8fafc; font-size: {21 if compact else 26}px; font-weight: 900;"
+            f"background:transparent; border:none; color:#eef2f8; font-size:{30 if compact else 26}px; font-weight:700;"
         )
         self.invalidReasonLabel.hide()
         choice_width = max(1, min(max(1, card_w - 36), available_cards_w))
@@ -8025,6 +8115,7 @@ QWidget#ClientUIRoot {{
         if self._invalid_movie is not None:
             self._invalid_movie.stop()
         self.invalidOverlay.hide()
+        self.invalidTextLabel.show()
         if restore_context:
             QTimer.singleShot(
                 0,
@@ -8312,8 +8403,8 @@ QWidget#ClientUIRoot {{
         self.rejectSummaryOverlay.setGeometry(x, y, w, h)
 
     def _position_product_history_overlay(self):
-        w = min(1180, max(900, int(self.width() * 0.82)))
-        h = min(820, max(620, int(self.height() * 0.78)))
+        w = max(1, min(1400, self.width() - 40))
+        h = max(1, min(780, self.height() - 40))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.productHistoryOverlay.setGeometry(x, y, w, h)
@@ -8377,11 +8468,10 @@ QWidget#ClientUIRoot {{
         self.rejectReviewLoadingLayer.setGeometry(0, 0, w, h)
 
     def _position_finish_overlay(self):
-        margin = 10
-        w = max(1, self.width() - (margin * 2))
-        h = max(1, self.height() - (margin * 2))
-        x = margin
-        y = margin
+        w = max(1, min(1400, self.width() - 40))
+        h = max(1, min(800, self.height() - 40))
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
         self.finishOverlay.setGeometry(x, y, w, h)
 
     def _set_finish_review_page_info(self):
@@ -8390,37 +8480,33 @@ QWidget#ClientUIRoot {{
         self.finishReviewPageInfo.setText(f"Page {current_page} of {total_pages}")
 
     def _build_finish_review_pages(self):
-        self.finishReviewPageOne.layout().setSpacing(6)
-        self.finishReviewPageTwo.layout().setSpacing(6)
+        self.finishReviewPageOne.layout().setSpacing(10)
+        self.finishReviewPageTwo.layout().setSpacing(10)
         self.finishReviewPageThree.layout().setSpacing(6)
         self.finishReviewPageFour.layout().setSpacing(6)
         self.finishReviewPageOne.layout().addWidget(self.finishSummaryOverviewSection)
-        page_one_grid_host = QWidget()
-        page_one_grid_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        page_one_grid = QGridLayout()
-        page_one_grid.setContentsMargins(0, 0, 0, 0)
-        page_one_grid.setHorizontalSpacing(6)
-        page_one_grid.setVerticalSpacing(6)
-        page_one_grid_host.setLayout(page_one_grid)
-        if getattr(self.finishReviewJobDetails, "_finish_section", None) is not None:
-            page_one_grid.addWidget(self.finishReviewJobDetails._finish_section, 0, 0)
-        if getattr(self.finishReviewCounters, "_finish_section", None) is not None:
-            page_one_grid.addWidget(self.finishReviewCounters._finish_section, 0, 1)
-        if getattr(self.finishReviewDowntime, "_finish_section", None) is not None:
-            page_one_grid.addWidget(self.finishReviewDowntime._finish_section, 1, 0)
-        if getattr(self.finishReviewRejects, "_finish_section", None) is not None:
-            page_one_grid.addWidget(self.finishReviewRejects._finish_section, 1, 1)
-        page_one_grid.setColumnStretch(0, 1)
-        page_one_grid.setColumnStretch(1, 1)
-        page_one_grid.setRowStretch(0, 1)
-        page_one_grid.setRowStretch(1, 1)
-        self.finishReviewPageOne.layout().addWidget(page_one_grid_host, 1)
+        page_one_top = QWidget()
+        page_one_top.setStyleSheet("background:#2b2f3a; border:none;")
+        page_one_top.setLayout(QHBoxLayout())
+        page_one_top.layout().setContentsMargins(0, 0, 0, 0)
+        page_one_top.layout().setSpacing(10)
+        page_one_top.layout().addWidget(self.finishReviewJobDetails._finish_section, 1)
+        page_one_top.layout().addWidget(self.finishReviewCounters._finish_section, 1)
+        self.finishReviewPageOne.layout().addWidget(page_one_top, 1)
+        page_one_bottom = QWidget()
+        page_one_bottom.setStyleSheet("background:#2b2f3a; border:none;")
+        page_one_bottom.setLayout(QHBoxLayout())
+        page_one_bottom.layout().setContentsMargins(0, 0, 0, 0)
+        page_one_bottom.layout().setSpacing(10)
+        page_one_bottom.layout().addWidget(self.finishReviewRejects._finish_section, 1)
+        page_one_bottom.layout().addWidget(self.finishReviewDowntime._finish_section, 2)
+        self.finishReviewPageOne.layout().addWidget(page_one_bottom, 1)
         if getattr(self.finishReviewPartialPayload, "_finish_section", None) is not None:
             self.finishReviewPageTwo.layout().addWidget(self.finishReviewPartialPayload._finish_section, 1)
         if getattr(self.finishReviewParts, "_finish_section", None) is not None:
-            self.finishReviewPageTwo.layout().addWidget(self.finishReviewParts._finish_section, 1)
-        if getattr(self.finishReviewRaw, "_finish_section", None) is not None:
-            self.finishReviewPageThree.layout().addWidget(self.finishReviewRaw._finish_section, 1)
+            self.finishReviewPageTwo.layout().addWidget(self.finishReviewParts._finish_section, 2)
+        if getattr(self.finishReviewCycleHistory, "_finish_section", None) is not None:
+            self.finishReviewPageTwo.layout().addWidget(self.finishReviewCycleHistory._finish_section, 2)
         self.finishReviewPageFour.layout().addStretch(1)
 
     def _clear_finish_review_extra_pages(self):
@@ -8551,20 +8637,10 @@ QWidget#ClientUIRoot {{
         )
 
     def _rebuild_finish_review_pages(self, include_second_page: bool, include_third_page: bool = False, include_fourth_page: bool = False):
-        self.finishSummaryStack.widget(1).setVisible(include_second_page)
-        self.finishSummaryStack.widget(2).setVisible(include_third_page)
-        self.finishSummaryStack.widget(3).setVisible(include_fourth_page)
-        page_indices = [0]
-        if include_second_page:
-            page_indices.append(1)
-        if include_third_page:
-            page_indices.append(2)
-        if include_fourth_page:
-            page_indices.append(3)
-        for page in getattr(self, "_finish_review_extra_pages", []) or []:
-            idx = self.finishSummaryStack.indexOf(page)
-            if idx >= 0:
-                page_indices.append(idx)
+        self.finishSummaryStack.widget(1).setVisible(True)
+        self.finishSummaryStack.widget(2).setVisible(False)
+        self.finishSummaryStack.widget(3).setVisible(False)
+        page_indices = [0, 1]
         self._finish_review_stack_indices = page_indices
         self._finish_review_total_pages = max(1, len(page_indices))
         self._finish_review_page_index = min(int(getattr(self, "_finish_review_page_index", 0) or 0), self._finish_review_total_pages - 1)
@@ -8605,6 +8681,12 @@ QWidget#ClientUIRoot {{
     def _hide_settings_overlay(self):
         self._append_app_log("SETTINGS", "Settings overlay closed")
         self.settingsOverlay.hide()
+        # Release any Settings editor focus so a keyboard/HID scanner is
+        # captured by ScannerFilter immediately after the overlay closes.
+        focused = QApplication.focusWidget()
+        if focused is not None:
+            focused.clearFocus()
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
         if not self._should_keep_background_blur():
             self._set_background_blur(False)
 
@@ -8868,7 +8950,7 @@ QWidget#ClientUIRoot {{
             x for x in (self.state.reject_review_logs or [])
             if isinstance(x, dict) and str(x.get("entry_type") or "").strip().upper() in ("REJECT_SCAN", "STARTUP_REJECT_SCAN")
         ]
-        page_size = max(1, int(getattr(self, "_product_history_page_size", 15) or 15))
+        page_size = max(1, int(getattr(self, "_product_history_page_size", 14) or 14))
         total_items = max(len(pack_logs), len(butal_logs), len(reject_logs))
         total_pages = max(1, (total_items + page_size - 1) // page_size)
         self._product_history_page = max(0, min(int(getattr(self, "_product_history_page", 0) or 0), total_pages - 1))
@@ -9819,9 +9901,10 @@ QWidget#ClientUIRoot {{
             dict(row) for row in (linked_payloads or []) if isinstance(row, dict)
         ]
         self._operator_shift_flash_active = True
+        self.finishOverlay.setStyleSheet(self._finish_review_stylesheet)
         self._position_finish_overlay()
         self._set_background_blur(True)
-        self.finishTitle.setText("FINISH SHIFT REVIEW")
+        self.finishTitle.setText("Finish shift review")
         self.finishStatus.setText("Supervisor review required before the next operator starts.")
         self.finishReviewHint.setText(
             'Scan "next" / "prev" to review, scan Supervisor QR to approve, or scan Operator Shift QR again to cancel.'
@@ -9859,10 +9942,11 @@ QWidget#ClientUIRoot {{
         self._pending_final_review_linked_payloads = [
             dict(row) for row in (linked_payloads or []) if isinstance(row, dict)
         ]
+        self.finishOverlay.setStyleSheet(self._finish_review_stylesheet)
         self._position_finish_overlay()
         self._set_background_blur(True)
-        self.finishTitle.setText("FINISH JOB SUMMARY")
-        self.finishStatus.setText("Review the summary. Scan NEXT / PREV to change page, then scan Supervisor QR to finish.")
+        self.finishTitle.setText("Finish job review")
+        self.finishStatus.setText("Supervisor review required before this job is completed.")
         self.finishReviewHint.setText(
             'Scan "next" / "prev" to review, scan Supervisor QR to approve, or scan Finish Job QR again to cancel.'
         )
@@ -11099,7 +11183,11 @@ QWidget#ClientUIRoot {{
         self.productionMaintenanceLine.setText(f"MAINTENANCE: {s.maintenance_name or '-'}")
         self.productionMaintenanceLine.setVisible(bool(self._overlay_mode == "active"))
         self.rightSupervisor.setText(f"Supervisor: {s.supervisor_name or '-'}")
-        self.rightSupervisorLeft.setText(f"Supervisor: {s.supervisor_name or '-'}")
+        completed_pdr_count = sum(
+            1 for row in (s.pdr_downtime_logs or []) if isinstance(row, dict)
+        )
+        active_pdr_count = 1 if self._pdr_workflow_active() else 0
+        self.rightPdrCount.setText(f"PDR Count: {completed_pdr_count + active_pdr_count}")
 
         overlay_wait_seconds = None
         if s.waiting_downtime_start_maintenance and s.downtime_wait_started_at:
@@ -11395,7 +11483,7 @@ QWidget#ClientUIRoot {{
     def _refresh_history_panel(self):
         if not all(
             hasattr(self, name)
-            for name in ("historyPackCol", "historyRawCol", "historyActionCol")
+            for name in ("historyCombinedCol", "historyActionCol")
         ):
             return
         s = self.state
@@ -11410,19 +11498,40 @@ QWidget#ClientUIRoot {{
             except Exception:
                 return txt[-8:] if len(txt) >= 8 else txt
 
-        pack_rows = []
-        for row in reversed(list(s.product_pack_history_logs or [])[-20:]):
+        combined_rows: List[tuple] = []
+
+        def _history_order(raw_val: Any, fallback: int) -> tuple:
+            txt = str(raw_val or "").strip()
+            if txt:
+                try:
+                    return (1, datetime.fromisoformat(txt.replace("Z", "+00:00")).timestamp(), fallback)
+                except Exception:
+                    pass
+            return (0, float(fallback), fallback)
+
+        pack_source = list(s.product_pack_history_logs or [])[-20:]
+        for index, row in enumerate(pack_source):
             if not isinstance(row, dict):
                 continue
-            pack_rows.append(self._format_pack_history_action_text(row, voided=bool(row.get("voided"))))
+            display = self._format_pack_history_action_text(row, voided=bool(row.get("voided")))
+            event_time = row.get("voided_at") if bool(row.get("voided")) else row.get("scanned_at")
+            combined_rows.append(
+                (_history_order(event_time or row.get("timestamp"), index), f"PRODUCTION | {display}")
+            )
 
-        raw_rows = []
-        for row in reversed(list(s.raw_material_logs or [])[-20:]):
+        raw_source = list(s.raw_material_logs or [])[-20:]
+        for index, row in enumerate(raw_source):
             if not isinstance(row, dict):
                 continue
             name = str(row.get("material_name") or row.get("material") or "-").strip() or "-"
             qty = int(row.get("qty") or 1)
-            raw_rows.append(f"{_fmt_ts(row.get('scanned_at'))}  {name}  +{qty}")
+            display = f"{_fmt_ts(row.get('scanned_at'))}  {name}  +{qty}"
+            combined_rows.append(
+                (_history_order(row.get("scanned_at") or row.get("timestamp"), len(pack_source) + index), f"PRODUCT PART | {display}")
+            )
+
+        combined_rows.sort(key=lambda item: item[0], reverse=True)
+        combined_history = [text for _order, text in combined_rows[:30]]
 
         action_rows = []
         raw_actions = list(reversed(list(getattr(self, "_action_logs", []) or [])[-20:]))
@@ -11449,8 +11558,7 @@ QWidget#ClientUIRoot {{
             else:
                 action_rows.append(action_text)
 
-        self._sync_history_column(self.historyPackCol, "pack", pack_rows)
-        self._sync_history_column(self.historyRawCol, "raw", raw_rows)
+        self._sync_history_column(self.historyCombinedCol, "combined", combined_history)
         self._sync_history_column(self.historyActionCol, "action", action_rows)
 
     def _sync_history_column(self, col_widget: Any, key: str, entries: List[str]):
@@ -15129,8 +15237,12 @@ QWidget#ClientUIRoot {{
             self.settingsContentTitle.setText("Display")
         elif is_mappings:
             self.settingsContentTitle.setText("QR Mappings")
+            self.qrMappingEditor.blockSignals(True)
             self.qrMappingEditor.setPlainText(qr_mapping_config_to_text(QR_MAPPING_CONFIG))
+            self.qrMappingEditor.blockSignals(False)
+            self._qr_mapping_editor_dirty = False
             self._refresh_qr_mappings_from_server(force=True)
+            self.qrMappingEditor.setFocus(Qt.FocusReason.OtherFocusReason)
         elif is_logs:
             self.settingsContentTitle.setText("App Logs")
             self._refresh_app_logs_table(force=True)
@@ -17271,6 +17383,7 @@ QWidget#ClientUIRoot {{
     def _hide_product_parts_missing_error(self):
         if hasattr(self, "productPartsErrorBlinkTimer") and self.productPartsErrorBlinkTimer is not None:
             self.productPartsErrorBlinkTimer.stop()
+            self.productPartsErrorBlinkTimer.start(220)
         self._product_parts_error_blink_remaining = 0
         self._product_parts_error_blink_on = False
         if hasattr(self, "jobPartsInlineError") and self.jobPartsInlineError is not None:
@@ -17376,7 +17489,6 @@ QWidget#ClientUIRoot {{
         self._product_parts_error_blink_on = True
         if hasattr(self, "productPartsErrorBlinkTimer") and self.productPartsErrorBlinkTimer is not None:
             self.productPartsErrorBlinkTimer.stop()
-            self.productPartsErrorBlinkTimer.start(220)
         self._apply_product_parts_missing_highlight(True)
 
     def _record_job_part_scan(
@@ -17786,27 +17898,25 @@ QWidget#ClientUIRoot {{
         section = QFrame()
         section.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         section.setStyleSheet(
-            "QFrame {"
-            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(103,107,115,220), stop:1 rgba(56,59,66,230));"
-            "border: 1px solid rgba(148,163,184,0.26); border-radius: 10px; }"
-            "QLabel { color: #f8fafc; font-size: 18px; font-weight: 900; background: transparent; border: none; }"
+            "QFrame { background:#1c212b; border:1px solid #364052; border-radius:10px; }"
+            "QLabel { color:#eef2f8; font-size:18px; font-weight:700; background:transparent; border:none; }"
         )
         section.setLayout(QVBoxLayout())
-        section.layout().setContentsMargins(6, 6, 6, 6)
-        section.layout().setSpacing(4)
+        section.layout().setContentsMargins(10, 8, 10, 8)
+        section.layout().setSpacing(6)
         title_lbl = QLabel(title)
         table = QFrame()
         table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         table.setStyleSheet(
-            "QFrame { background: rgba(15,23,42,0.32); border: none; border-radius: 10px; }"
-            "QLabel[role='header'] { background: rgba(71,85,105,0.96); color: #f8fafc; font-size: 14px; font-weight: 900; padding: 5px 6px; }"
-            "QLabel[role='cell'] { color: #f8fafc; font-size: 15px; font-weight: 800; padding: 4px 7px; border-bottom: 1px solid rgba(148,163,184,0.20); }"
+            "QFrame { background:transparent; border:none; border-radius:0px; }"
+            "QLabel[role='header'] { background:#33405a; color:#9aa6ba; font-size:15px; font-weight:600; padding:5px 10px; border-radius:4px; }"
+            "QLabel[role='cell'] { background:#262d3a; color:#eef2f8; font-size:16px; font-weight:600; padding:5px 9px; border:none; border-radius:4px; }"
         )
         rows_host = QWidget(table)
         rows_layout = QGridLayout()
         rows_layout.setContentsMargins(0, 0, 0, 0)
-        rows_layout.setHorizontalSpacing(0)
-        rows_layout.setVerticalSpacing(0)
+        rows_layout.setHorizontalSpacing(4)
+        rows_layout.setVerticalSpacing(4)
         rows_host.setLayout(rows_layout)
         table.setLayout(QVBoxLayout())
         table.layout().setContentsMargins(0, 0, 0, 0)
@@ -17836,7 +17946,9 @@ QWidget#ClientUIRoot {{
                 widget.deleteLater()
         col_count = max(1, len(headers))
         clean_rows = rows or [["-"] * col_count]
-        show_header = not (col_count == 1 and str(headers[0]).strip().lower() == "entry")
+        show_header = not bool(getattr(table, "_finish_hide_header", False)) and not (
+            col_count == 1 and str(headers[0]).strip().lower() == "entry"
+        )
         stretch_rows = bool(getattr(table, "_finish_stretch_rows", True))
         grid_row = 0
         if show_header:
@@ -17860,7 +17972,7 @@ QWidget#ClientUIRoot {{
                 lbl = QLabel(str(values[c]))
                 lbl.setProperty("role", "cell")
                 lbl.setWordWrap(True)
-                if col_count == 1 or c == 0:
+                if bool(getattr(table, "_finish_hide_header", False)) or col_count == 1 or c == 0:
                     lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
                 else:
                     lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -17868,15 +17980,15 @@ QWidget#ClientUIRoot {{
                     lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
                 else:
                     lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-                    lbl.setMinimumHeight(52)
-                    lbl.setMaximumHeight(58)
+                    lbl.setMinimumHeight(34)
+                    lbl.setMaximumHeight(38)
                 layout.addWidget(lbl, grid_row, c)
             grid_row += 1
         for c in range(col_count):
             layout.setColumnStretch(c, 1)
         for r in range(grid_row):
             layout.setRowStretch(r, 0 if (show_header and r == 0) or not stretch_rows else 1)
-        row_h = 30 if stretch_rows else 54
+        row_h = 30 if stretch_rows else 38
         header_h = 34 if show_header else 0
         target_h = max(30, header_h + (len(clean_rows) * row_h) + 3)
         rows_host = getattr(table, "_finish_rows_host", None)
@@ -18177,9 +18289,9 @@ QWidget#ClientUIRoot {{
         reject_breakdown = shift_payload.get("reject_breakdown") if isinstance(shift_payload.get("reject_breakdown"), dict) else {}
         produced_units = self._raw_consumption_unit_count(shift_payload)
         page_h = self._finish_review_available_content_height()
-        overview_h = min(320, max(270, int(page_h * 0.30)))
+        overview_h = min(220, max(185, int(page_h * 0.30)))
         page_one_section_h = max(220, int((page_h - overview_h - 12) / 2))
-        page_two_section_h = max(260, int((page_h - 6) / 2))
+        page_two_section_h = max(180, int((page_h - 20) / 3))
         full_page_section_h = max(560, page_h - 2)
 
         start_label = self._safe_text(shift_payload.get("started_at_utc"), "-")
@@ -18262,6 +18374,7 @@ QWidget#ClientUIRoot {{
             [f"Weight Sent At: {self._safe_text(shift_payload.get('external_average_weight_sent_at'), '-')}"],
             [f"Weight Received At: {self._safe_text(shift_payload.get('external_average_weight_received_at'), '-')}"],
         ]
+        job_rows = [[job_rows[i][0], job_rows[i + 1][0]] for i in range(0, min(10, len(job_rows) - 1), 2)]
         self._set_finish_summary_table_rows(self.finishReviewJobDetails, job_rows)
 
         counter_rows = [
@@ -18293,11 +18406,14 @@ QWidget#ClientUIRoot {{
                 f"Supervisor: {self._safe_text(row.get('supervisor_name'), '-')} | "
                 f"{self._safe_text(row.get('changed_at_utc'), '-')}"
             ])
+        counter_rows = [[counter_rows[i][0], counter_rows[i + 1][0]] for i in range(0, min(10, len(counter_rows) - 1), 2)]
         self._set_finish_summary_table_rows(self.finishReviewCounters, counter_rows)
         self._stretch_finish_summary_table(self.finishReviewJobDetails, page_one_section_h)
         self._stretch_finish_summary_table(self.finishReviewCounters, page_one_section_h)
 
         reject_rows = [[f"{str(k)}: {str(int(v or 0))}"] for k, v in reject_breakdown.items() if int(v or 0) > 0]
+        if not reject_rows:
+            reject_rows = [["No rejects recorded"]]
         self._set_finish_summary_table_rows(self.finishReviewRejects, reject_rows)
 
         supervisor_review_logs = [
@@ -18354,6 +18470,7 @@ QWidget#ClientUIRoot {{
                 f"{self._format_timer_seconds(int(row.get('duration_seconds') or 0))} | "
                 f"Maintenance: {self._safe_text(row.get('maintenance'), '-')}"
             ])
+        downtime_rows = [[downtime_rows[i][0], downtime_rows[i + 1][0]] for i in range(0, min(10, len(downtime_rows) - 1), 2)]
         self._set_finish_summary_table_rows(self.finishReviewDowntime, downtime_rows)
         self._stretch_finish_summary_table(self.finishReviewDowntime, page_one_section_h)
         self._stretch_finish_summary_table(self.finishReviewRejects, page_one_section_h)
@@ -18406,9 +18523,8 @@ QWidget#ClientUIRoot {{
                 f"{remaining_part_qty:.2f}".rstrip("0").rstrip("."),
                 f"{scan_pct:.1f}%",
             ])
-        part_page_size = 8
+        part_page_size = 4
         visible_part_table_rows = part_table_rows[:part_page_size]
-        extra_part_table_rows = part_table_rows[part_page_size:]
         self.finishReviewParts._finish_headers = ["SKU", "Name", "Part Qty/Unit", "Available", "Requested", "Remaining", "Scan %"]
         self.finishReviewParts._finish_stretch_rows = False
         self._set_finish_summary_table_rows(self.finishReviewParts, visible_part_table_rows)
@@ -18428,18 +18544,18 @@ QWidget#ClientUIRoot {{
         ]
         self.finishReviewPartialPayload._finish_stretch_rows = True
         self._set_finish_summary_table_rows(self.finishReviewPartialPayload, partial_payload_rows)
-        self._stretch_finish_summary_table(self.finishReviewPartialPayload, page_two_section_h)
-        self._stretch_finish_summary_table(self.finishReviewParts, page_two_section_h)
-        for idx in range(0, len(extra_part_table_rows), 14):
-            chunk = extra_part_table_rows[idx:idx + 14]
-            page_no = 2 + (idx // 14)
-            self._add_finish_review_extra_page(
-                f"Product Parts Continued {page_no}",
-                ["SKU", "Name", "Part Qty/Unit", "Available", "Requested", "Remaining", "Scan %"],
-                chunk,
-                section_height=full_page_section_h,
-                stretch_rows=False,
-            )
+        self._stretch_finish_summary_table(self.finishReviewPartialPayload, max(150, page_two_section_h - 30))
+        self._stretch_finish_summary_table(self.finishReviewParts, max(190, page_two_section_h + 20))
+        cycle_rows = []
+        for idx, row in enumerate([entry for entry in (shift_payload.get("cycle_time_change_logs") or []) if isinstance(entry, dict)][:4], 1):
+            cycle_rows.append([
+                str(idx), self._safe_text(row.get("set_at_utc"), "-"),
+                self._safe_text(row.get("previous_cycle_time"), "-"),
+                self._safe_text(row.get("cycle_time"), "-"), self._safe_text(row.get("source"), "-"),
+                self._safe_text(row.get("confirmed_by"), "-"), self._safe_text(row.get("confirmed_by_role"), "-"),
+            ])
+        self._set_finish_summary_table_rows(self.finishReviewCycleHistory, cycle_rows)
+        self._stretch_finish_summary_table(self.finishReviewCycleHistory, max(170, page_two_section_h))
 
         raw_rows = []
         for row in raw_logs:
@@ -18454,7 +18570,6 @@ QWidget#ClientUIRoot {{
             ])
         raw_page_size = 16
         visible_raw_rows = raw_rows[:raw_page_size]
-        extra_raw_rows = raw_rows[raw_page_size:]
         if getattr(self.finishReviewRaw, "_finish_title_label", None) is not None:
             self.finishReviewRaw._finish_title_label.setText(
                 f"Raw Material Scan Log  |  {len(raw_logs)} scans  |  {f'{scanned_raw_qty:.2f}'.rstrip('0').rstrip('.')} total qty"
@@ -18462,23 +18577,8 @@ QWidget#ClientUIRoot {{
         self.finishReviewRaw._finish_stretch_rows = False
         self._set_finish_summary_table_rows(self.finishReviewRaw, visible_raw_rows)
         self._stretch_finish_summary_table(self.finishReviewRaw, full_page_section_h)
-        for idx in range(0, len(extra_raw_rows), raw_page_size):
-            chunk = extra_raw_rows[idx:idx + raw_page_size]
-            page_no = 2 + (idx // raw_page_size)
-            self._add_finish_review_extra_page(
-                f"Raw Materials Continued {page_no}",
-                ["Material", "Qty", "Index", "Total", "Lot", "PO", "Scanned At"],
-                chunk,
-                section_height=full_page_section_h,
-                stretch_rows=False,
-            )
-
-        self._add_shift_jobs_review_page_if_needed()
-        self._add_operator_segments_review_page_if_needed(shift_payload)
-        self._add_cycle_time_changes_review_page_if_needed(shift_payload)
-
-        include_second_page = bool(partial_payload_rows or visible_part_table_rows)
-        include_third_page = bool(visible_raw_rows)
+        include_second_page = True
+        include_third_page = False
         include_fourth_page = False
         self._rebuild_finish_review_pages(
             include_second_page=include_second_page,
@@ -22121,7 +22221,7 @@ QWidget#ClientUIRoot {{
         if (
             (low in ("finishjob", "finishjob~1", "jobfinish") and self._pending_final_review_payload)
             or (
-                low in ("operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1")
+                low in ("finishshift", "operatorshift~1", "operator_shift~1", "shiftchange~1")
                 and (s.waiting_shift_end_machine_counter_input or self._operator_shift_flash_active)
             )
         ):
@@ -24411,7 +24511,10 @@ QWidget#ClientUIRoot {{
         self.filter = ScannerFilter(
             plain_digit_numpad_enabled=lambda: bool(
                 mode == "serial" or self._serial_scanner_connected
-            )
+            ),
+            keyboard_input_enabled=lambda _target=None: bool(
+                hasattr(self, "settingsOverlay") and self.settingsOverlay.isVisible()
+            ),
         )
         app = QApplication.instance()
         if app is not None:
@@ -24601,9 +24704,8 @@ QWidget#ClientUIRoot {{
         if self._operator_shift_flash_active:
             pending_shift = dict(self._pending_shift_review_payload or {})
             if pending_shift:
-                raw_s = str(raw).strip()
                 raw_l = raw_s.lower()
-                if raw_l in ("operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"):
+                if raw_l in ("finishshift", "operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"):
                     self._cancel_pending_finish_shift()
                     return
                 if raw_l in ("next", "prev", "previous", "preview"):
@@ -25282,7 +25384,7 @@ QWidget#ClientUIRoot {{
                 x for x in (self.state.reject_review_logs or [])
                 if isinstance(x, dict) and str(x.get("entry_type") or "").strip().upper() in ("REJECT_SCAN", "STARTUP_REJECT_SCAN")
             ])
-            page_size = max(1, int(getattr(self, "_product_history_page_size", 15) or 15))
+            page_size = max(1, int(getattr(self, "_product_history_page_size", 14) or 14))
             total_pages = max(1, (max(pack_count, butal_count, reject_count) + page_size - 1) // page_size)
             if raw_l == "next":
                 if self._product_history_page < (total_pages - 1):
@@ -25382,7 +25484,7 @@ QWidget#ClientUIRoot {{
             return
 
         if s.waiting_shift_end_machine_counter_input:
-            if raw_l in ("operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"):
+            if raw_l in ("finishshift", "operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"):
                 self._cancel_pending_finish_shift()
                 return
             self._open_finish_shift_review()
@@ -28470,22 +28572,30 @@ QWidget#ClientUIRoot {{
         except Exception:
             pass
 
+        if hasattr(self, "qrMappingVersionLabel"):
+            self.qrMappingVersionLabel.setText(
+                f"Published version: {int(QR_MAPPING_CONFIG.get('version') or 1)}"
+            )
+        if (
+            bool(payload.get("force"))
+            and hasattr(self, "qrMappingEditor")
+            and not bool(getattr(self, "_qr_mapping_editor_dirty", False))
+        ):
+            self.qrMappingEditor.blockSignals(True)
+            self.qrMappingEditor.setPlainText(qr_mapping_config_to_text(QR_MAPPING_CONFIG))
+            self.qrMappingEditor.blockSignals(False)
+            self._qr_mapping_editor_dirty = False
+        self._append_app_log(
+            "SETTINGS",
+            f"QR mapping version {int(QR_MAPPING_CONFIG.get('version') or 1)} loaded from server",
+        )
+
     def _offline_linkage_relation_key(self, routed_job_code: Any) -> str:
         main_code = self._normalize_job_code(self.state.job_code)
         linked_code = self._normalize_job_code(routed_job_code)
         if not main_code or not linked_code or main_code == linked_code:
             return ""
         return f"{main_code}|{linked_code}"
-        if hasattr(self, "qrMappingVersionLabel"):
-            self.qrMappingVersionLabel.setText(
-                f"Published version: {int(QR_MAPPING_CONFIG.get('version') or 1)}"
-            )
-        if bool(payload.get("force")) and hasattr(self, "qrMappingEditor"):
-            self.qrMappingEditor.setPlainText(qr_mapping_config_to_text(QR_MAPPING_CONFIG))
-        self._append_app_log(
-            "SETTINGS",
-            f"QR mapping version {int(QR_MAPPING_CONFIG.get('version') or 1)} loaded from server",
-        )
 
     def _mapping_editor_payload(self) -> Optional[Dict[str, Any]]:
         value, errors = qr_mapping_config_from_text(
@@ -28534,7 +28644,10 @@ QWidget#ClientUIRoot {{
             if isinstance(published, dict):
                 QR_MAPPING_CONFIG = copy.deepcopy(published)
                 _apply_runtime_qr_mapping_config(QR_MAPPING_CONFIG)
+                self.qrMappingEditor.blockSignals(True)
                 self.qrMappingEditor.setPlainText(qr_mapping_config_to_text(QR_MAPPING_CONFIG))
+                self.qrMappingEditor.blockSignals(False)
+                self._qr_mapping_editor_dirty = False
                 self.qrMappingVersionLabel.setText(
                     f"Published version: {int(QR_MAPPING_CONFIG.get('version') or 1)}"
                 )
