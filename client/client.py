@@ -7674,6 +7674,16 @@ QWidget#ClientUIRoot {{
         self.invalidTextLabel.show()
         self.productPartPromptWidget.hide()
         safe_choices = [row for row in choices if isinstance(row, dict)]
+        # Every newly requested menu invalidates delayed layout callbacks from
+        # the menu that was visible before it.  Without this, the queued
+        # first-open rebuild for Change Color/Mold can run after Reject mode
+        # opens and paint the old cards back over the Reject prompt.
+        if _stabilize_first_open:
+            self._choice_overlay_render_token += 1
+        # Non-compact menus rebuild the shared card grid.  The cached compact
+        # Reject key therefore no longer describes the widgets in that grid.
+        if not compact:
+            self._compact_choice_overlay_cache_key = None
         compact_cache_key = (
             self.width(),
             self.height(),
@@ -7716,8 +7726,6 @@ QWidget#ClientUIRoot {{
             self.invalidOverlay.layout().activate()
             self.invalidOverlay.update()
             return
-        if _stabilize_first_open and not compact:
-            self._choice_overlay_render_token += 1
         render_token = int(self._choice_overlay_render_token or 0)
         available_panel_w = max(1, self.width() - 24)
         available_cards_w = max(1, available_panel_w - 54)
