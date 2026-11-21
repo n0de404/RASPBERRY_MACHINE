@@ -2,7 +2,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -31,6 +31,51 @@ class ClientOperatorWorkflowTests(unittest.TestCase):
         self.assertEqual(text, "RELIEVER: Relief Operator")
         self.assertNotIn("Main Operator", text)
         self.assertTrue(highlighted)
+
+    def test_signed_carryover_fences_job_started_before_cutover(self):
+        ui = self._client()
+        ui.state.machine_code = "M00008"
+        ui.state.job_code = "122648"
+        ui.state.job_started_at = "2026-11-20T06:00:00+00:00"
+        ui._negative_carryover_policy = {
+            "version": 1,
+            "cutover_created_at_utc": "2026-11-21T00:00:00+00:00",
+            "grandfathered_job_keys": [],
+        }
+
+        with patch.object(production_client, "_save_negative_carryover_policy", return_value=True):
+            enabled = ui._signed_carryover_enabled_for_current_job()
+
+        self.assertFalse(enabled)
+        self.assertIn(
+            "M00008|122648",
+            ui._negative_carryover_policy["grandfathered_job_keys"],
+        )
+
+    def test_signed_carryover_enables_job_started_after_cutover(self):
+        ui = self._client()
+        ui.state.machine_code = "M00008"
+        ui.state.job_code = "NEW-123"
+        ui.state.job_started_at = "2026-11-21T01:00:00+00:00"
+        ui._negative_carryover_policy = {
+            "version": 1,
+            "cutover_created_at_utc": "2026-11-21T00:00:00+00:00",
+            "grandfathered_job_keys": [],
+        }
+
+        self.assertTrue(ui._signed_carryover_enabled_for_current_job())
+
+    def test_finish_job_releases_signed_carryover_fence(self):
+        ui = self._client()
+        ui._negative_carryover_policy = {
+            "version": 1,
+            "grandfathered_job_keys": ["M00008|122648"],
+        }
+
+        with patch.object(production_client, "_save_negative_carryover_policy", return_value=True):
+            ui._release_negative_carryover_job_fence("M00008", "122648")
+
+        self.assertEqual(ui._negative_carryover_policy["grandfathered_job_keys"], [])
 
     def test_active_reliever_has_priority_over_helper_manpower_count(self):
         ui = self._client()

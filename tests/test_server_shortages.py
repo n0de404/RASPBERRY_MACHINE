@@ -266,6 +266,47 @@ class DashboardPartShortageTests(unittest.TestCase):
 
         self.assertEqual(result, {"count": 0, "names": [], "details": []})
 
+    def test_versioned_negative_carryover_debt_is_applied_to_next_shift(self) -> None:
+        row = self._machine_308_row()
+        row["production_session_id"] = "TEST-SIGNED-CARRYOVER-DEBT"
+        row["raw_material_logs"] = [
+            {
+                "product_id": 5516,
+                "qty": -10,
+                "source": "FINISH_SHIFT_PART_CARRYOVER",
+                "carryover_balance_mode": "SIGNED_V1",
+            },
+            {"product_id": 5516, "qty": 25, "source": "RAW_MATERIAL_QR"},
+        ]
+        row["product_pack_history_logs"] = [{
+            "raw_part_consumption": [{"product_id": 5516, "used_qty": 20}]
+        }]
+
+        result = dashboard_server._dashboard_product_part_shortages(
+            row, include_prior_partials=False
+        )
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["details"][0]["scanned_qty"], 15)
+        self.assertEqual(result["details"][0]["shortage_qty"], 5)
+
+    def test_unversioned_negative_carryover_keeps_legacy_dashboard_behavior(self) -> None:
+        row = self._machine_308_row()
+        row["production_session_id"] = "TEST-LEGACY-CARRYOVER-DEBT"
+        row["raw_material_logs"] = [
+            {"product_id": 5516, "qty": -10, "source": "FINISH_SHIFT_PART_CARRYOVER"},
+            {"product_id": 5516, "qty": 25, "source": "RAW_MATERIAL_QR"},
+        ]
+        row["product_pack_history_logs"] = [{
+            "raw_part_consumption": [{"product_id": 5516, "used_qty": 20}]
+        }]
+
+        result = dashboard_server._dashboard_product_part_shortages(
+            row, include_prior_partials=False
+        )
+
+        self.assertEqual(result, {"count": 0, "names": [], "details": []})
+
     def test_replacement_with_enough_scanned_weight_is_not_short(self) -> None:
         row = self._machine_308_row()
         row["production_session_id"] = "TEST-M308-SUFFICIENT"

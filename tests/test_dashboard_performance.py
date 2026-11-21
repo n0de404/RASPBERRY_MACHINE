@@ -57,6 +57,26 @@ class DashboardPerformanceSafetyTests(unittest.TestCase):
         self.assertEqual(len(session.client_app_logs), 1)
         self.assertEqual(session.client_app_logs[0]["activity_id"], first_id)
 
+    def test_periodic_transport_noise_is_not_merged_into_activity(self):
+        session = dashboard_server.MachineSession(
+            client_id="RPI-TEST",
+            machine_code="M00010",
+            machine_name="IMM 310",
+        )
+        noisy_rows = [
+            {
+                "source": "SETTINGS",
+                "message": "QR mapping version 2 loaded from server",
+            },
+            {
+                "source": "STATUS",
+                "message": "Server send failed: HTTPConnectionPool connection refused",
+            },
+        ]
+        self.assertEqual(dashboard_server._normalize_client_activity_rows(noisy_rows), [])
+        self.assertEqual(dashboard_server._merge_client_app_logs(session, noisy_rows), 0)
+        self.assertFalse(session.client_app_logs)
+
     def test_dashboard_assets_are_separated_and_versioned(self):
         self.assertIn('/assets/dashboard.css?v=', dashboard_server.DASHBOARD_PAGE_HTML)
         self.assertIn('/assets/dashboard.js?v=', dashboard_server.DASHBOARD_PAGE_HTML)

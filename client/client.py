@@ -133,6 +133,8 @@ PRODUCT_CATALOG_CACHE_FILE = os.path.join(DATABASE_DIR, "product_catalog_cache.j
 FINISHED_JOBS_FILE = os.path.join(DATABASE_DIR, "finished_jobs.json")
 FINISH_SHIFT_FILE = os.path.join(DATABASE_DIR, "finish_shift.json")
 SHIFT_CARRYOVER_FILE = os.path.join(DATABASE_DIR, "shift_carryover.json")
+NEGATIVE_CARRYOVER_POLICY_FILE = os.path.join(DATABASE_DIR, "negative_carryover_policy.json")
+SIGNED_CARRYOVER_BALANCE_MODE = "SIGNED_V1"
 SQL_CONFIG_FILE = os.path.join(DATABASE_DIR, "sql_config.json")
 APP_LOGS_FILE = os.path.join(DATABASE_DIR, "app_logs.json")
 CLIENT_SETTINGS_FILE = os.path.join(DATABASE_DIR, "client_settings.json")
@@ -343,6 +345,67 @@ def _save_shift_carryover_json(rows: List[Dict[str, Any]]) -> bool:
         except Exception:
             pass
         return False
+
+
+def _carryover_job_key(machine_code: Any, job_code: Any) -> str:
+    machine = str(machine_code or "").strip().upper()
+    job = "".join(ch for ch in str(job_code or "").strip().upper() if ch.isalnum())
+    return f"{machine}|{job}" if machine and job else ""
+
+
+def _load_negative_carryover_policy() -> Dict[str, Any]:
+    try:
+        if not os.path.exists(NEGATIVE_CARRYOVER_POLICY_FILE):
+            return {}
+        with open(NEGATIVE_CARRYOVER_POLICY_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return dict(payload) if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_negative_carryover_policy(payload: Dict[str, Any]) -> bool:
+    try:
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        tmp = f"{NEGATIVE_CARRYOVER_POLICY_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(dict(payload or {}), f, ensure_ascii=False, indent=2, default=str)
+        os.replace(tmp, NEGATIVE_CARRYOVER_POLICY_FILE)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(f"{NEGATIVE_CARRYOVER_POLICY_FILE}.tmp"):
+                os.remove(f"{NEGATIVE_CARRYOVER_POLICY_FILE}.tmp")
+        except Exception:
+            pass
+        return False
+
+
+def _initialize_negative_carryover_policy() -> Dict[str, Any]:
+    """Fence jobs that were already active when signed carryover was deployed."""
+    policy = _load_negative_carryover_policy()
+    if int(policy.get("version") or 0) >= 1:
+        policy["grandfathered_job_keys"] = sorted({
+            str(key).strip() for key in (policy.get("grandfathered_job_keys") or [])
+            if str(key).strip()
+        })
+        return policy
+
+    active_keys = set()
+    for row in _load_active_sessions_json().values():
+        if not isinstance(row, dict):
+            continue
+        key = _carryover_job_key(row.get("machine_code"), row.get("job_code"))
+        if key:
+            active_keys.add(key)
+    policy = {
+        "version": 1,
+        "cutover_created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "grandfathered_job_keys": sorted(active_keys),
+        "mode": SIGNED_CARRYOVER_BALANCE_MODE,
+    }
+    _save_negative_carryover_policy(policy)
+    return policy
 
 
 def _append_finished_job_json(row: Dict[str, Any]) -> bool:
@@ -2403,6 +2466,12 @@ class ScannerFilter(QObject):
                 self._buf.clear()
                 self.scanned.emit("crewadd~1" if key == Qt.Key.Key_Plus else "crewremove~1")
                 return True
+            if key == Qt.Key.Key_Period and (
+                is_numpad_key or self._plain_digit_numpad_is_enabled()
+            ):
+                self._buf.clear()
+                self.scanned.emit("decimal")
+                return True
             if (is_numpad_key or plain_digit_numpad) and Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
                 self._buf.clear()
                 self.scanned.emit(f"num_{key - Qt.Key.Key_0}")
@@ -3595,6 +3664,9 @@ class ClientUI(QWidget):
     def __init__(self):
         super().__init__()
         self.state = ClientState()
+        # Existing jobs retain legacy dashboard carryover semantics through
+        # every shift until their final Finish Job approval.
+        self._negative_carryover_policy = _initialize_negative_carryover_policy()
         self._crew_action_mode = ""
         self._reliever_action_mode = False
         self._change_operator_phase = ""
@@ -3627,6 +3699,13 @@ class ClientUI(QWidget):
         self._reprint_prompt_restore_context = ""
         self._reprint_qr_phase = ""
         self._reprint_product_parts: List[Dict[str, Any]] = []
+        self._pending_finish_excess_payload: Optional[Dict[str, Any]] = None
+        self._pending_finish_excess_linked_payloads: List[Dict[str, Any]] = []
+        self._pending_finish_excess_hidden_payloads: List[Dict[str, Any]] = []
+        self._pending_finish_excess_rows: List[Dict[str, Any]] = []
+        self._pending_finish_excess_index = 0
+        self._pending_finish_excess_input = ""
+        self._pending_finish_excess_ready_to_print = False
         self._color_change_options: List[Dict[str, Any]] = []
         self._pending_color_mold_change: Optional[Dict[str, Any]] = None
         self._info_overlay_size = QSize(560, 150)
@@ -9937,6 +10016,357 @@ QWidget#ClientUIRoot {{
         if not self._should_keep_background_blur():
             self._set_background_blur(False)
 
+    def _finish_job_combined_totals(self, finished_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Combine approved prior shifts with the shift being finished now."""
+        payload = dict(finished_payload or {})
+        machine_code = str(payload.get("machine_code") or "").strip().upper()
+        job_code = self._normalize_job_code(payload.get("job_code"))
+        client_id = str(payload.get("client_id") or self._current_client_id()).strip()
+        latest_final_at = ""
+        for row in _load_finished_jobs_json():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("machine_code") or "").strip().upper() != machine_code:
+                continue
+            if self._normalize_job_code(row.get("job_code")) != job_code:
+                continue
+            latest_final_at = max(
+                latest_final_at,
+                str(row.get("finished_at_utc") or row.get("ended_at_utc") or ""),
+            )
+        prior_rows: List[Dict[str, Any]] = []
+        for row in _load_finish_shift_json():
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("machine_code") or "").strip().upper() != machine_code:
+                continue
+            if self._normalize_job_code(row.get("job_code")) != job_code:
+                continue
+            row_client = str(row.get("client_id") or "").strip()
+            if row_client and client_id and row_client != client_id:
+                continue
+            status = str(row.get("review_status") or "").strip().upper()
+            if status not in {REVIEW_STATUS_APPROVED, REVIEW_STATUS_CLOSED}:
+                continue
+            ended_at = str(row.get("finished_at_utc") or row.get("ended_at_utc") or "")
+            if latest_final_at and ended_at and ended_at <= latest_final_at:
+                continue
+            prior_rows.append(dict(row))
+        rows = [*prior_rows, payload]
+        keys = (
+            "pack_count", "good_total", "butal_total", "reject_total",
+            "startup_reject_total", "no_shot_total", "raw_sacks_count",
+        )
+        combined = {
+            key: sum(max(0, int(self._parse_number(row.get(key)))) for row in rows)
+            for key in keys
+        }
+        combined["total_good"] = int(combined["good_total"] + combined["butal_total"])
+        combined["partial_qty"] = combined["total_good"]
+        combined["shift_count"] = len(rows)
+        combined["prior_shift_count"] = len(prior_rows)
+        return combined
+
+    def _finish_job_excess_rows(self) -> List[Dict[str, Any]]:
+        parts = [dict(row) for row in self._job_part_rows() if isinstance(row, dict)]
+        statuses = self._current_part_availability_statuses()
+        rows: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for status in statuses:
+            status_keys = set(status.get("keys") or set())
+            part = next((
+                candidate for candidate in parts
+                if status_keys.intersection(
+                    self._part_material_match_keys(candidate)
+                    | self._part_material_name_keys(candidate)
+                )
+            ), {})
+            identity = str(
+                part.get("part_product_id") or part.get("product_id")
+                or part.get("sku") or status.get("storage_key") or status.get("name") or ""
+            ).strip()
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            rows.append({
+                "identity": identity,
+                "part": dict(part),
+                "product_id": str(part.get("part_product_id") or part.get("product_id") or "").strip(),
+                "sku": str(part.get("sku") or part.get("part_sku") or status.get("name") or identity).strip(),
+                "name": str(part.get("name") or part.get("part_name") or status.get("name") or identity).strip(),
+                "unit": self._part_unit_kind(part),
+                "expected_qty": round(float(status.get("available_qty") or 0.0), 6),
+                "actual_qty": None,
+                "difference_qty": None,
+                "status": "PENDING",
+                "input": "",
+            })
+        return rows
+
+    def _render_finish_job_excess_review(self) -> None:
+        rows = list(self._pending_finish_excess_rows or [])
+        selected = max(0, min(int(self._pending_finish_excess_index or 0), max(0, len(rows) - 1)))
+        self._pending_finish_excess_index = selected
+        table_rows: List[List[str]] = []
+        for index, row in enumerate(rows):
+            expected = float(row.get("expected_qty") or 0.0)
+            actual = row.get("actual_qty")
+            difference = row.get("difference_qty")
+            status = str(row.get("status") or "PENDING")
+            if row.get("variance_reason"):
+                status = f"{status}: {row.get('variance_reason')}"
+            actual_text = str(row.get("input") or "") if index == selected and actual is None else (
+                "-" if actual is None else _fmt_number(actual)
+            )
+            table_rows.append([
+                f"> {index + 1}" if index == selected else str(index + 1),
+                str(row.get("sku") or row.get("name") or "-"),
+                f"{_fmt_number(expected)} {row.get('unit') or ''}".strip(),
+                f"{actual_text} {row.get('unit') or ''}".strip(),
+                "-" if difference is None else _fmt_number(difference),
+                status,
+            ])
+        if not table_rows:
+            table_rows = [["-", "No product parts to return", "0", "0", "0", "READY"]]
+        self.finishReviewParts._finish_headers = [
+            "#", "Product Part", "Expected Excess", "Actual Excess", "Difference", "Status"
+        ]
+        self.finishReviewParts._finish_stretch_rows = False
+        self._set_finish_summary_table_rows(self.finishReviewParts, table_rows)
+        if getattr(self.finishReviewParts, "_finish_title_label", None) is not None:
+            self.finishReviewParts._finish_title_label.setText("Product-Part Excess Verification")
+        if self._pending_finish_excess_ready_to_print:
+            self.finishStatus.setText("Counts verified. Ready to print return labels.")
+            self.finishReviewHint.setText("Review Expected / Actual / Difference, then scan confirm to print.")
+        elif rows:
+            current = rows[selected]
+            self.finishStatus.setText(
+                f"Part {selected + 1} of {len(rows)}: {current.get('sku') or current.get('name')}"
+            )
+            if current.get("reason_required"):
+                self.finishReviewHint.setText(
+                    "Difference reason: 1 Counting  2 Damaged  3 Missing  4 Extra  5 Unrecorded use  6 Other"
+                )
+            else:
+                self.finishReviewHint.setText(
+                    "Enter the physical excess with numpad, then scan confirm. Use backspace to correct."
+                )
+        else:
+            self._pending_finish_excess_ready_to_print = True
+            self.finishStatus.setText("No product-part excess count is required.")
+            self.finishReviewHint.setText("Scan confirm to continue and print any remaining Butal label.")
+
+    def _start_finish_job_excess_review(
+        self,
+        finished_payload: Dict[str, Any],
+        linked_payloads: Optional[List[Dict[str, Any]]] = None,
+        hidden_payloads: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        payload = dict(finished_payload or {})
+        payload["job_combined_totals"] = self._finish_job_combined_totals(payload)
+        self._pending_finish_excess_payload = payload
+        self._pending_finish_excess_linked_payloads = [
+            dict(row) for row in (linked_payloads or []) if isinstance(row, dict)
+        ]
+        self._pending_finish_excess_hidden_payloads = [
+            dict(row) for row in (hidden_payloads or []) if isinstance(row, dict)
+        ]
+        self._pending_finish_excess_rows = self._finish_job_excess_rows()
+        self._pending_finish_excess_index = 0
+        self._pending_finish_excess_input = ""
+        self._pending_finish_excess_ready_to_print = not bool(self._pending_finish_excess_rows)
+        display_payload = dict(payload)
+        display_payload.update(payload.get("job_combined_totals") or {})
+        self.finishOverlay.setStyleSheet(self._finish_review_stylesheet)
+        self._position_finish_overlay()
+        self._set_background_blur(True)
+        self.finishTitle.setText("Finish job excess check")
+        self.finishProgressBar.hide()
+        self.finishSummaryScroll.show()
+        self.finishReviewHint.show()
+        self.finishReviewPageInfo.show()
+        self.finishSuccessRow.hide()
+        self._finish_review_page_index = 0
+        self._populate_finish_shift_summary(display_payload)
+        self._render_finish_job_excess_review()
+        self.finishSummaryStack.setCurrentIndex(0)
+        self._set_finish_review_page_info()
+        self.finishOverlay.show()
+        self.finishOverlay.raise_()
+        self.status.setText("Finish Job excess check opened. Review combined totals, then enter actual excess quantities.")
+
+    def _clear_finish_job_excess_review(self) -> None:
+        self._pending_finish_excess_payload = None
+        self._pending_finish_excess_linked_payloads = []
+        self._pending_finish_excess_hidden_payloads = []
+        self._pending_finish_excess_rows = []
+        self._pending_finish_excess_index = 0
+        self._pending_finish_excess_input = ""
+        self._pending_finish_excess_ready_to_print = False
+
+    def _commit_finish_job_excess_input(self) -> bool:
+        rows = self._pending_finish_excess_rows
+        if not rows:
+            self._pending_finish_excess_ready_to_print = True
+            self._render_finish_job_excess_review()
+            return True
+        index = max(0, min(self._pending_finish_excess_index, len(rows) - 1))
+        text = str(rows[index].get("input") or self._pending_finish_excess_input or "").strip()
+        if not re.fullmatch(r"\d+(?:\.\d{1,3})?", text):
+            self._show_invalid_overlay("Enter a valid actual excess quantity, then scan confirm.")
+            return False
+        actual = round(max(0.0, float(text)), 6)
+        expected = round(float(rows[index].get("expected_qty") or 0.0), 6)
+        difference = round(actual - expected, 6)
+        rows[index]["actual_qty"] = actual
+        rows[index]["difference_qty"] = difference
+        variance_status = "MATCH" if abs(difference) <= 0.000001 else ("OVER" if difference > 0 else "SHORT")
+        rows[index]["variance_status"] = variance_status
+        rows[index]["status"] = variance_status
+        rows[index]["reason_required"] = variance_status != "MATCH"
+        rows[index]["variance_reason"] = ""
+        rows[index]["verified_at_utc"] = datetime.now(timezone.utc).isoformat()
+        self._pending_finish_excess_input = ""
+        if rows[index]["reason_required"]:
+            rows[index]["status"] = "REASON REQUIRED"
+        elif index + 1 < len(rows):
+            self._pending_finish_excess_index = index + 1
+        else:
+            self._pending_finish_excess_ready_to_print = all(
+                row.get("actual_qty") is not None and not row.get("reason_required")
+                for row in rows
+            )
+        self._hide_invalid_overlay()
+        self._render_finish_job_excess_review()
+        return True
+
+    def _handle_finish_job_excess_scan(self, raw_scan: str) -> bool:
+        if not isinstance(self._pending_finish_excess_payload, dict):
+            return False
+        raw = str(raw_scan or "").strip()
+        low = raw.lower()
+        parsed = parse_scan(raw)
+        if parsed is not None and parsed.kind == "FINISH_JOB":
+            self._clear_finish_job_excess_review()
+            self._cancel_pending_finish_job()
+            return True
+        if low in ("next",):
+            current = (
+                self._pending_finish_excess_rows[self._pending_finish_excess_index]
+                if self._pending_finish_excess_rows else {}
+            )
+            if current.get("reason_required"):
+                self._render_finish_job_excess_review()
+                return True
+            if self._finish_review_page_index == 0:
+                self._change_finish_review_page(1)
+            elif self._pending_finish_excess_rows:
+                self._pending_finish_excess_index = min(
+                    len(self._pending_finish_excess_rows) - 1,
+                    self._pending_finish_excess_index + 1,
+                )
+                self._pending_finish_excess_input = str(
+                    self._pending_finish_excess_rows[self._pending_finish_excess_index].get("input") or ""
+                )
+                self._render_finish_job_excess_review()
+            return True
+        if low in ("prev", "previous", "preview"):
+            if self._finish_review_page_index > 0 and self._pending_finish_excess_index <= 0:
+                self._change_finish_review_page(-1)
+            elif self._pending_finish_excess_rows:
+                self._pending_finish_excess_index = max(0, self._pending_finish_excess_index - 1)
+                self._pending_finish_excess_input = str(
+                    self._pending_finish_excess_rows[self._pending_finish_excess_index].get("input") or ""
+                )
+                self._render_finish_job_excess_review()
+            return True
+        command = self._numpad_command_from_scan(raw)
+        current_row = (
+            self._pending_finish_excess_rows[self._pending_finish_excess_index]
+            if self._pending_finish_excess_rows else None
+        )
+        if isinstance(current_row, dict) and current_row.get("reason_required"):
+            reason_digit = self._numpad_digit_from_scan(raw)
+            reasons = {
+                "1": "COUNTING ERROR",
+                "2": "DAMAGED PARTS",
+                "3": "MISSING PARTS",
+                "4": "EXTRA PARTS FOUND",
+                "5": "UNRECORDED USAGE",
+                "6": "OTHER",
+            }
+            if reason_digit in reasons:
+                current_row["variance_reason"] = reasons[reason_digit]
+                current_row["reason_required"] = False
+                current_row["status"] = str(current_row.get("variance_status") or "DIFFERENCE")
+                if self._pending_finish_excess_index + 1 < len(self._pending_finish_excess_rows):
+                    self._pending_finish_excess_index += 1
+                else:
+                    self._pending_finish_excess_ready_to_print = all(
+                        row.get("actual_qty") is not None and not row.get("reason_required")
+                        for row in self._pending_finish_excess_rows
+                    )
+                self._render_finish_job_excess_review()
+                return True
+            self._render_finish_job_excess_review()
+            return True
+        if command == "confirm":
+            if self._pending_finish_excess_ready_to_print:
+                self._print_finish_job_excess_and_continue()
+            else:
+                self._commit_finish_job_excess_input()
+            return True
+        if command in ("backspace", "clear"):
+            if self._pending_finish_excess_rows:
+                row = self._pending_finish_excess_rows[self._pending_finish_excess_index]
+                current = str(row.get("input") or "")
+                row["input"] = "" if command == "clear" else current[:-1]
+                row["actual_qty"] = None
+                row["difference_qty"] = None
+                row["status"] = "PENDING"
+                row["reason_required"] = False
+                row["variance_reason"] = ""
+                self._pending_finish_excess_ready_to_print = False
+                self._render_finish_job_excess_review()
+            return True
+        if self._pending_finish_excess_rows and low in (".", "decimal", "num_decimal", "numpad_decimal"):
+            row = self._pending_finish_excess_rows[self._pending_finish_excess_index]
+            current = str(row.get("input") or "")
+            if "." not in current:
+                row["input"] = (current or "0") + "."
+            row["actual_qty"] = None
+            row["difference_qty"] = None
+            row["status"] = "PENDING"
+            self._pending_finish_excess_ready_to_print = False
+            self._render_finish_job_excess_review()
+            return True
+        digit = self._numpad_digit_from_scan(raw)
+        if self._pending_finish_excess_rows and digit is not None:
+            row = self._pending_finish_excess_rows[self._pending_finish_excess_index]
+            current = str(row.get("input") or "")
+            if len(current) < 12:
+                row["input"] = current + digit
+            row["actual_qty"] = None
+            row["difference_qty"] = None
+            row["status"] = "PENDING"
+            self._pending_finish_excess_ready_to_print = False
+            if self._finish_review_page_index == 0:
+                self._change_finish_review_page(1)
+            self._render_finish_job_excess_review()
+            return True
+        if self._pending_finish_excess_rows and re.fullmatch(r"\d+(?:\.\d{1,3})?", low):
+            row = self._pending_finish_excess_rows[self._pending_finish_excess_index]
+            row["input"] = low
+            row["actual_qty"] = None
+            row["difference_qty"] = None
+            row["status"] = "PENDING"
+            self._pending_finish_excess_ready_to_print = False
+            self._render_finish_job_excess_review()
+            return True
+        self.status.setText("Excess verification is active. Enter quantity, confirm it, or scan Finish Job to cancel.")
+        self._show_invalid_overlay("Finish the product-part excess verification first.")
+        return True
+
     def _show_final_job_review_overlay(self, finished_payload: Dict[str, Any], linked_payloads: Optional[List[Dict[str, Any]]] = None):
         self._pending_final_review_payload = dict(finished_payload or {})
         self._pending_final_review_linked_payloads = [
@@ -9948,14 +10378,16 @@ QWidget#ClientUIRoot {{
         self.finishTitle.setText("Finish job review")
         self.finishStatus.setText("Supervisor review required before this job is completed.")
         self.finishReviewHint.setText(
-            'Scan "next" / "prev" to review, scan Supervisor QR to approve, or scan Finish Job QR again to cancel.'
+            'Scan "next" / "prev" to review, then scan Supervisor QR to approve and close the job.'
         )
         self.finishReviewHint.show()
         self.finishReviewPageInfo.show()
         self.finishProgressBar.hide()
         self.finishSummaryScroll.show()
         self._finish_review_page_index = 0
-        self._populate_finish_shift_summary(self._pending_final_review_payload)
+        display_payload = dict(self._pending_final_review_payload)
+        display_payload.update(display_payload.get("job_combined_totals") or {})
+        self._populate_finish_shift_summary(display_payload)
         self.finishSummaryStack.setCurrentIndex(0)
         self._set_finish_review_page_info()
         self.finishSuccessRow.hide()
@@ -9978,6 +10410,7 @@ QWidget#ClientUIRoot {{
 
     def _cancel_pending_finish_job(self):
         snap = self._finish_job_cancel_snapshot
+        self._clear_finish_job_excess_review()
         self._hide_final_job_review_overlay()
         if isinstance(snap, dict):
             self._restore_state_from_snapshot(snap)
@@ -10096,6 +10529,9 @@ QWidget#ClientUIRoot {{
             # with no previous-shift material, BUTAL, or weight state.
             for row in [finished_payload] + linked_payloads:
                 self._clear_shift_carryover_record(row.get("machine_code"), row.get("job_code"))
+                self._release_negative_carryover_job_fence(
+                    row.get("machine_code"), row.get("job_code")
+                )
             self._clear_shift_session_keep_machine(preserve_carryover=False)
             self._hide_final_job_review_overlay()
         finally:
@@ -17008,8 +17444,9 @@ QWidget#ClientUIRoot {{
         return shown
 
     def _build_part_availability_carryover_logs(self) -> List[Dict[str, Any]]:
-        """Snapshot only unused part quantities for a same-job next shift."""
+        """Snapshot the signed part balance for a same-job next shift."""
         s = self.state
+        signed_dashboard_carryover = self._signed_carryover_enabled_for_current_job()
         parts = self._job_part_rows()
         raw_logs = [row for row in (s.raw_material_logs or []) if isinstance(row, dict)]
         produced_units = self._raw_consumption_unit_count({
@@ -17066,6 +17503,10 @@ QWidget#ClientUIRoot {{
                 "carryover_available_qty": available,
                 "carried_at_utc": datetime.now(timezone.utc).isoformat(),
             })
+            if signed_dashboard_carryover:
+                source_row["carryover_balance_mode"] = SIGNED_CARRYOVER_BALANCE_MODE
+                if available < 0:
+                    source_row["carryover_debt_qty"] = abs(available)
             carry_rows.append(source_row)
             if part_key:
                 seen.add(part_key)
@@ -17075,6 +17516,70 @@ QWidget#ClientUIRoot {{
         machine = str(machine_code or "").strip().upper()
         job = self._normalize_job_code(job_code)
         return f"{machine}|{job}" if machine and job else ""
+
+    def _signed_carryover_enabled_for_current_job(self) -> bool:
+        policy = dict(
+            getattr(self, "_negative_carryover_policy", None)
+            or _initialize_negative_carryover_policy()
+        )
+        self._negative_carryover_policy = policy
+        key = _carryover_job_key(self.state.machine_code, self.state.job_code)
+        if not key:
+            return False
+        grandfathered = {
+            str(value).strip() for value in (policy.get("grandfathered_job_keys") or [])
+            if str(value).strip()
+        }
+        # A session recovered from the server may not have existed in the
+        # client's local database during first launch of this version. Fence
+        # it as well when its original start predates the local cutover.
+        try:
+            started_text = str(self.state.job_started_at or "").strip().replace("Z", "+00:00")
+            cutover_text = str(policy.get("cutover_created_at_utc") or "").strip().replace("Z", "+00:00")
+            started_at = datetime.fromisoformat(started_text) if started_text else None
+            cutover_at = datetime.fromisoformat(cutover_text) if cutover_text else None
+            if started_at and cutover_at:
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=timezone.utc)
+                if cutover_at.tzinfo is None:
+                    cutover_at = cutover_at.replace(tzinfo=timezone.utc)
+                if started_at <= cutover_at and key not in grandfathered:
+                    grandfathered.add(key)
+                    policy["grandfathered_job_keys"] = sorted(grandfathered)
+                    if _save_negative_carryover_policy(policy):
+                        self._negative_carryover_policy = policy
+        except (TypeError, ValueError):
+            pass
+        return key not in grandfathered
+
+    def _release_negative_carryover_job_fence(self, machine_code: Any, job_code: Any) -> None:
+        policy = dict(
+            getattr(self, "_negative_carryover_policy", None)
+            or _initialize_negative_carryover_policy()
+        )
+        key = _carryover_job_key(machine_code, job_code)
+        grandfathered = {
+            str(value).strip() for value in (policy.get("grandfathered_job_keys") or [])
+            if str(value).strip()
+        }
+        if not key or key not in grandfathered:
+            self._negative_carryover_policy = policy
+            return
+        grandfathered.discard(key)
+        policy["grandfathered_job_keys"] = sorted(grandfathered)
+        policy["last_finished_job_released_at_utc"] = datetime.now(timezone.utc).isoformat()
+        if _save_negative_carryover_policy(policy):
+            self._negative_carryover_policy = policy
+
+    def _shared_storage_scan_qty(self, row: Dict[str, Any]) -> float:
+        qty = self._parse_number((row or {}).get("qty"))
+        if (
+            qty < 0
+            and str((row or {}).get("carryover_balance_mode") or "").strip().upper()
+            == SIGNED_CARRYOVER_BALANCE_MODE
+        ):
+            return qty
+        return max(0.0, qty)
 
     def _save_shift_carryover_record(self, shift_payload: Dict[str, Any]) -> bool:
         """Replace the small carryover balance for exactly one machine/job."""
@@ -17335,7 +17840,7 @@ QWidget#ClientUIRoot {{
                     if storage_keys.intersection(self._raw_material_match_keys(row))
                 ]
                 existing["scanned_qty"] = sum(
-                    max(0.0, self._parse_number(row.get("qty")))
+                    self._shared_storage_scan_qty(row)
                     for row in storage_logs
                 )
                 existing["available_qty"] = (
@@ -20023,7 +20528,7 @@ QWidget#ClientUIRoot {{
                             if storage_keys.intersection(self._raw_material_match_keys(row))
                         ]
                         scanned_raw_qty = sum(
-                            max(0.0, self._parse_number(row.get("qty")))
+                            self._shared_storage_scan_qty(row)
                             for row in storage_logs
                         )
                         used_raw_qty = sum(
@@ -21667,18 +22172,155 @@ QWidget#ClientUIRoot {{
             "lot_number": lot,
         }
 
-    def _submit_pack_qr_print(self, printable: Dict[str, Any]):
+    @staticmethod
+    def _qr_quantity_field(value: Any) -> str:
+        qty = max(0.0, float(value or 0.0))
+        if abs(qty - round(qty)) <= 0.000001:
+            return f"{int(round(qty)):011d}"
+        text = f"{qty:.3f}".rstrip("0").rstrip(".")
+        return text.zfill(11)
+
+    def _build_product_part_excess_print(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        part = dict(row.get("part") or {})
+        product_id = str(
+            row.get("product_id") or part.get("part_product_id") or part.get("product_id") or ""
+        ).strip()
+        actual_qty = max(0.0, self._parse_number(row.get("actual_qty")))
+        if not product_id or actual_qty <= 0:
+            return None
+        name = str(row.get("name") or part.get("name") or row.get("sku") or f"Product Part {product_id}").strip()
+        lot = datetime.now().strftime("%Y%m%d%H%M%S")
+        payload = (
+            "O00000000024" + self._zpad_digits(self.state.job_code, 11) + "00000000000V2"
+            + f"P{self._zpad_digits(product_id, 11)}"
+            + f"Q{self._qr_quantity_field(actual_qty)}"
+            + "I00000000001"
+            + "T00000000001"
+            + f"L{lot}-000000000000"
+        )
+        session_id = str(self.state.production_session_id or self.state.job_code or "JOB").strip()
+        identity = re.sub(r"[^A-Za-z0-9]+", "-", str(row.get("identity") or product_id)).strip("-")
+        return {
+            "payload": payload,
+            "next_index": 1,
+            "po_number": "",
+            "print_kind": "PRODUCT_PART_EXCESS",
+            "product_id": product_id,
+            "product_name": name,
+            "product_sku": str(row.get("sku") or part.get("sku") or part.get("part_sku") or "").strip(),
+            "quantity": actual_qty,
+            "lot_number": lot,
+            "idempotency_key": f"FINISH-EXCESS-{self._current_client_id()}-{session_id}-{identity}",
+        }
+
+    def _build_finish_butal_pack_print(self, quantity: Any) -> Optional[Dict[str, Any]]:
+        qty = max(0, int(round(self._parse_number(quantity))))
+        if qty <= 0:
+            return None
+        printable = self._next_printable_pack_payload()
+        if not isinstance(printable, dict):
+            return None
+        next_index = int(printable.get("suggested_index") or printable.get("next_index") or 0)
+        if next_index <= 0:
+            return None
+        payload = self._pack_payload_with_index(str(printable.get("payload") or ""), next_index)
+        payload = re.sub(
+            r"(?<=P\d{11})Q\d{11}(?=I\d{11})",
+            f"Q{qty:011d}",
+            payload,
+            count=1,
+        )
+        printable.update({
+            "payload": payload,
+            "next_index": next_index,
+            "quantity": qty,
+            "print_kind": "BUTAL_PACK",
+            "idempotency_key": (
+                f"FINISH-BUTAL-{self._current_client_id()}-"
+                f"{self.state.production_session_id or self.state.job_code}-{next_index}"
+            ),
+        })
+        return printable
+
+    def _print_finish_job_excess_and_continue(self) -> bool:
+        payload = self._pending_finish_excess_payload
+        if not isinstance(payload, dict):
+            return False
+        rows = [dict(row) for row in (self._pending_finish_excess_rows or [])]
+        if any(row.get("actual_qty") is None for row in rows):
+            self._pending_finish_excess_ready_to_print = False
+            self._show_invalid_overlay("Every product part needs an actual excess quantity before printing.")
+            return False
+        if any(row.get("reason_required") for row in rows):
+            self._pending_finish_excess_ready_to_print = False
+            self._show_invalid_overlay("Select a reason for every excess quantity difference before printing.")
+            return False
+        self.finishStatus.setText("Queuing verified excess labels...")
+        verified_logs: List[Dict[str, Any]] = []
+        for row in rows:
+            printable = self._build_product_part_excess_print(row)
+            if self._parse_number(row.get("actual_qty")) > 0:
+                if not isinstance(printable, dict):
+                    self._show_invalid_overlay(
+                        f"Cannot print {row.get('sku') or row.get('name')}: missing Product ID."
+                    )
+                    return False
+                if not self._submit_pack_qr_print(printable):
+                    return False
+                row["print_status"] = "QUEUED"
+                row["printed_at_utc"] = datetime.now(timezone.utc).isoformat()
+                row["qr_payload"] = printable.get("payload")
+            else:
+                row["print_status"] = "NOT_REQUIRED"
+            clean = {key: value for key, value in row.items() if key != "part"}
+            clean.update({
+                "source": "FINISH_JOB_PART_EXCESS_VERIFIED",
+                "excess_available_qty": row.get("expected_qty"),
+                "actual_excess_qty": row.get("actual_qty"),
+                "difference_qty": row.get("difference_qty"),
+                "recorded_at_utc": row.get("verified_at_utc") or datetime.now(timezone.utc).isoformat(),
+            })
+            verified_logs.append(clean)
+        butal_print = self._build_finish_butal_pack_print(payload.get("butal_total"))
+        if int(self._parse_number(payload.get("butal_total"))) > 0:
+            if not isinstance(butal_print, dict):
+                self._show_invalid_overlay("Butal exists, but no valid PACK QR template is available for printing.")
+                return False
+            if not self._submit_pack_qr_print(butal_print):
+                return False
+            payload["finish_job_butal_print"] = {
+                "quantity": butal_print.get("quantity"),
+                "series_index": butal_print.get("next_index"),
+                "qr_payload": butal_print.get("payload"),
+                "printed_at_utc": datetime.now(timezone.utc).isoformat(),
+                "status": "QUEUED",
+            }
+        payload["product_part_excess_logs"] = verified_logs
+        payload["excess_verification_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        payload["reprint_qr_logs"] = list(self.state.reprint_qr_logs or [])
+        linked = [dict(row) for row in self._pending_finish_excess_linked_payloads]
+        hidden = [dict(row) for row in self._pending_finish_excess_hidden_payloads]
+        self._clear_finish_job_excess_review()
+        self._pending_final_review_hidden_payloads = hidden
+        self._show_final_job_review_overlay(payload, linked)
+        self.status.setText("Excess labels queued. Finish Job review opened; scan Supervisor QR to complete.")
+        return True
+
+    def _submit_pack_qr_print(self, printable: Dict[str, Any]) -> bool:
         qr_payload = str(printable.get("payload") or "").strip()
         print_index = int(printable.get("next_index") or 0)
         print_kind = str(printable.get("print_kind") or "JOB_PACK").strip().upper()
-        label_kind = "PRODUCT PART" if print_kind == "PRODUCT_PART" else "JOB / PACK"
+        label_kind = (
+            "PRODUCT PART EXCESS" if print_kind == "PRODUCT_PART_EXCESS"
+            else ("PRODUCT PART" if print_kind == "PRODUCT_PART" else ("BUTAL PACK" if print_kind == "BUTAL_PACK" else "JOB / PACK"))
+        )
         if not qr_payload or print_index <= 0:
             self.status.setText("PACK QR print failed: invalid generated payload.")
-            return
+            return False
         # A reprint is intentionally a new printer job even when its QR payload
         # and index are identical (for example, the first label was lost before
         # it could be scanned). Keep each operator request independently queueable.
-        idempotency_key = f"{self._current_client_id()}-{uuid.uuid4()}"
+        idempotency_key = str(printable.get("idempotency_key") or "").strip() or f"{self._current_client_id()}-{uuid.uuid4()}"
         qrgen_base_url = str((self.client_config or {}).get("qrgen_base_url", QRGEN_BASE_URL) or QRGEN_BASE_URL).strip().rstrip("/")
         self.status.setText(f"Sending {label_kind} QR to printer...")
         try:
@@ -21717,6 +22359,7 @@ QWidget#ClientUIRoot {{
                 "qr_payload": qr_payload,
                 "print_job_id": job_id,
                 "duplicate": duplicate,
+                "idempotency_key": idempotency_key,
                 "requested_at_utc": datetime.now(timezone.utc).isoformat(),
                 "operator_id": self.state.operator_id,
             }
@@ -21728,9 +22371,11 @@ QWidget#ClientUIRoot {{
             self._reprint_qr_phase = ""
             self._reprint_product_parts = []
             self._hide_invalid_overlay()
+            return True
         except Exception as exc:
             self.status.setText(f"{label_kind} QR print failed: {exc}")
             self._show_invalid_overlay(f"QR Generator print request failed: {exc}")
+            return False
 
     def _print_next_pack_qr(self):
         if not self.can_accept_production_scans():
@@ -22209,6 +22854,7 @@ QWidget#ClientUIRoot {{
             or bool(s.pending_offline_qr_raw)
             or bool(str(s.reject_multiplier_input or "").strip())
             or bool(getattr(self, "_pending_finish_shift_clear_choice", False))
+            or isinstance(getattr(self, "_pending_finish_excess_payload", None), dict)
             or bool(str(self.__dict__.get("_change_operator_phase", "") or "").strip())
         )
         # Repeated digits are intentional input (11, 1001, etc.). Transport
@@ -22292,6 +22938,10 @@ QWidget#ClientUIRoot {{
         s = self.state
 
         if isinstance(getattr(self, "_pending_final_review_payload", None), dict):
+            if self._pending_final_review_payload.get("excess_verification_completed_at_utc"):
+                self.status.setText("Finish Job cannot be cancelled after excess labels are printed. Supervisor approval is required.")
+                self._show_invalid_overlay("Excess labels are already queued. Scan a Supervisor QR to complete Finish Job.")
+                return True
             self._cancel_pending_finish_job()
             return True
         if bool(getattr(self, "_operator_shift_flash_active", False)):
@@ -24061,6 +24711,15 @@ QWidget#ClientUIRoot {{
         actor_text = str(actor or "").replace("\n", " ").strip() or self._current_app_log_actor()
         if not msg:
             return
+        # These are periodic transport/configuration health messages, not
+        # operator actions. Keeping every poll/retry floods the activity table
+        # and hides useful scan history. Connectivity and retry state still
+        # remain tracked by the durable outbox and server-status fields.
+        if (
+            (src == "SETTINGS" and msg.startswith("QR mapping version ") and msg.endswith(" loaded from server"))
+            or (src == "STATUS" and msg.startswith("Server send failed:"))
+        ):
+            return
         row = {
             "activity_id": f"ACT-{uuid.uuid4().hex.upper()}",
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -24494,11 +25153,13 @@ QWidget#ClientUIRoot {{
             short = t[:117] + "..."
             self.status.setText(short)
             self.status.setToolTip(t)
-            self.log_last(short)
+            if not t.startswith("Server send failed:"):
+                self.log_last(short)
         else:
             self.status.setText(t)
             self.status.setToolTip("")
-            self.log_last(t)
+            if not t.startswith("Server send failed:"):
+                self.log_last(t)
 
     def _setup_scanner_input(self):
         mode = str(self.client_config.get("scanner_mode", SCANNER_MODE)).strip().lower()
@@ -24688,6 +25349,10 @@ QWidget#ClientUIRoot {{
         if self._pending_final_review_payload:
             raw_l = raw_s.lower()
             if raw_l in ("finishjob", "finishjob~1", "jobfinish"):
+                if self._pending_final_review_payload.get("excess_verification_completed_at_utc"):
+                    self.status.setText("Excess labels are already queued. Scan Supervisor QR to complete Finish Job.")
+                    self._show_invalid_overlay("Finish Job cannot be cancelled after label printing.")
+                    return
                 self._cancel_pending_finish_job()
                 return
             if raw_l in ("next", "prev", "previous", "preview"):
@@ -24751,6 +25416,10 @@ QWidget#ClientUIRoot {{
         # through to the reject multiplier.
         self._restore_visible_initial_prompt_state()
         self._repair_initial_setup_state()
+        if self._handle_finish_job_excess_scan(raw_s):
+            if raw_s:
+                self._append_app_log("SCAN", f"QR scanned: {raw_s}")
+            return
         if self._numpad_command_from_scan(raw_s) == "clear":
             if not self._clear_active_typed_input():
                 self.status.setText("Nothing typed to clear. The current workflow is unchanged.")
@@ -26812,10 +27481,13 @@ QWidget#ClientUIRoot {{
                     existing_session_ids.add(parked_session_id)
             # Parked color/mold jobs are closed together, but the operator and
             # supervisor review only the currently displayed job as requested.
-            self._pending_final_review_hidden_payloads = hidden_color_mold_payloads
-            self.status.setText('Finish job summary opened. Scan "next" / "prev", then scan Supervisor QR to approve; scan Finish Job QR to cancel.')
+            self.status.setText("Finish job excess verification opened.")
             self._finish_pending_clear = False
-            self._show_final_job_review_overlay(finished_payload, linked_finished_payloads)
+            self._start_finish_job_excess_review(
+                finished_payload,
+                linked_finished_payloads,
+                hidden_color_mold_payloads,
+            )
             return
 
         if res.kind == "PREPACK_LINKAGE_TRIGGER":
@@ -28585,10 +29257,8 @@ QWidget#ClientUIRoot {{
             self.qrMappingEditor.setPlainText(qr_mapping_config_to_text(QR_MAPPING_CONFIG))
             self.qrMappingEditor.blockSignals(False)
             self._qr_mapping_editor_dirty = False
-        self._append_app_log(
-            "SETTINGS",
-            f"QR mapping version {int(QR_MAPPING_CONFIG.get('version') or 1)} loaded from server",
-        )
+        # Periodic mapping refresh is intentionally silent. Only explicit
+        # refresh failures are shown; successful polls are not audit actions.
 
     def _offline_linkage_relation_key(self, routed_job_code: Any) -> str:
         main_code = self._normalize_job_code(self.state.job_code)

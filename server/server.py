@@ -222,32 +222,32 @@ MACHINE_NAME_MAP: Dict[str, str] = {
     "M00019": "IMM 319",
     "M00020": "IMM 320",
     "M00021": "IMM 321",
-    "M00111": "IMM 411",
-    "M00112": "IMM 412",
-    "M00113": "IMM 413",
-    "M00114": "IMM 414",
-    "M00115": "IMM 415",
-    "M00116": "IMM 416",
-    "M00117": "IMM 417",
-    "M00118": "IMM 418",
-    "M00121": "IMM 421",
-    "M00122": "IMM 422",
-    "M00123": "IMM 423",
-    "M00124": "IMM 424",
-    "M00125": "IMM 425",
-    "M00126": "IMM 426",
-    "M00141": "IMM 441",
-    "M00142": "IMM 442",
-    "M00143": "IMM 443",
-    "M00144": "IMM 444",
+    "M00411": "IMM 411",
+    "M00412": "IMM 412",
+    "M00413": "IMM 413",
+    "M00414": "IMM 414",
+    "M00415": "IMM 415",
+    "M00416": "IMM 416",
+    "M00417": "IMM 417",
+    "M00418": "IMM 418",
+    "M00421": "IMM 421",
+    "M00422": "IMM 422",
+    "M00423": "IMM 423",
+    "M00424": "IMM 424",
+    "M00425": "IMM 425",
+    "M00426": "IMM 426",
+    "M00441": "IMM 441",
+    "M00442": "IMM 442",
+    "M00443": "IMM 443",
+    "M00444": "IMM 444",
     "MT-301": "MT-301",
     "MT-302": "MT-302",
     "MT-303": "MT-303",
 }
 ADDITIONAL_MACHINE_CODES = {
-    "M00111", "M00112", "M00113", "M00114", "M00115", "M00116", "M00117", "M00118",
-    "M00121", "M00122", "M00123", "M00124", "M00125", "M00126",
-    "M00141", "M00142", "M00143", "M00144",
+    "M00411", "M00412", "M00413", "M00414", "M00415", "M00416", "M00417", "M00418",
+    "M00421", "M00422", "M00423", "M00424", "M00425", "M00426",
+    "M00441", "M00442", "M00443", "M00444",
 }
 MIXING_MACHINE_CODES = {"MT-301", "MT-302", "MT-303"}
 SUPERVISOR_BADGES: Dict[str, str] = {"3000001": "Charlie Brown"}
@@ -2110,12 +2110,15 @@ def _normalize_machine_code_from_scan(value: Any) -> str:
         code = f"M{int(digits):05d}"
         return code if code in MACHINE_NAME_MAP else ""
     machine_no = int(digits)
-    if 301 <= machine_no <= 321 or machine_no in {
+    if 301 <= machine_no <= 321:
+        code = f"M{machine_no - 300:05d}"
+        return code if code in MACHINE_NAME_MAP else ""
+    if machine_no in {
         411, 412, 413, 414, 415, 416, 417, 418,
         421, 422, 423, 424, 425, 426,
         441, 442, 443, 444,
     }:
-        code = f"M{machine_no - 300:05d}"
+        code = f"M{machine_no:05d}"
         return code if code in MACHINE_NAME_MAP else ""
     if 1 <= machine_no <= len(MACHINE_NAME_MAP):
         code = f"M{machine_no:05d}"
@@ -3149,8 +3152,6 @@ def _load_machine_activity_logs_sql(
             if until:
                 where_sql += " AND `timestamp_utc` <= %s"
                 params.append(until)
-            cur.execute(f"SELECT COUNT(*) AS total FROM `machine_activity_logs` WHERE {where_sql}", tuple(params))
-            count_row = cur.fetchone() or {}
             cur.execute(
                 f"""
                 SELECT `raw_json` FROM `machine_activity_logs`
@@ -3158,15 +3159,16 @@ def _load_machine_activity_logs_sql(
                 ORDER BY `timestamp_utc` DESC, `activity_id` DESC
                 LIMIT %s
                 """,
-                tuple(params + [safe_limit]),
+                tuple(params + [10000]),
             )
             fetched = cur.fetchall() or []
+        visible = [
+            decoded for decoded in (_sql_decode_json(row.get("raw_json"), {}) for row in fetched)
+            if isinstance(decoded, dict) and not _client_activity_row_is_noise(decoded)
+        ]
         return {
-            "items": [
-                decoded for decoded in (_sql_decode_json(row.get("raw_json"), {}) for row in fetched)
-                if isinstance(decoded, dict)
-            ],
-            "total": int(count_row.get("total") or 0),
+            "items": visible[:safe_limit],
+            "total": len(visible),
         }
     except Exception:
         return None
@@ -6946,6 +6948,11 @@ def load_server_settings() -> Dict[str, Any]:
         seen_codes = set()
         for value in raw_visible:
             code = str(value or "").strip()
+            legacy_factory4 = re.fullmatch(r"M001(\d{2})", code.upper())
+            if legacy_factory4:
+                replacement = f"M004{legacy_factory4.group(1)}"
+                if replacement in MACHINE_NAME_MAP:
+                    code = replacement
             if code and code not in seen_codes:
                 seen_codes.add(code)
                 visible_machine_codes.append(code)
@@ -8544,6 +8551,11 @@ def _stored_production_session_ids(*row_sets: List[Dict[str, Any]]) -> set[str]:
         for row in rows or []:
             if not isinstance(row, dict):
                 continue
+            # FINISH_SHIFT writes a SHIFT_PARTIAL audit record, but the
+            # production run remains open for the next operator.  Only a
+            # finished job may fence a production_session_id permanently.
+            if str(row.get("record_type") or "").strip().upper() == "SHIFT_PARTIAL":
+                continue
             session_id = str(row.get("production_session_id") or "").strip()
             if session_id:
                 session_ids.add(session_id)
@@ -9296,7 +9308,14 @@ def _dashboard_product_part_shortages(row: Dict[str, Any], *, include_prior_part
             if source_is_carryover and include_prior_partials and prior_rows:
                 continue
             if part_keys.intersection(_dashboard_material_identity_keys(raw)):
-                scanned += max(0.0, _parse_number_like(raw.get("qty") or raw.get("quantity")))
+                raw_qty = _parse_number_like(
+                    raw.get("qty") if raw.get("qty") not in (None, "") else raw.get("quantity")
+                )
+                signed_carryover = bool(
+                    source_is_carryover
+                    and str(raw.get("carryover_balance_mode") or "").strip().upper() == "SIGNED_V1"
+                )
+                scanned += raw_qty if signed_carryover else max(0.0, raw_qty)
         for pack in packs:
             consumption = pack.get("raw_part_consumption")
             if not isinstance(consumption, list):
@@ -13328,32 +13347,32 @@ DASHBOARD_HTML = r"""
     "M00019": "IMM 319",
     "M00020": "IMM 320",
     "M00021": "IMM 321",
-    "M00111": "IMM 411",
-    "M00112": "IMM 412",
-    "M00113": "IMM 413",
-    "M00114": "IMM 414",
-    "M00115": "IMM 415",
-    "M00116": "IMM 416",
-    "M00117": "IMM 417",
-    "M00118": "IMM 418",
-    "M00121": "IMM 421",
-    "M00122": "IMM 422",
-    "M00123": "IMM 423",
-    "M00124": "IMM 424",
-    "M00125": "IMM 425",
-    "M00126": "IMM 426",
-    "M00141": "IMM 441",
-    "M00142": "IMM 442",
-    "M00143": "IMM 443",
-    "M00144": "IMM 444",
+    "M00411": "IMM 411",
+    "M00412": "IMM 412",
+    "M00413": "IMM 413",
+    "M00414": "IMM 414",
+    "M00415": "IMM 415",
+    "M00416": "IMM 416",
+    "M00417": "IMM 417",
+    "M00418": "IMM 418",
+    "M00421": "IMM 421",
+    "M00422": "IMM 422",
+    "M00423": "IMM 423",
+    "M00424": "IMM 424",
+    "M00425": "IMM 425",
+    "M00426": "IMM 426",
+    "M00441": "IMM 441",
+    "M00442": "IMM 442",
+    "M00443": "IMM 443",
+    "M00444": "IMM 444",
     "MT-301": "MT-301",
     "MT-302": "MT-302",
     "MT-303": "MT-303",
   };
   const ADDITIONAL_MACHINE_CODES = new Set([
-    "M00111", "M00112", "M00113", "M00114", "M00115", "M00116", "M00117", "M00118",
-    "M00121", "M00122", "M00123", "M00124", "M00125", "M00126",
-    "M00141", "M00142", "M00143", "M00144",
+    "M00411", "M00412", "M00413", "M00414", "M00415", "M00416", "M00417", "M00418",
+    "M00421", "M00422", "M00423", "M00424", "M00425", "M00426",
+    "M00441", "M00442", "M00443", "M00444",
   ]);
   const MIXING_MACHINE_CODES = new Set(["MT-301", "MT-302", "MT-303"]);
   function isMixingMachine(code){
@@ -13369,9 +13388,9 @@ DASHBOARD_HTML = r"""
   const DEFAULT_MACHINE_CODES = Object.keys(MACHINE_NAME_MAP);
   function planningLaneMachineCode(code){
     const machineCode = String(code || "").trim().toUpperCase();
-    const factory4Match = machineCode.match(/^M004(\d{2})$/);
+    const factory4Match = machineCode.match(/^M001(\d{2})$/);
     if(factory4Match){
-      const laneCode = `M001${factory4Match[1]}`;
+      const laneCode = `M004${factory4Match[1]}`;
       if(ADDITIONAL_MACHINE_CODES.has(laneCode)) return laneCode;
     }
     return machineCode;
@@ -25947,12 +25966,25 @@ def _client_activity_id(row: Any) -> str:
     return _machine_activity_id(row)
 
 
+def _client_activity_row_is_noise(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    source = str(row.get("source") or "").strip().upper()
+    message = str(row.get("message") or "").replace("\n", " ").strip()
+    return bool(
+        (source == "SETTINGS" and message.startswith("QR mapping version ") and message.endswith(" loaded from server"))
+        or (source == "STATUS" and message.startswith("Server send failed:"))
+    )
+
+
 def _normalize_client_activity_rows(incoming: Any) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     for raw in incoming or []:
         if not isinstance(raw, dict):
             continue
         row = dict(raw)
+        if _client_activity_row_is_noise(row):
+            continue
         row["activity_id"] = _machine_activity_id(row)
         normalized.append(row)
     return normalized
@@ -26987,7 +27019,11 @@ async def api_machine_client_activity(machine_code: str, limit: int = 400, curre
             "items": stored["items"],
             "total": stored["total"],
         }
-    rows = [dict(row) for row in ((sess.client_app_logs if sess else None) or []) if isinstance(row, dict)]
+    rows = [
+        dict(row)
+        for row in ((sess.client_app_logs if sess else None) or [])
+        if isinstance(row, dict) and not _client_activity_row_is_noise(row)
+    ]
     if shift_started_at:
         started = _parse_iso_utc(shift_started_at)
         if started is not None:
@@ -27738,18 +27774,9 @@ async def api_event(req: Request):
                     row for row in (sess.operator_shift_logs or [])
                     if not (isinstance(row, dict) and _active_shift_segment_key(row, sess) == finished_segment_key)
                 ]
-            finish_matches_active_session = bool(
-                not incoming_session_id
-                or not str(sess.production_session_id or "").strip()
-                or incoming_session_id == str(sess.production_session_id or "").strip()
-            )
-            if closing_session_id:
-                CLOSED_PRODUCTION_SESSION_IDS.add(closing_session_id)
-            if finish_matches_active_session and machine_code in SESSIONS:
-                # Acknowledged Finish Shift closes this exact production run.
-                # The next scan starts with a fresh ID and zero counters.
-                del SESSIONS[machine_code]
-                _remove_persisted_active_session(machine_code)
+            # FINISH_SHIFT closes only the operator's shift segment. Keep the
+            # machine production session alive so the next operator continues
+            # the same job, counters, and production_session_id.
         if created_session_for_event and machine_code in SESSIONS and not str(SESSIONS[machine_code].job_code or "").strip():
             del SESSIONS[machine_code]
     elif ev_type == "FINISH_JOB":
