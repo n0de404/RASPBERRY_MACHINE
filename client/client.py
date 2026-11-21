@@ -8568,17 +8568,17 @@ QWidget#ClientUIRoot {{
         self.finishInventoryOverlay = QFrame(self)
         self.finishInventoryOverlay.setObjectName("FinishInventoryOverlay")
         self.finishInventoryOverlay.setLayout(QVBoxLayout())
-        self.finishInventoryOverlay.layout().setContentsMargins(14, 12, 14, 12)
-        self.finishInventoryOverlay.layout().setSpacing(8)
+        self.finishInventoryOverlay.layout().setContentsMargins(12, 10, 12, 10)
+        self.finishInventoryOverlay.layout().setSpacing(6)
         self.finishInventoryOverlay.setStyleSheet(
             "QFrame#FinishInventoryOverlay { background:#171b24; border:1px solid #4a5468; border-radius:16px; }"
             "QLabel { background:transparent; border:none; color:#eef2f8; font-family:'Segoe UI'; }"
-            "QLabel#FinishInventoryTitle { font-size:28px; font-weight:700; }"
-            "QLabel#FinishInventoryBadge { background:#0d4f93; border:1px solid #3b8ee8; border-radius:12px; padding:4px 12px; font-size:15px; font-weight:700; }"
-            "QLabel#FinishInventoryInstruction { background:#1167c7; border:none; border-radius:7px; padding:4px 10px; font-size:16px; font-weight:600; }"
-            "QLabel#FinishInventorySection { color:#eef2f8; font-size:19px; font-weight:700; }"
-            "QLabel#FinishInventoryRule { color:#dbeafe; font-size:15px; font-weight:600; }"
-            "QLabel#FinishInventoryFooter { background:#242a36; border:1px solid #364052; border-radius:8px; padding:6px 10px; color:#dbeafe; font-size:14px; font-weight:600; }"
+            "QLabel#FinishInventoryTitle { font-size:24px; font-weight:700; }"
+            "QLabel#FinishInventoryBadge { background:#0d4f93; border:1px solid #3b8ee8; border-radius:10px; padding:3px 10px; font-size:13px; font-weight:700; }"
+            "QLabel#FinishInventoryInstruction { background:#1167c7; border:none; border-radius:6px; padding:3px 9px; font-size:14px; font-weight:600; }"
+            "QLabel#FinishInventorySection { color:#eef2f8; font-size:16px; font-weight:700; }"
+            "QLabel#FinishInventoryRule { color:#dbeafe; font-size:13px; font-weight:600; }"
+            "QLabel#FinishInventoryFooter { background:transparent; border:none; padding:3px 4px; color:#dbeafe; font-size:12px; font-weight:600; }"
         )
 
         title_row = QWidget()
@@ -8600,16 +8600,16 @@ QWidget#ClientUIRoot {{
         )
         self.finishInventoryInstruction.setObjectName("FinishInventoryInstruction")
         self.finishInventoryInstruction.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.finishInventoryInstruction.setFixedHeight(34)
+        self.finishInventoryInstruction.setFixedHeight(30)
         self.finishInventoryOverlay.layout().addWidget(self.finishInventoryInstruction)
 
         summary_section = QFrame()
         summary_section.setStyleSheet(
-            "QFrame { background:#1c212b; border:1px solid #364052; border-radius:9px; }"
+            "QFrame { background:transparent; border:none; }"
         )
         summary_section.setLayout(QVBoxLayout())
-        summary_section.layout().setContentsMargins(10, 7, 10, 9)
-        summary_section.layout().setSpacing(5)
+        summary_section.layout().setContentsMargins(4, 2, 4, 4)
+        summary_section.layout().setSpacing(2)
         summary_title = QLabel("JOB SUMMARY")
         summary_title.setObjectName("FinishInventorySection")
         summary_section.layout().addWidget(summary_title)
@@ -8622,12 +8622,12 @@ QWidget#ClientUIRoot {{
         for key, title in (("job", "JOB"), ("mold", "MOLD"), ("product_sku", "PRODUCT SKU"), ("color", "COLOR")):
             card = QFrame()
             card.setStyleSheet(
-                "QFrame { background:#242a36; border:1px solid #465267; border-radius:7px; }"
-                "QLabel[role='caption'] { color:#9aa6ba; font-size:13px; font-weight:600; }"
-                "QLabel[role='value'] { color:#eef2f8; font-size:19px; font-weight:700; }"
+                "QFrame { background:transparent; border:none; }"
+                "QLabel[role='caption'] { color:#9aa6ba; font-size:11px; font-weight:600; }"
+                "QLabel[role='value'] { color:#eef2f8; font-size:17px; font-weight:700; }"
             )
             card.setLayout(QVBoxLayout())
-            card.layout().setContentsMargins(10, 6, 10, 7)
+            card.layout().setContentsMargins(8, 2, 8, 3)
             card.layout().setSpacing(1)
             caption = QLabel(title)
             caption.setProperty("role", "caption")
@@ -8639,18 +8639,18 @@ QWidget#ClientUIRoot {{
             summary_cards.layout().addWidget(card, 1)
             self.finishInventorySummaryLabels[key] = value
         summary_section.layout().addWidget(summary_cards)
-        summary_section.setFixedHeight(116)
+        summary_section.setFixedHeight(72)
         self.finishInventoryOverlay.layout().addWidget(summary_section)
 
         totals_section = QFrame()
         totals_section.setStyleSheet(
-            "QFrame { background:#1c212b; border:1px solid #364052; border-radius:9px; }"
+            "QFrame { background:transparent; border:none; }"
         )
         totals_section.setLayout(QHBoxLayout())
-        totals_section.layout().setContentsMargins(10, 7, 10, 7)
-        totals_section.layout().setSpacing(8)
+        totals_section.layout().setContentsMargins(4, 3, 4, 3)
+        totals_section.layout().setSpacing(6)
         totals_title = QLabel("ALL-SHIFT TOTALS\nCompleted shifts + current shift")
-        totals_title.setStyleSheet("color:#eef2f8; font-size:17px; font-weight:700;")
+        totals_title.setStyleSheet("color:#eef2f8; font-size:14px; font-weight:700;")
         totals_section.layout().addWidget(totals_title, 2)
         self.finishInventoryTotalLabels: Dict[str, QLabel] = {}
         total_colors = {
@@ -8664,11 +8664,11 @@ QWidget#ClientUIRoot {{
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setStyleSheet(
                 f"background:{background}; border:1px solid {border}; border-radius:7px; "
-                "color:#ffffff; font-size:20px; font-weight:700; padding:7px 10px;"
+                "color:#ffffff; font-size:17px; font-weight:700; padding:5px 8px;"
             )
             totals_section.layout().addWidget(label, 1)
             self.finishInventoryTotalLabels[key] = label
-        totals_section.setFixedHeight(70)
+        totals_section.setFixedHeight(52)
         self.finishInventoryOverlay.layout().addWidget(totals_section)
 
         table_title = QLabel("RETURN INVENTORY — BUTAL + PRODUCT PART EXCESS")
@@ -8694,16 +8694,18 @@ QWidget#ClientUIRoot {{
             )
         self.finishInventoryTable.horizontalHeader().setFixedHeight(42)
         self.finishInventoryTable.setStyleSheet(
-            "QTableWidget { background:#1c212b; border:1px solid #364052; border-radius:9px; color:#eef2f8; }"
+            "QTableWidget { background:#1c212b; border:1px solid #364052; border-radius:7px; color:#eef2f8; }"
             "QHeaderView::section { background:#33405a; color:#dbeafe; border:none; border-right:1px solid #4a5468; padding:5px; font-size:13px; font-weight:700; }"
             "QTableWidget::item { border:none; border-bottom:1px solid #364052; padding:6px; font-size:14px; font-weight:600; }"
         )
+        self.finishInventoryTable.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.finishInventoryTable.setFixedHeight(100)
         self.finishInventoryOverlay.layout().addWidget(self.finishInventoryTable, 1)
 
         self.finishInventorySavedHint = QLabel(
             "Saved with Finish Job: expected balance • optional actual count • difference • printed quantity"
         )
-        self.finishInventorySavedHint.setStyleSheet("color:#bbf7d0; font-size:13px; font-weight:600;")
+        self.finishInventorySavedHint.setStyleSheet("color:#bbf7d0; font-size:11px; font-weight:600;")
         self.finishInventoryOverlay.layout().addWidget(self.finishInventorySavedHint)
         self.finishInventoryRule = QLabel(
             "Blank Actual = print Expected Balance     |     Entered Actual = print Actual Count"
@@ -8727,12 +8729,13 @@ QWidget#ClientUIRoot {{
         self.finishInventoryConfirm.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishInventoryConfirm.setStyleSheet(
             "background:#166534; border:1px solid #22c55e; border-radius:8px; "
-            "color:#ffffff; font-size:15px; font-weight:700; padding:7px 12px;"
+            "color:#ffffff; font-size:13px; font-weight:700; padding:5px 10px;"
         )
         footer.layout().addWidget(nav)
         footer.layout().addWidget(decimal, 1)
         footer.layout().addWidget(self.finishInventoryProgress)
         footer.layout().addWidget(self.finishInventoryConfirm)
+        footer.setFixedHeight(34)
         self.finishInventoryOverlay.layout().addWidget(footer)
         self.finishInventoryOverlay.hide()
         self.finishInventoryOverlay.raise_()
@@ -8740,8 +8743,10 @@ QWidget#ClientUIRoot {{
     def _position_finish_inventory_overlay(self) -> None:
         if not hasattr(self, "finishInventoryOverlay"):
             return
-        w = max(1, min(1540, self.width() - 28))
-        h = max(1, min(860, self.height() - 28))
+        row_count = len(getattr(self, "_pending_finish_excess_rows", []) or [])
+        w = max(1, min(1240, self.width() - 48))
+        desired_h = 310 + (max(1, row_count) * 54)
+        h = max(1, min(max(395, desired_h), 720, self.height() - 48))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.finishInventoryOverlay.setGeometry(x, y, w, h)
@@ -10379,10 +10384,15 @@ QWidget#ClientUIRoot {{
                     item.setForeground(QColor("#eef2f8"))
                 table.setItem(index, column, item)
             table.setRowHeight(index, 54)
+        # Keep this modal content-sized. The table only reserves space for the
+        # rows that actually exist instead of stretching into a large empty box.
+        visible_rows = max(1, len(rows))
+        table.setFixedHeight(46 + (visible_rows * 54))
         self._pending_finish_excess_ready_to_print = True
         self.finishInventoryProgress.setText(
             f"ROW {selected + 1} OF {len(rows)}" if rows else "NO RETURN ROWS"
         )
+        self._position_finish_inventory_overlay()
 
     def _start_finish_job_excess_review(
         self,
