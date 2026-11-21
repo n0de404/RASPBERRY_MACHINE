@@ -75,7 +75,8 @@ class ChoiceOverlayCacheTests(unittest.TestCase):
                 "expected_qty": 12.5,
                 "actual_qty": 10.25,
                 "difference_qty": -2.25,
-                "status": "SHORT",
+                "print_qty": 10.25,
+                "status": "ACTUAL SAVED",
                 "input": "10.25",
                 "unit": "kg",
             }]
@@ -84,14 +85,10 @@ class ChoiceOverlayCacheTests(unittest.TestCase):
 
             ui._render_finish_job_excess_review()
 
-            cells = [
-                label.text()
-                for label in ui.finishReviewParts.findChildren(QLabel)
-                if label.property("role") == "cell"
-            ]
-            self.assertEqual(cells[2], "12.5 kg")
-            self.assertEqual(cells[3], "10.25 kg")
-            self.assertEqual(cells[4], "-2.25")
+            self.assertEqual(ui.finishInventoryTable.item(0, 3).text(), "12.5 kg")
+            self.assertEqual(ui.finishInventoryTable.item(0, 4).text(), "10.25 kg")
+            self.assertEqual(ui.finishInventoryTable.item(0, 5).text(), "10.25 kg")
+            self.assertEqual(ui.finishInventoryTable.item(0, 6).text(), "-2.25 kg")
         finally:
             ui.close()
             ui.deleteLater()

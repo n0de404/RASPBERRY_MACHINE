@@ -6352,6 +6352,7 @@ QWidget#ClientUIRoot {{
             label.setFont(label_font)
         self.finishOverlay.hide()
         self.finishOverlay.raise_()
+        self._build_finish_inventory_overlay()
         self._finish_anim_timer = QTimer(self)
         self._finish_anim_timer.setInterval(max(75, HEAVY_ANIM_INTERVAL_MS))
         self._finish_anim_timer.timeout.connect(self._tick_finish_anim)
@@ -7170,6 +7171,7 @@ QWidget#ClientUIRoot {{
         self._position_floating_pack_qr_panel()
         self._position_reject_review_overlay()
         self._position_finish_overlay()
+        self._position_finish_inventory_overlay()
         self._position_bms_loading_overlay()
         self._sync_machine_status_pulse_overlay()
         self._apply_production_timer_fonts()
@@ -8560,6 +8562,189 @@ QWidget#ClientUIRoot {{
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.finishOverlay.setGeometry(x, y, w, h)
+
+    def _build_finish_inventory_overlay(self) -> None:
+        """Build the dedicated, single-screen Finish Job return inventory modal."""
+        self.finishInventoryOverlay = QFrame(self)
+        self.finishInventoryOverlay.setObjectName("FinishInventoryOverlay")
+        self.finishInventoryOverlay.setLayout(QVBoxLayout())
+        self.finishInventoryOverlay.layout().setContentsMargins(14, 12, 14, 12)
+        self.finishInventoryOverlay.layout().setSpacing(8)
+        self.finishInventoryOverlay.setStyleSheet(
+            "QFrame#FinishInventoryOverlay { background:#171b24; border:1px solid #4a5468; border-radius:16px; }"
+            "QLabel { background:transparent; border:none; color:#eef2f8; font-family:'Segoe UI'; }"
+            "QLabel#FinishInventoryTitle { font-size:28px; font-weight:700; }"
+            "QLabel#FinishInventoryBadge { background:#0d4f93; border:1px solid #3b8ee8; border-radius:12px; padding:4px 12px; font-size:15px; font-weight:700; }"
+            "QLabel#FinishInventoryInstruction { background:#1167c7; border:none; border-radius:7px; padding:4px 10px; font-size:16px; font-weight:600; }"
+            "QLabel#FinishInventorySection { color:#eef2f8; font-size:19px; font-weight:700; }"
+            "QLabel#FinishInventoryRule { color:#dbeafe; font-size:15px; font-weight:600; }"
+            "QLabel#FinishInventoryFooter { background:#242a36; border:1px solid #364052; border-radius:8px; padding:6px 10px; color:#dbeafe; font-size:14px; font-weight:600; }"
+        )
+
+        title_row = QWidget()
+        title_row.setStyleSheet("background:transparent; border:none;")
+        title_row.setLayout(QHBoxLayout())
+        title_row.layout().setContentsMargins(4, 0, 4, 0)
+        title_row.layout().setSpacing(10)
+        self.finishInventoryTitle = QLabel("FINISH JOB INVENTORY CHECK")
+        self.finishInventoryTitle.setObjectName("FinishInventoryTitle")
+        self.finishInventoryBadge = QLabel("SUPERVISOR CHECK")
+        self.finishInventoryBadge.setObjectName("FinishInventoryBadge")
+        title_row.layout().addWidget(self.finishInventoryTitle)
+        title_row.layout().addStretch(1)
+        title_row.layout().addWidget(self.finishInventoryBadge)
+        self.finishInventoryOverlay.layout().addWidget(title_row)
+
+        self.finishInventoryInstruction = QLabel(
+            "Review expected returns. Actual count is optional; blank rows print the expected balance."
+        )
+        self.finishInventoryInstruction.setObjectName("FinishInventoryInstruction")
+        self.finishInventoryInstruction.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.finishInventoryInstruction.setFixedHeight(34)
+        self.finishInventoryOverlay.layout().addWidget(self.finishInventoryInstruction)
+
+        summary_section = QFrame()
+        summary_section.setStyleSheet(
+            "QFrame { background:#1c212b; border:1px solid #364052; border-radius:9px; }"
+        )
+        summary_section.setLayout(QVBoxLayout())
+        summary_section.layout().setContentsMargins(10, 7, 10, 9)
+        summary_section.layout().setSpacing(5)
+        summary_title = QLabel("JOB SUMMARY")
+        summary_title.setObjectName("FinishInventorySection")
+        summary_section.layout().addWidget(summary_title)
+        summary_cards = QWidget()
+        summary_cards.setStyleSheet("background:transparent; border:none;")
+        summary_cards.setLayout(QHBoxLayout())
+        summary_cards.layout().setContentsMargins(0, 0, 0, 0)
+        summary_cards.layout().setSpacing(8)
+        self.finishInventorySummaryLabels: Dict[str, QLabel] = {}
+        for key, title in (("job", "JOB"), ("mold", "MOLD"), ("product_sku", "PRODUCT SKU"), ("color", "COLOR")):
+            card = QFrame()
+            card.setStyleSheet(
+                "QFrame { background:#242a36; border:1px solid #465267; border-radius:7px; }"
+                "QLabel[role='caption'] { color:#9aa6ba; font-size:13px; font-weight:600; }"
+                "QLabel[role='value'] { color:#eef2f8; font-size:19px; font-weight:700; }"
+            )
+            card.setLayout(QVBoxLayout())
+            card.layout().setContentsMargins(10, 6, 10, 7)
+            card.layout().setSpacing(1)
+            caption = QLabel(title)
+            caption.setProperty("role", "caption")
+            value = QLabel("-")
+            value.setProperty("role", "value")
+            value.setWordWrap(True)
+            card.layout().addWidget(caption)
+            card.layout().addWidget(value, 1)
+            summary_cards.layout().addWidget(card, 1)
+            self.finishInventorySummaryLabels[key] = value
+        summary_section.layout().addWidget(summary_cards)
+        summary_section.setFixedHeight(116)
+        self.finishInventoryOverlay.layout().addWidget(summary_section)
+
+        totals_section = QFrame()
+        totals_section.setStyleSheet(
+            "QFrame { background:#1c212b; border:1px solid #364052; border-radius:9px; }"
+        )
+        totals_section.setLayout(QHBoxLayout())
+        totals_section.layout().setContentsMargins(10, 7, 10, 7)
+        totals_section.layout().setSpacing(8)
+        totals_title = QLabel("ALL-SHIFT TOTALS\nCompleted shifts + current shift")
+        totals_title.setStyleSheet("color:#eef2f8; font-size:17px; font-weight:700;")
+        totals_section.layout().addWidget(totals_title, 2)
+        self.finishInventoryTotalLabels: Dict[str, QLabel] = {}
+        total_colors = {
+            "packs": ("PACKS", "#0d4f93", "#3b8ee8"),
+            "good": ("GOOD", "#166534", "#22c55e"),
+            "reject": ("REJECT", "#7f1d1d", "#ef4444"),
+            "butal": ("BUTAL", "#854d0e", "#f59e0b"),
+        }
+        for key, (title, background, border) in total_colors.items():
+            label = QLabel(f"{title}  0")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setStyleSheet(
+                f"background:{background}; border:1px solid {border}; border-radius:7px; "
+                "color:#ffffff; font-size:20px; font-weight:700; padding:7px 10px;"
+            )
+            totals_section.layout().addWidget(label, 1)
+            self.finishInventoryTotalLabels[key] = label
+        totals_section.setFixedHeight(70)
+        self.finishInventoryOverlay.layout().addWidget(totals_section)
+
+        table_title = QLabel("RETURN INVENTORY — BUTAL + PRODUCT PART EXCESS")
+        table_title.setObjectName("FinishInventorySection")
+        self.finishInventoryOverlay.layout().addWidget(table_title)
+        self.finishInventoryTable = QTableWidget(0, 8)
+        self.finishInventoryTable.setHorizontalHeaderLabels([
+            "#", "RETURN TYPE", "SKU / QR PRODUCT", "EXPECTED BALANCE",
+            "ACTUAL COUNT (OPTIONAL)", "PRINT QTY", "DIFFERENCE", "STATUS",
+        ])
+        self.finishInventoryTable.verticalHeader().setVisible(False)
+        self.finishInventoryTable.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.finishInventoryTable.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.finishInventoryTable.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.finishInventoryTable.setWordWrap(True)
+        self.finishInventoryTable.setShowGrid(False)
+        self.finishInventoryTable.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.finishInventoryTable.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        for column in range(8):
+            self.finishInventoryTable.horizontalHeader().setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.Stretch if column == 2 else QHeaderView.ResizeMode.ResizeToContents,
+            )
+        self.finishInventoryTable.horizontalHeader().setFixedHeight(42)
+        self.finishInventoryTable.setStyleSheet(
+            "QTableWidget { background:#1c212b; border:1px solid #364052; border-radius:9px; color:#eef2f8; }"
+            "QHeaderView::section { background:#33405a; color:#dbeafe; border:none; border-right:1px solid #4a5468; padding:5px; font-size:13px; font-weight:700; }"
+            "QTableWidget::item { border:none; border-bottom:1px solid #364052; padding:6px; font-size:14px; font-weight:600; }"
+        )
+        self.finishInventoryOverlay.layout().addWidget(self.finishInventoryTable, 1)
+
+        self.finishInventorySavedHint = QLabel(
+            "Saved with Finish Job: expected balance • optional actual count • difference • printed quantity"
+        )
+        self.finishInventorySavedHint.setStyleSheet("color:#bbf7d0; font-size:13px; font-weight:600;")
+        self.finishInventoryOverlay.layout().addWidget(self.finishInventorySavedHint)
+        self.finishInventoryRule = QLabel(
+            "Blank Actual = print Expected Balance     |     Entered Actual = print Actual Count"
+        )
+        self.finishInventoryRule.setObjectName("FinishInventoryRule")
+        self.finishInventoryRule.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.finishInventoryOverlay.layout().addWidget(self.finishInventoryRule)
+
+        footer = QWidget()
+        footer.setStyleSheet("background:transparent; border:none;")
+        footer.setLayout(QHBoxLayout())
+        footer.layout().setContentsMargins(0, 0, 0, 0)
+        footer.layout().setSpacing(8)
+        nav = QLabel("Scan PREV / NEXT to select a row")
+        nav.setObjectName("FinishInventoryFooter")
+        decimal = QLabel("Numpad enters Actual • Custom 01 adds decimal • BACKSPACE corrects")
+        decimal.setObjectName("FinishInventoryFooter")
+        self.finishInventoryProgress = QLabel("ROW 0 OF 0")
+        self.finishInventoryProgress.setObjectName("FinishInventoryFooter")
+        self.finishInventoryConfirm = QLabel("SCAN CONFIRM — PRINT ALL RETURN QRs")
+        self.finishInventoryConfirm.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.finishInventoryConfirm.setStyleSheet(
+            "background:#166534; border:1px solid #22c55e; border-radius:8px; "
+            "color:#ffffff; font-size:15px; font-weight:700; padding:7px 12px;"
+        )
+        footer.layout().addWidget(nav)
+        footer.layout().addWidget(decimal, 1)
+        footer.layout().addWidget(self.finishInventoryProgress)
+        footer.layout().addWidget(self.finishInventoryConfirm)
+        self.finishInventoryOverlay.layout().addWidget(footer)
+        self.finishInventoryOverlay.hide()
+        self.finishInventoryOverlay.raise_()
+
+    def _position_finish_inventory_overlay(self) -> None:
+        if not hasattr(self, "finishInventoryOverlay"):
+            return
+        w = max(1, min(1540, self.width() - 28))
+        h = max(1, min(860, self.height() - 28))
+        x = max(0, (self.width() - w) // 2)
+        y = max(0, (self.height() - h) // 2)
+        self.finishInventoryOverlay.setGeometry(x, y, w, h)
 
     def _set_finish_review_page_info(self):
         total_pages = max(1, int(getattr(self, "_finish_review_total_pages", 1) or 1))
@@ -10029,7 +10214,6 @@ QWidget#ClientUIRoot {{
         payload = dict(finished_payload or {})
         machine_code = str(payload.get("machine_code") or "").strip().upper()
         job_code = self._normalize_job_code(payload.get("job_code"))
-        client_id = str(payload.get("client_id") or self._current_client_id()).strip()
         latest_final_at = ""
         for row in _load_finished_jobs_json():
             if not isinstance(row, dict):
@@ -10049,9 +10233,6 @@ QWidget#ClientUIRoot {{
             if str(row.get("machine_code") or "").strip().upper() != machine_code:
                 continue
             if self._normalize_job_code(row.get("job_code")) != job_code:
-                continue
-            row_client = str(row.get("client_id") or "").strip()
-            if row_client and client_id and row_client != client_id:
                 continue
             status = str(row.get("review_status") or "").strip().upper()
             if status not in {REVIEW_STATUS_APPROVED, REVIEW_STATUS_CLOSED}:
@@ -10076,9 +10257,27 @@ QWidget#ClientUIRoot {{
         return combined
 
     def _finish_job_excess_rows(self) -> List[Dict[str, Any]]:
+        payload = dict(self._pending_finish_excess_payload or {})
         parts = [dict(row) for row in self._job_part_rows() if isinstance(row, dict)]
         statuses = self._current_part_availability_statuses()
         rows: List[Dict[str, Any]] = []
+        combined = payload.get("job_combined_totals") if isinstance(payload.get("job_combined_totals"), dict) else {}
+        butal_qty = max(0.0, self._parse_number(combined.get("butal_total", payload.get("butal_total"))))
+        if butal_qty > 0:
+            rows.append({
+                "identity": "BUTAL_PACK",
+                "return_type": "BUTAL PACK",
+                "product_id": str(payload.get("product_id") or "").strip(),
+                "sku": str(payload.get("product_sku") or payload.get("product_name") or "PACK QR").strip(),
+                "name": str(payload.get("product_name") or payload.get("job_name") or "Butal Pack").strip(),
+                "unit": "pcs",
+                "expected_qty": round(butal_qty, 6),
+                "actual_qty": None,
+                "difference_qty": None,
+                "print_qty": round(butal_qty, 6),
+                "status": "USES EXPECTED",
+                "input": "",
+            })
         seen: Set[str] = set()
         for status in statuses:
             status_keys = set(status.get("keys") or set())
@@ -10098,6 +10297,7 @@ QWidget#ClientUIRoot {{
             seen.add(identity)
             rows.append({
                 "identity": identity,
+                "return_type": "PRODUCT PART",
                 "part": dict(part),
                 "product_id": str(part.get("part_product_id") or part.get("product_id") or "").strip(),
                 "sku": str(part.get("sku") or part.get("part_sku") or status.get("name") or identity).strip(),
@@ -10106,63 +10306,83 @@ QWidget#ClientUIRoot {{
                 "expected_qty": round(float(status.get("available_qty") or 0.0), 6),
                 "actual_qty": None,
                 "difference_qty": None,
-                "status": "PENDING",
+                "print_qty": round(max(0.0, float(status.get("available_qty") or 0.0)), 6),
+                "status": "USES EXPECTED" if float(status.get("available_qty") or 0.0) > 0 else "NO RETURN",
                 "input": "",
             })
         return rows
+
+    def _apply_finish_inventory_actual_input(self, row: Dict[str, Any]) -> bool:
+        text = str(row.get("input") or "").strip()
+        expected = round(self._parse_number(row.get("expected_qty")), 6)
+        if not text:
+            row["actual_qty"] = None
+            row["difference_qty"] = None
+            row["print_qty"] = max(0.0, expected)
+            row["status"] = "USES EXPECTED" if expected > 0 else "NO RETURN"
+            row["actual_recorded_at_utc"] = None
+            return True
+        if not re.fullmatch(r"\d+(?:\.\d{0,3})?", text) or text.endswith("."):
+            return False
+        actual = round(max(0.0, float(text)), 6)
+        row["actual_qty"] = actual
+        row["difference_qty"] = round(actual - expected, 6)
+        row["print_qty"] = actual
+        row["status"] = "ACTUAL SAVED"
+        row["actual_recorded_at_utc"] = datetime.now(timezone.utc).isoformat()
+        return True
 
     def _render_finish_job_excess_review(self) -> None:
         rows = list(self._pending_finish_excess_rows or [])
         selected = max(0, min(int(self._pending_finish_excess_index or 0), max(0, len(rows) - 1)))
         self._pending_finish_excess_index = selected
-        table_rows: List[List[str]] = []
+        table = self.finishInventoryTable
+        table.setRowCount(len(rows))
         for index, row in enumerate(rows):
             expected = float(row.get("expected_qty") or 0.0)
             actual = row.get("actual_qty")
             difference = row.get("difference_qty")
-            status = str(row.get("status") or "PENDING")
-            if row.get("variance_reason"):
-                status = f"{status}: {row.get('variance_reason')}"
-            actual_text = str(row.get("input") or "") if index == selected and actual is None else (
-                "-" if actual is None else self._format_compact_number(actual)
+            unit = str(row.get("unit") or "").strip()
+            actual_input = str(row.get("input") or "").strip()
+            actual_text = (
+                f"{actual_input} {unit}".strip()
+                if actual_input
+                else "OPTIONAL — blank"
             )
-            table_rows.append([
+            print_qty = self._parse_number(row.get("print_qty", expected))
+            values = [
                 f"> {index + 1}" if index == selected else str(index + 1),
+                str(row.get("return_type") or "PRODUCT PART"),
                 str(row.get("sku") or row.get("name") or "-"),
-                f"{self._format_compact_number(expected)} {row.get('unit') or ''}".strip(),
-                f"{actual_text} {row.get('unit') or ''}".strip(),
-                "-" if difference is None else self._format_compact_number(difference),
-                status,
-            ])
-        if not table_rows:
-            table_rows = [["-", "No product parts to return", "0", "0", "0", "READY"]]
-        self.finishReviewParts._finish_headers = [
-            "#", "Product Part", "Expected Excess", "Actual Excess", "Difference", "Status"
-        ]
-        self.finishReviewParts._finish_stretch_rows = False
-        self._set_finish_summary_table_rows(self.finishReviewParts, table_rows)
-        if getattr(self.finishReviewParts, "_finish_title_label", None) is not None:
-            self.finishReviewParts._finish_title_label.setText("Product-Part Excess Verification")
-        if self._pending_finish_excess_ready_to_print:
-            self.finishStatus.setText("Counts verified. Ready to print return labels.")
-            self.finishReviewHint.setText("Review Expected / Actual / Difference, then scan confirm to print.")
-        elif rows:
-            current = rows[selected]
-            self.finishStatus.setText(
-                f"Part {selected + 1} of {len(rows)}: {current.get('sku') or current.get('name')}"
-            )
-            if current.get("reason_required"):
-                self.finishReviewHint.setText(
-                    "Difference reason: 1 Counting  2 Damaged  3 Missing  4 Extra  5 Unrecorded use  6 Other"
-                )
-            else:
-                self.finishReviewHint.setText(
-                    "Enter the physical excess with numpad, then scan confirm. Use backspace to correct."
-                )
-        else:
-            self._pending_finish_excess_ready_to_print = True
-            self.finishStatus.setText("No product-part excess count is required.")
-            self.finishReviewHint.setText("Scan confirm to continue and print any remaining Butal label.")
+                f"{self._format_compact_number(expected)} {unit}".strip(),
+                actual_text,
+                f"{self._format_compact_number(print_qty)} {unit}".strip(),
+                "—" if difference is None else f"{self._format_compact_number(difference)} {unit}".strip(),
+                str(row.get("status") or ("ACTUAL SAVED" if actual is not None else "USES EXPECTED")),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                if column == 2:
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
+                if index == selected:
+                    item.setBackground(QColor("#12365a"))
+                elif str(row.get("return_type")) == "BUTAL PACK":
+                    item.setBackground(QColor("#3b2b12"))
+                else:
+                    item.setBackground(QColor("#242a36"))
+                if column in (3, 5):
+                    item.setForeground(QColor("#bbf7d0"))
+                elif column == 7:
+                    item.setForeground(QColor("#86efac"))
+                else:
+                    item.setForeground(QColor("#eef2f8"))
+                table.setItem(index, column, item)
+            table.setRowHeight(index, 54)
+        self._pending_finish_excess_ready_to_print = True
+        self.finishInventoryProgress.setText(
+            f"ROW {selected + 1} OF {len(rows)}" if rows else "NO RETURN ROWS"
+        )
 
     def _start_finish_job_excess_review(
         self,
@@ -10182,26 +10402,42 @@ QWidget#ClientUIRoot {{
         self._pending_finish_excess_rows = self._finish_job_excess_rows()
         self._pending_finish_excess_index = 0
         self._pending_finish_excess_input = ""
-        self._pending_finish_excess_ready_to_print = not bool(self._pending_finish_excess_rows)
-        display_payload = dict(payload)
-        display_payload.update(payload.get("job_combined_totals") or {})
-        self.finishOverlay.setStyleSheet(self._finish_review_stylesheet)
-        self._position_finish_overlay()
+        self._pending_finish_excess_ready_to_print = True
+        self.finishInventoryInstruction.setText(
+            "Review expected returns. Actual count is optional; blank rows print the expected balance."
+        )
+        job_payload = payload.get("job_payload") if isinstance(payload.get("job_payload"), dict) else {}
+        ctx = self._extract_job_payload_context(job_payload)
+        job = ctx.get("job") if isinstance(ctx.get("job"), dict) else {}
+        job_details = ctx.get("job_details") if isinstance(ctx.get("job_details"), dict) else {}
+        self.finishInventorySummaryLabels["job"].setText(
+            self._safe_text(payload.get("job_name") or payload.get("job_code"), "-")
+        )
+        self.finishInventorySummaryLabels["mold"].setText(
+            self._safe_text(job_details.get("mold") or job.get("custom_05"), "-")
+        )
+        self.finishInventorySummaryLabels["product_sku"].setText(
+            self._safe_text(payload.get("product_sku") or job_details.get("product_sku") or job.get("product_sku"), "-")
+        )
+        self.finishInventorySummaryLabels["color"].setText(
+            self._safe_text(job_details.get("color") or job.get("custom_06"), "-")
+        )
+        combined = payload.get("job_combined_totals") or {}
+        total_values = {
+            "packs": ("PACKS", combined.get("pack_count", 0)),
+            "good": ("GOOD", combined.get("good_total", 0)),
+            "reject": ("REJECT", combined.get("reject_total", 0)),
+            "butal": ("BUTAL", combined.get("butal_total", 0)),
+        }
+        for key, (caption, value) in total_values.items():
+            self.finishInventoryTotalLabels[key].setText(f"{caption}  {int(self._parse_number(value)):,}")
+        self.finishOverlay.hide()
+        self._position_finish_inventory_overlay()
         self._set_background_blur(True)
-        self.finishTitle.setText("Finish job excess check")
-        self.finishProgressBar.hide()
-        self.finishSummaryScroll.show()
-        self.finishReviewHint.show()
-        self.finishReviewPageInfo.show()
-        self.finishSuccessRow.hide()
-        self._finish_review_page_index = 0
-        self._populate_finish_shift_summary(display_payload)
         self._render_finish_job_excess_review()
-        self.finishSummaryStack.setCurrentIndex(0)
-        self._set_finish_review_page_info()
-        self.finishOverlay.show()
-        self.finishOverlay.raise_()
-        self.status.setText("Finish Job excess check opened. Review combined totals, then enter actual excess quantities.")
+        self.finishInventoryOverlay.show()
+        self.finishInventoryOverlay.raise_()
+        self.status.setText("Finish Job inventory check opened. Actual counts are optional; scan confirm to print returns.")
 
     def _clear_finish_job_excess_review(self) -> None:
         self._pending_finish_excess_payload = None
@@ -10211,39 +10447,21 @@ QWidget#ClientUIRoot {{
         self._pending_finish_excess_index = 0
         self._pending_finish_excess_input = ""
         self._pending_finish_excess_ready_to_print = False
+        inventory_overlay = self.__dict__.get("finishInventoryOverlay")
+        if inventory_overlay is not None:
+            inventory_overlay.hide()
+            if not self._should_keep_background_blur():
+                self._set_background_blur(False)
 
     def _commit_finish_job_excess_input(self) -> bool:
         rows = self._pending_finish_excess_rows
         if not rows:
-            self._pending_finish_excess_ready_to_print = True
-            self._render_finish_job_excess_review()
             return True
         index = max(0, min(self._pending_finish_excess_index, len(rows) - 1))
-        text = str(rows[index].get("input") or self._pending_finish_excess_input or "").strip()
-        if not re.fullmatch(r"\d+(?:\.\d{1,3})?", text):
-            self._show_invalid_overlay("Enter a valid actual excess quantity, then scan confirm.")
+        if not self._apply_finish_inventory_actual_input(rows[index]):
+            self._show_invalid_overlay("Actual count must be a number with up to 3 decimal places.")
             return False
-        actual = round(max(0.0, float(text)), 6)
-        expected = round(float(rows[index].get("expected_qty") or 0.0), 6)
-        difference = round(actual - expected, 6)
-        rows[index]["actual_qty"] = actual
-        rows[index]["difference_qty"] = difference
-        variance_status = "MATCH" if abs(difference) <= 0.000001 else ("OVER" if difference > 0 else "SHORT")
-        rows[index]["variance_status"] = variance_status
-        rows[index]["status"] = variance_status
-        rows[index]["reason_required"] = variance_status != "MATCH"
-        rows[index]["variance_reason"] = ""
-        rows[index]["verified_at_utc"] = datetime.now(timezone.utc).isoformat()
-        self._pending_finish_excess_input = ""
-        if rows[index]["reason_required"]:
-            rows[index]["status"] = "REASON REQUIRED"
-        elif index + 1 < len(rows):
-            self._pending_finish_excess_index = index + 1
-        else:
-            self._pending_finish_excess_ready_to_print = all(
-                row.get("actual_qty") is not None and not row.get("reason_required")
-                for row in rows
-            )
+        self._pending_finish_excess_ready_to_print = True
         self._hide_invalid_overlay()
         self._render_finish_job_excess_review()
         return True
@@ -10259,120 +10477,62 @@ QWidget#ClientUIRoot {{
             self._cancel_pending_finish_job()
             return True
         if low in ("next",):
-            current = (
-                self._pending_finish_excess_rows[self._pending_finish_excess_index]
-                if self._pending_finish_excess_rows else {}
-            )
-            if current.get("reason_required"):
-                self._render_finish_job_excess_review()
-                return True
-            if self._finish_review_page_index == 0:
-                self._change_finish_review_page(1)
-            elif self._pending_finish_excess_rows:
+            if self._pending_finish_excess_rows:
                 self._pending_finish_excess_index = min(
                     len(self._pending_finish_excess_rows) - 1,
                     self._pending_finish_excess_index + 1,
                 )
-                self._pending_finish_excess_input = str(
-                    self._pending_finish_excess_rows[self._pending_finish_excess_index].get("input") or ""
-                )
                 self._render_finish_job_excess_review()
             return True
         if low in ("prev", "previous", "preview"):
-            if self._finish_review_page_index > 0 and self._pending_finish_excess_index <= 0:
-                self._change_finish_review_page(-1)
-            elif self._pending_finish_excess_rows:
+            if self._pending_finish_excess_rows:
                 self._pending_finish_excess_index = max(0, self._pending_finish_excess_index - 1)
-                self._pending_finish_excess_input = str(
-                    self._pending_finish_excess_rows[self._pending_finish_excess_index].get("input") or ""
-                )
                 self._render_finish_job_excess_review()
             return True
         command = self._numpad_command_from_scan(raw)
-        current_row = (
-            self._pending_finish_excess_rows[self._pending_finish_excess_index]
-            if self._pending_finish_excess_rows else None
-        )
-        if isinstance(current_row, dict) and current_row.get("reason_required"):
-            reason_digit = self._numpad_digit_from_scan(raw)
-            reasons = {
-                "1": "COUNTING ERROR",
-                "2": "DAMAGED PARTS",
-                "3": "MISSING PARTS",
-                "4": "EXTRA PARTS FOUND",
-                "5": "UNRECORDED USAGE",
-                "6": "OTHER",
-            }
-            if reason_digit in reasons:
-                current_row["variance_reason"] = reasons[reason_digit]
-                current_row["reason_required"] = False
-                current_row["status"] = str(current_row.get("variance_status") or "DIFFERENCE")
-                if self._pending_finish_excess_index + 1 < len(self._pending_finish_excess_rows):
-                    self._pending_finish_excess_index += 1
-                else:
-                    self._pending_finish_excess_ready_to_print = all(
-                        row.get("actual_qty") is not None and not row.get("reason_required")
-                        for row in self._pending_finish_excess_rows
-                    )
-                self._render_finish_job_excess_review()
-                return True
-            self._render_finish_job_excess_review()
-            return True
         if command == "confirm":
-            if self._pending_finish_excess_ready_to_print:
-                self._print_finish_job_excess_and_continue()
-            else:
-                self._commit_finish_job_excess_input()
+            if self._pending_finish_excess_rows and not self._commit_finish_job_excess_input():
+                return True
+            self._print_finish_job_excess_and_continue()
             return True
         if command in ("backspace", "clear"):
             if self._pending_finish_excess_rows:
                 row = self._pending_finish_excess_rows[self._pending_finish_excess_index]
                 current = str(row.get("input") or "")
                 row["input"] = "" if command == "clear" else current[:-1]
-                row["actual_qty"] = None
-                row["difference_qty"] = None
-                row["status"] = "PENDING"
-                row["reason_required"] = False
-                row["variance_reason"] = ""
-                self._pending_finish_excess_ready_to_print = False
+                self._apply_finish_inventory_actual_input(row)
                 self._render_finish_job_excess_review()
             return True
-        if self._pending_finish_excess_rows and low in (".", "decimal", "num_decimal", "numpad_decimal"):
+        normalized_command = re.sub(r"[^a-z0-9]", "", low)
+        if self._pending_finish_excess_rows and (
+            low in (".", "decimal", "num_decimal", "numpad_decimal")
+            or normalized_command in ("custom01", "custom1")
+        ):
             row = self._pending_finish_excess_rows[self._pending_finish_excess_index]
             current = str(row.get("input") or "")
             if "." not in current:
                 row["input"] = (current or "0") + "."
-            row["actual_qty"] = None
-            row["difference_qty"] = None
-            row["status"] = "PENDING"
-            self._pending_finish_excess_ready_to_print = False
+            self._apply_finish_inventory_actual_input(row) if not str(row.get("input") or "").endswith(".") else None
             self._render_finish_job_excess_review()
             return True
         digit = self._numpad_digit_from_scan(raw)
         if self._pending_finish_excess_rows and digit is not None:
             row = self._pending_finish_excess_rows[self._pending_finish_excess_index]
             current = str(row.get("input") or "")
-            if len(current) < 12:
+            decimals = current.split(".", 1)[1] if "." in current else ""
+            if len(current) < 12 and len(decimals) < 3:
                 row["input"] = current + digit
-            row["actual_qty"] = None
-            row["difference_qty"] = None
-            row["status"] = "PENDING"
-            self._pending_finish_excess_ready_to_print = False
-            if self._finish_review_page_index == 0:
-                self._change_finish_review_page(1)
+            self._apply_finish_inventory_actual_input(row)
             self._render_finish_job_excess_review()
             return True
         if self._pending_finish_excess_rows and re.fullmatch(r"\d+(?:\.\d{1,3})?", low):
             row = self._pending_finish_excess_rows[self._pending_finish_excess_index]
             row["input"] = low
-            row["actual_qty"] = None
-            row["difference_qty"] = None
-            row["status"] = "PENDING"
-            self._pending_finish_excess_ready_to_print = False
+            self._apply_finish_inventory_actual_input(row)
             self._render_finish_job_excess_review()
             return True
-        self.status.setText("Excess verification is active. Enter quantity, confirm it, or scan Finish Job to cancel.")
-        self._show_invalid_overlay("Finish the product-part excess verification first.")
+        self.status.setText("Inventory check active. Use PREV/NEXT, numpad, Custom 01 decimal, or CONFIRM.")
+        self._show_invalid_overlay("Finish the return inventory check first.")
         return True
 
     def _show_final_job_review_overlay(self, finished_payload: Dict[str, Any], linked_payloads: Optional[List[Dict[str, Any]]] = None):
@@ -16309,6 +16469,10 @@ QWidget#ClientUIRoot {{
             or self.productHistoryOverlay.isVisible()
             or self.rejectReviewOverlay.isVisible()
             or self.finishOverlay.isVisible()
+            or bool(
+                getattr(self, "finishInventoryOverlay", None)
+                and self.finishInventoryOverlay.isVisible()
+            )
             or self.settingsOverlay.isVisible()
         )
 
@@ -22203,15 +22367,21 @@ QWidget#ClientUIRoot {{
         product_id = str(
             row.get("product_id") or part.get("part_product_id") or part.get("product_id") or ""
         ).strip()
-        actual_qty = max(0.0, self._parse_number(row.get("actual_qty")))
-        if not product_id or actual_qty <= 0:
+        print_qty = max(0.0, self._parse_number(
+            row.get("print_qty")
+            if row.get("print_qty") is not None
+            else row.get("actual_qty")
+            if row.get("actual_qty") is not None
+            else row.get("expected_qty")
+        ))
+        if not product_id or print_qty <= 0:
             return None
         name = str(row.get("name") or part.get("name") or row.get("sku") or f"Product Part {product_id}").strip()
         lot = datetime.now().strftime("%Y%m%d%H%M%S")
         payload = (
             "O00000000024" + self._zpad_digits(self.state.job_code, 11) + "00000000000V2"
             + f"P{self._zpad_digits(product_id, 11)}"
-            + f"Q{self._qr_quantity_field(actual_qty)}"
+            + f"Q{self._qr_quantity_field(print_qty)}"
             + "I00000000001"
             + "T00000000001"
             + f"L{lot}-000000000000"
@@ -22226,13 +22396,13 @@ QWidget#ClientUIRoot {{
             "product_id": product_id,
             "product_name": name,
             "product_sku": str(row.get("sku") or part.get("sku") or part.get("part_sku") or "").strip(),
-            "quantity": actual_qty,
+            "quantity": print_qty,
             "lot_number": lot,
             "idempotency_key": f"FINISH-EXCESS-{self._current_client_id()}-{session_id}-{identity}",
         }
 
     def _build_finish_butal_pack_print(self, quantity: Any) -> Optional[Dict[str, Any]]:
-        qty = max(0, int(round(self._parse_number(quantity))))
+        qty = max(0.0, self._parse_number(quantity))
         if qty <= 0:
             return None
         printable = self._next_printable_pack_payload()
@@ -22244,7 +22414,7 @@ QWidget#ClientUIRoot {{
         payload = self._pack_payload_with_index(str(printable.get("payload") or ""), next_index)
         payload = re.sub(
             r"(?<=P\d{11})Q\d{11}(?=I\d{11})",
-            f"Q{qty:011d}",
+            f"Q{self._qr_quantity_field(qty)}",
             payload,
             count=1,
         )
@@ -22264,23 +22434,43 @@ QWidget#ClientUIRoot {{
         payload = self._pending_finish_excess_payload
         if not isinstance(payload, dict):
             return False
+        for index, pending_row in enumerate(self._pending_finish_excess_rows or []):
+            if not self._apply_finish_inventory_actual_input(pending_row):
+                self._pending_finish_excess_index = index
+                self._render_finish_job_excess_review()
+                self._show_invalid_overlay(
+                    "Complete the decimal value on the selected row, or use BACKSPACE to remove it."
+                )
+                return False
         rows = [dict(row) for row in (self._pending_finish_excess_rows or [])]
-        if any(row.get("actual_qty") is None for row in rows):
-            self._pending_finish_excess_ready_to_print = False
-            self._show_invalid_overlay("Every product part needs an actual excess quantity before printing.")
-            return False
-        if any(row.get("reason_required") for row in rows):
-            self._pending_finish_excess_ready_to_print = False
-            self._show_invalid_overlay("Select a reason for every excess quantity difference before printing.")
-            return False
-        self.finishStatus.setText("Queuing verified excess labels...")
+        self.finishInventoryInstruction.setText("Queuing return inventory QR labels...")
         verified_logs: List[Dict[str, Any]] = []
+        product_part_logs: List[Dict[str, Any]] = []
         for row in rows:
-            printable = self._build_product_part_excess_print(row)
-            if self._parse_number(row.get("actual_qty")) > 0:
+            expected_qty = self._parse_number(row.get("expected_qty"))
+            actual_qty = row.get("actual_qty")
+            print_qty = max(0.0, self._parse_number(
+                row.get("print_qty")
+                if row.get("print_qty") is not None
+                else actual_qty
+                if actual_qty is not None
+                else expected_qty
+            ))
+            row["print_qty"] = print_qty
+            row["difference_qty"] = (
+                round(self._parse_number(actual_qty) - expected_qty, 6)
+                if actual_qty is not None else None
+            )
+            row["status"] = "ACTUAL SAVED" if actual_qty is not None else "USES EXPECTED"
+            is_butal = str(row.get("return_type") or "").strip().upper() == "BUTAL PACK"
+            printable = (
+                self._build_finish_butal_pack_print(print_qty)
+                if is_butal else self._build_product_part_excess_print(row)
+            )
+            if print_qty > 0:
                 if not isinstance(printable, dict):
                     self._show_invalid_overlay(
-                        f"Cannot print {row.get('sku') or row.get('name')}: missing Product ID."
+                        f"Cannot print {row.get('sku') or row.get('name')}: missing a valid QR template or Product ID."
                     )
                     return False
                 if not self._submit_pack_qr_print(printable):
@@ -22292,28 +22482,23 @@ QWidget#ClientUIRoot {{
                 row["print_status"] = "NOT_REQUIRED"
             clean = {key: value for key, value in row.items() if key != "part"}
             clean.update({
-                "source": "FINISH_JOB_PART_EXCESS_VERIFIED",
-                "excess_available_qty": row.get("expected_qty"),
-                "actual_excess_qty": row.get("actual_qty"),
+                "source": "FINISH_JOB_RETURN_INVENTORY",
+                "expected_balance_qty": expected_qty,
+                "excess_available_qty": expected_qty,
+                "actual_count_qty": actual_qty,
+                "actual_excess_qty": actual_qty,
+                "printed_quantity": print_qty,
+                "quantity_source": "ACTUAL_COUNT" if actual_qty is not None else "EXPECTED_BALANCE",
                 "difference_qty": row.get("difference_qty"),
-                "recorded_at_utc": row.get("verified_at_utc") or datetime.now(timezone.utc).isoformat(),
+                "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
             })
             verified_logs.append(clean)
-        butal_print = self._build_finish_butal_pack_print(payload.get("butal_total"))
-        if int(self._parse_number(payload.get("butal_total"))) > 0:
-            if not isinstance(butal_print, dict):
-                self._show_invalid_overlay("Butal exists, but no valid PACK QR template is available for printing.")
-                return False
-            if not self._submit_pack_qr_print(butal_print):
-                return False
-            payload["finish_job_butal_print"] = {
-                "quantity": butal_print.get("quantity"),
-                "series_index": butal_print.get("next_index"),
-                "qr_payload": butal_print.get("payload"),
-                "printed_at_utc": datetime.now(timezone.utc).isoformat(),
-                "status": "QUEUED",
-            }
-        payload["product_part_excess_logs"] = verified_logs
+            if is_butal:
+                payload["finish_job_butal_print"] = clean
+            else:
+                product_part_logs.append(clean)
+        payload["return_inventory_logs"] = verified_logs
+        payload["product_part_excess_logs"] = product_part_logs
         payload["excess_verification_completed_at_utc"] = datetime.now(timezone.utc).isoformat()
         payload["reprint_qr_logs"] = list(self.state.reprint_qr_logs or [])
         linked = [dict(row) for row in self._pending_finish_excess_linked_payloads]
@@ -22880,6 +23065,8 @@ QWidget#ClientUIRoot {{
         if input_mode and (
             self._numpad_digit_from_scan(low) is not None
             or self._numpad_command_from_scan(low) in ("backspace", "clear", "confirm")
+            or low in ("next", "prev", "previous", "preview")
+            or re.sub(r"[^a-z0-9]", "", low) in ("custom01", "custom1")
         ):
             return False
         if (
@@ -24839,6 +25026,8 @@ QWidget#ClientUIRoot {{
 
     def _expected_scan_instruction(self) -> str:
         s = self.state
+        if isinstance(getattr(self, "_pending_finish_excess_payload", None), dict):
+            return "Scan PREV/NEXT, enter optional Actual Count with numpad, Custom 01 for decimal, or CONFIRM to print."
         if self._pending_final_review_payload:
             return 'Scan "next", "prev", or "confirm".'
         if self._operator_shift_flash_active:
@@ -24950,6 +25139,8 @@ QWidget#ClientUIRoot {{
     def _active_command_banner_text(self) -> str:
         """Return the active command state for the permanent blue banner."""
         s = self.state
+        if isinstance(getattr(self, "_pending_finish_excess_payload", None), dict):
+            return "RETURN INVENTORY: PREV/NEXT row • numpad actual • Custom 01 decimal • CONFIRM print"
         if isinstance(getattr(self, "_pending_final_review_payload", None), dict):
             return "FINISH JOB REVIEW: scan NEXT, PREV, or CONFIRM"
         if bool(getattr(self, "_operator_shift_flash_active", False)):
