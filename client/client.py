@@ -5248,7 +5248,7 @@ QWidget#ClientUIRoot {{
             card.setFixedHeight(64)
             card.setStyleSheet(
                 f"QFrame#{object_name} {{ background:#1c212b; border:1px solid #364052; "
-                "border-radius:10px; }} QLabel { background:transparent; border:none; color:#eef2f8; }"
+                "border-radius:10px; } QLabel { background:transparent; border:none; color:#eef2f8; }"
             )
             card.setLayout(QHBoxLayout())
             card.layout().setContentsMargins(0, 0, 0, 0)
@@ -10124,14 +10124,14 @@ QWidget#ClientUIRoot {{
             if row.get("variance_reason"):
                 status = f"{status}: {row.get('variance_reason')}"
             actual_text = str(row.get("input") or "") if index == selected and actual is None else (
-                "-" if actual is None else _fmt_number(actual)
+                "-" if actual is None else self._format_compact_number(actual)
             )
             table_rows.append([
                 f"> {index + 1}" if index == selected else str(index + 1),
                 str(row.get("sku") or row.get("name") or "-"),
-                f"{_fmt_number(expected)} {row.get('unit') or ''}".strip(),
+                f"{self._format_compact_number(expected)} {row.get('unit') or ''}".strip(),
                 f"{actual_text} {row.get('unit') or ''}".strip(),
-                "-" if difference is None else _fmt_number(difference),
+                "-" if difference is None else self._format_compact_number(difference),
                 status,
             ])
         if not table_rows:
@@ -16334,6 +16334,16 @@ QWidget#ClientUIRoot {{
                 return float(m.group(0))
             except Exception:
                 return 0.0
+
+    def _format_compact_number(self, value: Any, decimal_places: int = 3) -> str:
+        """Format a UI quantity without unnecessary trailing zeroes."""
+        number = self._parse_number(value)
+        if not math.isfinite(number):
+            return "0"
+        if abs(number - round(number)) < 1e-9:
+            return str(int(round(number)))
+        places = max(0, min(6, int(decimal_places or 0)))
+        return f"{number:.{places}f}".rstrip("0").rstrip(".")
 
     def _clear_external_average_weight(self):
         s = self.state

@@ -64,6 +64,39 @@ class ChoiceOverlayCacheTests(unittest.TestCase):
             ui.deleteLater()
             self.app.processEvents()
 
+    def test_finish_job_excess_rows_render_quantities(self):
+        ui = production_client.ClientUI()
+        try:
+            ui.resize(1280, 720)
+            self.assertNotIn("}}", ui.productPartYesCard.styleSheet())
+            self.assertNotIn("}}", ui.productPartNoCard.styleSheet())
+            ui._pending_finish_excess_rows = [{
+                "sku": "PART-A",
+                "expected_qty": 12.5,
+                "actual_qty": 10.25,
+                "difference_qty": -2.25,
+                "status": "SHORT",
+                "input": "10.25",
+                "unit": "kg",
+            }]
+            ui._pending_finish_excess_index = 0
+            ui._pending_finish_excess_ready_to_print = True
+
+            ui._render_finish_job_excess_review()
+
+            cells = [
+                label.text()
+                for label in ui.finishReviewParts.findChildren(QLabel)
+                if label.property("role") == "cell"
+            ]
+            self.assertEqual(cells[2], "12.5 kg")
+            self.assertEqual(cells[3], "10.25 kg")
+            self.assertEqual(cells[4], "-2.25")
+        finally:
+            ui.close()
+            ui.deleteLater()
+            self.app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()
