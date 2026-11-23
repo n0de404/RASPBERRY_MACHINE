@@ -85,12 +85,12 @@ class ChoiceOverlayCacheTests(unittest.TestCase):
 
             ui._render_finish_job_excess_review()
 
-            self.assertEqual(ui.finishInventoryTable.item(0, 3).text(), "12.5 kg")
+            self.assertEqual(ui.finishInventoryTable.item(0, 3).text(), "12.50 kg")
             self.assertEqual(ui.finishInventoryTable.item(0, 4).text(), "10.25 kg")
             self.assertEqual(ui.finishInventoryTable.item(0, 5).text(), "10.25 kg")
             self.assertEqual(ui.finishInventoryTable.item(0, 6).text(), "-2.25 kg")
             self.assertEqual(ui.finishInventoryTable.height(), 100)
-            self.assertLessEqual(ui.finishInventoryOverlay.height(), 395)
+            self.assertLessEqual(ui.finishInventoryOverlay.height(), 400)
         finally:
             ui.close()
             ui.deleteLater()

@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 import math
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import queue
 import uuid
 from collections import deque
@@ -8573,12 +8573,12 @@ QWidget#ClientUIRoot {{
         self.finishInventoryOverlay.setStyleSheet(
             "QFrame#FinishInventoryOverlay { background:#171b24; border:1px solid #4a5468; border-radius:16px; }"
             "QLabel { background:transparent; border:none; color:#eef2f8; font-family:'Segoe UI'; }"
-            "QLabel#FinishInventoryTitle { font-size:24px; font-weight:700; }"
-            "QLabel#FinishInventoryBadge { background:#0d4f93; border:1px solid #3b8ee8; border-radius:10px; padding:3px 10px; font-size:13px; font-weight:700; }"
-            "QLabel#FinishInventoryInstruction { background:#1167c7; border:none; border-radius:6px; padding:3px 9px; font-size:14px; font-weight:600; }"
-            "QLabel#FinishInventorySection { color:#eef2f8; font-size:16px; font-weight:700; }"
-            "QLabel#FinishInventoryRule { color:#dbeafe; font-size:13px; font-weight:600; }"
-            "QLabel#FinishInventoryFooter { background:transparent; border:none; padding:3px 4px; color:#dbeafe; font-size:12px; font-weight:600; }"
+            "QLabel#FinishInventoryTitle { font-size:28px; font-weight:700; }"
+            "QLabel#FinishInventoryBadge { background:#0d4f93; border:1px solid #3b8ee8; border-radius:10px; padding:3px 10px; font-size:15px; font-weight:700; }"
+            "QLabel#FinishInventoryInstruction { background:#1167c7; border:none; border-radius:6px; padding:3px 9px; font-size:16px; font-weight:600; }"
+            "QLabel#FinishInventorySection { color:#eef2f8; font-size:19px; font-weight:700; }"
+            "QLabel#FinishInventoryRule { color:#dbeafe; font-size:15px; font-weight:600; }"
+            "QLabel#FinishInventoryFooter { background:transparent; border:none; padding:3px 4px; color:#dbeafe; font-size:14px; font-weight:600; }"
         )
 
         title_row = QWidget()
@@ -8600,7 +8600,7 @@ QWidget#ClientUIRoot {{
         )
         self.finishInventoryInstruction.setObjectName("FinishInventoryInstruction")
         self.finishInventoryInstruction.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.finishInventoryInstruction.setFixedHeight(30)
+        self.finishInventoryInstruction.setFixedHeight(34)
         self.finishInventoryOverlay.layout().addWidget(self.finishInventoryInstruction)
 
         summary_section = QFrame()
@@ -8623,8 +8623,8 @@ QWidget#ClientUIRoot {{
             card = QFrame()
             card.setStyleSheet(
                 "QFrame { background:transparent; border:none; }"
-                "QLabel[role='caption'] { color:#9aa6ba; font-size:11px; font-weight:600; }"
-                "QLabel[role='value'] { color:#eef2f8; font-size:17px; font-weight:700; }"
+                "QLabel[role='caption'] { color:#9aa6ba; font-size:13px; font-weight:600; }"
+                "QLabel[role='value'] { color:#eef2f8; font-size:19px; font-weight:700; }"
             )
             card.setLayout(QVBoxLayout())
             card.layout().setContentsMargins(8, 2, 8, 3)
@@ -8639,7 +8639,7 @@ QWidget#ClientUIRoot {{
             summary_cards.layout().addWidget(card, 1)
             self.finishInventorySummaryLabels[key] = value
         summary_section.layout().addWidget(summary_cards)
-        summary_section.setFixedHeight(72)
+        summary_section.setFixedHeight(82)
         self.finishInventoryOverlay.layout().addWidget(summary_section)
 
         totals_section = QFrame()
@@ -8650,7 +8650,7 @@ QWidget#ClientUIRoot {{
         totals_section.layout().setContentsMargins(4, 3, 4, 3)
         totals_section.layout().setSpacing(6)
         totals_title = QLabel("ALL-SHIFT TOTALS\nCompleted shifts + current shift")
-        totals_title.setStyleSheet("color:#eef2f8; font-size:14px; font-weight:700;")
+        totals_title.setStyleSheet("color:#eef2f8; font-size:17px; font-weight:700;")
         totals_section.layout().addWidget(totals_title, 2)
         self.finishInventoryTotalLabels: Dict[str, QLabel] = {}
         total_colors = {
@@ -8664,11 +8664,11 @@ QWidget#ClientUIRoot {{
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setStyleSheet(
                 f"background:{background}; border:1px solid {border}; border-radius:7px; "
-                "color:#ffffff; font-size:17px; font-weight:700; padding:5px 8px;"
+                "color:#ffffff; font-size:20px; font-weight:700; padding:5px 8px;"
             )
             totals_section.layout().addWidget(label, 1)
             self.finishInventoryTotalLabels[key] = label
-        totals_section.setFixedHeight(52)
+        totals_section.setFixedHeight(60)
         self.finishInventoryOverlay.layout().addWidget(totals_section)
 
         table_title = QLabel("RETURN INVENTORY — BUTAL + PRODUCT PART EXCESS")
@@ -8705,7 +8705,7 @@ QWidget#ClientUIRoot {{
         self.finishInventorySavedHint = QLabel(
             "Saved with Finish Job: expected balance • optional actual count • difference • printed quantity"
         )
-        self.finishInventorySavedHint.setStyleSheet("color:#bbf7d0; font-size:11px; font-weight:600;")
+        self.finishInventorySavedHint.setStyleSheet("color:#bbf7d0; font-size:13px; font-weight:600;")
         self.finishInventoryOverlay.layout().addWidget(self.finishInventorySavedHint)
         self.finishInventoryRule = QLabel(
             "Blank Actual = print Expected Balance     |     Entered Actual = print Actual Count"
@@ -8729,13 +8729,13 @@ QWidget#ClientUIRoot {{
         self.finishInventoryConfirm.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.finishInventoryConfirm.setStyleSheet(
             "background:#166534; border:1px solid #22c55e; border-radius:8px; "
-            "color:#ffffff; font-size:13px; font-weight:700; padding:5px 10px;"
+            "color:#ffffff; font-size:15px; font-weight:700; padding:5px 10px;"
         )
         footer.layout().addWidget(nav)
         footer.layout().addWidget(decimal, 1)
         footer.layout().addWidget(self.finishInventoryProgress)
         footer.layout().addWidget(self.finishInventoryConfirm)
-        footer.setFixedHeight(34)
+        footer.setFixedHeight(40)
         self.finishInventoryOverlay.layout().addWidget(footer)
         self.finishInventoryOverlay.hide()
         self.finishInventoryOverlay.raise_()
@@ -8745,8 +8745,8 @@ QWidget#ClientUIRoot {{
             return
         row_count = len(getattr(self, "_pending_finish_excess_rows", []) or [])
         w = max(1, min(1240, self.width() - 48))
-        desired_h = 310 + (max(1, row_count) * 54)
-        h = max(1, min(max(395, desired_h), 720, self.height() - 48))
+        desired_h = 315 + (max(1, row_count) * 54)
+        h = max(1, min(max(400, desired_h), 760, self.height() - 48))
         x = max(0, (self.width() - w) // 2)
         y = max(0, (self.height() - h) // 2)
         self.finishInventoryOverlay.setGeometry(x, y, w, h)
@@ -10276,10 +10276,10 @@ QWidget#ClientUIRoot {{
                 "sku": str(payload.get("product_sku") or payload.get("product_name") or "PACK QR").strip(),
                 "name": str(payload.get("product_name") or payload.get("job_name") or "Butal Pack").strip(),
                 "unit": "pcs",
-                "expected_qty": round(butal_qty, 6),
+                "expected_qty": self._finish_inventory_quantity(butal_qty),
                 "actual_qty": None,
                 "difference_qty": None,
-                "print_qty": round(butal_qty, 6),
+                "print_qty": self._finish_inventory_quantity(butal_qty),
                 "status": "USES EXPECTED",
                 "input": "",
             })
@@ -10308,18 +10308,32 @@ QWidget#ClientUIRoot {{
                 "sku": str(part.get("sku") or part.get("part_sku") or status.get("name") or identity).strip(),
                 "name": str(part.get("name") or part.get("part_name") or status.get("name") or identity).strip(),
                 "unit": self._part_unit_kind(part),
-                "expected_qty": round(float(status.get("available_qty") or 0.0), 6),
+                "expected_qty": self._finish_inventory_quantity(status.get("available_qty")),
                 "actual_qty": None,
                 "difference_qty": None,
-                "print_qty": round(max(0.0, float(status.get("available_qty") or 0.0)), 6),
+                "print_qty": self._finish_inventory_quantity(
+                    max(0.0, float(status.get("available_qty") or 0.0))
+                ),
                 "status": "USES EXPECTED" if float(status.get("available_qty") or 0.0) > 0 else "NO RETURN",
                 "input": "",
             })
         return rows
 
+    def _finish_inventory_quantity(self, value: Any) -> float:
+        """Round Finish Job return quantities to two decimals, half up."""
+        number = self._parse_number(value)
+        if not math.isfinite(number):
+            return 0.0
+        return float(
+            Decimal(str(number)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        )
+
+    def _format_finish_inventory_quantity(self, value: Any) -> str:
+        return f"{self._finish_inventory_quantity(value):.2f}"
+
     def _apply_finish_inventory_actual_input(self, row: Dict[str, Any]) -> bool:
         text = str(row.get("input") or "").strip()
-        expected = round(self._parse_number(row.get("expected_qty")), 6)
+        expected = self._finish_inventory_quantity(row.get("expected_qty"))
         if not text:
             row["actual_qty"] = None
             row["difference_qty"] = None
@@ -10329,9 +10343,9 @@ QWidget#ClientUIRoot {{
             return True
         if not re.fullmatch(r"\d+(?:\.\d{0,3})?", text) or text.endswith("."):
             return False
-        actual = round(max(0.0, float(text)), 6)
+        actual = self._finish_inventory_quantity(max(0.0, float(text)))
         row["actual_qty"] = actual
-        row["difference_qty"] = round(actual - expected, 6)
+        row["difference_qty"] = self._finish_inventory_quantity(actual - expected)
         row["print_qty"] = actual
         row["status"] = "ACTUAL SAVED"
         row["actual_recorded_at_utc"] = datetime.now(timezone.utc).isoformat()
@@ -10359,10 +10373,10 @@ QWidget#ClientUIRoot {{
                 f"> {index + 1}" if index == selected else str(index + 1),
                 str(row.get("return_type") or "PRODUCT PART"),
                 str(row.get("sku") or row.get("name") or "-"),
-                f"{self._format_compact_number(expected)} {unit}".strip(),
+                f"{self._format_finish_inventory_quantity(expected)} {unit}".strip(),
                 actual_text,
-                f"{self._format_compact_number(print_qty)} {unit}".strip(),
-                "—" if difference is None else f"{self._format_compact_number(difference)} {unit}".strip(),
+                f"{self._format_finish_inventory_quantity(print_qty)} {unit}".strip(),
+                "-" if difference is None else f"{self._format_finish_inventory_quantity(difference)} {unit}".strip(),
                 str(row.get("status") or ("ACTUAL SAVED" if actual is not None else "USES EXPECTED")),
             ]
             for column, value in enumerate(values):
@@ -22366,24 +22380,27 @@ QWidget#ClientUIRoot {{
 
     @staticmethod
     def _qr_quantity_field(value: Any) -> str:
-        qty = max(0.0, float(value or 0.0))
-        if abs(qty - round(qty)) <= 0.000001:
-            return f"{int(round(qty)):011d}"
-        text = f"{qty:.3f}".rstrip("0").rstrip(".")
-        return text.zfill(11)
+        try:
+            qty = Decimal(str(value or 0).replace(",", ""))
+        except (InvalidOperation, ValueError, TypeError):
+            qty = Decimal("0")
+        if not qty.is_finite() or qty < 0:
+            qty = Decimal("0")
+        qty = qty.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return f"{qty:.2f}".zfill(11)
 
     def _build_product_part_excess_print(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         part = dict(row.get("part") or {})
         product_id = str(
             row.get("product_id") or part.get("part_product_id") or part.get("product_id") or ""
         ).strip()
-        print_qty = max(0.0, self._parse_number(
+        print_qty = self._finish_inventory_quantity(max(0.0, self._parse_number(
             row.get("print_qty")
             if row.get("print_qty") is not None
             else row.get("actual_qty")
             if row.get("actual_qty") is not None
             else row.get("expected_qty")
-        ))
+        )))
         if not product_id or print_qty <= 0:
             return None
         name = str(row.get("name") or part.get("name") or row.get("sku") or f"Product Part {product_id}").strip()
@@ -22412,7 +22429,7 @@ QWidget#ClientUIRoot {{
         }
 
     def _build_finish_butal_pack_print(self, quantity: Any) -> Optional[Dict[str, Any]]:
-        qty = max(0.0, self._parse_number(quantity))
+        qty = self._finish_inventory_quantity(max(0.0, self._parse_number(quantity)))
         if qty <= 0:
             return None
         printable = self._next_printable_pack_payload()
@@ -22457,18 +22474,23 @@ QWidget#ClientUIRoot {{
         verified_logs: List[Dict[str, Any]] = []
         product_part_logs: List[Dict[str, Any]] = []
         for row in rows:
-            expected_qty = self._parse_number(row.get("expected_qty"))
-            actual_qty = row.get("actual_qty")
-            print_qty = max(0.0, self._parse_number(
+            expected_qty = self._finish_inventory_quantity(row.get("expected_qty"))
+            actual_qty = (
+                self._finish_inventory_quantity(row.get("actual_qty"))
+                if row.get("actual_qty") is not None else None
+            )
+            print_qty = self._finish_inventory_quantity(max(0.0, self._parse_number(
                 row.get("print_qty")
                 if row.get("print_qty") is not None
                 else actual_qty
                 if actual_qty is not None
                 else expected_qty
-            ))
+            )))
+            row["expected_qty"] = expected_qty
+            row["actual_qty"] = actual_qty
             row["print_qty"] = print_qty
             row["difference_qty"] = (
-                round(self._parse_number(actual_qty) - expected_qty, 6)
+                self._finish_inventory_quantity(actual_qty - expected_qty)
                 if actual_qty is not None else None
             )
             row["status"] = "ACTUAL SAVED" if actual_qty is not None else "USES EXPECTED"

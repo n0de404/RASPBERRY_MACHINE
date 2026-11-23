@@ -109,6 +109,19 @@ class FinishJobExcessWorkflowTests(unittest.TestCase):
         self.assertEqual(row["print_qty"], 10)
         self.assertTrue(ui._pending_finish_excess_ready_to_print)
 
+    def test_actual_excess_rounds_half_up_to_two_decimals(self):
+        ui = self._client()
+        row = {
+            "sku": "PART-A", "expected_qty": 10, "actual_qty": None,
+            "difference_qty": None, "status": "PENDING", "input": "12.345",
+        }
+
+        self.assertTrue(ui._apply_finish_inventory_actual_input(row))
+
+        self.assertEqual(row["actual_qty"], 12.35)
+        self.assertEqual(row["difference_qty"], 2.35)
+        self.assertEqual(row["print_qty"], 12.35)
+
     def test_custom_01_adds_decimal_to_optional_actual_count(self):
         ui = self._client()
         ui._pending_finish_excess_payload = {"job_code": "122648"}
@@ -164,8 +177,8 @@ class FinishJobExcessWorkflowTests(unittest.TestCase):
         ui._pending_finish_excess_rows = [{
             "identity": "8335", "return_type": "PRODUCT PART",
             "product_id": "8335", "sku": "Z-RM-TEST", "name": "Test Resin",
-            "unit": "kg", "expected_qty": 8.5, "actual_qty": None,
-            "difference_qty": None, "print_qty": 8.5,
+            "unit": "kg", "expected_qty": 8.555, "actual_qty": None,
+            "difference_qty": None, "print_qty": 8.555,
             "status": "USES EXPECTED", "input": "", "part": {"part_product_id": "8335"},
         }]
         ui.finishInventoryInstruction = Mock()
@@ -175,12 +188,13 @@ class FinishJobExcessWorkflowTests(unittest.TestCase):
 
         self.assertTrue(ui._print_finish_job_excess_and_continue())
         printable = ui._submit_pack_qr_print.call_args.args[0]
-        self.assertEqual(printable["quantity"], 8.5)
+        self.assertEqual(printable["quantity"], 8.56)
+        self.assertIn("Q00000008.56", printable["payload"])
         final_payload = ui._show_final_job_review_overlay.call_args.args[0]
         saved = final_payload["return_inventory_logs"][0]
-        self.assertEqual(saved["expected_balance_qty"], 8.5)
+        self.assertEqual(saved["expected_balance_qty"], 8.56)
         self.assertIsNone(saved["actual_count_qty"])
-        self.assertEqual(saved["printed_quantity"], 8.5)
+        self.assertEqual(saved["printed_quantity"], 8.56)
         self.assertEqual(saved["quantity_source"], "EXPECTED_BALANCE")
 
     def test_incomplete_custom_decimal_blocks_print(self):
@@ -218,7 +232,7 @@ class FinishJobExcessWorkflowTests(unittest.TestCase):
         second = ui._build_product_part_excess_print(row)
 
         self.assertIsNotNone(first)
-        self.assertIn("Q000000012.5", first["payload"])
+        self.assertIn("Q00000012.50", first["payload"])
         self.assertEqual(first["quantity"], 12.5)
         self.assertEqual(first["idempotency_key"], second["idempotency_key"])
 
