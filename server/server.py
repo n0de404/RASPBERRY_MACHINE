@@ -6927,13 +6927,19 @@ def _normalize_server_qr_mapping_config(config: Any) -> Dict[str, Any]:
             row["aliases"] = ["pdrstart"]
         commands.append(row)
     command_ids = {str(row.get("id") or "").strip() for row in commands}
-    if "no_shot" not in command_ids:
-        default_no_shot = next(
-            (deepcopy(row) for row in DEFAULT_QR_MAPPING_CONFIG.get("commands", []) if row.get("id") == "no_shot"),
+    for required_command_id in ("no_shot", "machine_release"):
+        if required_command_id in command_ids:
+            continue
+        default_command = next(
+            (
+                deepcopy(row)
+                for row in DEFAULT_QR_MAPPING_CONFIG.get("commands", [])
+                if row.get("id") == required_command_id
+            ),
             None,
         )
-        if default_no_shot is not None:
-            commands.append(default_no_shot)
+        if default_command is not None:
+            commands.append(default_command)
     normalized["commands"] = commands
     return normalized
 
@@ -10932,6 +10938,30 @@ DASHBOARD_HTML = r"""
     #approvePrintOverlay.approved-shift-report .overlay-actions .review-edge-arrow { position:static; transform:none; width:auto; height:auto; border-radius:14px; padding:9px 20px; font-size:.9rem; font-weight:900; }
     #approvePrintOverlay.approved-shift-report .overlay-actions .review-slide-status { flex:0 0 auto; margin:0 auto 0 0; color:#09266a; font-size:13px; font-weight:950; text-align:left; white-space:nowrap; }
     #approvePrintOverlay.portrait-shift-report .overlay-body { background:var(--ui-subtle); }
+    #approvePrintOverlay.finish-job-report .overlay-card { width:min(1180px, calc(100vw - 24px)); height:min(850px, calc(100vh - 20px)); max-height:calc(100vh - 20px); border-radius:12px; }
+    #approvePrintOverlay.finish-job-report .overlay-head { padding:8px 12px; }
+    #approvePrintOverlay.finish-job-report .overlay-body { padding:8px; overflow:auto; background:var(--ui-subtle); }
+    #approvePrintOverlay.finish-job-report #overlayReviewStep { padding:0; max-height:none; overflow:visible; }
+    #approvePrintOverlay.finish-job-report #reviewSubslide1 > .review-panel:nth-of-type(2),
+    #approvePrintOverlay.finish-job-report #reviewSubslide1 > input,
+    #approvePrintOverlay.finish-job-report #reviewSubslide1 > textarea { display:none !important; }
+    #approvePrintOverlay.finish-job-report #reviewSubslide1 > .review-panel:first-child,
+    #approvePrintOverlay.finish-job-report #reviewSubslide3 > .review-panel { border:0; border-radius:0; background:var(--ui-surface); }
+    #approvePrintOverlay.finish-job-report #reviewSubslide1 > .review-panel:first-child > .review-panel-title,
+    #approvePrintOverlay.finish-job-report #reviewSubslide3 > .review-panel > .review-panel-title { display:none; }
+    #approvePrintOverlay.finish-job-report #reviewSubslide1 > .review-panel:first-child > .review-panel-body,
+    #approvePrintOverlay.finish-job-report #reviewSubslide3 > .review-panel > .review-panel-body { padding:0; background:var(--ui-surface); overflow:visible; }
+    #approvePrintOverlay.finish-job-report .finish-job-sheet { width:100%; min-height:0; padding:12px; box-sizing:border-box; }
+    #approvePrintOverlay.finish-job-report .finish-job-table td,
+    #approvePrintOverlay.finish-job-report .finish-job-table th { padding:9px 8px; }
+    #approvePrintOverlay.finish-job-report .finish-job-total-row td { background:#eaf2ff; color:#071d50; font-weight:950; }
+    #approvePrintOverlay.finish-job-report .finish-job-muted { color:var(--ui-muted); font-weight:700; }
+    #approvePrintOverlay.finish-job-report .finish-job-details-stack { display:grid; gap:12px; }
+    #approvePrintOverlay.finish-job-report .finish-job-approval { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; padding:12px; background:var(--ui-surface); border:1px solid var(--ui-border); border-radius:10px; }
+    #approvePrintOverlay.finish-job-report .finish-job-approval-item { padding:9px 10px; background:var(--ui-subtle); border-radius:8px; }
+    #approvePrintOverlay.finish-job-report .finish-job-approval-item .k { color:var(--ui-muted); font-size:.72rem; font-weight:900; text-transform:uppercase; }
+    #approvePrintOverlay.finish-job-report .finish-job-approval-item .v { margin-top:4px; color:var(--ui-text); font-weight:900; overflow-wrap:anywhere; }
+    #approvePrintOverlay.finish-job-report .overlay-actions { display:none; }
     .pdr-sheet { color:#071d50; background:var(--ui-surface); font-size:12px; line-height:1.2; }
     .pdr-sheet.pdr-portrait { width:min(820px,100%); min-height:680px; margin:0 auto; padding:10px; box-sizing:border-box; box-shadow:0 8px 26px rgba(15,23,42,.12); }
     .linked-shift-layout { width:100%; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; align-items:start; }
@@ -16528,23 +16558,28 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
   function setOverlayStep(step){
     const isReview = step !== "qr";
     const approvedShiftView = isReview && overlayReviewMode === "shift" && isApprovedShiftRecord(activeJobRow);
+    const finishJobView = isReview && overlayReviewMode === "job";
     approvePrintOverlay?.classList.toggle("approved-shift-report", approvedShiftView);
+    approvePrintOverlay?.classList.toggle("finish-job-report", finishJobView);
     overlayReviewStep.style.display = isReview ? "" : "none";
     overlayQrStep.style.display = isReview ? "none" : "";
-    overlayReviewSubmitBtn.style.display = (isReview && !approvedShiftView) ? "" : "none";
-    overlayReviewContinueBtn.style.display = (isReview && overlayReviewMode !== "shift") ? "" : "none";
+    overlayReviewSubmitBtn.style.display = (isReview && !approvedShiftView && !finishJobView) ? "" : "none";
+    overlayReviewContinueBtn.style.display = "none";
     overlayBackToReviewBtn.style.display = isReview ? "none" : "";
     overlayGenerateBtn.style.display = "none";
     overlayRequestBtn.style.display = isReview ? "none" : "";
-    overlayCancelBtn.style.display = approvedShiftView ? "none" : "";
+    overlayCancelBtn.style.display = (approvedShiftView || finishJobView) ? "none" : "";
     syncReviewSubslides();
   }
 
   function syncReviewSubslides(){
     const slides = [reviewSubslide1, reviewSubslide2, reviewSubslide3, reviewSubslide4, reviewSubslide5, reviewSubslide6];
     const approvedShiftView = overlayReviewMode === "shift" && isApprovedShiftRecord(activeJobRow);
+    const finishJobView = overlayReviewMode === "job";
     const visibleSlides = approvedShiftView
       ? slides.filter((el, idx) => el && (idx === 0 || idx === 2))
+      : finishJobView
+      ? slides.filter((el, idx) => el && idx === 0)
       : slides.filter((el, idx) => el && !(overlayReviewMode !== "shift" && idx === 1));
     const total = slides.length;
     const visibleTotal = visibleSlides.length;
@@ -16563,6 +16598,8 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     if(overlayReviewSlideStatus){
       const labels = approvedShiftView
         ? ["Shift Report", "Product Parts and Consumption"]
+        : finishJobView
+        ? ["Finish Job Details"]
         : overlayReviewMode === "shift"
         ? ["Shift Summary", "Reject Details", "Raw Materials", "Job / Cycle", "Downtime / Team", "Review / Edit"]
         : ["Job Summary", "Raw Mats / Cycle", "Downtime / Team", "Approval"];
@@ -17959,6 +17996,284 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     };
   }
 
+  function finishJobShiftRows(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const machineCode = String(item.machine_code || "").trim();
+    const jobCode = String(item.job_code || "").trim();
+    const finishedAt = String(item.finished_at_utc || item.ended_at_utc || "");
+    const previousFinishAt = (finishedJobsState || [])
+      .filter(candidate => candidate && !isShiftPartialRecord(candidate))
+      .filter(candidate => String(candidate.machine_code || "").trim() === machineCode)
+      .filter(candidate => String(candidate.job_code || "").trim() === jobCode)
+      .map(candidate => String(candidate.finished_at_utc || candidate.ended_at_utc || ""))
+      .filter(stamp => stamp && stamp < finishedAt)
+      .sort()
+      .pop() || "";
+    const savedShiftSummaries = Array.isArray(item.production_shift_summaries)
+      ? item.production_shift_summaries
+      : [];
+    const partials = (savedShiftSummaries.length ? savedShiftSummaries : (finishedShiftState || []))
+      .filter(shift => shift && String(shift.machine_code || "").trim() === machineCode)
+      .filter(shift => String(shift.job_code || "").trim() === jobCode)
+      .filter(shift => {
+        const stamp = String(shift.finished_at_utc || shift.ended_at_utc || "");
+        return (!previousFinishAt || stamp > previousFinishAt) && (!finishedAt || !stamp || stamp <= finishedAt);
+      });
+    const rows = [...partials, item]
+      .filter(candidate => candidate && typeof candidate === "object")
+      .sort((a, b) => String(a.finished_at_utc || a.ended_at_utc || "").localeCompare(String(b.finished_at_utc || b.ended_at_utc || "")));
+    const seen = new Set();
+    return rows.filter(candidate => {
+      const key = jobKeyOf(candidate) || `${candidate.record_type || "FINAL_JOB"}|${candidate.finished_at_utc || ""}`;
+      if(seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function finishJobShiftStart(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const operatorLogs = Array.isArray(item.operator_shift_logs) ? item.operator_shift_logs : [];
+    const firstOperatorLog = operatorLogs.find(entry => entry && typeof entry === "object") || {};
+    return firstValue(
+      item.started_at_utc,
+      item.shift_started_at_utc,
+      item.job_started_at_utc,
+      item.job_started_at,
+      firstOperatorLog.started_at_utc,
+      firstOperatorLog.started_at,
+      ""
+    );
+  }
+
+  function finishJobProductionSummaryHtml(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const shifts = finishJobShiftRows(item);
+    const totals = shifts.reduce((sum, shift) => {
+      sum.pack_count += Math.max(0, Number(shift.pack_count || 0));
+      sum.good_total += Math.max(0, Number(shift.good_total || 0));
+      sum.butal_total += Math.max(0, Number(shift.butal_total || 0));
+      sum.reject_total += Math.max(0, Number(shift.reject_total || 0));
+      sum.total_good += Math.max(0, Number(shift.total_good ?? (Number(shift.good_total || 0) + Number(shift.butal_total || 0))));
+      return sum;
+    }, {pack_count:0, good_total:0, butal_total:0, reject_total:0, total_good:0});
+    const rows = shifts.map((shift, index) => ({
+      label: isShiftPartialRecord(shift)
+        ? `Shift ${shift.shift_index ?? index + 1}`
+        : `Shift ${shift.shift_index ?? index + 1} (Final)`,
+      operator: displayNameForId(shift.operator_id || shift.operator_name || "-"),
+      started: fmtDateLocal(finishJobShiftStart(shift)) || "-",
+      ended: fmtDateLocal(shift.ended_at_utc || shift.finished_at_utc || "") || "-",
+      pack_count: Math.max(0, Number(shift.pack_count || 0)),
+      good_total: Math.max(0, Number(shift.good_total || 0)),
+      total_good: Math.max(0, Number(shift.total_good ?? (Number(shift.good_total || 0) + Number(shift.butal_total || 0)))),
+      reject_total: Math.max(0, Number(shift.reject_total || 0)),
+      butal_total: Math.max(0, Number(shift.butal_total || 0)),
+    }));
+    return `
+      <div class="pdr-sheet finish-job-sheet">
+        <header class="pdr-topbar">
+          <h2>FINISH JOB PRODUCTION REPORT</h2>
+          <div class="pdr-top-meta"><span>${esc(item.machine_name || item.machine_code || "-")}</span><span>${esc(jobDisplayName(item, item.job_code || "-"))}</span></div>
+        </header>
+        <div class="pdr-kpis" style="margin-top:10px;">
+          <div class="pdr-kpi"><div class="k">TOTAL PACKS</div><div class="v">${esc(totals.pack_count)}</div></div>
+          <div class="pdr-kpi good"><div class="k">GOOD</div><div class="v">${esc(totals.good_total)}</div></div>
+          <div class="pdr-kpi good"><div class="k">TOTAL GOOD</div><div class="v">${esc(totals.total_good)}</div></div>
+          <div class="pdr-kpi bad"><div class="k">REJECT</div><div class="v">${esc(totals.reject_total)}</div></div>
+          <div class="pdr-kpi butal"><div class="k">BUTAL</div><div class="v">${esc(totals.butal_total)}</div></div>
+        </div>
+        <section class="pdr-section" style="margin-top:10px;">
+          <div class="pdr-section-title">Production by Shift</div>
+          <table class="review-kv-table review-data-table finish-job-table">
+            <thead><tr><th>Shift</th><th>Operator</th><th>Started</th><th>Ended</th><th>Packs</th><th>Good</th><th>Total Good</th><th>Reject</th><th>Butal</th></tr></thead>
+            <tbody>
+              ${rows.map(shift => `<tr><td>${esc(shift.label)}</td><td>${esc(shift.operator)}</td><td>${esc(shift.started)}</td><td>${esc(shift.ended)}</td><td>${esc(shift.pack_count)}</td><td>${esc(shift.good_total)}</td><td>${esc(shift.total_good)}</td><td>${esc(shift.reject_total)}</td><td>${esc(shift.butal_total)}</td></tr>`).join("")}
+              <tr class="finish-job-total-row"><td>TOTAL</td><td colspan="3">${esc(rows.length)} shift${rows.length === 1 ? "" : "s"}</td><td>${esc(totals.pack_count)}</td><td>${esc(totals.good_total)}</td><td>${esc(totals.total_good)}</td><td>${esc(totals.reject_total)}</td><td>${esc(totals.butal_total)}</td></tr>
+            </tbody>
+          </table>
+          <div class="finish-job-muted" style="margin-top:8px;">Production quantities only. Individual pack QR and product-part QR scan records are intentionally hidden from this report.</div>
+        </section>
+      </div>
+    `;
+  }
+
+  function finishJobInventoryNumber(value){
+    if(value === null || value === undefined || value === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function finishJobInventoryQty(value, unit = ""){
+    const number = finishJobInventoryNumber(value);
+    if(number === null) return "-";
+    return `${number.toFixed(2)}${unit ? ` ${unit}` : ""}`;
+  }
+
+  function finishJobInventoryIdentityKeys(value){
+    const item = (value && typeof value === "object") ? value : {};
+    return [
+      item.product_id, item.material_product_id, item.part_product_id,
+      item.sku, item.material_sku, item.job_part_sku, item.part_sku,
+      item.name, item.material_name, item.material, item.job_part_name,
+    ].map(materialKeyText).filter(Boolean);
+  }
+
+  function finishJobReturnInventoryRows(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const verified = Array.isArray(item.return_inventory_logs)
+      ? item.return_inventory_logs.filter(entry => entry && typeof entry === "object")
+      : [];
+    let sourceRows = verified.length
+      ? verified.map(entry => ({...entry}))
+      : (Array.isArray(item.product_part_excess_logs) ? item.product_part_excess_logs : [])
+          .filter(entry => entry && typeof entry === "object")
+          .map(entry => ({...entry, return_type: entry.return_type || "PRODUCT PART"}));
+    if(!verified.length && item.finish_job_butal_print && typeof item.finish_job_butal_print === "object"){
+      sourceRows.unshift({...item.finish_job_butal_print, return_type:"BUTAL PACK"});
+    }
+    const combined = item.job_combined_totals && typeof item.job_combined_totals === "object" ? item.job_combined_totals : {};
+    const butalTotal = Math.max(0, Number(combined.butal_total ?? item.butal_total ?? 0));
+    if(butalTotal > 0 && !sourceRows.some(entry => String(entry.return_type || "").trim().toUpperCase() === "BUTAL PACK")){
+      sourceRows.unshift({
+        return_type: "BUTAL PACK",
+        sku: item.product_sku || item.product_id || "PACK QR",
+        name: item.product_name || item.job_name || "Butal Pack",
+        unit: "pcs",
+        expected_balance_qty: butalTotal,
+        printed_quantity: butalTotal,
+        quantity_source: "EXPECTED_BALANCE",
+      });
+    }
+    const rawLogs = Array.isArray(item.raw_material_logs)
+      ? item.raw_material_logs.filter(entry => entry && typeof entry === "object")
+      : [];
+    const cumulativeRows = Array.isArray(item.job_inventory_totals)
+      ? item.job_inventory_totals.filter(entry => entry && typeof entry === "object")
+      : [];
+    return sourceRows.map((entry, index) => {
+      const type = String(entry.return_type || "PRODUCT PART").trim().toUpperCase();
+      const unit = String(entry.unit || (type === "BUTAL PACK" ? "pcs" : "")).trim();
+      const expected = firstValue(
+        entry.expected_balance_qty, entry.expected_qty, entry.excess_available_qty,
+        entry.carryover_available_qty, entry.available_qty, entry.qty, 0
+      );
+      const expectedNumber = finishJobInventoryNumber(expected) ?? 0;
+      const actual = firstValue(entry.actual_count_qty, entry.actual_excess_qty, entry.actual_qty, null);
+      const actualNumber = finishJobInventoryNumber(actual);
+      const entryKeys = finishJobInventoryIdentityKeys(entry);
+      const matchingRaw = type === "BUTAL PACK" ? [] : rawLogs.filter(log => {
+        const logKeys = finishJobInventoryIdentityKeys(log);
+        return logKeys.some(key => entryKeys.includes(key));
+      });
+      const cumulative = type === "BUTAL PACK" ? null : cumulativeRows.find(total => {
+        const totalKeys = finishJobInventoryIdentityKeys(total);
+        return totalKeys.some(key => entryKeys.includes(key));
+      });
+      const rawAvailable = matchingRaw.reduce((sum, log) => sum + Math.max(0, Number(log.qty ?? log.quantity ?? 0)), 0);
+      const explicitAvailable = firstValue(
+        entry.available_before_use_qty, entry.total_available_qty, entry.issued_qty,
+        entry.scanned_qty, entry.produced_issued_qty, null
+      );
+      const available = cumulative
+        ? (finishJobInventoryNumber(cumulative.total_scanned) ?? 0)
+        : type === "BUTAL PACK"
+        ? expectedNumber
+        : (finishJobInventoryNumber(explicitAvailable) ?? (rawAvailable > 0 ? rawAvailable : expectedNumber));
+      const explicitUsed = firstValue(
+        entry.used_qty, entry.consumed_qty, entry.actual_consumed_qty,
+        entry.raw_consumed_qty, null
+      );
+      const used = cumulative
+        ? (finishJobInventoryNumber(cumulative.total_used) ?? 0)
+        : type === "BUTAL PACK"
+        ? 0
+        : (finishJobInventoryNumber(explicitUsed) ?? Math.max(0, available - expectedNumber));
+      const balance = cumulative
+        ? (finishJobInventoryNumber(cumulative.balance) ?? (available - used))
+        : type === "BUTAL PACK"
+        ? expectedNumber
+        : Math.max(0, available - used);
+      const difference = finishJobInventoryNumber(entry.difference_qty)
+        ?? (actualNumber === null ? null : actualNumber - expectedNumber);
+      const printed = firstValue(entry.printed_quantity, entry.print_qty, actualNumber, expectedNumber);
+      return {
+        index:index + 1,
+        type,
+        sku:firstValue(entry.sku, entry.material_sku, entry.job_part_sku, entry.product_id, entry.material_product_id, "-"),
+        name:firstValue(entry.name, entry.material_name, entry.material, entry.job_part_name, type === "BUTAL PACK" ? "Butal Pack" : "Product Part"),
+        unit:unit || String(cumulative?.unit || "").trim(),
+        used,
+        scanned:available,
+        balance,
+        expected:expectedNumber,
+        actual:actualNumber,
+        difference,
+        printed:finishJobInventoryNumber(printed),
+        source:String(entry.quantity_source || (actualNumber === null ? "EXPECTED BALANCE" : "ACTUAL COUNT")).replace(/_/g, " "),
+      };
+    });
+  }
+
+  function finishJobReturnInventoryHtml(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const rows = finishJobReturnInventoryRows(item);
+    return `
+      <div class="pdr-sheet finish-job-sheet">
+        <header class="pdr-topbar">
+          <h2>FINISH JOB RETURN INVENTORY</h2>
+          <div class="pdr-top-meta"><span>BUTAL + PRODUCT-PART EXCESS</span><span>${esc(item.job_code || "-")}</span></div>
+        </header>
+        <section class="pdr-section" style="margin-top:10px;">
+          <div class="pdr-section-title">Excess Summary</div>
+          ${rows.length ? `
+            <table class="review-kv-table review-data-table finish-job-table">
+              <thead><tr><th>#</th><th>Return Type</th><th>SKU / Item</th><th>Total Scanned</th><th>Total Used</th><th>Balance</th><th>Expected Excess</th><th>Actual Qty</th><th>Difference</th><th>Print Qty</th><th>Based On</th></tr></thead>
+              <tbody>${rows.map(entry => `<tr>
+                <td>${esc(entry.index)}</td><td>${esc(entry.type)}</td><td>${skuNameHoverHtml(entry.sku, entry.name)}</td>
+                <td>${esc(finishJobInventoryQty(entry.scanned, entry.unit))}</td>
+                <td>${esc(finishJobInventoryQty(entry.used, entry.unit))}</td>
+                <td>${esc(finishJobInventoryQty(entry.balance, entry.unit))}</td>
+                <td>${esc(finishJobInventoryQty(entry.expected, entry.unit))}</td>
+                <td>${entry.actual === null ? '<span class="finish-job-muted">Not entered</span>' : esc(finishJobInventoryQty(entry.actual, entry.unit))}</td>
+                <td>${esc(finishJobInventoryQty(entry.difference, entry.unit))}</td>
+                <td>${esc(finishJobInventoryQty(entry.printed, entry.unit))}</td>
+                <td>${esc(entry.source)}</td>
+              </tr>`).join("")}</tbody>
+            </table>
+          ` : '<div class="machine-detail-empty">No butal or product-part excess was recorded for this finished job.</div>'}
+          <div class="finish-job-muted" style="margin-top:8px;">Actual Count is optional. When it is blank, the printed return quantity uses Expected Excess.</div>
+        </section>
+      </div>
+    `;
+  }
+
+  function finishJobApprovalHtml(row){
+    const item = (row && typeof row === "object") ? row : {};
+    const supervisor = firstValue(item.approved_by, item.supervisor_name, item.approved_by_code, "-");
+    const supervisorCode = firstValue(item.approved_by_code, "-");
+    const role = firstValue(item.approved_by_role, "SUPERVISOR");
+    const confirmedAt = firstValue(item.approved_at_utc, item.excess_verification_completed_at_utc, item.finished_at_utc, "");
+    return `
+      <section class="finish-job-approval" aria-label="Finish Job confirmation">
+        <div class="finish-job-approval-item"><div class="k">Confirmed / Approved By</div><div class="v">${esc(supervisor)}</div></div>
+        <div class="finish-job-approval-item"><div class="k">Supervisor QR / Badge</div><div class="v">${esc(supervisorCode)}</div></div>
+        <div class="finish-job-approval-item"><div class="k">Role</div><div class="v">${esc(role)}</div></div>
+        <div class="finish-job-approval-item"><div class="k">Confirmed At</div><div class="v">${esc(fmtDateLocal(confirmedAt) || "-")}</div></div>
+      </section>
+    `;
+  }
+
+  function finishJobDetailsHtml(row){
+    return `
+      <div class="finish-job-details-stack">
+        ${finishJobProductionSummaryHtml(row)}
+        ${finishJobReturnInventoryHtml(row)}
+        ${finishJobApprovalHtml(row)}
+      </div>
+    `;
+  }
+
   function renderSummaryMetricsHtml(row){
     const r = row || {};
     const totalGood = Number(r.total_good ?? ((Number(r.good_total||0) + Number(r.butal_total||0))));
@@ -18304,14 +18619,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     finishedJobsList.innerHTML = sorted.map((r, idx) => {
       const machineCode = String(r.machine_code || "").trim();
       const machineName = (r.machine_name || MACHINE_NAME_MAP[machineCode] || machineCode || "-");
-      const rawLogs = Array.isArray(r.raw_material_logs) ? r.raw_material_logs : [];
       const relatedApprovedShifts = shiftItems.filter(x => isApprovedShiftRecord(x) && String(x.job_code || "") === String(r.job_code || ""));
-      const rawText = rawLogs.length
-        ? rawLogs.map((x, idx) => `${idx+1}. ${x.material || "-"} | qty=${x.qty || 0}`).join("\n")
-        : "No raw materials scanned.";
-      const partialSummaryText = relatedApprovedShifts.length
-        ? relatedApprovedShifts.map((x, rowIdx) => `${rowIdx + 1}. ${fmtDateLocal(x.finished_at_utc || x.ended_at_utc || "")} | Qty ${x.partial_qty || x.total_good || 0} | Reject ${x.reject_total || 0} | No Shot ${x.no_shot_total || 0} | Downtime ${fmtDowntimeSeconds(x.downtime_last_seconds)} | Approved by ${x.approved_by || "-"} ${x.approved_at_utc ? `at ${fmtDateLocal(x.approved_at_utc)}` : ""}`).join("\n")
-        : "No approved shift partials linked to this job yet.";
       const linkageRole = String(r.linkage_role || "").toUpperCase();
       const linkageTotal = Number(r.linkage_group_total_jobs || 0);
       const linkageBadge = linkageRole ? `<span class="linkage-pill">${esc(linkageRole)}${linkageTotal ? ` (${linkageTotal})` : ""}</span>` : "";
@@ -18323,27 +18631,18 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
             <span class="finished-badge">FINISHED</span>
           </div>
           <div class="finished-grid">
-            <div><strong>Finished UTC:</strong> ${esc(r.finished_at_utc || "-")}</div>
+            <div><strong>Finished:</strong> ${esc(fmtDateLocal(r.finished_at_utc || "") || "-")}</div>
             <div><strong>Operator:</strong> ${esc(displayNameForId(r.operator_id || "-"))}</div>
-            <div><strong>Pack Count:</strong> ${esc(r.pack_count ?? 0)}</div>
-            <div><strong>Good:</strong> ${esc(r.good_total ?? 0)}</div>
-            <div><strong>Butal:</strong> ${esc(r.butal_total ?? 0)}</div>
-            <div><strong>Reject:</strong> ${esc(r.reject_total ?? 0)}</div>
-            <div><strong>No Shot:</strong> ${esc(r.no_shot_total ?? 0)}</div>
-            <div><strong>Total Good:</strong> ${esc(r.total_good ?? 0)}</div>
-            <div><strong>Startup Reject:</strong> ${esc(r.startup_reject_total ?? 0)}</div>
-            <div><strong>App Counter:</strong> ${esc(r.machine_counter_app_end ?? "-")}</div>
-            <div><strong>Machine Counter:</strong> ${esc(r.machine_counter_end ?? "-")}</div>
-            <div><strong>Counter Diff:</strong> ${esc(r.machine_counter_difference ?? "-")}</div>
-            <div><strong>Raw Sacks:</strong> ${esc(r.raw_sacks_count ?? 0)}</div>
-            <div><strong>Approved Shifts:</strong> ${esc(relatedApprovedShifts.length)}</div>
-            <div><strong>Approved Shift Qty:</strong> ${esc(relatedApprovedShifts.reduce((sum, x) => sum + Number(x.partial_qty || x.total_good || 0), 0))}</div>
+            <div><strong>Final Shift Packs:</strong> ${esc(r.pack_count ?? 0)}</div>
+            <div><strong>Final Shift Good:</strong> ${esc(r.good_total ?? 0)}</div>
+            <div><strong>Final Shift Reject:</strong> ${esc(r.reject_total ?? 0)}</div>
+            <div><strong>Final Shift Butal:</strong> ${esc(r.butal_total ?? 0)}</div>
+            <div><strong>Saved Prior Shifts:</strong> ${esc(relatedApprovedShifts.length)}</div>
+            <div><strong>Confirmed By:</strong> ${esc(r.approved_by || r.supervisor_name || "-")}</div>
           </div>
-          <div class="raw-list">${esc(rawText)}</div>
-          <div class="raw-list">${esc(partialSummaryText)}</div>
           ${linkageNote ? `<div class="finished-linkage-note"><strong>Link Info:</strong> ${esc(linkageNote)}</div>` : ""}
           <div class="finished-actions">
-            <button class="approve-print-btn" data-row-index="${idx}" type="button">Approve and Print QR</button>
+            <button class="approve-print-btn" data-row-index="${idx}" type="button">View Finish Job</button>
           </div>
         </div>
       `;
@@ -21162,7 +21461,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const approvePrintOverlayTitle = document.getElementById("approvePrintOverlayTitle");
     if(approvePrintOverlayTitle) approvePrintOverlayTitle.textContent = approvedShiftViewAtOpen
       ? "Production Shift Report"
-      : (overlayReviewMode === "shift" ? "Review Shift" : "Approve and Print QR");
+      : (overlayReviewMode === "shift" ? "Review Shift" : "Finish Job Report");
     if(overlayReviewSubmitBtn) overlayReviewSubmitBtn.textContent = overlayReviewMode === "shift" ? "Approve & Continue" : "Save Review";
     if(overlayReviewContinueBtn) overlayReviewContinueBtn.style.display = overlayReviewMode === "shift" ? "none" : "";
     const title = activeJobRow
@@ -21179,7 +21478,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     if(overlayReviewSummaryDisplay) overlayReviewSummaryDisplay.innerHTML = approvedShiftView
       ? shiftDailyReportHtml(activeJobRow)
       : shiftPanels ? renderShiftGroupedPanelHtml(shiftPanels.summary, "No shift summary.")
-      : renderSummaryMetricsHtml(activeJobRow);
+      : finishJobDetailsHtml(activeJobRow);
     if(overlayReviewRejectsDisplay) overlayReviewRejectsDisplay.innerHTML = shiftPanels
       ? '<div class="machine-detail-empty">Use the next arrow for reject details.</div>'
       : renderBulletListHtml(reviewRejectsText(activeJobRow), "No reject details recorded.");
@@ -21195,7 +21494,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     if(overlayRawConsumptionDisplay) overlayRawConsumptionDisplay.innerHTML = approvedShiftView
       ? shiftProductConsumptionComparisonHtml(activeJobRow)
       : shiftPanels ? renderShiftGroupedPanelHtml(shiftPanels.rawConsumption, "No raw material records.")
-      : renderBulletListHtml(overlayRawConsumption?.value || "", "No raw material consumption records.");
+      : finishJobReturnInventoryHtml(activeJobRow);
     if(overlayRawCycleSummary) overlayRawCycleSummary.value = shiftPanels
       ? shiftPanels.rawCycle
       : [
@@ -21262,6 +21561,7 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     closeShiftActionHistory();
     approvePrintOverlay.classList.remove("active");
     approvePrintOverlay.classList.remove("linked-shift-report");
+    approvePrintOverlay.classList.remove("finish-job-report");
     activeJobRow = null;
     overlayReviewSavedApproved = false;
     overlayReviewMode = "job";
@@ -23865,8 +24165,21 @@ Finished-job history will remain saved. This action cannot be undone.`)) return;
     const idx = Number(btn.getAttribute("data-row-index"));
     if(Number.isNaN(idx) || idx < 0) return;
     const sorted = [...(finishedJobsState || [])].reverse();
-    const row = sorted[idx];
+    let row = sorted[idx];
     if(!row) return;
+    try {
+      btn.disabled = true;
+      btn.textContent = "Loading report...";
+      const response = await fetch(`/api/finished-jobs/detail?job_key=${encodeURIComponent(jobKeyOf(row))}`, {cache:"no-store"});
+      const output = await response.json();
+      if(!response.ok || !output?.ok || !output?.item) throw new Error(output?.error || `HTTP ${response.status}`);
+      row = output.item;
+    } catch(error) {
+      alert(`Unable to load Finish Job report: ${error?.message || error}`);
+      renderFinishedJobs(finishedJobsState);
+      setFinishedJobsInteractionLock(false);
+      return;
+    }
     openApprovePrintOverlay(row);
     if(!productItems.length){
       loadProducts(false);
@@ -24417,13 +24730,16 @@ Archive warning: ${e}`;
     if(overlayReviewSummaryDisplay) overlayReviewSummaryDisplay.innerHTML = approvedShiftView
       ? shiftDailyReportHtml(activeJobRow)
       : shiftPanels ? renderShiftGroupedPanelHtml(shiftPanels.summary, "No shift summary.")
-      : renderSummaryMetricsHtml(activeJobRow);
+      : finishJobDetailsHtml(activeJobRow);
     if(overlayReviewRejectsDisplay) overlayReviewRejectsDisplay.innerHTML = shiftPanels
       ? '<div class="machine-detail-empty">Use the next arrow for reject details.</div>'
       : renderBulletListHtml(overlayReviewRejects.value || "", "No reject details recorded.");
     if(overlayRejectDetailsPageDisplay) overlayRejectDetailsPageDisplay.innerHTML = shiftPanels
       ? renderShiftGroupedPanelHtml(shiftPanels.rejects, "No reject details recorded.")
       : renderBulletListHtml(overlayReviewRejects.value || "", "No reject details recorded.");
+    if(overlayRawConsumptionDisplay && overlayReviewMode === "job"){
+      overlayRawConsumptionDisplay.innerHTML = finishJobReturnInventoryHtml(activeJobRow);
+    }
     if(overlayTransferPreviewDisplay) overlayTransferPreviewDisplay.innerHTML = renderTransferPreviewHtml(activeJobRow);
     fillDisapproveFields(activeJobRow);
     if(Array.isArray(latestState.finished_jobs)){
@@ -28294,6 +28610,11 @@ async def api_event(req: Request):
                 },
             )
 
+    if ev_type == "MACHINE_RELEASE":
+        # Preserve the recoverable machine session but remove ownership by the
+        # physical RPI that issued the release.
+        sess.client_id = ""
+
     resulting_live_session = SESSIONS.get(machine_code)
     if resulting_live_session is not None and ev_type not in TRANSPORT_ONLY_EVENT_TYPES:
         resulting_live_session.last_event = _dashboard_event_description(
@@ -28318,6 +28639,19 @@ async def api_event(req: Request):
         return JSONResponse(
             {"ok": False, "error": f"{ev_type} state was not durably saved; retry required"},
             status_code=503,
+        )
+
+    if ev_type == "MACHINE_RELEASE":
+        # Detach only the physical client. The MachineSession above remains
+        # stored and can be recovered when this or another RPI scans the machine.
+        _update_client_status(
+            client_id,
+            remote_host,
+            machine_code="",
+            machine_name="",
+            event_type=ev_type,
+            last_event="MACHINE RELEASED - SESSION RETAINED",
+            machine_scanned=False,
         )
 
     if ev_type != "HEARTBEAT" and not BATCH_BROADCAST_DEFERRED.get():
@@ -28494,13 +28828,192 @@ def api_mixing_material_history(machine_code: str = "", job_code: str = ""):
     }
 
 
+def _finish_job_inventory_aliases(row: Dict[str, Any]) -> List[str]:
+    aliases: List[str] = []
+    product_id = str(
+        row.get("product_id")
+        or row.get("material_product_id")
+        or row.get("part_product_id")
+        or ""
+    ).strip()
+    if product_id:
+        aliases.append(f"ID:{product_id.lstrip('0') or '0'}")
+    for value in (
+        row.get("sku"), row.get("material_sku"), row.get("job_part_sku"),
+        row.get("part_sku"), row.get("part_code"), row.get("product_code"),
+    ):
+        normalized = re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+        if normalized:
+            aliases.append(f"SKU:{normalized}")
+    for value in (
+        row.get("name"), row.get("material_name"), row.get("material"),
+        row.get("job_part_name"), row.get("part_name"), row.get("product_name"),
+    ):
+        normalized = re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+        if normalized:
+            aliases.append(f"NAME:{normalized}")
+    return list(dict.fromkeys(aliases))
+
+
+def _finish_job_cumulative_inventory(
+    final_detail: Dict[str, Any],
+    shift_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Aggregate original part scans and actual pack consumption for the whole job."""
+    details = [
+        _load_history_detail_sql(row)
+        for row in shift_rows
+        if isinstance(row, dict)
+    ]
+    details.append(final_detail)
+    totals: Dict[str, Dict[str, Any]] = {}
+    alias_owner: Dict[str, str] = {}
+
+    def bucket_for(source: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        aliases = _finish_job_inventory_aliases(source)
+        owner = next((alias_owner[a] for a in aliases if a in alias_owner), "")
+        if not owner:
+            if not aliases:
+                return None
+            owner = aliases[0]
+            totals[owner] = {
+                "product_id": str(
+                    source.get("product_id")
+                    or source.get("material_product_id")
+                    or source.get("part_product_id")
+                    or ""
+                ).strip(),
+                "sku": str(
+                    source.get("sku")
+                    or source.get("material_sku")
+                    or source.get("job_part_sku")
+                    or source.get("part_sku")
+                    or ""
+                ).strip(),
+                "name": str(
+                    source.get("name")
+                    or source.get("material_name")
+                    or source.get("material")
+                    or source.get("job_part_name")
+                    or source.get("part_name")
+                    or "Product Part"
+                ).strip(),
+                "unit": str(source.get("unit") or "").strip(),
+                "total_scanned": 0.0,
+                "total_used": 0.0,
+                "scan_count": 0,
+            }
+        bucket = totals[owner]
+        for alias in aliases:
+            alias_owner[alias] = owner
+        if not bucket.get("product_id"):
+            bucket["product_id"] = str(
+                source.get("product_id")
+                or source.get("material_product_id")
+                or source.get("part_product_id")
+                or ""
+            ).strip()
+        if not bucket.get("sku"):
+            bucket["sku"] = str(
+                source.get("sku")
+                or source.get("material_sku")
+                or source.get("job_part_sku")
+                or source.get("part_sku")
+                or ""
+            ).strip()
+        if not bucket.get("unit"):
+            bucket["unit"] = str(source.get("unit") or "").strip()
+        return bucket
+
+    seen_scans: set[str] = set()
+    for detail in details:
+        for log in detail.get("raw_material_logs") or []:
+            if not isinstance(log, dict) or bool(log.get("voided")):
+                continue
+            source = str(log.get("source") or "").strip().upper()
+            if any(marker in source for marker in ("CARRYOVER", "EXCESS", "RETURN")):
+                continue
+            scan_identity = str(log.get("unique_key") or log.get("raw_scan") or "").strip()
+            if not scan_identity:
+                scan_identity = "|".join(
+                    str(log.get(key) or "").strip()
+                    for key in ("material_product_id", "index", "lot_number", "scanned_at")
+                )
+            if scan_identity in seen_scans:
+                continue
+            seen_scans.add(scan_identity)
+            bucket = bucket_for(log)
+            if bucket is None:
+                continue
+            bucket["total_scanned"] += max(
+                0.0, _parse_number_like(log.get("qty", log.get("quantity", 0)))
+            )
+            bucket["scan_count"] += 1
+
+    seen_consumption: set[str] = set()
+    for detail in details:
+        for pack in detail.get("product_pack_history_logs") or []:
+            if not isinstance(pack, dict) or bool(pack.get("voided")):
+                continue
+            pack_identity = str(
+                pack.get("pack_key") or pack.get("raw_scan") or pack.get("unique_key") or ""
+            ).strip()
+            for entry_index, consumption in enumerate(pack.get("raw_part_consumption") or []):
+                if not isinstance(consumption, dict):
+                    continue
+                aliases = _finish_job_inventory_aliases(consumption)
+                part_identity = aliases[0] if aliases else str(entry_index)
+                event_identity = f"{pack_identity}|{part_identity}"
+                if event_identity in seen_consumption:
+                    continue
+                seen_consumption.add(event_identity)
+                bucket = bucket_for(consumption)
+                if bucket is None:
+                    continue
+                used = _parse_number_like(
+                    consumption.get("used_qty_kg", consumption.get("used_qty", 0))
+                )
+                if used <= 0:
+                    produced = max(
+                        0.0, _parse_number_like(consumption.get("produced_units", 0))
+                    )
+                    rate = max(
+                        0.0,
+                        _parse_number_like(
+                            consumption.get(
+                                "part_qty_per_unit_kg",
+                                consumption.get("part_qty_per_unit", 0),
+                            )
+                        ),
+                    )
+                    used = produced * rate
+                bucket["total_used"] += max(0.0, used)
+
+    rows: List[Dict[str, Any]] = []
+    for bucket in totals.values():
+        scanned = float(bucket.get("total_scanned") or 0.0)
+        used = float(bucket.get("total_used") or 0.0)
+        if scanned <= 0 and used <= 0:
+            continue
+        rows.append({
+            **bucket,
+            "total_scanned": round(scanned, 6),
+            "total_used": round(used, 6),
+            "balance": round(scanned - used, 6),
+            "shift_count": len(details),
+        })
+    rows.sort(key=lambda item: (str(item.get("sku") or ""), str(item.get("name") or "")))
+    return rows
+
+
 def _finished_detail_with_prior_partials(
     row: Dict[str, Any],
     *,
     include_activity: bool = False,
 ) -> Dict[str, Any]:
     detail = _load_history_detail_sql(row)
-    if str(detail.get("record_type") or "").strip().upper() == "SHIFT_PARTIAL":
+    record_type = str(detail.get("record_type") or "").strip().upper()
+    if record_type == "SHIFT_PARTIAL":
         detail["prior_partial_raw_material_totals"] = (
             _same_job_partial_raw_material_totals(detail)
         )
@@ -28534,6 +29047,61 @@ def _finished_detail_with_prior_partials(
                     key=lambda item: str(item.get("timestamp_utc") or ""),
                 )
                 detail["client_app_logs_total"] = int(stored.get("total") or 0)
+    else:
+        machine_code = str(detail.get("machine_code") or "").strip()
+        job_code = str(detail.get("job_code") or "").strip()
+        finished_at = _parse_iso_utc(
+            detail.get("finished_at_utc") or detail.get("ended_at_utc")
+        )
+        previous_finish: Optional[datetime] = None
+        for candidate in FINISHED_JOBS:
+            if not isinstance(candidate, dict):
+                continue
+            if str(candidate.get("record_type") or "FINAL_JOB").strip().upper() == "SHIFT_PARTIAL":
+                continue
+            if str(candidate.get("machine_code") or "").strip() != machine_code:
+                continue
+            if str(candidate.get("job_code") or "").strip() != job_code:
+                continue
+            candidate_at = _parse_iso_utc(
+                candidate.get("finished_at_utc") or candidate.get("ended_at_utc")
+            )
+            if candidate_at is None or finished_at is None or candidate_at >= finished_at:
+                continue
+            if previous_finish is None or candidate_at > previous_finish:
+                previous_finish = candidate_at
+        shift_summaries: List[Dict[str, Any]] = []
+        matching_shift_rows: List[Dict[str, Any]] = []
+        for candidate in FINISHED_JOBS:
+            if not isinstance(candidate, dict):
+                continue
+            if str(candidate.get("record_type") or "").strip().upper() != "SHIFT_PARTIAL":
+                continue
+            if str(candidate.get("machine_code") or "").strip() != machine_code:
+                continue
+            if str(candidate.get("job_code") or "").strip() != job_code:
+                continue
+            candidate_at = _parse_iso_utc(
+                candidate.get("finished_at_utc") or candidate.get("ended_at_utc")
+            )
+            if candidate_at is None:
+                continue
+            if previous_finish is not None and candidate_at <= previous_finish:
+                continue
+            if finished_at is not None and candidate_at > finished_at:
+                continue
+            matching_shift_rows.append(candidate)
+            shift_summaries.append(_dashboard_finished_summary(candidate))
+        shift_summaries.sort(
+            key=lambda item: str(
+                item.get("finished_at_utc") or item.get("ended_at_utc") or ""
+            )
+        )
+        detail["production_shift_summaries"] = shift_summaries
+        detail["job_inventory_totals"] = _finish_job_cumulative_inventory(
+            detail,
+            matching_shift_rows,
+        )
     return detail
 
 

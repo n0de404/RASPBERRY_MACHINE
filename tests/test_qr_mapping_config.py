@@ -82,6 +82,13 @@ class QrMappingConfigurationTests(unittest.TestCase):
         self.assertEqual(resolve_mapped_scan("finishshift"), "finishshift")
         self.assertEqual(parse_scan("finishshift").kind, "OPERATOR_SHIFT_TRIGGER")
 
+    def test_custom_02_releases_the_current_machine(self):
+        row = next(row for row in DEFAULT_QR_MAPPING_CONFIG["commands"] if row["id"] == "machine_release")
+
+        self.assertEqual(row["aliases"][0], "Custom 02")
+        self.assertEqual(resolve_mapped_scan("Custom 02"), "custom02")
+        self.assertEqual(parse_scan("Custom 02").kind, "MACHINE_RELEASE_TRIGGER")
+
     def test_custom_finish_shift_mapping_uses_existing_workflow(self):
         config = deepcopy(DEFAULT_QR_MAPPING_CONFIG)
         row = next(row for row in config["commands"] if row["id"] == "operator_shift")

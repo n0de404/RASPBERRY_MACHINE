@@ -1671,6 +1671,25 @@ def _load_cached_qr_mapping_config() -> Dict[str, Any]:
     try:
         with open(QR_MAPPING_CACHE_FILE, "r", encoding="utf-8") as f:
             cached = json.load(f)
+        if isinstance(cached, dict):
+            cached = copy.deepcopy(cached)
+            commands = [
+                row for row in (cached.get("commands") or [])
+                if isinstance(row, dict)
+            ]
+            command_ids = {str(row.get("id") or "").strip() for row in commands}
+            if "machine_release" not in command_ids:
+                default_release = next(
+                    (
+                        copy.deepcopy(row)
+                        for row in DEFAULT_QR_MAPPING_CONFIG.get("commands", [])
+                        if row.get("id") == "machine_release"
+                    ),
+                    None,
+                )
+                if default_release is not None:
+                    commands.append(default_release)
+            cached["commands"] = commands
         if isinstance(cached, dict) and _apply_runtime_qr_mapping_config(cached):
             return cached
     except Exception:
@@ -13998,6 +14017,57 @@ QWidget#ClientUIRoot {{
         _delete_active_session_json(code)
         self._last_active_session_snapshot_serialized = ""
 
+    def _release_current_machine(self) -> bool:
+        """Detach this terminal while leaving the server's machine session recoverable."""
+        s = self.state
+        machine_code = str(s.machine_code or "").strip()
+        machine_name = str(s.machine_name or machine_code or "").strip()
+        if not machine_code:
+            self.status.setText("No machine is currently assigned to this RPI.")
+            return False
+        if (
+            isinstance(getattr(self, "_pending_final_review_payload", None), dict)
+            or bool(getattr(self, "_operator_shift_flash_active", False))
+            or bool(getattr(self, "_finish_anim_running", False))
+            or bool(getattr(self, "_supervisor_validation_pending", False))
+        ):
+            self.status.setText("Complete or cancel the open Finish review before releasing the machine.")
+            self._show_invalid_overlay("Machine Release is blocked while a Finish review is open.")
+            return False
+
+        snapshot = self._state_to_active_snapshot()
+        queued = self.push_event(
+            {
+                "type": "MACHINE_RELEASE",
+                "released_machine_code": machine_code,
+                "released_machine_name": machine_name,
+                "session_snapshot": snapshot,
+            },
+            "MACHINE RELEASED FROM RPI",
+        )
+        if not queued:
+            self.status.setText("Machine Release was not saved. The machine remains assigned.")
+            self._show_invalid_overlay("Unable to save the latest session before Machine Release.")
+            return False
+
+        self._pending_server_recovery = None
+        self._skip_server_recovery_machine = ""
+        self._clear_full_session()
+        # Remove any asynchronous snapshot write queued immediately before the
+        # release, then make the deletion the final local persistence action.
+        self._enqueue_active_session_file_persist(
+            {"op": "delete", "machine_code": machine_code}
+        )
+        self._hide_invalid_overlay()
+        self.status.setText(
+            f"{machine_name or machine_code} released. Scan any Machine QR to continue."
+        )
+        self._append_app_log(
+            "MACHINE RELEASE",
+            f"Released {machine_name or machine_code}; server session retained for recovery",
+        )
+        return True
+
     def _sync_active_session_snapshots_to_sql(self):
         return
 
@@ -24904,6 +24974,8 @@ QWidget#ClientUIRoot {{
             return "Machine counter overwrite requested"
         if res.kind == "SUPERVISOR_REVIEW_TRIGGER":
             return "Supervisor Review requested"
+        if res.kind == "MACHINE_RELEASE_TRIGGER":
+            return "Machine Release requested"
         if res.kind == "PRODUCTION_DAILY_REPORT_RESOLVE":
             return "Production daily report resolve"
         if res.kind == "PRODUCTION_DAILY_REPORT_REASON":
@@ -25660,6 +25732,10 @@ QWidget#ClientUIRoot {{
         if self._handle_finish_job_excess_scan(raw_s):
             if raw_s:
                 self._append_app_log("SCAN", f"QR scanned: {raw_s}")
+            return
+        release_trigger = parse_scan(raw_s)
+        if release_trigger is not None and release_trigger.kind == "MACHINE_RELEASE_TRIGGER":
+            self._release_current_machine()
             return
         if self._numpad_command_from_scan(raw_s) == "clear":
             if not self._clear_active_typed_input():

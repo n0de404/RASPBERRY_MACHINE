@@ -84,6 +84,7 @@ REJECT_REASON_CANONICAL_MAP: Dict[str, str] = {
 
 _COMMAND_DEFAULTS: List[Dict[str, Any]] = [
     {"id": "test_machine", "label": "Test Machine", "handler_token": "testmachine~1", "kind": "MACHINE", "value": "TEST MACHINE", "aliases": ["testmachine~1"]},
+    {"id": "machine_release", "label": "Machine Release", "handler_token": "custom02", "kind": "MACHINE_RELEASE_TRIGGER", "value": "Release this RPI from its current machine", "aliases": ["Custom 02", "custom02", "custom_02", "custom2"]},
     {"id": "finish_job", "label": "Finish Job", "handler_token": "finishjob", "kind": "FINISH_JOB", "value": "Finish current job session", "aliases": ["finishjob", "finishjob~1", "jobfinish"]},
     {"id": "operator_shift", "label": "Finish Operator Shift", "handler_token": "finishshift", "kind": "OPERATOR_SHIFT_TRIGGER", "value": "Finish shift", "aliases": ["finishshift", "operatorshift", "operatorshift~1", "operator_shift~1", "shiftchange~1"]},
     {"id": "change_operator", "label": "Change Operator", "handler_token": "changeoperator", "kind": "CHANGE_OPERATOR_TRIGGER", "value": "Change operator or helper", "aliases": ["changeoperator", "changeoperator~1", "change_operator~1", "operatorchange~1", "operator_change~1"]},
@@ -545,6 +546,13 @@ def parse_scan(raw: str) -> Optional[ScanResult]:
             raw=raw,
             value="TEST MACHINE",
             meta={"machine_code": "TEST-MACHINE", "test_machine": True},
+        )
+
+    if s_l in ("custom02", "custom_02", "custom2", "custom 02"):
+        return ScanResult(
+            kind="MACHINE_RELEASE_TRIGGER",
+            raw=raw,
+            value="Release this RPI from its current machine",
         )
 
     # Operator handoff trigger

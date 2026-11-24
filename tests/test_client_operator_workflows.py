@@ -77,6 +77,42 @@ class ClientOperatorWorkflowTests(unittest.TestCase):
 
         self.assertEqual(ui._negative_carryover_policy["grandfathered_job_keys"], [])
 
+    def test_machine_release_retains_server_snapshot_and_clears_local_assignment(self):
+        ui = self._client()
+        ui.state.machine_code = "M00008"
+        ui.state.machine_name = "IMM 308"
+        ui.state.job_code = "JOB-100"
+        ui._pending_final_review_payload = None
+        ui._operator_shift_flash_active = False
+        ui._finish_anim_running = False
+        ui._supervisor_validation_pending = False
+        ui._pending_server_recovery = {"machine_code": "M00008"}
+        ui._skip_server_recovery_machine = "M00008"
+        ui.status = Mock()
+        ui._state_to_active_snapshot = Mock(return_value={
+            "machine_code": "M00008",
+            "job_code": "JOB-100",
+            "pack_count": 7,
+        })
+        ui.push_event = Mock(return_value=True)
+        ui._clear_full_session = Mock()
+        ui._enqueue_active_session_file_persist = Mock()
+        ui._hide_invalid_overlay = Mock()
+        ui._append_app_log = Mock()
+
+        released = ui._release_current_machine()
+
+        self.assertTrue(released)
+        event = ui.push_event.call_args.args[0]
+        self.assertEqual(event["type"], "MACHINE_RELEASE")
+        self.assertEqual(event["session_snapshot"]["pack_count"], 7)
+        ui._clear_full_session.assert_called_once_with()
+        ui._enqueue_active_session_file_persist.assert_called_once_with(
+            {"op": "delete", "machine_code": "M00008"}
+        )
+        self.assertIsNone(ui._pending_server_recovery)
+        self.assertEqual(ui._skip_server_recovery_machine, "")
+
     def test_active_reliever_has_priority_over_helper_manpower_count(self):
         ui = self._client()
         ui.state.operator_id = "OP-1 - Main Operator"
