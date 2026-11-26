@@ -43,6 +43,14 @@ class ClientOperatorWorkflowTests(unittest.TestCase):
         self.assertLess(choice_position, reject_choice_position)
         self.assertLess(choice_position, multiplier_position)
 
+    def test_color_mold_preview_checks_supervisor_before_numeric_choice(self):
+        source = inspect.getsource(production_client.ClientUI.on_scanned)
+
+        preview_position = source.index("if isinstance(self._pending_color_mold_change, dict):")
+        choice_position = source.index("if self._handle_color_change_number_choice(raw_l):")
+
+        self.assertLess(preview_position, choice_position)
+
     def test_num_1_selects_color_without_becoming_multiplier(self):
         ui = self._client()
         ui.state.waiting_color_change_job_scan = True

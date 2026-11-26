@@ -25533,10 +25533,11 @@ QWidget#ClientUIRoot {{
         raw_s = str(raw).strip()
         raw_l = raw_s.lower()
         s = self.state
-        # Scanner-owned option menus must resolve before any other numpad
-        # consumer (offline prompts, reject detail, counters, or multiplier).
-        if self._handle_color_change_number_choice(raw_l):
-            return
+        # Once the target JOB preview is staged, its Supervisor/Cancel prompt
+        # owns the next scan.  Supervisor badge payloads may be numeric, so
+        # this must run before the num_1/num_2 change-type handler; otherwise a
+        # valid Supervisor QR is mistaken for another menu choice and approval
+        # can never complete.
         if isinstance(self._pending_color_mold_change, dict):
             pending_trigger = parse_scan(raw_s)
             if pending_trigger is not None and pending_trigger.kind == "COLOR_CHANGE_TRIGGER":
@@ -25548,6 +25549,10 @@ QWidget#ClientUIRoot {{
                 self._show_invalid_overlay("Only a registered Supervisor can approve this color/mold change.")
                 return
             self._apply_pending_color_mold_change(reviewer)
+            return
+        # Scanner-owned option menus must resolve before any other numpad
+        # consumer (offline prompts, reject detail, counters, or multiplier).
+        if self._handle_color_change_number_choice(raw_l):
             return
         # A new operator scan supersedes any pending redraw from the previous
         # invalid reprint input. A fresh invalid result will schedule its own.
