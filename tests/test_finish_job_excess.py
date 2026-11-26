@@ -165,6 +165,27 @@ class FinishJobExcessWorkflowTests(unittest.TestCase):
         self.assertEqual(rows[0]["print_qty"], 18)
         self.assertIsNone(rows[0]["actual_qty"])
 
+    def test_finish_butal_print_uses_standalone_return_series(self):
+        ui = self._client()
+        ui.state.job_code = "122648"
+        ui.state.production_session_id = "PS-BUTAL-RETURN"
+        ui.state.product_pack_history_logs = [{
+            "raw_scan": (
+                "V2P00000003480Q00000000012I00000000010"
+                "T00000000010L20261125103045-00000122648"
+            ),
+            "product_name": "Test Product",
+            "product_sku": "W-TEST-COVER",
+        }]
+
+        printable = ui._build_finish_butal_pack_print(3)
+
+        self.assertIsNotNone(printable)
+        self.assertEqual(printable["next_index"], 1)
+        self.assertEqual(printable["series_total"], 1)
+        self.assertEqual(printable["template_scanned_index"], 11)
+        self.assertIn("Q00000003.00I00000000001T00000000001", printable["payload"])
+
     def test_blank_actual_prints_and_saves_expected_balance(self):
         ui = self._client()
         ui.state.machine_code = "M00008"

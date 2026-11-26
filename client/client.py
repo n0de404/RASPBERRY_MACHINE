@@ -136,10 +136,24 @@ SHIFT_CARRYOVER_FILE = os.path.join(DATABASE_DIR, "shift_carryover.json")
 NEGATIVE_CARRYOVER_POLICY_FILE = os.path.join(DATABASE_DIR, "negative_carryover_policy.json")
 SIGNED_CARRYOVER_BALANCE_MODE = "SIGNED_V1"
 SQL_CONFIG_FILE = os.path.join(DATABASE_DIR, "sql_config.json")
-APP_LOGS_FILE = os.path.join(DATABASE_DIR, "app_logs.json")
 CLIENT_SETTINGS_FILE = os.path.join(DATABASE_DIR, "client_settings.json")
 QR_MAPPING_CACHE_FILE = os.path.join(DATABASE_DIR, "qr_mapping_cache.json")
 DAILY_ROLE_ASSIGNMENTS_FILE = os.path.join(DATABASE_DIR, "daily_role_assignments.json")
+
+
+def _remove_retired_client_app_logs() -> None:
+    """Delete the obsolete standalone App Logs file after the feature removal."""
+    try:
+        os.remove(os.path.join(DATABASE_DIR, "app_logs.json"))
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # A read-only legacy file must never prevent the production client
+        # from starting; it is no longer opened or used.
+        pass
+
+
+_remove_retired_client_app_logs()
 RUNTIME_STORE = ClientRuntimeStore(DATABASE_DIR)
 RUNTIME_STORE.migrate_legacy_json(
     active_sessions_file=CLIENT_ACTIVE_MACHINE_SESSIONS_FILE,
@@ -148,8 +162,6 @@ RUNTIME_STORE.migrate_legacy_json(
     finished_jobs_file=FINISHED_JOBS_FILE,
     finish_shifts_file=FINISH_SHIFT_FILE,
 )
-APP_LOG_MAX_ROWS = 1000
-APP_LOG_TABLE_MAX_ROWS = 400
 RECORD_TYPE_SHIFT_PARTIAL = "SHIFT_PARTIAL"
 RECORD_TYPE_FINAL_JOB = "FINAL_JOB"
 REVIEW_STATUS_PENDING = "PENDING_SUPERVISOR"
@@ -254,17 +266,6 @@ def _default_graphics_mode() -> str:
     if sys.platform.startswith("linux") and machine and any(token in machine for token in ("arm", "aarch64")):
         return "faster"
     return "quality"
-
-
-def _load_app_logs_json() -> List[Dict[str, Any]]:
-    try:
-        if not os.path.exists(APP_LOGS_FILE):
-            return []
-        with open(APP_LOGS_FILE, "r", encoding="utf-8") as f:
-            rows = json.load(f)
-        return [row for row in (rows or []) if isinstance(row, dict)]
-    except Exception:
-        return []
 
 
 def _load_finished_jobs_json() -> List[Dict[str, Any]]:
@@ -517,16 +518,6 @@ def _normalized_finished_job_row(row: Dict[str, Any]) -> Dict[str, Any]:
         if key not in out:
             out[key] = None
     return out
-
-
-def _save_app_logs_json(rows: List[Dict[str, Any]]) -> bool:
-    try:
-        os.makedirs(DATABASE_DIR, exist_ok=True)
-        with open(APP_LOGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(rows or []), f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
 
 
 def _load_sql_config() -> Dict[str, Any]:
@@ -1328,63 +1319,6 @@ def _replace_finish_shift_sql(rows: List[Dict[str, Any]]) -> bool:
         return ok
     except Exception as e:
         print(f"[SQL] Replace finish_shift failed: {e}")
-        return False
-    finally:
-        conn.close()
-
-
-def _load_app_logs_sql() -> List[Dict[str, Any]]:
-    conn = _sql_conn()
-    if conn is None:
-        return []
-    try:
-        items: List[Dict[str, Any]] = []
-        with conn.cursor() as cur:
-            cur.execute("SELECT `raw_json` FROM `app_logs` ORDER BY `id` ASC")
-            for row in cur.fetchall() or []:
-                raw = row.get("raw_json")
-                item = raw if isinstance(raw, dict) else None
-                if item is None and isinstance(raw, str):
-                    try:
-                        parsed = json.loads(raw)
-                    except Exception:
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        item = parsed
-                if isinstance(item, dict):
-                    items.append(item)
-        return items
-    except Exception:
-        return []
-    finally:
-        conn.close()
-
-
-def _insert_app_log_sql(row: Dict[str, Any]) -> bool:
-    if not isinstance(row, dict):
-        return False
-    conn = _sql_conn()
-    if conn is None:
-        return False
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO `app_logs`
-                (`timestamp_utc`,`source`,`actor`,`message`,`raw_json`)
-                VALUES (%s,%s,%s,%s,CAST(%s AS JSON))
-                """,
-                (
-                    row.get("timestamp_utc"),
-                    row.get("source"),
-                    row.get("actor"),
-                    row.get("message"),
-                    json.dumps(row, ensure_ascii=False),
-                ),
-            )
-        conn.commit()
-        return True
-    except Exception:
         return False
     finally:
         conn.close()
@@ -2541,23 +2475,6 @@ class AppStatusLabel(QLabel):
                 cb(str(text or ""))
             except Exception:
                 pass
-
-
-class AppInteractionLogFilter(QObject):
-    def __init__(self, owner: "ClientUI"):
-        super().__init__(owner)
-        self._owner = owner
-
-    def eventFilter(self, obj, event):
-        owner = self._owner
-        if owner is None or not bool(getattr(owner, "_app_log_ready", False)):
-            return False
-        try:
-            if isinstance(obj, QLineEdit) and event.type() == QEvent.Type.FocusOut:
-                owner._log_user_input_edit(obj)
-        except Exception:
-            pass
-        return False
 
 
 class ServerConnectionIndicator(QWidget):
@@ -3777,12 +3694,6 @@ class ClientUI(QWidget):
         self._event_worker_stop = threading.Event()
         self._event_worker_thread = threading.Thread(target=self._event_dispatch_loop, daemon=True)
         self._event_worker_thread.start()
-        # Persistence workers only need the newest full snapshot. Keeping
-        # hundreds of older copies wastes RAM and disk I/O on Raspberry Pi.
-        self._app_log_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=2)
-        self._app_log_worker_stop = threading.Event()
-        self._app_log_worker_thread = threading.Thread(target=self._app_log_persist_loop, daemon=True)
-        self._app_log_worker_thread.start()
         self._active_session_file_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=32)
         self._active_session_file_worker_stop = threading.Event()
         self._active_session_file_worker_thread = threading.Thread(target=self._active_session_file_persist_loop, daemon=True)
@@ -3825,12 +3736,6 @@ class ClientUI(QWidget):
         self._ensure_product_catalog_index()
         self._last_finish_shift_sync_signature = ""
         self._action_logs: List[str] = []
-        self._app_logs: List[Dict[str, Any]] = _load_app_logs_json()
-        self._app_logs_dirty = True
-        # Activity acknowledgements are intentionally runtime-only. After a
-        # restart the latest rows are offered once again and the server's
-        # deterministic IDs safely deduplicate them.
-        self._server_acknowledged_activity_ids: Set[str] = set()
         self._avg_weight_server: Optional[ThreadingHTTPServer] = None
         self._avg_weight_server_thread: Optional[threading.Thread] = None
         self._avg_weight_server_error: Optional[str] = None
@@ -6400,9 +6305,6 @@ QWidget#ClientUIRoot {{
         self._pending_finish_shift_clear_choice = False
         self._pending_finish_shift_turnover_snapshot: Optional[Dict[str, Any]] = None
         self._finish_job_cancel_snapshot: Optional[Dict[str, Any]] = None
-        self._app_log_ready = False
-        self._app_log_filter = AppInteractionLogFilter(self)
-
         # Settings overlay with category navigation (Graphics / Display).
         self.settingsOverlay = QFrame(self)
         self.settingsOverlay.setObjectName("SettingsOverlay")
@@ -6439,17 +6341,12 @@ QWidget#ClientUIRoot {{
         self.settingsBtnMappings.setObjectName("SettingsNavButton")
         self.settingsBtnMappings.setCheckable(True)
         self.settingsBtnMappings.setProperty("app_log_name", "Settings QR Mappings")
-        self.settingsBtnLogs = QPushButton("App Logs")
-        self.settingsBtnLogs.setObjectName("SettingsNavButton")
-        self.settingsBtnLogs.setCheckable(True)
-        self.settingsBtnLogs.setProperty("app_log_name", "Settings App Logs")
         self.settingsNav.layout().addWidget(self.settingsTitle)
         self.settingsNav.layout().addSpacing(8)
         self.settingsNav.layout().addWidget(self.settingsBtnGraphics)
         self.settingsNav.layout().addWidget(self.settingsBtnDisplay)
         self.settingsNav.layout().addWidget(self.settingsBtnApi)
         self.settingsNav.layout().addWidget(self.settingsBtnMappings)
-        self.settingsNav.layout().addWidget(self.settingsBtnLogs)
         self.settingsNav.layout().addStretch(1)
 
         self.settingsContent = QFrame()
@@ -6844,37 +6741,6 @@ QWidget#ClientUIRoot {{
         self.settingsMappingsSection.layout().addWidget(self.qrMappingBadgeInput)
         self.settingsMappingsSection.layout().addLayout(mapping_actions)
 
-        self.settingsLogsSection = QWidget()
-        self.settingsLogsSection.setObjectName("SettingsPage")
-        self.settingsLogsSection.setLayout(QVBoxLayout())
-        self.settingsLogsSection.layout().setContentsMargins(0, 0, 0, 0)
-        self.settingsLogsSection.layout().setSpacing(8)
-        self.appLogsInfoLabel = QLabel("Persistent admin log of app actions with timestamps and actor names. Table shows the latest logs first.")
-        self.appLogsInfoLabel.setObjectName("MetaLabel")
-        self.appLogsTable = QTableWidget(0, 4)
-        self.appLogsTable.setHorizontalHeaderLabels(["Timestamp", "Source", "Actor", "Action"])
-        self.appLogsTable.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.appLogsTable.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self.appLogsTable.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.appLogsTable.setWordWrap(True)
-        self.appLogsTable.verticalHeader().setVisible(False)
-        self.appLogsTable.verticalHeader().setDefaultSectionSize(30)
-        self.appLogsTable.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.appLogsTable.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.appLogsTable.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.appLogsTable.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.appLogsTable.setColumnWidth(0, 230)
-        self.appLogsTable.setColumnWidth(1, 110)
-        self.appLogsTable.setColumnWidth(2, 220)
-        self.appLogsTable.setMinimumHeight(520)
-        self.appLogsTable.setStyleSheet(
-            "QTableWidget { background: rgba(28,33,40,0.55); border: 1px solid rgba(148,163,184,0.18); border-radius: 14px; }"
-            "QHeaderView::section { background: rgba(71,85,105,0.96); color: #f8fafc; font-weight: 900; border: none; border-bottom: 1px solid rgba(148,163,184,0.35); padding: 6px; }"
-            "QTableWidget::item { padding: 6px; color: #f8fafc; font-weight: 700; }"
-        )
-        self.settingsLogsSection.layout().addWidget(self.appLogsInfoLabel)
-        self.settingsLogsSection.layout().addWidget(self.appLogsTable, 1)
-
         # Job API settings are available in the client Settings > API Config section.
 
         self.settingsCloseBtn.clicked.connect(self._hide_settings_overlay)
@@ -6885,7 +6751,6 @@ QWidget#ClientUIRoot {{
         self.settingsBtnDisplay.clicked.connect(lambda: self._show_settings_section("display"))
         self.settingsBtnApi.clicked.connect(lambda: self._show_settings_section("api"))
         self.settingsBtnMappings.clicked.connect(lambda: self._show_settings_section("mappings"))
-        self.settingsBtnLogs.clicked.connect(lambda: self._show_settings_section("logs"))
         self.graphicsModeToggle.modeChanged.connect(self._apply_graphics_settings)
         self.displayApplyBtn.clicked.connect(self._apply_display_settings)
         self.apiJobApiTestBtn.clicked.connect(self._test_job_api_settings)
@@ -6904,7 +6769,6 @@ QWidget#ClientUIRoot {{
         self.settingsScrollContent.layout().addWidget(self.settingsDisplaySection)
         self.settingsScrollContent.layout().addWidget(self.settingsApiSection)
         self.settingsScrollContent.layout().addWidget(self.settingsMappingsSection)
-        self.settingsScrollContent.layout().addWidget(self.settingsLogsSection)
         self.settingsScrollContent.layout().addStretch(1)
         self.settingsScroll.setWidget(self.settingsScrollContent)
         self.settingsContent.layout().addWidget(self.settingsScroll, 1)
@@ -7063,10 +6927,6 @@ QWidget#ClientUIRoot {{
         self._load_api_settings_form()
         self._load_graphics_settings_form()
         self._show_settings_section("graphics", log_action=False)
-        self._install_app_log_hooks()
-        self._app_log_ready = True
-        self._append_app_log("APP", "Application UI initialized")
-        self._append_app_log("APP", f"Writable Database dir: {DATABASE_DIR}")
         self.settingsOverlay.hide()
         self.settingsOverlay.raise_()
         self._apply_graphics_mode(self.client_config.get("graphics_mode", "quality"), persist=False)
@@ -10646,7 +10506,7 @@ QWidget#ClientUIRoot {{
         self._save_active_session_snapshot()
 
     def _open_finish_shift_review(self) -> bool:
-        """Finalize current values and open Supervisor review immediately."""
+        """Review current values without closing or splitting the running job."""
         s = self.state
         self._hide_resolve_overlay()
         s.waiting_shift_end_machine_counter_input = False
@@ -10654,14 +10514,12 @@ QWidget#ClientUIRoot {{
         s.cycle_time_new_input = ""
         self._sync_machine_counter_current()
         s.machine_counter_shift_end = self._parse_int_value(s.machine_counter_current)
-        shift_payload = self._finalize_current_operator_shift("QR_SHIFT_HANDOFF", emit_event=False)
+        shift_payload = self._build_operator_shift_payload(reason="QR_SHIFT_HANDOFF")
         if shift_payload is None:
             self.status.setText("Operator shift handoff failed: no active operator data.")
             self._show_invalid_overlay("No active operator shift to save.")
             return False
-        review_payloads = self._pending_shift_review_payloads_for_current_operator()
-        if not review_payloads:
-            review_payloads = [shift_payload]
+        review_payloads = [shift_payload]
         existing_review_keys = {
             self._finish_shift_row_key(row)
             for row in review_payloads
@@ -10752,50 +10610,17 @@ QWidget#ClientUIRoot {{
         shift_payload = dict(self._pending_shift_review_payload or {})
         if not shift_payload:
             return
-        linked_payloads = [
-            dict(row) for row in (self._pending_shift_review_linked_payloads or []) if isinstance(row, dict)
-        ]
-        all_shift_payloads = [shift_payload] + linked_payloads
-        remarks = f"Approved on client finish-shift review by {self._safe_text(reviewer.get('name'))}"
-        approved_rows: List[Dict[str, Any]] = []
-        for row in all_shift_payloads:
-            if not self._save_finished_job_local(row):
-                self.status.setText("Approval could not be saved locally. Shift review remains open.")
-                self._show_invalid_overlay("Unable to save the finished shift locally.")
-                return
-            if not self._approve_local_finished_shift(row, reviewer, remarks):
-                self.status.setText("Approval could not be written locally. Shift review remains open.")
-                self._show_invalid_overlay("Unable to update local finished shift approval.")
-                return
-            if not self._save_shift_carryover_record(row):
-                self.status.setText("Carryover could not be saved. Shift review remains open.")
-                self._show_invalid_overlay("Unable to save the shift carryover safely.")
-                return
-            approved_rows.append(row)
-
-        # Queue completion immediately even while offline. The SQLite outbox is
-        # the durable handoff, so the operator can begin the next job without
-        # waiting for the server to become reachable.
-        # Keep a small copy of the completed job setup until the operator picks
-        # the next action. A fast server acknowledgement may clear the old
-        # production session before num_1 is scanned.
-        self._pending_finish_shift_turnover_snapshot = self._state_to_active_snapshot()
-        self._pending_finish_shift_clear_choice = True
-        self._last_finish_shift_sync_signature = ""
-        self.sync_local_finish_shifts_to_server(force=True)
+        handoff_row = self._record_operator_handoff(
+            reason="QR_SHIFT_HANDOFF",
+            reviewer=reviewer,
+            reviewed_payload=shift_payload,
+        )
         self._finish_shift_cancel_snapshot = None
         self._hide_operator_shift_overlay()
-        self._show_info_overlay(
-            "SHIFT COMPLETE - CHOOSE NEXT ACTION",
-            "num_1  SHIFT TURNOVER\n"
-            "Keep the same job, product-part setup, and operator; clear shift totals and continue setup.\n\n"
-            "num_2  CHANGE MOLD / CHANGE COLOR\n"
-            "Clear all shift data, JOB, and OPERATOR, then scan the next JOB.",
-            hide_ms=0,
-        )
+        self._prepare_continuous_operator_handoff(handoff_row)
         self.status.setText(
             f"Shift approved by {self._safe_text(reviewer.get('name'))}. "
-            "Scan num_1 for shift turnover or num_2 for change mold/color."
+            "The job and all production remain active. Scan the next OPERATOR QR."
         )
 
     def _set_reject_review_blur(self, enabled: bool):
@@ -12484,6 +12309,7 @@ QWidget#ClientUIRoot {{
             "raw_sacks_count": raw_sacks_count,
             "raw_material_logs": list((s.raw_material_logs or [])[raw_from:]),
             "raw_material_scans": list(s.raw_material_scans or []),
+            "raw_material_unique_keys": sorted(s.raw_material_unique_keys or set()),
             "part_availability_carryover_logs": self._build_part_availability_carryover_logs(),
             "product_pack_history_logs": shift_pack_rows,
             "pack_ledger_count": ledger_pack_count,
@@ -12499,10 +12325,6 @@ QWidget#ClientUIRoot {{
             "reprint_qr_logs": list(s.reprint_qr_logs or []),
             "production_adjustment_logs": list((s.production_adjustment_logs or [])[adjustment_from:]),
             "action_logs": list(getattr(self, "_action_logs", []) or []),
-            # Audit rows are uploaded incrementally.  Embedding the full
-            # 1,000-row log in every retry made one finish-shift event hundreds
-            # of kilobytes and caused severe UI stalls on Raspberry Pi clients.
-            "client_app_logs": self._pending_server_activity_logs(limit=80),
             "downtime_active": bool(s.downtime_active),
             "downtime_reason_code": s.downtime_reason_code,
             "downtime_reason_text": s.downtime_reason_text,
@@ -12568,6 +12390,82 @@ QWidget#ClientUIRoot {{
                 f"OPERATOR SHIFT SAVE {payload.get('operator_name') or payload.get('operator_id') or ''}".strip(),
             )
         return payload
+
+    def _record_operator_handoff(
+        self,
+        *,
+        reason: str,
+        next_operator: Any = None,
+        reviewer: Optional[Dict[str, Any]] = None,
+        reviewed_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record personnel ownership without creating a production segment."""
+        s = self.state
+        source = reviewed_payload if isinstance(reviewed_payload, dict) else {}
+        outgoing_operator = str(source.get("operator_id") or s.operator_id or "").strip()
+        reviewer_row = reviewer if isinstance(reviewer, dict) else {}
+        row = {
+            "record_type": "OPERATOR_HANDOFF",
+            "handoff_id": f"OH-{uuid.uuid4().hex.upper()}",
+            "reason": str(reason or "OPERATOR_HANDOFF").strip().upper(),
+            "client_id": self._current_client_id(),
+            "machine_code": s.machine_code,
+            "machine_name": _machine_display_name(s.machine_code, s.machine_name),
+            "job_code": s.job_code,
+            "job_name": s.job_name,
+            "production_session_id": s.production_session_id,
+            "outgoing_operator_id": outgoing_operator,
+            "outgoing_operator_name": self._operator_display_name(outgoing_operator),
+            "incoming_operator_id": str(next_operator or "").strip(),
+            "incoming_operator_name": self._operator_display_name(next_operator) if next_operator else "",
+            "started_at_utc": str(source.get("started_at_utc") or s.operator_shift_started_at or ""),
+            "handoff_at_utc": datetime.now(timezone.utc).isoformat(),
+            "approved_by": str(reviewer_row.get("name") or "").strip(),
+            "approved_by_code": str(reviewer_row.get("code") or "").strip(),
+            "approved_by_role": str(reviewer_row.get("role") or "").strip(),
+        }
+        s.operator_shift_logs = [
+            *[dict(item) for item in (s.operator_shift_logs or []) if isinstance(item, dict)],
+            row,
+        ][-200:]
+        return row
+
+    def _prepare_continuous_operator_handoff(self, handoff_row: Dict[str, Any]) -> None:
+        """Keep production continuous and wait for the next primary operator."""
+        s = self.state
+        self._close_open_relief_for_operator_handoff()
+        s.operator_id = None
+        s.operator_qr_payload = ""
+        s.operator_pending_server_validation = False
+        s.active_scan_operator_id = None
+        s.active_scan_owner_type = "ORIGINAL"
+        s.reliever_id = None
+        s.reliever_qr_payload = ""
+        s.break_active = False
+        s.current_break_session_id = ""
+        s.break_out_time = None
+        s.operator_shift_started_at = None
+        s.operator_shift_baseline_machine_counter_start = self._parse_int_value(s.machine_counter_current)
+        s.operator_shift_baseline_pack_count = int(s.pack_count or 0)
+        s.operator_shift_baseline_good_total = int(s.good_total or 0)
+        s.operator_shift_baseline_butal_total = int(s.butal_total or 0)
+        s.operator_shift_baseline_reject_total = int(s.reject_total or 0)
+        s.operator_shift_baseline_startup_reject_total = int(s.startup_reject_total or 0)
+        s.operator_shift_baseline_no_shot_total = int(s.no_shot_total or 0)
+        s.operator_shift_baseline_raw_sacks_count = int(s.raw_sacks_count or 0)
+        s.operator_shift_baseline_reject_breakdown = dict(s.reject_breakdown or {})
+        s.operator_shift_baseline_raw_material_logs_len = len(s.raw_material_logs or [])
+        s.operator_shift_baseline_product_pack_history_logs_len = len(s.product_pack_history_logs or [])
+        s.operator_shift_baseline_reject_review_logs_len = len(s.reject_review_logs or [])
+        s.operator_shift_baseline_butal_scan_logs_len = len(s.butal_scan_logs or [])
+        s.operator_shift_baseline_production_adjustment_logs_len = len(s.production_adjustment_logs or [])
+        self._refresh_ui(force=True)
+        self._save_active_session_snapshot(force=True)
+        self.push_event(
+            {"type": "OPERATOR_HANDOFF", "operator_handoff": dict(handoff_row or {})},
+            "OPERATOR HANDOFF - SCAN NEXT OPERATOR",
+        )
+        self.sync_session_snapshot_to_server("SESSION SNAPSHOT SYNC (OPERATOR HANDOFF)")
 
     def _pack_history_for_output_job(
         self,
@@ -12701,7 +12599,6 @@ QWidget#ClientUIRoot {{
             linked_payload["no_shot_total"] = 0
             # Structured client audit logs belong to the main shift record.
             # Avoid duplicating them into every linked-job copy.
-            linked_payload["client_app_logs"] = []
             self._clear_linked_downtime_and_startup_rejects(linked_payload)
             linked_payload["total_good"] = int(linked_payload.get("good_total") or 0) + int(linked_butal_total or 0)
             linked_payload["partial_qty"] = int(linked_payload.get("good_total") or 0) + int(linked_butal_total or 0)
@@ -12823,6 +12720,7 @@ QWidget#ClientUIRoot {{
 
     def _state_to_active_snapshot(self) -> Dict[str, Any]:
         s = self.state
+        self._sanitize_active_raw_material_inventory(s.raw_material_unique_keys)
         if s.job_code and not str(s.production_session_id or "").strip():
             s.production_session_id = self._legacy_production_session_id(
                 s.machine_code, s.job_code, s.job_started_at, self._current_client_id()
@@ -12960,6 +12858,7 @@ QWidget#ClientUIRoot {{
             "raw_sacks_count": int(s.raw_sacks_count or 0),
             "raw_material_scans": list(s.raw_material_scans or []),
             "raw_material_logs": list(s.raw_material_logs or []),
+            "raw_material_unique_keys": sorted(s.raw_material_unique_keys or set()),
             "offline_qr_type_rules": dict(s.offline_qr_type_rules or {}),
             "offline_linkage_relation_rules": dict(
                 s.offline_linkage_relation_rules or {}
@@ -12977,11 +12876,9 @@ QWidget#ClientUIRoot {{
                 for row in self._build_part_availability_carryover_logs()
                 if isinstance(row, dict)
             ],
-            "raw_material_unique_keys": sorted(list(s.raw_material_unique_keys or set())),
             "product_pack_history_logs": list(s.product_pack_history_logs or []),
             "butal_scan_logs": list(s.butal_scan_logs or []),
             "action_logs": list(getattr(self, "_action_logs", []) or []),
-            "client_app_logs": self._pending_server_activity_logs(limit=80),
             "startup_reject_total": int(s.startup_reject_total or 0),
             "reject_review_open": bool(s.reject_review_open),
             "reject_review_phase": int(s.reject_review_phase or 0),
@@ -13370,6 +13267,113 @@ QWidget#ClientUIRoot {{
             return snap
         return None
 
+    @staticmethod
+    def _raw_material_identity_marker(row: Any) -> str:
+        """Return the job-wide identity of one accepted product-part QR."""
+        if not isinstance(row, dict):
+            return ""
+        unique_key = str(row.get("unique_key") or "").strip()
+        if unique_key:
+            return f"KEY:{unique_key.upper()}"
+        raw_scan = re.sub(r"\s+", "", str(row.get("raw_scan") or "")).strip()
+        if raw_scan:
+            return f"RAW:{raw_scan.upper()}"
+        try:
+            canonical = json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            canonical = repr(row)
+        return f"ROW:{canonical}"
+
+    def _dedupe_raw_material_logs(self, rows: Any) -> List[Dict[str, Any]]:
+        """Collapse replicated copies of a QR while retaining distinct identities."""
+        deduped: List[Dict[str, Any]] = []
+        marker_indexes: Dict[str, int] = {}
+        for raw in rows or []:
+            if not isinstance(raw, dict) or bool(raw.get("voided")):
+                continue
+            row = dict(raw)
+            marker = self._raw_material_identity_marker(row)
+            if marker in marker_indexes:
+                index = marker_indexes[marker]
+                combined = dict(deduped[index])
+                combined.update(row)
+                deduped[index] = combined
+                continue
+            marker_indexes[marker] = len(deduped)
+            deduped.append(row)
+        genuine_keys = {
+            str(row.get("unique_key") or "").strip().upper()
+            for row in deduped
+            if not str(row.get("source") or "").strip().upper().startswith(
+                "FINISH_SHIFT_PART_CARRYOVER"
+            )
+            and str(row.get("unique_key") or "").strip()
+        }
+        genuine_raw_scans = {
+            re.sub(r"\s+", "", str(row.get("raw_scan") or "")).strip().upper()
+            for row in deduped
+            if not str(row.get("source") or "").strip().upper().startswith(
+                "FINISH_SHIFT_PART_CARRYOVER"
+            )
+            and str(row.get("raw_scan") or "").strip()
+        }
+        repaired: List[Dict[str, Any]] = []
+        for row in deduped:
+            source = str(row.get("source") or "").strip().upper()
+            if source.startswith("FINISH_SHIFT_PART_CARRYOVER"):
+                origin_key = str(row.get("carryover_origin_unique_key") or "").strip().upper()
+                origin_raw = re.sub(
+                    r"\s+", "", str(row.get("raw_scan") or "")
+                ).strip().upper()
+                if (origin_key and origin_key in genuine_keys) or (
+                    origin_raw and origin_raw in genuine_raw_scans
+                ):
+                    # A replicated recovery copy already contains the original
+                    # job-wide scans. Counting their derived opening balance as
+                    # another scan would inflate finish-job excess.
+                    continue
+            repaired.append(row)
+        return repaired
+
+    @staticmethod
+    def _physical_raw_material_scan_count(rows: Any) -> int:
+        count = 0
+        for row in rows or []:
+            if not isinstance(row, dict) or bool(row.get("voided")):
+                continue
+            source = str(row.get("source") or "").strip().upper()
+            if source.startswith("FINISH_SHIFT_PART_CARRYOVER") or "AUTO_PART" in source:
+                continue
+            count += 1
+        return count
+
+    def _sanitize_active_raw_material_inventory(self, preserved_keys: Any = None) -> None:
+        """Repair restored inventory and rebuild the duplicate-scan registry."""
+        s = self.state
+        rows = self._dedupe_raw_material_logs(s.raw_material_logs)
+        existing_keys = (
+            preserved_keys
+            if preserved_keys is not None
+            else (s.raw_material_unique_keys or set())
+        )
+        keys = {
+            str(value or "").strip()
+            for value in existing_keys
+            if str(value or "").strip()
+        }
+        keys.update(
+            str(row.get("unique_key") or "").strip()
+            for row in rows
+            if str(row.get("unique_key") or "").strip()
+        )
+        s.raw_material_logs = rows
+        s.raw_material_scans = [
+            str(row.get("material_name") or row.get("material") or "Product Part").strip()
+            for row in rows
+        ]
+        s.raw_material_unique_keys = keys
+        s.raw_sacks_count = self._physical_raw_material_scan_count(rows)
+
     def _merge_matching_recovery_snapshots(self, server_snap: Dict[str, Any], local_snap: Dict[str, Any]) -> Dict[str, Any]:
         """Merge replicated copies of one job without double-counting totals.
 
@@ -13426,7 +13430,7 @@ QWidget#ClientUIRoot {{
             str(key): max(int(server_rejects.get(key, 0) or 0), int(local_rejects.get(key, 0) or 0))
             for key in set(server_rejects) | set(local_rejects)
         }
-        for key in ("product_pack_history_logs", "raw_material_logs", "raw_material_scans", "butal_scan_logs", "reject_review_logs", "operator_shift_logs"):
+        for key in ("product_pack_history_logs", "butal_scan_logs", "reject_review_logs", "operator_shift_logs"):
             rows, seen = [], set()
             for row in list(server_snap.get(key) or []) + list(local_snap.get(key) or []):
                 try:
@@ -13437,6 +13441,25 @@ QWidget#ClientUIRoot {{
                     seen.add(marker)
                     rows.append(row)
             merged[key] = rows
+        merged_raw_logs = self._dedupe_raw_material_logs(
+            list(server_snap.get("raw_material_logs") or [])
+            + list(local_snap.get("raw_material_logs") or [])
+        )
+        merged["raw_material_logs"] = merged_raw_logs
+        merged["raw_material_scans"] = [
+            str(row.get("material_name") or row.get("material") or "Product Part").strip()
+            for row in merged_raw_logs
+        ]
+        merged["raw_sacks_count"] = self._physical_raw_material_scan_count(merged_raw_logs)
+        merged["raw_material_unique_keys"] = sorted({
+            str(value or "").strip()
+            for value in (
+                list(server_snap.get("raw_material_unique_keys") or [])
+                + list(local_snap.get("raw_material_unique_keys") or [])
+                + [row.get("unique_key") for row in merged_raw_logs]
+            )
+            if str(value or "").strip()
+        })
         crew_by_code: Dict[str, Dict[str, Any]] = {}
         for row in list(server_snap.get("crew_members") or []) + list(local_snap.get("crew_members") or []):
             if not isinstance(row, dict):
@@ -13869,11 +13892,8 @@ QWidget#ClientUIRoot {{
         s.raw_sacks_count = int(segment.get("raw_sacks_count") or 0)
         s.raw_material_logs = list(segment.get("raw_material_logs") or [])
         s.raw_material_scans = list(segment.get("raw_material_scans") or [])
-        s.raw_material_unique_keys = {
-            str(item).strip()
-            for item in (s.raw_material_scans or [])
-            if str(item).strip()
-        }
+        s.raw_material_unique_keys = set(segment.get("raw_material_unique_keys") or [])
+        self._sanitize_active_raw_material_inventory(s.raw_material_unique_keys)
         s.product_pack_history_logs = list(segment.get("product_pack_history_logs") or [])
         s.product_pack_history_keys = {
             self._pack_history_key(row)
@@ -14240,6 +14260,7 @@ QWidget#ClientUIRoot {{
         s.raw_material_scans = list(snap.get("raw_material_scans") or [])
         s.raw_material_logs = list(snap.get("raw_material_logs") or [])
         s.raw_material_unique_keys = set(snap.get("raw_material_unique_keys") or [])
+        self._sanitize_active_raw_material_inventory(s.raw_material_unique_keys)
         s.offline_qr_type_rules = {
             str(key): str(value).strip().upper()
             for key, value in dict(snap.get("offline_qr_type_rules") or {}).items()
@@ -14423,7 +14444,13 @@ QWidget#ClientUIRoot {{
 
     def _operator_shift_segment_rows(self, rows: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         source = rows if isinstance(rows, list) else (self.state.operator_shift_logs or [])
-        clean_rows = [dict(row) for row in source if isinstance(row, dict)]
+        clean_rows = [
+            dict(row)
+            for row in source
+            if isinstance(row, dict)
+            and str(row.get("record_type") or RECORD_TYPE_SHIFT_PARTIAL).strip().upper()
+            == RECORD_TYPE_SHIFT_PARTIAL
+        ]
         clean_rows.sort(key=lambda row: (
             int(row.get("shift_index") or 0),
             str(row.get("started_at_utc") or ""),
@@ -14478,6 +14505,7 @@ QWidget#ClientUIRoot {{
 
     def _build_finished_job_payload(self) -> Dict[str, Any]:
         s = self.state
+        self._sanitize_active_raw_material_inventory(s.raw_material_unique_keys)
         main_butal_total = self._butal_qty_for_job(s.job_code, fallback_current=not bool(s.linkage_enabled and (s.linkage_jobs or [])))
         product_identity = self._job_product_identity_from_payload(s.job_payload or {})
         return {
@@ -14512,6 +14540,7 @@ QWidget#ClientUIRoot {{
             "raw_sacks_count": int(s.raw_sacks_count or 0),
             "raw_material_scans": list(s.raw_material_scans or []),
             "raw_material_logs": list(s.raw_material_logs or []),
+            "raw_material_unique_keys": sorted(s.raw_material_unique_keys or set()),
             "product_part_excess_logs": [
                 {
                     **row,
@@ -14738,7 +14767,6 @@ QWidget#ClientUIRoot {{
             linked_payload["partial_qty"] = int(linked_payload.get("good_total") or 0) + int(linked_butal_total or 0)
             linked_payload["startup_reject_total"] = 0
             linked_payload["no_shot_total"] = 0
-            linked_payload["client_app_logs"] = []
             self._clear_linked_downtime_and_startup_rejects(linked_payload)
             linked_payload["linkage_enabled"] = True
             linked_payload["linkage_role"] = "LINKED"
@@ -15918,17 +15946,14 @@ QWidget#ClientUIRoot {{
         is_display = section == "display"
         is_api = section == "api"
         is_mappings = section == "mappings"
-        is_logs = section == "logs"
         self.settingsBtnGraphics.setChecked(is_graphics)
         self.settingsBtnDisplay.setChecked(is_display)
         self.settingsBtnApi.setChecked(is_api)
         self.settingsBtnMappings.setChecked(is_mappings)
-        self.settingsBtnLogs.setChecked(is_logs)
         self.settingsGraphicsSection.setVisible(is_graphics)
         self.settingsDisplaySection.setVisible(is_display)
         self.settingsApiSection.setVisible(is_api)
         self.settingsMappingsSection.setVisible(is_mappings)
-        self.settingsLogsSection.setVisible(is_logs)
         if is_graphics:
             self.settingsContentTitle.setText("Graphics")
         elif is_display:
@@ -15941,9 +15966,6 @@ QWidget#ClientUIRoot {{
             self._qr_mapping_editor_dirty = False
             self._refresh_qr_mappings_from_server(force=True)
             self.qrMappingEditor.setFocus(Qt.FocusReason.OtherFocusReason)
-        elif is_logs:
-            self.settingsContentTitle.setText("App Logs")
-            self._refresh_app_logs_table(force=True)
         else:
             self.settingsContentTitle.setText("API Config")
 
@@ -17762,6 +17784,7 @@ QWidget#ClientUIRoot {{
                 continue
             matched_logs = self._raw_logs_for_part(raw_logs, part, total_part_count=len(parts))
             source_row = dict(matched_logs[-1]) if matched_logs else {}
+            origin_unique_key = str(source_row.get("unique_key") or "").strip()
             product_id = str(part.get("part_product_id") or part.get("product_id") or source_row.get("material_product_id") or "").strip()
             sku = str(part.get("sku") or part.get("part_sku") or source_row.get("material_sku") or "").strip()
             name = str(part.get("name") or part.get("part_name") or source_row.get("material_name") or sku or "Job Part").strip()
@@ -17775,6 +17798,7 @@ QWidget#ClientUIRoot {{
                 "qty": available,
                 "source": "FINISH_SHIFT_PART_CARRYOVER",
                 "unique_key": f"SHIFT-CARRY:{self._normalize_job_code(s.job_code)}:{product_id or sku}:{datetime.now(timezone.utc).isoformat()}",
+                "carryover_origin_unique_key": origin_unique_key or None,
                 "carryover_from_job_code": str(s.job_code or ""),
                 "carryover_available_qty": available,
                 "carried_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -17877,6 +17901,15 @@ QWidget#ClientUIRoot {{
             "job_code": job_code,
             "job_name": payload.get("job_name") or self.state.job_name,
             "part_availability_carryover_logs": part_rows,
+            "raw_material_unique_keys": sorted({
+                str(value or "").strip()
+                for value in (
+                    payload.get("raw_material_unique_keys")
+                    or self.state.raw_material_unique_keys
+                    or []
+                )
+                if str(value or "").strip()
+            }),
             "butal_carryover": butal,
             "external_average_weight_grams": payload.get("external_average_weight_grams"),
             "external_average_weight_unit": payload.get("external_average_weight_unit"),
@@ -18000,9 +18033,12 @@ QWidget#ClientUIRoot {{
         if not rows:
             return 0
         s.raw_material_logs = rows
-        s.raw_material_scans = [str(row.get("material_name") or row.get("material") or "Job Part") for row in rows]
-        s.raw_material_unique_keys = {str(row.get("unique_key") or "").strip() for row in rows if str(row.get("unique_key") or "").strip()}
-        s.raw_sacks_count = len(rows)
+        s.raw_material_unique_keys = {
+            str(value or "").strip()
+            for value in (latest.get("raw_material_unique_keys") or [])
+            if str(value or "").strip()
+        }
+        self._sanitize_active_raw_material_inventory(s.raw_material_unique_keys)
         return len(rows)
 
     def _current_part_availability_statuses(self) -> List[Dict[str, Any]]:
@@ -20089,11 +20125,10 @@ QWidget#ClientUIRoot {{
         old_operator = str(s.operator_id or "").strip()
         if self._operator_code_only(old_operator) == self._operator_code_only(operator_value):
             return False
-        outgoing_payload = self._finalize_current_operator_shift("OPERATOR_CHANGE", emit_event=True)
-        if outgoing_payload is None:
-            self.status.setText("Operator change failed: no active operator data to save.")
-            self._show_invalid_overlay("No active operator data to save.")
-            return False
+        handoff_row = self._record_operator_handoff(
+            reason="OPERATOR_CHANGE",
+            next_operator=operator_value,
+        )
         self._close_open_relief_for_operator_handoff()
         # This is a permanent personnel replacement inside the same running
         # job. Preserve production totals, material/pack history, cycle time,
@@ -20119,7 +20154,7 @@ QWidget#ClientUIRoot {{
         new_name = self._operator_display_name(operator_value)
         message = (
             f"Operator has been changed: {old_name} -> {new_name}. "
-            "Production continues with the current job and totals. Previous operator data is saved in shift logs."
+            "Production continues with the current job and totals. The operator change is saved in the handoff log."
         )
         self._hide_invalid_overlay()
         self._refresh_ui(force=True)
@@ -20137,7 +20172,7 @@ QWidget#ClientUIRoot {{
                 "type": "OPERATOR_CHANGE",
                 "previous_operator": old_operator,
                 "new_operator": operator_value,
-                "operator_shift": outgoing_payload,
+                "operator_handoff": handoff_row,
                 "operator_qr_payload": raw_payload,
                 "pending_server_validation": bool(pending_server_validation),
             },
@@ -20235,6 +20270,8 @@ QWidget#ClientUIRoot {{
         s.raw_sacks_count = int(existing_segment.get("raw_sacks_count") or 0)
         s.raw_material_logs = list(existing_segment.get("raw_material_logs") or [])
         s.raw_material_scans = list(existing_segment.get("raw_material_scans") or [])
+        s.raw_material_unique_keys = set(existing_segment.get("raw_material_unique_keys") or [])
+        self._sanitize_active_raw_material_inventory(s.raw_material_unique_keys)
         s.product_pack_history_logs = list(existing_segment.get("product_pack_history_logs") or [])
         s.product_pack_history_keys = {
             self._pack_history_key(row)
@@ -22107,7 +22144,27 @@ QWidget#ClientUIRoot {{
     def _handle_color_change_number_choice(self, raw_text: str) -> bool:
         s = self.state
         match = re.fullmatch(r"(?:num_)?([0-9]+)", str(raw_text or "").strip().lower())
-        if not (s.waiting_color_change_job_scan and match):
+        if not match:
+            return False
+        # The server-authoritative session refresh intentionally contains only
+        # durable production state.  It can therefore clear this transient
+        # flag while the locally rendered choice menu is still on screen.  In
+        # that case the visible menu remains the owner of num_1 / num_2; repair
+        # the transient state instead of letting the scan become a multiplier.
+        color_mold_menu_visible = False
+        if not s.waiting_color_change_job_scan:
+            try:
+                color_mold_menu_visible = bool(
+                    self.invalidOverlay.isVisible()
+                    and self.choiceCardsWidget.isVisible()
+                    and str(self.invalidTextLabel.text() or "").strip().upper() == "CHANGE COLOR / MOLD"
+                )
+            except (AttributeError, RuntimeError):
+                color_mold_menu_visible = False
+        if color_mold_menu_visible and not s.waiting_color_change_job_scan:
+            s.waiting_color_change_job_scan = True
+            s.pending_color_change_reason = "CHOOSE_TYPE"
+        if not s.waiting_color_change_job_scan:
             return False
         choice = int(match.group(1))
         phase = str(s.pending_color_change_reason or "").strip().upper()
@@ -22505,9 +22562,15 @@ QWidget#ClientUIRoot {{
         printable = self._next_printable_pack_payload()
         if not isinstance(printable, dict):
             return None
-        next_index = int(printable.get("suggested_index") or printable.get("next_index") or 0)
-        if next_index <= 0:
+        template_index = int(printable.get("suggested_index") or printable.get("next_index") or 0)
+        if template_index <= 0:
             return None
+        # A Finish Job Butal label represents returned inventory, not another
+        # label in the production pack series. Keep it as a standalone 1-of-1
+        # label so the printer does not reject it when the source series is
+        # already complete. Normal production/reprint labels remain strict.
+        next_index = 1
+        series_total = 1
         payload = self._pack_payload_with_index(str(printable.get("payload") or ""), next_index)
         payload = re.sub(
             r"(?<=P\d{11})Q\d{11}(?=I\d{11})",
@@ -22515,9 +22578,17 @@ QWidget#ClientUIRoot {{
             payload,
             count=1,
         )
+        payload = re.sub(
+            r"(?<=I\d{11})T\d{11}(?=L\d{14}-)",
+            f"T{series_total:011d}",
+            payload,
+            count=1,
+        )
         printable.update({
             "payload": payload,
             "next_index": next_index,
+            "series_total": series_total,
+            "template_scanned_index": template_index,
             "quantity": qty,
             "print_kind": "BUTAL_PACK",
             "idempotency_key": (
@@ -24996,113 +25067,14 @@ QWidget#ClientUIRoot {{
         self._action_logs = rows[-20:]
         self._schedule_history_panel_refresh()
 
-    def _current_app_log_actor(self) -> str:
-        s = getattr(self, "state", None)
-        if s is None:
-            return "-"
-        if bool(getattr(s, "supervisor_review_open", False)):
-            actor_name = str(getattr(s, "supervisor_review_actor_name", "") or "").strip()
-            actor_role = str(getattr(s, "supervisor_review_actor_role", "") or "").strip()
-            if actor_name:
-                return f"{actor_name} ({actor_role or 'Supervisor'})"
-        if bool(getattr(s, "waiting_supervisor_qr", False)):
-            supervisor_name = str(getattr(s, "supervisor_name", "") or "").strip()
-            if supervisor_name:
-                return f"{supervisor_name} (Supervisor)"
-        operator_id = str(getattr(s, "operator_id", "") or "").strip()
-        if operator_id:
-            return f"{self._operator_display_name(operator_id)} (Operator)"
-        return "-"
-
     def _append_app_log(self, source: str, message: str, actor: Optional[str] = None):
-        msg = str(message or "").replace("\n", " ").strip()
-        src = str(source or "APP").strip().upper() or "APP"
-        actor_text = str(actor or "").replace("\n", " ").strip() or self._current_app_log_actor()
-        if not msg:
-            return
-        # These are periodic transport/configuration health messages, not
-        # operator actions. Keeping every poll/retry floods the activity table
-        # and hides useful scan history. Connectivity and retry state still
-        # remain tracked by the durable outbox and server-status fields.
-        if (
-            (src == "SETTINGS" and msg.startswith("QR mapping version ") and msg.endswith(" loaded from server"))
-            or (src == "STATUS" and msg.startswith("Server send failed:"))
-        ):
-            return
-        row = {
-            "activity_id": f"ACT-{uuid.uuid4().hex.upper()}",
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "source": src,
-            "actor": actor_text,
-            "message": msg,
-        }
-        rows = list(getattr(self, "_app_logs", []) or [])
-        rows.append(row)
-        if len(rows) > APP_LOG_MAX_ROWS:
-            rows = rows[-APP_LOG_MAX_ROWS:]
-        self._app_logs = rows
-        self._app_logs_dirty = True
-        self._enqueue_app_log_persist(row, list(self._app_logs))
-        if self._is_logs_section_active():
-            self._refresh_app_logs_table(force=True)
-
-    @staticmethod
-    def _app_log_activity_id(row: Any) -> str:
-        if not isinstance(row, dict):
-            return ""
-        existing = str(row.get("activity_id") or "").strip()
-        if existing:
-            return existing
-        canonical = json.dumps(
-            {key: value for key, value in row.items() if key != "activity_id"},
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
-        return f"ACT-{uuid.uuid5(uuid.NAMESPACE_URL, canonical).hex.upper()}"
-
-    def _pending_server_activity_logs(self, limit: int = 80) -> List[Dict[str, Any]]:
-        acknowledged = set(getattr(self, "_server_acknowledged_activity_ids", set()) or set())
-        rows: List[Dict[str, Any]] = []
-        for raw in list(getattr(self, "_app_logs", []) or []):
-            if not isinstance(raw, dict):
-                continue
-            row = dict(raw)
-            activity_id = self._app_log_activity_id(row)
-            if not activity_id or activity_id in acknowledged:
-                continue
-            row["activity_id"] = activity_id
-            rows.append(row)
-        return rows[-max(1, int(limit or 80)):]
-
-    def _remove_server_acknowledged_app_logs(self, uploaded_rows: Any):
-        """Remove only audit rows included in a server-confirmed shift."""
-        uploaded = [row for row in (uploaded_rows or []) if isinstance(row, dict)]
-        if not uploaded:
-            return
-        uploaded_counts: Dict[str, int] = {}
-        for row in uploaded:
-            key = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
-            uploaded_counts[key] = uploaded_counts.get(key, 0) + 1
-        kept: List[Dict[str, Any]] = []
-        for row in list(getattr(self, "_app_logs", []) or []):
-            if not isinstance(row, dict):
-                continue
-            key = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
-            remaining = int(uploaded_counts.get(key, 0) or 0)
-            if remaining > 0:
-                uploaded_counts[key] = remaining - 1
-                continue
-            kept.append(row)
-        self._app_logs = kept[-APP_LOG_MAX_ROWS:]
-        self._app_logs_dirty = True
-        self._enqueue_app_log_persist({}, list(self._app_logs))
+        """Compatibility no-op: the standalone client App Logs feature was removed."""
+        return
 
     def _on_status_label_changed(self, text: str):
         msg = str(text or "").replace("\n", " ").strip()
         if not msg:
             return
-        self._append_app_log("STATUS", msg)
         if not bool(getattr(self, "_scan_feedback_context_active", False)):
             return
         lowered = msg.lower()
@@ -25130,7 +25102,7 @@ QWidget#ClientUIRoot {{
 
     def _expected_scan_instruction(self) -> str:
         s = self.state
-        if isinstance(getattr(self, "_pending_finish_excess_payload", None), dict):
+        if isinstance(self.__dict__.get("_pending_finish_excess_payload"), dict):
             return "Scan PREV/NEXT, enter optional Actual Count with numpad, Custom 01 for decimal, or CONFIRM to print."
         if self._pending_final_review_payload:
             return 'Scan "next", "prev", or "confirm".'
@@ -25243,7 +25215,7 @@ QWidget#ClientUIRoot {{
     def _active_command_banner_text(self) -> str:
         """Return the active command state for the permanent blue banner."""
         s = self.state
-        if isinstance(getattr(self, "_pending_finish_excess_payload", None), dict):
+        if isinstance(self.__dict__.get("_pending_finish_excess_payload"), dict):
             return "RETURN INVENTORY: PREV/NEXT row • numpad actual • Custom 01 decimal • CONFIRM print"
         if isinstance(getattr(self, "_pending_final_review_payload", None), dict):
             return "FINISH JOB REVIEW: scan NEXT, PREV, or CONFIRM"
@@ -25305,153 +25277,6 @@ QWidget#ClientUIRoot {{
             (s.waiting_butal_completion_pack_scan, "BUTAL COMPLETION: scan PACK QR"),
         )
         return next((text for active, text in checks if active), "")
-
-    def _is_logs_section_active(self) -> bool:
-        try:
-            return bool(
-                hasattr(self, "settingsOverlay")
-                and self.settingsOverlay is not None
-                and self.settingsOverlay.isVisible()
-                and hasattr(self, "settingsLogsSection")
-                and self.settingsLogsSection is not None
-                and self.settingsLogsSection.isVisible()
-            )
-        except Exception:
-            return False
-
-    def _refresh_app_logs_table(self, force: bool = False):
-        if not hasattr(self, "appLogsTable") or self.appLogsTable is None:
-            return
-        if not force and not bool(getattr(self, "_app_logs_dirty", False)):
-            return
-        all_rows = list(reversed(list(getattr(self, "_app_logs", []) or [])))
-        rows = all_rows[:APP_LOG_TABLE_MAX_ROWS]
-        self.appLogsTable.setUpdatesEnabled(False)
-        self.appLogsTable.setSortingEnabled(False)
-        self.appLogsTable.clearContents()
-        self.appLogsTable.setRowCount(max(1, len(rows)))
-        for row_idx, row in enumerate(rows):
-            if not isinstance(row, dict):
-                continue
-            ts_raw = str(row.get("timestamp_utc") or "").strip()
-            ts_text = ts_raw or "-"
-            if ts_raw:
-                try:
-                    dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                    ts_text = dt.astimezone().strftime("%Y-%m-%d %I:%M:%S %p")
-                except Exception:
-                    ts_text = ts_raw
-            values = [
-                ts_text,
-                str(row.get("source") or "-"),
-                str(row.get("actor") or "-"),
-                str(row.get("message") or "-"),
-            ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setTextAlignment(
-                    int(Qt.AlignmentFlag.AlignCenter)
-                    if col in (0, 1, 2)
-                    else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                )
-                self.appLogsTable.setItem(row_idx, col, item)
-        if not rows:
-            for col, value in enumerate(("No logs yet", "-", "-", "No app actions recorded yet")):
-                item = QTableWidgetItem(str(value))
-                item.setTextAlignment(
-                    int(Qt.AlignmentFlag.AlignCenter)
-                    if col in (0, 1, 2)
-                    else int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                )
-                self.appLogsTable.setItem(0, col, item)
-        self.appLogsTable.setUpdatesEnabled(True)
-        self.appLogsTable.viewport().update()
-        self._app_logs_dirty = False
-
-    def _widget_log_name(self, widget: Optional[QWidget]) -> str:
-        if widget is None:
-            return "Unknown"
-        custom_name = str(widget.property("app_log_name") or "").strip()
-        if custom_name:
-            return custom_name
-        if isinstance(widget, QPushButton):
-            text = str(widget.text() or "").strip()
-            if text == "\u2699":
-                return "Settings Button"
-            return text or str(widget.objectName() or "Button")
-        if isinstance(widget, QComboBox):
-            return str(widget.objectName() or "Dropdown")
-        if isinstance(widget, QLineEdit):
-            return str(widget.placeholderText() or widget.objectName() or "Input")
-        return str(widget.objectName() or widget.__class__.__name__ or "Widget")
-
-    def _install_app_log_hooks(self):
-        for btn in self.findChildren(QPushButton):
-            try:
-                btn.clicked.connect(lambda checked=False, w=btn: self._log_user_button_click(w))
-            except Exception:
-                continue
-        for combo in self.findChildren(QComboBox):
-            try:
-                combo.activated.connect(lambda _index, w=combo: self._log_user_combo_change(w))
-            except Exception:
-                continue
-        for field in self.findChildren(QLineEdit):
-            try:
-                field.installEventFilter(self._app_log_filter)
-                field.returnPressed.connect(lambda w=field: self._log_user_input_edit(w))
-            except Exception:
-                continue
-
-    def _log_user_button_click(self, widget: Optional[QPushButton]):
-        if not bool(getattr(self, "_app_log_ready", False)) or widget is None:
-            return
-        name = self._widget_log_name(widget)
-        if widget.isCheckable():
-            state = "ON" if widget.isChecked() else "OFF"
-            self._append_app_log("UI", f"Button clicked: {name} [{state}]")
-            return
-        self._append_app_log("UI", f"Button clicked: {name}")
-
-    def _log_user_combo_change(self, widget: Optional[QComboBox]):
-        if not bool(getattr(self, "_app_log_ready", False)) or widget is None:
-            return
-        name = self._widget_log_name(widget)
-        value = str(widget.currentText() or "").strip() or "-"
-        self._append_app_log("UI", f"Dropdown changed: {name} -> {value}")
-
-    def _log_user_input_edit(self, widget: Optional[QLineEdit]):
-        if not bool(getattr(self, "_app_log_ready", False)) or widget is None:
-            return
-        name = self._widget_log_name(widget)
-        text = str(widget.text() or "")
-        if widget.echoMode() == QLineEdit.EchoMode.Password:
-            value = "<hidden>"
-        else:
-            value = text.strip()
-            if len(value) > 80:
-                value = value[:77] + "..."
-            value = value or "<blank>"
-        signature = f"{name}::{value}"
-        if str(widget.property("_app_log_last_signature") or "") == signature:
-            return
-        widget.setProperty("_app_log_last_signature", signature)
-        self._append_app_log("UI", f"Input updated: {name} = {value}")
-
-    def _scan_log_details(self, raw: str) -> tuple[str, str]:
-        raw_s = str(raw or "").strip()
-        actor = self._current_app_log_actor()
-        person = self._authorized_person_from_scan(raw_s)
-        if isinstance(person, dict):
-            person_name = str(person.get("name") or raw_s).strip() or raw_s
-            person_role = str(person.get("role") or "Authorized").strip() or "Authorized"
-            return f"QR scanned: {raw_s} [{person_role} badge]", f"{person_name} ({person_role})"
-        res = parse_scan(raw_s)
-        if res is None:
-            return f"QR scanned: {raw_s} [UNKNOWN]", actor
-        detail = self._scan_display_text(res, raw_s)
-        kind = str(res.kind or "").strip().upper() or "SCAN"
-        return f"QR scanned: {detail} [{kind}] | Raw: {raw_s}", actor
 
     def _set_status_text(self, text: str):
         t = str(text).replace("\n", " ").strip()
@@ -25708,6 +25533,10 @@ QWidget#ClientUIRoot {{
         raw_s = str(raw).strip()
         raw_l = raw_s.lower()
         s = self.state
+        # Scanner-owned option menus must resolve before any other numpad
+        # consumer (offline prompts, reject detail, counters, or multiplier).
+        if self._handle_color_change_number_choice(raw_l):
+            return
         if isinstance(self._pending_color_mold_change, dict):
             pending_trigger = parse_scan(raw_s)
             if pending_trigger is not None and pending_trigger.kind == "COLOR_CHANGE_TRIGGER":
@@ -27212,8 +27041,6 @@ QWidget#ClientUIRoot {{
         if res is None and str(s.reject_multiplier_input or "").strip() and raw_l != "backspace" and self._numpad_digit_from_scan(raw_l) is None:
             self._clear_reject_multiplier()
             self._refresh_ui()
-        if self._handle_color_change_number_choice(raw_l):
-            return
         if res is None:
             self.status.setText("Unknown or invalid QR.")
             self._show_invalid_overlay("QR not recognized.")
@@ -27768,7 +27595,6 @@ QWidget#ClientUIRoot {{
                 self.status.setText("Cannot finish while downtime/reject flow is active.")
                 return
             self._finish_job_cancel_snapshot = self._state_to_active_snapshot()
-            self._finalize_current_operator_shift("JOB_FINISH", emit_event=False)
             finished_payload = self._build_finished_job_payload()
             if self.state.linkage_enabled and (self.state.linkage_jobs or []):
                 total_jobs_in_group = 1 + len(self.state.linkage_jobs or [])
@@ -30455,26 +30281,6 @@ QWidget#ClientUIRoot {{
                     if authoritative_replace_queued:
                         self._server_authoritative_reconcile_needed = False
                 if event_type == "HEARTBEAT":
-                    acknowledged_activity_ids = {
-                        str(value or "").strip()
-                        for value in (response_body.get("client_activity_ack_ids") or [])
-                        if str(value or "").strip()
-                    }
-                    if acknowledged_activity_ids:
-                        current_activity_ids = set(
-                            getattr(self, "_server_acknowledged_activity_ids", set()) or set()
-                        )
-                        current_activity_ids.update(acknowledged_activity_ids)
-                        # Keep only acknowledgements that can still correspond
-                        # to the bounded local audit history.
-                        live_activity_ids = {
-                            self._app_log_activity_id(row)
-                            for row in list(getattr(self, "_app_logs", []) or [])
-                            if isinstance(row, dict)
-                        }
-                        self._server_acknowledged_activity_ids = (
-                            current_activity_ids.intersection(live_activity_ids)
-                        )
                     self.sync_local_finish_shifts_to_server(force=False)
                     self.sync_local_finished_jobs_to_server()
                 if event_type == "FINISH_SHIFT" and not discard_item and isinstance(event_body, dict):
@@ -30488,7 +30294,6 @@ QWidget#ClientUIRoot {{
                 if event_type == "FINISH_JOB" and isinstance(event_body, dict):
                     finished_row = event_body.get("finished_job")
                     if isinstance(finished_row, dict):
-                        self._remove_server_acknowledged_app_logs(finished_row.get("client_app_logs"))
                         self._remove_acknowledged_local_finished_job(finished_row)
                         if not discard_item:
                             self.server_closed_session_received.emit(
@@ -30609,40 +30414,6 @@ QWidget#ClientUIRoot {{
                 continue
         return False
 
-    def _app_log_persist_loop(self):
-        while not self._app_log_worker_stop.is_set() or not self._app_log_queue.empty():
-            try:
-                item = self._app_log_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
-                rows_snapshot = item.get("rows") if isinstance(item.get("rows"), list) else list(getattr(self, "_app_logs", []) or [])
-                _save_app_logs_json(rows_snapshot)
-            except Exception:
-                pass
-            finally:
-                self._app_log_queue.task_done()
-
-    def _enqueue_app_log_persist(self, row: Dict[str, Any], rows_snapshot: List[Dict[str, Any]]):
-        item = {
-            "row": dict(row or {}),
-            "rows": list(rows_snapshot or []),
-        }
-        if self._app_log_worker_stop.is_set():
-            _save_app_logs_json(item["rows"])
-            return
-        while True:
-            try:
-                self._app_log_queue.get_nowait()
-            except queue.Empty:
-                break
-            else:
-                self._app_log_queue.task_done()
-        try:
-            self._app_log_queue.put_nowait(item)
-        except queue.Full:
-            _save_app_logs_json(item["rows"])
-
     def _active_session_file_persist_loop(self):
         while not self._active_session_file_worker_stop.is_set() or not self._active_session_file_queue.empty():
             try:
@@ -30729,9 +30500,6 @@ QWidget#ClientUIRoot {{
             return False
         event_payload = dict(event or {})
         event_type = str(event_payload.get("type") or "").strip().upper()
-        # Audit rows are transported by the regular heartbeat. Copying and
-        # encoding the same batch on every production scan adds latency without
-        # improving delivery because the server already deduplicates the rows.
         if event_type == "HEARTBEAT":
             event_payload.setdefault("rpi_uptime_seconds", _system_uptime_seconds())
             event_payload.setdefault(
@@ -30741,10 +30509,6 @@ QWidget#ClientUIRoot {{
             event_payload.setdefault(
                 "known_production_session_id",
                 str(s.production_session_id or "").strip(),
-            )
-            event_payload.setdefault(
-                "client_activity_logs",
-                self._pending_server_activity_logs(80),
             )
         state_session_id = str(s.production_session_id or "").strip()
         finished_row = event_payload.get("finished_job")
@@ -30797,13 +30561,10 @@ QWidget#ClientUIRoot {{
         self._save_active_session_snapshot()
         self._serial_stop.set()
         self._event_worker_stop.set()
-        self._app_log_worker_stop.set()
         self._active_session_file_worker_stop.set()
         self._shutdown_average_weight_server()
         if self._event_worker_thread and self._event_worker_thread.is_alive():
             self._event_worker_thread.join(timeout=1.0)
-        if self._app_log_worker_thread and self._app_log_worker_thread.is_alive():
-            self._app_log_worker_thread.join(timeout=1.0)
         if self._active_session_file_worker_thread and self._active_session_file_worker_thread.is_alive():
             self._active_session_file_worker_thread.join(timeout=1.0)
         super().closeEvent(event)

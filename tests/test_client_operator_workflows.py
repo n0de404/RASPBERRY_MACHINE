@@ -1,4 +1,5 @@
 import os
+import inspect
 import sys
 import unittest
 from types import SimpleNamespace
@@ -31,6 +32,52 @@ class ClientOperatorWorkflowTests(unittest.TestCase):
         self.assertEqual(text, "RELIEVER: Relief Operator")
         self.assertNotIn("Main Operator", text)
         self.assertTrue(highlighted)
+
+    def test_color_mold_choice_precedes_general_multiplier_input(self):
+        source = inspect.getsource(production_client.ClientUI.on_scanned)
+
+        choice_position = source.index("if self._handle_color_change_number_choice(raw_l):")
+        reject_choice_position = source.index('state_choice = re.fullmatch(r"num_(\\d+)", raw_l)')
+        multiplier_position = source.index("self._append_reject_multiplier_digit(input_digit)")
+
+        self.assertLess(choice_position, reject_choice_position)
+        self.assertLess(choice_position, multiplier_position)
+
+    def test_num_1_selects_color_without_becoming_multiplier(self):
+        ui = self._client()
+        ui.state.waiting_color_change_job_scan = True
+        ui.state.pending_color_change_reason = "CHOOSE_TYPE"
+        ui.state.reject_multiplier_input = ""
+        ui.status = Mock()
+        ui._hide_invalid_overlay = Mock()
+        ui._show_info_overlay = Mock()
+        ui._save_active_session_snapshot = Mock()
+
+        handled = ui._handle_color_change_number_choice("num_1")
+
+        self.assertTrue(handled)
+        self.assertEqual(ui.state.pending_color_change_reason, "COLOR_CHANGE")
+        self.assertEqual(ui.state.reject_multiplier_input, "")
+        ui._show_info_overlay.assert_called_once()
+
+    def test_visible_color_mold_menu_repairs_cleared_transient_state(self):
+        ui = self._client()
+        ui.state.waiting_color_change_job_scan = False
+        ui.state.pending_color_change_reason = ""
+        ui.invalidOverlay = SimpleNamespace(isVisible=lambda: True)
+        ui.choiceCardsWidget = SimpleNamespace(isVisible=lambda: True)
+        ui.invalidTextLabel = SimpleNamespace(text=lambda: "CHANGE COLOR / MOLD")
+        ui.status = Mock()
+        ui._hide_invalid_overlay = Mock()
+        ui._show_info_overlay = Mock()
+        ui._save_active_session_snapshot = Mock()
+
+        handled = ui._handle_color_change_number_choice("num_2")
+
+        self.assertTrue(handled)
+        self.assertTrue(ui.state.waiting_color_change_job_scan)
+        self.assertEqual(ui.state.pending_color_change_reason, "MOLD_CHANGE")
+        ui._show_info_overlay.assert_called_once()
 
     def test_signed_carryover_fences_job_started_before_cutover(self):
         ui = self._client()
@@ -112,6 +159,59 @@ class ClientOperatorWorkflowTests(unittest.TestCase):
         )
         self.assertIsNone(ui._pending_server_recovery)
         self.assertEqual(ui._skip_server_recovery_machine, "")
+
+    def test_operator_handoff_is_a_log_not_a_production_segment(self):
+        ui = self._client()
+        ui.state.machine_code = "M00008"
+        ui.state.machine_name = "IMM 308"
+        ui.state.job_code = "JOB-100"
+        ui.state.job_name = "3-26-100-1"
+        ui.state.production_session_id = "PS-CONTINUOUS"
+        ui.state.operator_id = "OP-1 - First Operator"
+        ui.state.operator_shift_started_at = "2026-11-24T01:00:00+00:00"
+        ui._current_client_id = Mock(return_value="RPI-CLIENT-008")
+        ui._operator_display_name = lambda value: str(value or "")
+
+        row = ui._record_operator_handoff(
+            reason="QR_SHIFT_HANDOFF",
+            reviewer={"code": "SV-1", "name": "Supervisor One", "role": "SUPERVISOR"},
+        )
+
+        self.assertEqual(row["record_type"], "OPERATOR_HANDOFF")
+        self.assertEqual(row["outgoing_operator_id"], "OP-1 - First Operator")
+        self.assertNotIn("pack_count", row)
+        self.assertNotIn("good_total", row)
+        self.assertEqual(ui._operator_shift_segment_rows(), [])
+
+    def test_continuous_handoff_preserves_job_totals_and_scan_history(self):
+        ui = self._client()
+        ui.state.machine_code = "M00008"
+        ui.state.job_code = "JOB-100"
+        ui.state.production_session_id = "PS-CONTINUOUS"
+        ui.state.operator_id = "OP-1 - First Operator"
+        ui.state.pack_count = 12
+        ui.state.good_total = 48
+        ui.state.reject_total = 2
+        ui.state.product_pack_history_logs = [{"pack_key": "PACK-1", "scan_operator_id": "OP-1"}]
+        ui.state.raw_material_logs = [{"unique_key": "PART-1", "scan_operator_id": "OP-1"}]
+        ui.state.raw_material_unique_keys = {"PART-1"}
+        ui._close_open_relief_for_operator_handoff = Mock()
+        ui._refresh_ui = Mock()
+        ui._save_active_session_snapshot = Mock()
+        ui.push_event = Mock(return_value=True)
+        ui.sync_session_snapshot_to_server = Mock()
+
+        ui._prepare_continuous_operator_handoff({"handoff_id": "OH-1"})
+
+        self.assertIsNone(ui.state.operator_id)
+        self.assertEqual(ui.state.production_session_id, "PS-CONTINUOUS")
+        self.assertEqual(ui.state.pack_count, 12)
+        self.assertEqual(ui.state.good_total, 48)
+        self.assertEqual(ui.state.reject_total, 2)
+        self.assertEqual(len(ui.state.product_pack_history_logs), 1)
+        self.assertEqual(len(ui.state.raw_material_logs), 1)
+        self.assertEqual(ui.state.raw_material_unique_keys, {"PART-1"})
+        self.assertEqual(ui.push_event.call_args.args[0]["type"], "OPERATOR_HANDOFF")
 
     def test_active_reliever_has_priority_over_helper_manpower_count(self):
         ui = self._client()
@@ -234,6 +334,106 @@ class ClientOperatorWorkflowTests(unittest.TestCase):
         self.assertEqual(event["removed_job_code"], "JOB-300")
         self.assertEqual([row["job_code"] for row in event["post_linkage_jobs"]], ["JOB-200"])
         self.assertTrue(event["post_linkage_enabled"])
+
+
+class ClientRawMaterialRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _client():
+        ui = production_client.ClientUI.__new__(production_client.ClientUI)
+        ui.state = production_client.ClientState()
+        return ui
+
+    def test_dedupe_uses_qr_identity_not_sku_or_lot(self):
+        ui = self._client()
+        rows = [
+            {"unique_key": "PART:LOT-A:1", "material_sku": "RESIN-A", "qty": 25},
+            {"unique_key": "PART:LOT-A:2", "material_sku": "RESIN-A", "qty": 25},
+            {"unique_key": "PART:LOT-A:1", "material_sku": "RESIN-A", "qty": 25},
+        ]
+
+        deduped = ui._dedupe_raw_material_logs(rows)
+
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(
+            [row["unique_key"] for row in deduped],
+            ["PART:LOT-A:1", "PART:LOT-A:2"],
+        )
+        self.assertEqual(sum(row["qty"] for row in deduped), 50)
+
+    def test_recovery_merge_unions_registry_and_deduplicates_replicas(self):
+        ui = self._client()
+        server = {
+            "production_session_id": "PS-1",
+            "raw_material_logs": [
+                {"unique_key": "PART-1", "material_name": "Resin", "qty": 25},
+            ],
+            "raw_material_unique_keys": ["PART-1"],
+        }
+        local = {
+            "production_session_id": "PS-1",
+            "raw_material_logs": [
+                {"unique_key": "PART-1", "material_name": "Resin", "qty": 25},
+                {"unique_key": "PART-2", "material_name": "Resin", "qty": 25},
+            ],
+            "raw_material_unique_keys": ["PART-1", "PART-2", "VOIDED-HISTORY-BLOCK"],
+        }
+
+        merged = ui._merge_matching_recovery_snapshots(server, local)
+
+        self.assertEqual(len(merged["raw_material_logs"]), 2)
+        self.assertEqual(merged["raw_sacks_count"], 2)
+        self.assertEqual(
+            set(merged["raw_material_unique_keys"]),
+            {"PART-1", "PART-2", "VOIDED-HISTORY-BLOCK"},
+        )
+
+    def test_sanitize_repairs_count_and_keeps_job_wide_identity_history(self):
+        ui = self._client()
+        ui.state.raw_material_logs = [
+            {"unique_key": "PART-1", "material_name": "Resin", "qty": 25},
+            {"unique_key": "PART-1", "material_name": "Resin", "qty": 25},
+            {
+                "unique_key": "SHIFT-CARRY:PART-1",
+                "material_name": "Resin",
+                "qty": 5,
+                "source": "FINISH_SHIFT_PART_CARRYOVER",
+            },
+        ]
+        ui.state.raw_material_unique_keys = {"PART-1", "PART-OLD"}
+
+        ui._sanitize_active_raw_material_inventory(ui.state.raw_material_unique_keys)
+
+        self.assertEqual(len(ui.state.raw_material_logs), 2)
+        self.assertEqual(ui.state.raw_sacks_count, 1)
+        self.assertIn("PART-OLD", ui.state.raw_material_unique_keys)
+        self.assertIn("SHIFT-CARRY:PART-1", ui.state.raw_material_unique_keys)
+
+    def test_recovery_drops_carryover_when_its_original_qr_is_present(self):
+        ui = self._client()
+        original_raw = "O000000000060000001246500000000000|LOT-A|1"
+        rows = [
+            {
+                "unique_key": "PART:LOT-A:1",
+                "raw_scan": original_raw,
+                "material_name": "Resin",
+                "qty": 25,
+                "source": "RAW_MATERIAL_QR",
+            },
+            {
+                "unique_key": "SHIFT-CARRY:JOB-1:RESIN:TIME",
+                "carryover_origin_unique_key": "PART:LOT-A:1",
+                "raw_scan": original_raw,
+                "material_name": "Resin",
+                "qty": 14.738,
+                "source": "FINISH_SHIFT_PART_CARRYOVER",
+            },
+        ]
+
+        deduped = ui._dedupe_raw_material_logs(rows)
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0]["unique_key"], "PART:LOT-A:1")
+        self.assertEqual(sum(row["qty"] for row in deduped), 25)
 
 
 class ClientShiftTurnoverWorkflowTests(unittest.TestCase):
