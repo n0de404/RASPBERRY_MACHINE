@@ -13763,7 +13763,10 @@ DASHBOARD_HTML = r"""
     const productId = firstValue(item.product_id, details.product_id, job.product_id);
     const catalogSku = cleanSku(productCatalogSku(productId));
     if(catalogSku) return catalogSku;
-    return firstValue(item.job_name, item.job_code, job.ref_no, payload.job_name, payload.job_code, "-");
+    // A job reference is not a product SKU. Return an empty value so callers
+    // can fall back to the live session or catalog SKU without displaying the
+    // job name twice as both "Job Name" and "SKU".
+    return "";
   }
 
   function jobDisplayName(row, fallback = "Job"){
@@ -26306,6 +26309,135 @@ def _normalize_client_activity_rows(incoming: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _durable_machine_activity_rows(sess: Optional[MachineSession]) -> List[Dict[str, Any]]:
+    """Build Machine History from durable production ledgers.
+
+    Client App Logs were retired because periodic settings/connection messages
+    flooded the audit view. The dashboard must therefore use the production
+    records already stored in the active session instead of depending on that
+    retired client-side log transport.
+    """
+    if sess is None:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+
+    def first_text(row: Dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            value = str(row.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def actor_for(row: Dict[str, Any]) -> str:
+        return first_text(
+            row,
+            "active_operator_name",
+            "operator_name",
+            "actor_name",
+            "supervisor_name",
+            "confirmed_by",
+            "maintenance",
+            "active_operator",
+            "operator",
+            "actor",
+        ) or str(sess.operator_id or "-").strip() or "-"
+
+    def add(row: Any, source: str, message: str, *timestamp_keys: str) -> None:
+        if not isinstance(row, dict):
+            return
+        timestamp = first_text(
+            row,
+            *(timestamp_keys or (
+                "timestamp_utc",
+                "scanned_at_utc",
+                "scanned_at",
+                "changed_at_utc",
+                "checked_at_utc",
+                "finished_at_utc",
+                "ended_at_utc",
+                "started_at_utc",
+            )),
+        )
+        if not timestamp:
+            return
+        item = {
+            "timestamp_utc": timestamp,
+            "source": str(source or "APP").strip().upper() or "APP",
+            "actor": actor_for(row),
+            "message": str(message or "-").replace("\n", " ").strip() or "-",
+        }
+        item["activity_id"] = _machine_activity_id(item)
+        rows.append(item)
+
+    for row in sess.product_pack_history_logs or []:
+        if not isinstance(row, dict):
+            continue
+        series = first_text(row, "index", "series") or "-"
+        sku = first_text(row, "sku", "product_sku", "product_name") or "-"
+        qty = row.get("good_qty", row.get("completed_pack_qty", row.get("qty_q", row.get("qty", 0))))
+        status = "VOIDED" if bool(row.get("voided")) else "scanned"
+        add(row, "SCAN", f"PACK {status} | Series {series} | SKU {sku} | Qty {qty}", "scanned_at", "scanned_at_utc")
+
+    for row in sess.raw_material_logs or []:
+        if not isinstance(row, dict):
+            continue
+        sku = first_text(row, "material_sku", "job_part_sku", "sku", "material_name", "material") or "-"
+        qty = row.get("qty", row.get("quantity", 0))
+        unit = first_text(row, "unit")
+        status = "VOIDED" if bool(row.get("voided")) else "scanned"
+        add(row, "SCAN", f"PRODUCT PART {status} | {sku} | Qty {qty}{(' ' + unit) if unit else ''}", "scanned_at", "scanned_at_utc")
+
+    for row in sess.butal_scan_logs or []:
+        if not isinstance(row, dict):
+            continue
+        qty = row.get("qty", row.get("quantity", 0))
+        status = "VOIDED" if bool(row.get("voided")) else "scanned"
+        add(row, "SCAN", f"BUTAL {status} | Qty {qty}", "scanned_at", "scanned_at_utc")
+
+    for row in sess.reject_review_logs or []:
+        if not isinstance(row, dict):
+            continue
+        reason = first_text(row, "reason_text", "reason_code", "action", "entry_type") or "-"
+        qty = row.get("qty", row.get("quantity", 1))
+        status = "VOIDED" if bool(row.get("voided")) else "recorded"
+        add(row, "REJECT", f"REJECT {status} | {reason} | Qty {qty}", "scanned_at", "timestamp_utc")
+
+    for row in sess.cycle_time_change_logs or []:
+        if not isinstance(row, dict):
+            continue
+        before = row.get("previous_cycle_time", row.get("before", "-"))
+        after = row.get("cycle_time", row.get("after", "-"))
+        add(row, "CYCLE TIME", f"Cycle time changed | {before} -> {after}", "set_at_utc", "changed_at_utc", "timestamp_utc")
+
+    for row in sess.pdr_downtime_logs or []:
+        if not isinstance(row, dict):
+            continue
+        reason = first_text(row, "reason", "operator_reason", "reason_code") or "-"
+        duration = row.get("duration_seconds")
+        suffix = f" | {duration}s" if duration not in (None, "") else ""
+        add(row, "DOWNTIME", f"Downtime recorded | {reason}{suffix}", "finished_at_utc", "ended_at_utc", "started_at_utc")
+
+    for row in sess.supervisor_rotation_logs or []:
+        if not isinstance(row, dict):
+            continue
+        name = first_text(row, "supervisor_name", "supervisor_code") or "Supervisor"
+        add(row, "SUPERVISOR", f"Supervisor rotation check | {name}", "checked_at_utc", "timestamp_utc")
+
+    for row in sess.operator_shift_logs or []:
+        if not isinstance(row, dict):
+            continue
+        outgoing = first_text(row, "outgoing_operator_name", "outgoing_operator_id", "operator_name", "operator_id") or "-"
+        incoming = first_text(row, "incoming_operator_name", "incoming_operator_id")
+        message = f"Operator handoff | {outgoing}"
+        if incoming:
+            message += f" -> {incoming}"
+        add(row, "OPERATOR", message, "changed_at_utc", "ended_at_utc", "timestamp_utc", "started_at_utc")
+
+    rows.sort(key=lambda row: str(row.get("timestamp_utc") or ""), reverse=True)
+    return rows
+
+
 def _merge_client_app_logs(sess: MachineSession, incoming: Any) -> int:
     rows = _normalize_client_activity_rows(incoming)
     if not rows:
@@ -27328,18 +27460,15 @@ async def api_machine_client_activity(machine_code: str, limit: int = 400, curre
     safe_limit = max(1, min(10000, int(limit or 400)))
     shift_started_at = str(sess.job_started_at or "").strip() if current_shift and sess is not None else ""
     stored = _load_machine_activity_logs_sql(code, safe_limit, shift_started_at)
-    if stored is not None:
-        return {
-            "ok": True,
-            "machine_code": code,
-            "items": stored["items"],
-            "total": stored["total"],
-        }
     rows = [
         dict(row)
-        for row in ((sess.client_app_logs if sess else None) or [])
+        for row in (
+            (stored.get("items") if isinstance(stored, dict) else None)
+            or ((sess.client_app_logs if sess else None) or [])
+        )
         if isinstance(row, dict) and not _client_activity_row_is_noise(row)
     ]
+    rows.extend(_durable_machine_activity_rows(sess))
     if shift_started_at:
         started = _parse_iso_utc(shift_started_at)
         if started is not None:
@@ -27347,6 +27476,12 @@ async def api_machine_client_activity(machine_code: str, limit: int = 400, curre
                 row for row in rows
                 if (_parse_iso_utc(row.get("timestamp_utc")) or datetime.min.replace(tzinfo=timezone.utc)) >= started
             ]
+    unique_rows: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        activity_id = str(row.get("activity_id") or _machine_activity_id(row)).strip()
+        row["activity_id"] = activity_id
+        unique_rows.setdefault(activity_id, row)
+    rows = list(unique_rows.values())
     rows.sort(key=lambda row: str(row.get("timestamp_utc") or ""), reverse=True)
     return {
         "ok": True,
@@ -27991,16 +28126,19 @@ async def api_event(req: Request):
         sess.current_break_session_id = ""
         sess.break_out_time = None
     elif ev_type == "OPERATOR_CHANGE":
-        shift_payload = ev.get("operator_shift")
+        shift_payload = ev.get("operator_handoff") or ev.get("operator_shift")
         if isinstance(shift_payload, dict):
             rows = list(sess.operator_shift_logs or [])
+            handoff_id = str(shift_payload.get("handoff_id") or "").strip()
             key = _active_shift_segment_key(shift_payload, sess)
             rows = [
                 row for row in rows
                 if not (
                     isinstance(row, dict)
-                    and key
-                    and _active_shift_segment_key(row, sess) == key
+                    and (
+                        (handoff_id and str(row.get("handoff_id") or "").strip() == handoff_id)
+                        or (not handoff_id and key and _active_shift_segment_key(row, sess) == key)
+                    )
                 )
             ]
             rows.append(dict(shift_payload))
@@ -28021,21 +28159,36 @@ async def api_event(req: Request):
         sess.break_active = False
         sess.current_break_session_id = ""
         sess.break_out_time = None
-        sess.pack_total = 0
-        sess.good_total = 0
-        sess.butal_total = 0
-        sess.reject_total = 0
-        sess.reject_breakdown = {}
-        sess.no_shot_total = 0
-        sess.startup_reject_total = 0
-        sess.raw_sacks_count = 0
-        sess.raw_material_scans = []
-        sess.raw_material_logs = []
-        sess.product_pack_history_logs = []
-        sess.last_supervisor_check_at_utc = None
-        sess.last_supervisor_check_name = None
-        sess.last_supervisor_check_code = None
         sess.last_event = f"OPERATOR CHANGE {new_operator}".strip()
+    elif ev_type == "OPERATOR_HANDOFF":
+        handoff = ev.get("operator_handoff")
+        if isinstance(handoff, dict):
+            rows = list(sess.operator_shift_logs or [])
+            handoff_id = str(handoff.get("handoff_id") or "").strip()
+            if handoff_id:
+                rows = [
+                    row for row in rows
+                    if not (
+                        isinstance(row, dict)
+                        and str(row.get("handoff_id") or "").strip() == handoff_id
+                    )
+                ]
+            rows.append(dict(handoff))
+            sess.operator_shift_logs = _clean_operator_shift_logs_for_session(
+                rows,
+                client_id=sess.client_id,
+                machine_code=sess.machine_code,
+            )
+        sess.operator_id = None
+        sess.operator_qr_payload = ""
+        sess.active_scan_operator_id = None
+        sess.active_scan_owner_type = "ORIGINAL"
+        sess.reliever_id = None
+        sess.reliever_qr_payload = ""
+        sess.break_active = False
+        sess.current_break_session_id = ""
+        sess.break_out_time = None
+        sess.last_event = "OPERATOR HANDOFF - WAITING FOR NEXT OPERATOR"
     elif ev_type in ("RELIEF_START", "RELIEF_END"):
         break_row = ev.get("break_session")
         if isinstance(break_row, dict):

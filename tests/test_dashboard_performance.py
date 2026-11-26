@@ -77,6 +77,37 @@ class DashboardPerformanceSafetyTests(unittest.TestCase):
         self.assertEqual(dashboard_server._merge_client_app_logs(session, noisy_rows), 0)
         self.assertFalse(session.client_app_logs)
 
+    def test_machine_history_uses_durable_production_ledgers_without_app_logs(self):
+        session = dashboard_server.MachineSession(
+            client_id="RPI-TEST",
+            machine_code="M00020",
+            machine_name="IMM 320",
+            operator_id="26-00001 - Operator One",
+            product_pack_history_logs=[{
+                "index": "12",
+                "product_sku": "W-1714-COVER",
+                "qty_q": 6,
+                "scanned_at": "2026-11-26T04:00:00+00:00",
+                "operator_name": "Operator One",
+            }],
+            raw_material_logs=[{
+                "material_sku": "Z-RM-TEST",
+                "qty": 25,
+                "unit": "kg",
+                "scanned_at": "2026-11-26T04:01:00+00:00",
+                "operator_name": "Operator One",
+            }],
+            client_app_logs=[],
+        )
+
+        rows = dashboard_server._durable_machine_activity_rows(session)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["source"], "SCAN")
+        self.assertIn("PRODUCT PART scanned", rows[0]["message"])
+        self.assertIn("PACK scanned", rows[1]["message"])
+        self.assertNotIn("raw_scan", rows[0])
+
     def test_dashboard_assets_are_separated_and_versioned(self):
         self.assertIn('/assets/dashboard.css?v=', dashboard_server.DASHBOARD_PAGE_HTML)
         self.assertIn('/assets/dashboard.js?v=', dashboard_server.DASHBOARD_PAGE_HTML)
